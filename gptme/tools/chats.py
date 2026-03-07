@@ -2,9 +2,13 @@
 List, search, and summarize past conversation logs.
 """
 
+import json as json_mod
 import logging
 import re
+import statistics
 import textwrap
+from collections import Counter
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Literal
 
@@ -170,15 +174,12 @@ def _format_message_with_context(
         context_suffix = context[match_end:].split("\n", 1)[0]
         context = f"{context_prefix}{context[match_start:match_end]}{context_suffix}"
 
-        # highlighted = f"{prefix}{context_prefix}\033[1m{context[match_start:match_end]}\033[0m{context_suffix}{suffix}"
         highlighted = f"{prefix}{context}{suffix}"
         highlighted = re.sub(
-            query,
-            lambda m: (
-                f"\033[1;31m{m.group(0)!r}\033[0m"
-            ),  # not sure why !r is needed to avoid linting error
+            re.escape(query),
+            lambda m: f"\033[1;31m{m.group(0)}\033[0m",
             highlighted,
-            flags=re.DOTALL,
+            flags=re.IGNORECASE,
         )
         formatted_matches.append(highlighted)
 
@@ -215,6 +216,238 @@ def read_chat(id: str, max_results: int = 5, incl_system=False) -> None:
             break
     else:
         print(f"Conversation '{id}' not found.")
+
+
+def find_empty_conversations(
+    max_messages: int = 1,
+    include_test: bool = False,
+) -> list[dict]:
+    """Find conversations with few or no messages.
+
+    Scans all conversations and returns those with at most `max_messages` messages.
+    Useful for cleaning up abandoned or empty conversation logs.
+
+    Args:
+        max_messages: Maximum message count to consider "empty" (default: 1, system-only).
+        include_test: Whether to include test/eval conversations.
+
+    Returns:
+        List of dicts with conversation metadata and disk size.
+    """
+    from ..logmanager import get_conversations, get_user_conversations  # fmt: skip
+
+    conversation_iter = (
+        get_conversations() if include_test else get_user_conversations()
+    )
+
+    results = []
+    for conv in conversation_iter:
+        # Skip conversations with branch history — conv.messages only counts the main
+        # branch, so a conversation with few main-branch messages but significant branch
+        # history could be incorrectly flagged as empty.
+        if conv.messages <= max_messages and conv.branches <= 1:
+            # Calculate disk usage for the conversation directory
+            conv_dir = Path(conv.path).parent
+            try:
+                size_bytes = sum(
+                    f.stat().st_size for f in conv_dir.rglob("*") if f.is_file()
+                )
+            except OSError:
+                size_bytes = 0
+
+            results.append(
+                {
+                    "conversation": conv,
+                    "size_bytes": size_bytes,
+                }
+            )
+
+    return results
+
+
+def _parse_since(since: str | None) -> float | None:
+    """Parse a --since argument into a timestamp.
+
+    Supports:
+        - YYYY-MM-DD: specific date
+        - Nd: N days ago (e.g. 7d, 30d)
+
+    Returns None if since is None.
+    """
+    if since is None:
+        return None
+
+    # Try "Nd" format (days ago)
+    if since.endswith("d") and since[:-1].isdigit():
+        days = int(since[:-1])
+        cutoff = datetime.now(tz=timezone.utc) - timedelta(days=days)
+        return cutoff.timestamp()
+
+    # Try YYYY-MM-DD format
+    try:
+        dt = datetime.strptime(since, "%Y-%m-%d").replace(tzinfo=timezone.utc)
+        return dt.timestamp()
+    except ValueError:
+        pass
+
+    raise ValueError(
+        f"Invalid --since format: '{since}'. Use YYYY-MM-DD or Nd (e.g. 7d, 30d)."
+    )
+
+
+def conversation_stats(since: str | None = None, as_json: bool = False) -> None:
+    """Show statistics about conversation history.
+
+    Args:
+        since: Only include conversations since this date (YYYY-MM-DD or Nd).
+        as_json: Output as JSON instead of formatted text.
+    """
+    from ..logmanager import get_user_conversations  # fmt: skip
+
+    since_ts = _parse_since(since)
+
+    # Collect stats
+    total_conversations = 0
+    total_messages = 0
+    oldest_ts: float | None = None
+    newest_ts: float | None = None
+    daily_counts: Counter[str] = Counter()
+    agent_counts: Counter[str] = Counter()
+    messages_list: list[int] = []
+
+    for conv in get_user_conversations():
+        # Conversations are sorted newest-first by modification time.
+        # If filtering by --since, stop once we pass the cutoff.
+        if since_ts and conv.modified < since_ts:
+            break
+
+        total_conversations += 1
+        total_messages += conv.messages
+        messages_list.append(conv.messages)
+
+        # Track date range.
+        # When filtering by --since (which uses conv.modified), also use modified for
+        # display so the "Oldest" date and histogram align with the filtered window.
+        ts_for_display = conv.modified if since_ts else conv.created
+        if oldest_ts is None or ts_for_display < oldest_ts:
+            oldest_ts = ts_for_display
+        if newest_ts is None or conv.modified > newest_ts:
+            newest_ts = conv.modified
+
+        # Daily activity
+        day = datetime.fromtimestamp(ts_for_display, tz=timezone.utc).strftime(
+            "%Y-%m-%d"
+        )
+        daily_counts[day] += 1
+
+        # Agent breakdown
+        agent = conv.agent_name or "interactive"
+        agent_counts[agent] += 1
+
+    if total_conversations == 0:
+        if since:
+            print(f"No conversations found since {since}.")
+        else:
+            print("No conversations found.")
+        return
+
+    # Compute derived stats
+    avg_messages = total_messages / total_conversations if total_conversations else 0
+    median_messages = statistics.median(messages_list) if messages_list else 0
+
+    # Recent activity (last 7 and 30 days)
+    now = datetime.now(tz=timezone.utc)
+
+    # Histogram window: match the --since window (or default to 14 days).
+    # Cap at 365 to avoid thousands of output lines for old --since dates.
+    if since_ts:
+        hist_days = min(
+            365,
+            max(1, (now - datetime.fromtimestamp(since_ts, tz=timezone.utc)).days),
+        )
+    else:
+        hist_days = 14
+
+    last_7d = sum(
+        count
+        for day, count in daily_counts.items()
+        if (now - datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)).days
+        < 7
+    )
+    last_30d = sum(
+        count
+        for day, count in daily_counts.items()
+        if (now - datetime.strptime(day, "%Y-%m-%d").replace(tzinfo=timezone.utc)).days
+        < 30
+    )
+
+    oldest_dt = (
+        datetime.fromtimestamp(oldest_ts, tz=timezone.utc) if oldest_ts else None
+    )
+    newest_dt = (
+        datetime.fromtimestamp(newest_ts, tz=timezone.utc) if newest_ts else None
+    )
+
+    if as_json:
+        data: dict = {
+            "total_conversations": total_conversations,
+            "total_messages": total_messages,
+            "avg_messages_per_conversation": round(avg_messages, 1),
+            "median_messages_per_conversation": median_messages,
+            "oldest": oldest_dt.isoformat() if oldest_dt else None,
+            "newest": newest_dt.isoformat() if newest_dt else None,
+            "by_agent": dict(agent_counts.most_common()),
+            "by_day": {
+                (now - timedelta(days=i)).strftime("%Y-%m-%d"): daily_counts.get(
+                    (now - timedelta(days=i)).strftime("%Y-%m-%d"), 0
+                )
+                for i in range(hist_days)
+            },
+        }
+        if since:
+            data["since"] = since
+        else:
+            # Only include last_7d/last_30d when not filtering — otherwise they'd
+            # equal total_conversations and be misleading.
+            data["conversations_last_7d"] = last_7d
+            data["conversations_last_30d"] = last_30d
+        print(json_mod.dumps(data, indent=2))
+        return
+
+    # Formatted output
+    since_label = f" (since {since})" if since else ""
+    print(f"Conversation Statistics{since_label}")
+    print("=" * 40)
+    print(f"  Total conversations:  {total_conversations:,}")
+    print(f"  Total messages:       {total_messages:,}")
+    print(f"  Avg messages/conv:    {avg_messages:.1f}")
+    print(f"  Median messages/conv: {median_messages}")
+    if oldest_dt:
+        print(f"  Oldest:               {oldest_dt:%Y-%m-%d %H:%M}")
+    if newest_dt:
+        print(f"  Newest:               {newest_dt:%Y-%m-%d %H:%M}")
+
+    # Only show last-7d/last-30d when not filtering; when --since is set the
+    # data is already scoped and these values would just repeat the total.
+    if not since:
+        print("\nRecent Activity")
+        print(f"  Last 7 days:   {last_7d} conversations")
+        print(f"  Last 30 days:  {last_30d} conversations")
+
+    if agent_counts:
+        print("\nBy Agent")
+        for agent, count in agent_counts.most_common(10):
+            pct = count / total_conversations * 100
+            print(f"  {agent:20s}  {count:5,} ({pct:5.1f}%)")
+
+    # Show daily breakdown for the histogram window
+    print(f"\nDaily Activity (last {hist_days} days)")
+    for i in range(hist_days):
+        day = (now - timedelta(days=i)).strftime("%Y-%m-%d")
+        count = daily_counts.get(day, 0)
+        bar = "#" * min(count, 50)
+        weekday = (now - timedelta(days=i)).strftime("%a")
+        print(f"  {day} ({weekday}): {count:3d} {bar}")
 
 
 def examples(tool_format):

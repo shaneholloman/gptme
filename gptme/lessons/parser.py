@@ -26,6 +26,9 @@ class LessonMetadata:
     name: str | None = None
     description: str | None = None
 
+    # Stable lesson identifier (optional)
+    id: str | None = None
+
     # Lesson format fields
     keywords: list[str] = field(default_factory=list)
     patterns: list[str] = field(default_factory=list)
@@ -204,6 +207,7 @@ def _translate_cursor_metadata(frontmatter: dict) -> LessonMetadata:
     version = frontmatter.get("version")
 
     return LessonMetadata(
+        id=frontmatter.get("id"),
         name=name,
         description=description,
         keywords=list(dict.fromkeys(keywords)),  # Remove duplicates
@@ -323,6 +327,7 @@ def parse_lesson(path: Path) -> Lesson:
                         # Extract Anthropic skill format fields
                         name = frontmatter.get("name")
                         description = frontmatter.get("description")
+                        lesson_id = frontmatter.get("id")
 
                         # Extract lesson format fields
                         match_data = frontmatter.get("match", {})
@@ -347,6 +352,7 @@ def parse_lesson(path: Path) -> Lesson:
                         metadata = LessonMetadata(
                             name=name,
                             description=description,
+                            id=lesson_id,
                             keywords=keywords,
                             patterns=patterns,
                             tools=match_data.get("tools", []),

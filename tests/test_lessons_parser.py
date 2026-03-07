@@ -154,6 +154,30 @@ Lesson content.
             assert "---" not in lesson.body  # Frontmatter stripped
             assert "# Test Lesson" in lesson.body
 
+    def test_parse_lesson_with_explicit_id(self):
+        """Test parsing optional stable lesson id from frontmatter."""
+        with tempfile.TemporaryDirectory() as tmpdir:
+            lesson_dir = Path(tmpdir) / "workflow"
+            lesson_dir.mkdir()
+            lesson_file = lesson_dir / "git-workflow.md"
+
+            content = """---
+id: workflow.git-workflow
+match:
+  keywords: [git, workflow]
+---
+
+# Git Workflow
+
+Description.
+"""
+            lesson_file.write_text(content)
+
+            lesson = parse_lesson(lesson_file)
+
+            assert lesson.metadata.id == "workflow.git-workflow"
+            assert lesson.metadata.keywords == ["git", "workflow"]
+
     def test_parse_lesson_frontmatter_without_match(self):
         """Test parsing lesson with frontmatter but no match section."""
         with tempfile.TemporaryDirectory() as tmpdir:
@@ -500,6 +524,29 @@ class TestTranslateCursorMetadata:
         assert "python" in metadata.keywords
         assert "typescript" in metadata.keywords
         assert "javascript" in metadata.keywords
+
+    def test_cursor_metadata_propagates_id(self):
+        """Test that explicit id field is propagated through .mdc translation."""
+        frontmatter = {
+            "id": "workflow.python-style",
+            "name": "Python Style",
+            "description": "Enforce PEP8",
+            "globs": ["**/*.py"],
+        }
+        metadata = _translate_cursor_metadata(frontmatter)
+
+        assert metadata.id == "workflow.python-style"
+
+    def test_cursor_metadata_id_defaults_to_none(self):
+        """Test that id defaults to None when not specified in .mdc metadata."""
+        frontmatter = {
+            "name": "Python Style",
+            "description": "Enforce PEP8",
+            "globs": ["**/*.py"],
+        }
+        metadata = _translate_cursor_metadata(frontmatter)
+
+        assert metadata.id is None
 
 
 class TestParseMdcLesson:

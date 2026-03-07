@@ -14,6 +14,23 @@ export default defineConfig({
   use: {
     baseURL: 'http://localhost:' + port,
     trace: 'on-first-retry',
+    // Skip the first-run setup wizard in all E2E tests by default.
+    // Tests that need to verify the wizard itself must override storageState
+    // at the test level (e.g. `test.use({ storageState: { cookies: [], origins: [] } })`).
+    storageState: {
+      cookies: [],
+      origins: [
+        {
+          origin: 'http://localhost:' + port,
+          localStorage: [
+            {
+              name: 'gptme-settings',
+              value: JSON.stringify({ hasCompletedSetup: true }),
+            },
+          ],
+        },
+      ],
+    },
   },
   projects: [
     {

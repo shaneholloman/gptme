@@ -23,7 +23,6 @@ except ImportError:
 
 import gptme
 
-from .. import __version__
 from ..chat import chat
 from ..commands import _gen_help
 from ..config import setup_config_from_cli
@@ -39,6 +38,7 @@ from ..telemetry import init_telemetry, shutdown_telemetry
 from ..tools import ToolFormat, get_available_tools, init_tools
 from ..util import epoch_to_age
 from ..util.auto_naming import generate_conversation_id
+from ..util.context import md_codeblock
 from ..util.interrupt import handle_keyboard_interrupt, set_interruptible
 from ..util.prompt import add_history
 
@@ -57,18 +57,30 @@ class CommaSeparatedChoice(click.ParamType):
         self,
         choices: list[str],
         allow_prefix: str | None = None,
+        allow_prefixes: list[str] | None = None,
         metavar: str | None = None,
     ):
         self.choices = choices
-        self.allow_prefix = allow_prefix
+        # Support both single prefix and multiple prefixes
+        if allow_prefixes:
+            self.allow_prefixes = allow_prefixes
+        elif allow_prefix:
+            self.allow_prefixes = [allow_prefix]
+        else:
+            self.allow_prefixes = []
         self._metavar = metavar
 
     def convert(self, value, param, ctx):
         parts = [v.strip() for v in value.split(",") if v.strip()]
         for part in parts:
             check = part
-            if self.allow_prefix and check.startswith(self.allow_prefix):
-                check = check[len(self.allow_prefix) :]
+            for prefix in self.allow_prefixes:
+                if check.startswith(prefix):
+                    check = check[len(prefix) :]
+                    break
+            # Allow file paths (e.g. path/to/tool.py) to pass through
+            if check.endswith(".py") or "/" in check or "\\" in check:
+                continue
             if check not in self.choices:
                 self.fail(
                     f"invalid choice: {part}. (choose from {', '.join(self.choices)})",
@@ -122,11 +134,24 @@ Examples:
   gptme --tools none "what is 2+2"           No tools, just chat
   gptme -t patch,save "fix typo" main.py     Only specific tools (comma-separated)
   gptme -t +subagent "plan a refactor"       Default tools + subagent
+  gptme -t=-browser "summarize code"         Default tools minus browser
   gptme --context files "do task"             Skip context_cmd, keep project files
 
 \b
 The interface provides /commands during a conversation:
-{commands_help}"""
+{commands_help}
+
+\b
+Utilities (gptme-util):
+  gptme-util tools list       List all tools and their availability
+  gptme-util tools info TOOL  Show detailed tool instructions/examples
+  gptme-util chats list       List past conversations
+  gptme-util chats search Q   Search conversations for query
+  gptme-util models list      List available models
+  gptme-util context index    Index project files for RAG
+  gptme-util llm generate     Direct LLM generation without chat
+
+Run 'gptme-util --help' for all utility commands."""
 
 
 @click.command(help=docstring, context_settings={"auto_envvar_prefix": "GPTME"})
@@ -195,9 +220,9 @@ The interface provides /commands during a conversation:
     default=None,
     multiple=True,
     type=CommaSeparatedChoice(
-        _available_tools + ["none"], allow_prefix="+", metavar="TOOL"
+        _available_tools + ["none"], allow_prefixes=["+", "-"], metavar="TOOL"
     ),
-    help=f"Tools to allow. Comma-separated or repeated. Use '+tool' to add to defaults (e.g., '-t +subagent'). Use 'none' to disable all tools. Available: {available_tool_names}.",
+    help=f"Tools to allow. Comma-separated or repeated. Use '+tool' to add to defaults (e.g., '-t +subagent'). Use '-tool' to exclude from defaults (e.g., '-t=-browser'). Use 'none' to disable all tools. Supports .py file paths for custom tools (e.g., '-t path/to/tool.py'). Available: {available_tool_names}.",
 )
 @click.option(
     "--agent-profile",
@@ -240,6 +265,13 @@ The interface provides /commands during a conversation:
     "--version",
     is_flag=True,
     help="Show version and configuration information",
+)
+@click.option(
+    "--version-json",
+    "version_json",
+    is_flag=True,
+    hidden=True,
+    help="Show version info as JSON (for scripting)",
 )
 @click.option(
     "--profile",
@@ -291,6 +323,7 @@ def main(
     non_interactive: bool,
     show_hidden: bool,
     version: bool,
+    version_json: bool,
     resume: bool,
     workspace: str | None,
     agent_path: str | None,
@@ -358,6 +391,14 @@ def main(
 
         # Check if any tool starts with '+' (additive syntax)
         additive_mode = any(t.startswith("+") for t in tools_list)
+        # Check if any tool starts with '-' (exclusion syntax)
+        exclusion_mode = any(t.startswith("-") for t in tools_list)
+
+        if additive_mode and exclusion_mode:
+            raise click.UsageError(
+                "Cannot mix '+tool' (additive) and '-tool' (exclusion) syntax. "
+                "Use one or the other."
+            )
 
         if additive_mode:
             # Strip '+' prefix from all tools
@@ -370,6 +411,24 @@ def main(
                 tool_allowlist_str = "+" + ",".join(additional_tools)
             else:
                 # Just '+' means use defaults
+                tool_allowlist_str = None
+        elif exclusion_mode:
+            # Guard: bare tool names mixed with '-' exclusion tools is ambiguous
+            bare_tools = [t for t in tools_list if not t.startswith("-")]
+            if bare_tools:
+                raise click.UsageError(
+                    f"Cannot mix bare tool names ({', '.join(bare_tools)}) with '-tool' exclusion syntax. "
+                    "Prefix all tools with '-' to exclude them."
+                )
+            # Strip '-' prefix from all tools
+            excluded_tools = [t.removeprefix("-") for t in tools_list]
+            # Filter out empty strings
+            excluded_tools = [t for t in excluded_tools if t]
+
+            if excluded_tools:
+                # Prefix with '-' to signal exclusion mode to config layer
+                tool_allowlist_str = "-" + ",".join(excluded_tools)
+            else:
                 tool_allowlist_str = None
         else:
             # Normal mode - replace defaults with specified tools
@@ -405,14 +464,15 @@ def main(
         atexit.register(save_profile)
 
     interactive = not non_interactive
-    if version:
-        # print version
+    if version or version_json:
+        from ..info import format_version_info
 
-        print(f"gptme v{__version__}")
+        print(format_version_info(verbose=verbose, output_json=version_json))
 
-        # print dirs
-        print(f"Logs dir: {get_logs_dir()}")
-
+        # hint about utilities (non-JSON only)
+        if not version_json:
+            print()
+            print("Utilities: gptme-util (run 'gptme-util --help' for more)")
         exit(0)
 
     if "PYTEST_CURRENT_TEST" in os.environ:
@@ -466,7 +526,7 @@ def main(
         # if piped input, append it to first prompt, or create a new prompt if none exists
         if not piped_input:
             return prompt_msgs
-        stdin_msg = Message("user", f"```stdin\n{piped_input}\n```")
+        stdin_msg = Message("user", md_codeblock("stdin", piped_input))
         if not prompt_msgs:
             prompt_msgs.append(stdin_msg)
         else:
@@ -675,12 +735,6 @@ def pick_log(limit=20) -> Path:  # pragma: no cover
 
     # load conversations
     convs.extend(islice(gen_convs, limit))
-
-    # filter out test conversations
-    # TODO: save test convos to different folder instead
-    # def is_test(name: str) -> bool:
-    #     return "-test-" in name or name.startswith("test-")
-    # prev_conv_files = [f for f in prev_conv_files if not is_test(f.parent.name)]
 
     try:
         terminal_width = os.get_terminal_size().columns

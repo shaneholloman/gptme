@@ -1,0 +1,392 @@
+name: Tauri
+
+on:
+  push:
+    branches: [ master ]
+    tags: [ 'v*' ]
+    paths:
+      - 'tauri/**'
+      - 'webui/**'
+      - '.github/workflows/tauri.yml'
+  pull_request:
+    branches: [ master ]
+    paths:
+      - 'tauri/**'
+      - 'webui/**'
+      - '.github/workflows/tauri.yml'
+
+jobs:
+  lint:
+    name: Lint (format + clippy)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+
+      - name: Check formatting
+        run: cd tauri/src-tauri && cargo fmt -- --check
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
+
+      - name: Create placeholder sidecar for tauri-build
+        run: |
+          # tauri-build checks that externalBin paths exist at compile time.
+          mkdir -p tauri/bins
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          touch "tauri/bins/gptme-server-${TRIPLE}"
+
+      - name: Create placeholder icons for tauri::generate_context!
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          # Minimal valid PNG (1x1 transparent pixel)
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Run clippy
+        run: cd tauri/src-tauri && cargo clippy -- -D warnings
+
+  test:
+    name: Test (unit + IPC)
+    runs-on: ubuntu-latest
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+
+      - name: Create placeholder sidecar for tauri-build
+        run: |
+          mkdir -p tauri/bins
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          touch "tauri/bins/gptme-server-${TRIPLE}"
+
+      - name: Create placeholder icons for tauri::generate_context!
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Run Rust tests
+        run: cd tauri/src-tauri && cargo test
+
+  build:
+    name: Build (${{ matrix.platform }})
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--bundles app'
+          - platform: ubuntu-24.04
+            args: '--bundles appimage,deb'
+          - platform: windows-latest
+            args: '--bundles nsis'
+
+    runs-on: ${{ matrix.platform }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: |
+            tauri/package-lock.json
+            webui/package-lock.json
+
+      - name: Install Tauri CLI deps
+        run: cd tauri && npm install
+
+      - name: Create placeholder sidecar for tauri-build
+        shell: bash
+        run: |
+          # tauri-build checks that externalBin paths exist at compile time.
+          mkdir -p tauri/bins
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            # Windows needs .exe extension for sidecar
+            touch "tauri/bins/gptme-server-${TRIPLE}.exe"
+          else
+            touch "tauri/bins/gptme-server-${TRIPLE}"
+          fi
+
+      - name: Install webui deps and build
+        run: cd webui && npm install && npm run build
+
+      - name: Create placeholder icons for tauri::generate_context!
+        shell: bash
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Generate Tauri icons
+        shell: bash
+        run: cd tauri && npm run tauri icon ../webui/public/logo.png || true
+
+      - name: Fix ICO for Windows Resource Compiler
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          # tauri icon may produce PNG-inside-ICO which Windows RC rejects (RC2176).
+          # Regenerate as BMP-based ICO that RC can compile.
+          python3 -c "
+          import struct
+          s = 32
+          bpp = 32
+          px = s * s * 4
+          mask = ((s + 31) // 32) * 4 * s
+          bmp = struct.pack('<IiiHHIIiiII', 40, s, s*2, 1, bpp, 0, px + mask, 0, 0, 0, 0)
+          img = bmp + (b'\x00\x80\x00\xff' * s * s) + (b'\x00' * mask)
+          hdr = struct.pack('<HHH', 0, 1, 1)
+          entry = struct.pack('<BBBBHHII', s, s, 0, 0, 1, bpp, len(img), 22)
+          open('tauri/src-tauri/icons/icon.ico', 'wb').write(hdr + entry + img)
+          "
+
+      - name: Build the app
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          projectPath: tauri
+          args: ${{ matrix.args }}
+
+  build-sidecar:
+    name: Build sidecar (${{ matrix.os }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install system dependencies (Linux)
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y python3-dev build-essential libffi-dev
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Set up Python
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.13'
+          cache: 'poetry'
+
+      - name: Install dependencies
+        shell: bash
+        run: |
+          make build
+          poetry install --extras server --extras pyinstaller --with dev
+
+      - name: Build PyInstaller executable
+        shell: bash
+        run: make build-server-exe
+
+      - name: Place sidecar with Rust target triple
+        shell: bash
+        run: |
+          mkdir -p tauri/bins
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          if [[ "$RUNNER_OS" == "Windows" ]]; then
+            cp dist/gptme-server.exe "tauri/bins/gptme-server-${TRIPLE}.exe"
+          else
+            cp dist/gptme-server "tauri/bins/gptme-server-${TRIPLE}"
+          fi
+
+      - name: Upload sidecar artifact
+        uses: actions/upload-artifact@v4
+        with:
+          name: sidecar-${{ matrix.os }}
+          path: tauri/bins/gptme-server-*
+
+  release:
+    name: Release (${{ matrix.platform }})
+    if: startsWith(github.ref, 'refs/tags/v')
+    needs: [lint, test, build, build-sidecar]
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - platform: macos-latest
+            args: '--target aarch64-apple-darwin'
+          - platform: ubuntu-24.04
+            args: ''
+          - platform: windows-latest
+            args: '--bundles nsis'
+
+    runs-on: ${{ matrix.platform }}
+    permissions:
+      contents: write
+
+    steps:
+      - uses: actions/checkout@v6
+
+      - name: Install Linux dependencies
+        if: matrix.platform == 'ubuntu-24.04'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
+            librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
+
+      - name: Set up Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.platform == 'macos-latest' && 'aarch64-apple-darwin,x86_64-apple-darwin' || '' }}
+
+      - name: Rust cache
+        uses: swatinem/rust-cache@v2
+        with:
+          workspaces: 'tauri/src-tauri -> target'
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 'lts/*'
+          cache: 'npm'
+          cache-dependency-path: |
+            tauri/package-lock.json
+            webui/package-lock.json
+
+      - name: Install Tauri CLI deps
+        run: cd tauri && npm install
+
+      - name: Install webui deps and build
+        run: cd webui && npm install && npm run build
+
+      - name: Download sidecar binaries
+        uses: actions/download-artifact@v4
+        with:
+          pattern: sidecar-*
+          merge-multiple: true
+          path: tauri/bins
+
+      - name: Create placeholder icons for tauri::generate_context!
+        shell: bash
+        run: |
+          mkdir -p tauri/src-tauri/icons
+          printf '\x89PNG\r\n\x1a\n\x00\x00\x00\rIHDR\x00\x00\x00\x01\x00\x00\x00\x01\x08\x06\x00\x00\x00\x1f\x15\xc4\x89\x00\x00\x00\nIDATx\x9cc\x00\x01\x00\x00\x05\x00\x01\r\n-\xb4\x00\x00\x00\x00IEND\xaeB`\x82' > tauri/src-tauri/icons/32x32.png
+          cp tauri/src-tauri/icons/32x32.png tauri/src-tauri/icons/128x128.png
+          cp tauri/src-tauri/icons/32x32.png "tauri/src-tauri/icons/128x128@2x.png"
+          touch tauri/src-tauri/icons/icon.icns
+          touch tauri/src-tauri/icons/icon.ico
+
+      - name: Generate Tauri icons
+        shell: bash
+        run: cd tauri && npm run tauri icon ../webui/public/logo.png || true
+
+      - name: Fix ICO for Windows Resource Compiler
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          python3 -c "
+          import struct
+          s = 32
+          bpp = 32
+          px = s * s * 4
+          mask = ((s + 31) // 32) * 4 * s
+          bmp = struct.pack('<IiiHHIIiiII', 40, s, s*2, 1, bpp, 0, px + mask, 0, 0, 0, 0)
+          img = bmp + (b'\x00\x80\x00\xff' * s * s) + (b'\x00' * mask)
+          hdr = struct.pack('<HHH', 0, 1, 1)
+          entry = struct.pack('<BBBBHHII', s, s, 0, 0, 1, bpp, len(img), 22)
+          open('tauri/src-tauri/icons/icon.ico', 'wb').write(hdr + entry + img)
+          "
+
+      # macOS code signing setup
+      - name: Import Apple Developer Certificate (macOS)
+        if: matrix.platform == 'macos-latest'
+        env:
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          KEYCHAIN_PASSWORD: ${{ secrets.KEYCHAIN_PASSWORD }}
+        run: |
+          if [ -z "$APPLE_CERTIFICATE" ] || [ -z "$APPLE_CERTIFICATE_PASSWORD" ] || [ -z "$KEYCHAIN_PASSWORD" ]; then
+            echo "Warning: Apple signing certificates not available. Building without code signing."
+            exit 0
+          fi
+          echo "$APPLE_CERTIFICATE" | base64 --decode > certificate.p12
+          security create-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security default-keychain -s build.keychain
+          security unlock-keychain -p "$KEYCHAIN_PASSWORD" build.keychain
+          security set-keychain-settings -t 3600 -u build.keychain
+          security import certificate.p12 -k build.keychain -P "$APPLE_CERTIFICATE_PASSWORD" -T /usr/bin/codesign
+          security set-key-partition-list -S apple-tool:,apple:,codesign: -s -k "$KEYCHAIN_PASSWORD" build.keychain
+          CERT_INFO=$(security find-identity -v -p codesigning build.keychain | head -n 1)
+          SIGNING_IDENTITY=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
+          echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
+
+      - name: Build and publish release
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
+          APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
+          APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
+          APPLE_ID: ${{ secrets.APPLE_ID }}
+          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+        with:
+          projectPath: tauri
+          tagName: ${{ github.ref_name }}
+          releaseName: 'gptme ${{ github.ref_name }}'
+          releaseBody: 'Desktop app release. See the assets to download and install.'
+          releaseDraft: true
+          prerelease: false
+          args: ${{ matrix.args }}

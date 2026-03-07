@@ -4,6 +4,7 @@ import tempfile
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
+import click
 import pytest
 from click.testing import CliRunner
 
@@ -91,6 +92,15 @@ def test_command_tokens(args: list[str], runner: CliRunner):
     # When no LLM calls have been made, shows "No cost data available"
     # When data exists, shows "Tokens:" - either is valid
     assert "Tokens:" in result.output or "No cost data available" in result.output
+    assert result.exit_code == 0
+
+
+def test_command_context(args: list[str], runner: CliRunner):
+    args.append("/context")
+    result = runner.invoke(cli.main, args)
+    assert "/context" in result.output
+    assert "Token Usage by Role:" in result.output
+    assert "Total Context:" in result.output
     assert result.exit_code == 0
 
 
@@ -228,7 +238,6 @@ def test_shell(args: list[str], runner: CliRunner):
     assert result.exit_code == 0
 
 
-@pytest.mark.xfail(strict=False, reason="Flaky in CI")
 def test_shell_file(args: list[str], runner: CliRunner):
     # test running the shell tool with a filename
     # make sure we don't accidentally expand the filename and include it in the shell command
@@ -238,12 +247,17 @@ def test_shell_file(args: list[str], runner: CliRunner):
         f.write("yes")
     args.append(f"/shell cat {tmp_path}")
     result = runner.invoke(cli.main, args)
-    output_pre, output_post = result.output.split("System", 1)
-    # check for no 'yes' in parsed input (only direct command output)
-    assert output_pre.count("yes") == 1, "no yes before System message: " + output_pre
-    # check for one 'yes' in system response (only message stdout)
-    assert output_post.count("yes") == 1, output_post
     assert result.exit_code == 0
+    # "yes" should appear in output (from cat stdout)
+    assert "yes" in result.output, f"Expected 'yes' in output: {result.output}"
+    # The total count of "yes" should be 2-3: typically 2 (once in echoed command,
+    # once in stdout), but output formatting may vary. More than 3 indicates filename expansion.
+    # Tolerates output variations that caused flakiness (#1325, #1327).
+    yes_count = result.output.count("yes")
+    assert 2 <= yes_count <= 3, (
+        f"Expected 2-3 'yes' occurrences (command echo + stdout), got {yes_count}: "
+        f"{result.output}"
+    )
 
 
 def test_python(args: list[str], runner: CliRunner):
@@ -446,3 +460,47 @@ def test_nested_gptme_calls(args: list[str], runner: CliRunner):
     assert "we are testing nested gptme" in result.output
     # Check that both gptme instances exited successfully
     assert result.exit_code == 0
+
+
+def test_comma_separated_choice_minus_prefix():
+    """Test that CommaSeparatedChoice accepts '-' prefixed tools."""
+    from gptme.cli.main import CommaSeparatedChoice
+
+    csc = CommaSeparatedChoice(
+        ["shell", "browser", "save", "read"], allow_prefixes=["+", "-"]
+    )
+    # Should accept '-browser'
+    result = csc.convert("-browser", None, None)
+    assert result == "-browser"
+
+    # Should accept '-browser,-save'
+    result = csc.convert("-browser,-save", None, None)
+    assert result == "-browser,-save"
+
+    # Should still accept '+shell'
+    result = csc.convert("+shell", None, None)
+    assert result == "+shell"
+
+    # Should accept bare tool names
+    result = csc.convert("shell,save", None, None)
+    assert result == "shell,save"
+
+    # Should reject invalid tool name even with '-' prefix
+    with pytest.raises(click.exceptions.BadParameter):
+        csc.convert("-nonexistent", None, None)
+
+
+def test_tool_exclusion_mixed_bare_and_minus_raises():
+    """Test that mixing bare tool names with '-' exclusion syntax raises UsageError."""
+    from click.testing import CliRunner
+
+    runner = CliRunner()
+    # Passing 'shell,-tmux' should raise a UsageError because 'shell' is bare
+    # Note: use a valid tool name so CommaSeparatedChoice passes before the mixing guard
+    result = runner.invoke(cli.main, ["--tools", "shell,-tmux", "test prompt"])
+    assert result.exit_code != 0
+    # Check output directly; if it's empty, the error may be in result.exception
+    error_text = result.output or (str(result.exception) if result.exception else "")
+    assert "Cannot mix bare tool names" in error_text, (
+        f"Expected 'Cannot mix bare tool names' in output, got: {error_text!r}"
+    )

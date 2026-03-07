@@ -178,6 +178,10 @@ enabled = true
 name = "TestBot"
 avatar = "assets/avatar.png"
 
+[agent.urls]
+dashboard = "https://testbot.example.com/dashboard/"
+repo = "https://github.com/testorg/testbot"
+
 """
 
 project_config_json = """
@@ -209,7 +213,11 @@ project_config_json = """
     },
     "agent": {
         "name": "TestBot",
-        "avatar": "assets/avatar.png"
+        "avatar": "assets/avatar.png",
+        "urls": {
+            "dashboard": "https://testbot.example.com/dashboard/",
+            "repo": "https://github.com/testorg/testbot"
+        }
     }
 }
 """
@@ -553,6 +561,10 @@ def test_project_config_loaded_from_toml():
     assert config.agent is not None
     assert config.agent.name == "TestBot"
     assert config.agent.avatar == "assets/avatar.png"
+    assert config.agent.urls == {
+        "dashboard": "https://testbot.example.com/dashboard/",
+        "repo": "https://github.com/testorg/testbot",
+    }
 
 
 def test_project_config_loaded_from_json():
@@ -586,6 +598,10 @@ def test_project_config_loaded_from_json():
     assert config.agent is not None
     assert config.agent.name == "TestBot"
     assert config.agent.avatar == "assets/avatar.png"
+    assert config.agent.urls == {
+        "dashboard": "https://testbot.example.com/dashboard/",
+        "repo": "https://github.com/testorg/testbot",
+    }
 
 
 def test_project_config_to_dict():
@@ -927,3 +943,86 @@ def test_cli_auto_envvar_prefix():
     assert "model" in params, "CLI should have --model option"
     assert "tool_format" in params, "CLI should have --tool-format option"
     assert "workspace" in params, "CLI should have --workspace option"
+
+
+def test_tool_exclusion_config(tmp_path):
+    """Test that '-' prefixed tool_allowlist excludes tools from defaults."""
+    from gptme.config import setup_config_from_cli
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    # Get default tools for comparison
+    from gptme.tools import get_toolchain
+
+    default_tools = [tool.name for tool in get_toolchain(None)]
+    assert "browser" in default_tools or "shell" in default_tools, (
+        "Need at least one default tool to test exclusion"
+    )
+
+    # Pick a tool that exists in defaults to exclude
+    tool_to_exclude = default_tools[0]
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=f"-{tool_to_exclude}",
+        tool_format=None,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.tools is not None
+    assert tool_to_exclude not in config.chat.tools, (
+        f"Excluded tool '{tool_to_exclude}' should not be in tools list"
+    )
+    # Other default tools should still be present (minus the excluded one)
+    remaining_defaults = [t for t in default_tools if t != tool_to_exclude]
+    for tool in remaining_defaults:
+        assert tool in config.chat.tools, (
+            f"Non-excluded default tool '{tool}' should still be present"
+        )
+
+
+def test_tool_exclusion_multiple(tmp_path):
+    """Test excluding multiple tools with '-' prefix."""
+    from gptme.config import setup_config_from_cli
+    from gptme.tools import get_toolchain
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    default_tools = [tool.name for tool in get_toolchain(None)]
+    # Exclude first two tools
+    tools_to_exclude = default_tools[:2]
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist="-" + ",".join(tools_to_exclude),
+        tool_format=None,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.tools is not None
+    for excluded in tools_to_exclude:
+        assert excluded not in config.chat.tools, (
+            f"Excluded tool '{excluded}' should not be in tools list"
+        )
+    # Also verify the remaining default tools are still present
+    remaining_defaults = [t for t in default_tools if t not in tools_to_exclude]
+    for tool in remaining_defaults:
+        assert tool in config.chat.tools, (
+            f"Default tool '{tool}' should still be in tools list after exclusion"
+        )

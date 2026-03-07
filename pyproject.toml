@@ -21,6 +21,8 @@ gptme = "gptme.cli.main:main"
 gptme-server = "gptme.server.cli:main"
 gptme-acp = "gptme.acp.__main__:main"
 gptme-eval = "gptme.eval.main:main"
+gptme-eval-swebench = "gptme.eval.swebench.main:main"
+gptme-eval-tbench = "gptme.eval.tbench.run:main"
 gptme-util = "gptme.cli.util:main"
 gptme-agent = "gptme.agent.cli:main"
 gptme-doctor = "gptme.cli.doctor:main"
@@ -33,7 +35,7 @@ gptme-dspy = "gptme.eval.dspy:main"
 packages = [
     { include = "gptme" },
 ]
-include = ["gptme/server/static/**/*", "media/*.png", "media/*.wav"]
+include = ["gptme/server/static/**/*", "gptme/eval/tbench/setup.sh", "media/*.png", "media/*.wav"]
 
 [tool.poetry.dependencies]
 python = "^3.10"
@@ -48,7 +50,7 @@ tomlkit = "*"
 typing-extensions = "*"
 platformdirs = "^4.3"
 lxml = "*"
-pypdf = ">=5.1.0"  # For PDF text extraction in browser tool
+pypdf = ">=6.7.3"  # For PDF text extraction in browser tool (CVE fix: RAM exhaustion + infinite loop)
 requests = "^2.32"  # For HTTP requests in browser tool (PDF detection)
 json-repair = "^0.32.0"
 mcp = "^1.13.0"
@@ -70,6 +72,9 @@ python-xlib = {version = "^0.33", optional=true}  # for X11 interaction
 # evals
 multiprocessing-logging = "^0.3.4"
 dspy = {version = "^3.0.2", python = "<=3.13", optional=true}
+datasets = {version = ">=2.14.0", optional=true}  # for SWE-bench eval
+swebench = {version = ">=1.0", optional=true}  # for SWE-bench eval harness
+terminal-bench = {version = ">=0.1", optional=true, python = ">=3.12"}  # for Terminal-Bench eval harness
 
 # datascience essentials
 pillow = {version = "*"}  # non-optional, needed for image scaling in vision
@@ -113,6 +118,7 @@ openapi-spec-validator = "^0.7.2"
 
 # test
 pytest = "^8.0"
+pytest-asyncio = "*"
 pytest-cov = "*"
 pytest-xdist = "^3.5.0"
 pytest-profiling = "^1.7.0"
@@ -161,7 +167,7 @@ telemetry = [
     "opentelemetry-instrumentation-threading",
 ]
 dspy = ["dspy", "sentence-transformers"]
-eval = ["dspy", "sentence-transformers"]
+eval = ["dspy", "sentence-transformers", "datasets", "swebench", "terminal-bench"]
 all = [
     # server
     "flask", "flask-cors", "pydantic",
@@ -237,6 +243,10 @@ module = "langchain.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = "matplotlib.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "numpy.*"
 ignore_missing_imports = true
 
@@ -246,6 +256,10 @@ ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "sounddevice.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "acp.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
@@ -264,7 +278,26 @@ ignore_missing_imports = true
 module = "playwright.*"
 ignore_missing_imports = true
 
+
+[[tool.mypy.overrides]]
+module = "swebench.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "terminal_bench.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "datasets.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "acp.*"
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
+asyncio_mode = "auto"
+asyncio_default_fixture_loop_scope = "function"
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
     "eval: marks tests as evals (deselect with '-m \"not eval\"'), these may fail, and will not run in CI",
@@ -273,6 +306,7 @@ markers = [
     "requires_api: marks tests that require API access",
     "flaky: marks tests as flaky (retried automatically)",
     "integration: marks tests as integration tests requiring external services",
+    "xdist_group: marks tests that should run in the same xdist group",
 ]
 
 [tool.coverage.run]

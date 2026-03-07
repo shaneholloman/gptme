@@ -1,13 +1,23 @@
 """Tests for hybrid lesson matching integration."""
 
+import json
+from pathlib import Path
+
 import pytest
 
 from gptme.lessons import MatchContext
 from gptme.lessons.matcher import LessonMatcher
+from gptme.lessons.parser import Lesson, LessonMetadata
 
 # Check if hybrid matching is available
 try:
-    from gptme.lessons.hybrid_matcher import HybridConfig, HybridLessonMatcher
+    from gptme.lessons.hybrid_matcher import (
+        HybridConfig,
+        HybridLessonMatcher,
+        _default_effectiveness_state_file,
+        _lesson_lookup_keys,
+        _load_ts_posteriors,
+    )
 
     HYBRID_AVAILABLE = True
 except ImportError:
@@ -53,3 +63,232 @@ def test_backward_compatibility():
 
     assert isinstance(results, list)
     assert len(results) == 0
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_ts_posteriors(tmp_path):
+    """Test loading Thompson sampling posteriors from JSON state file."""
+    state = {
+        "arms": {
+            "git-workflow.md": {"alpha": 8.0, "beta": 2.0},
+            "python-invocation.md": {"alpha": 3.0, "beta": 7.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+    posteriors = _load_ts_posteriors(str(state_file))
+
+    assert len(posteriors) == 2
+    assert posteriors["git-workflow.md"] == pytest.approx(0.8)
+    assert posteriors["python-invocation.md"] == pytest.approx(0.3)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_ts_posteriors_missing_file():
+    """Test graceful handling of missing state file."""
+    posteriors = _load_ts_posteriors("/nonexistent/path.json")
+    assert posteriors == {}
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_ts_posteriors_zero_total_defaults_to_neutral(tmp_path):
+    """Test zero-count arms fall back to neutral 0.5 instead of crashing."""
+    state = {
+        "arms": {
+            "empty-arm.md": {"alpha": 0.0, "beta": 0.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_ts_posteriors(str(state_file))
+
+    assert posteriors == {"empty-arm.md": 0.5}
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_ts_posteriors_invalid_numeric_data_returns_empty(tmp_path):
+    """Test malformed alpha/beta values are handled gracefully."""
+    state = {
+        "arms": {
+            "bad-arm.md": {"alpha": "not-a-number", "beta": 1.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_ts_posteriors(str(state_file))
+
+    assert posteriors == {}
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_ts_posteriors_non_dict_arm_skipped(tmp_path):
+    """Test non-dict arm values (e.g. scalars) are skipped without crashing."""
+    state = {
+        "arms": {
+            "bad-arm.md": 0.9,  # not a dict — would raise AttributeError without guard
+            "good-arm.md": {"alpha": 8.0, "beta": 2.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_ts_posteriors(str(state_file))
+
+    # bad-arm skipped, good-arm still parsed
+    assert "bad-arm.md" not in posteriors
+    assert posteriors.get("good-arm.md") == pytest.approx(0.8)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_effectiveness_score_with_ts(tmp_path):
+    """Test that effectiveness_score uses TS posteriors when configured."""
+    state = {
+        "arms": {
+            "git-workflow.md": {"alpha": 9.0, "beta": 1.0},  # 0.9 effectiveness
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    config = HybridConfig(
+        enable_semantic=False,
+        effectiveness_state_file=str(state_file),
+    )
+    matcher = HybridLessonMatcher(config=config)
+
+    # Verify posteriors were loaded
+    assert len(matcher._ts_posteriors) == 1
+    assert matcher._ts_posteriors["git-workflow.md"] == pytest.approx(0.9)
+
+    # Verify _effectiveness_score uses posteriors via basename lookup
+    lesson = Lesson(
+        path=Path("/tmp/lessons/git-workflow.md"),
+        metadata=LessonMetadata(),
+        title="Git Workflow",
+        description="",
+        category="workflow",
+        body="",
+    )
+    assert matcher._effectiveness_score(lesson) == pytest.approx(0.9)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_effectiveness_score_matches_short_path(tmp_path):
+    """Test lessons can match TS posteriors via category/filename path."""
+    state = {
+        "arms": {
+            "workflow/git-workflow.md": {"alpha": 7.0, "beta": 3.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    matcher = HybridLessonMatcher(
+        config=HybridConfig(
+            enable_semantic=False,
+            effectiveness_state_file=str(state_file),
+        )
+    )
+    lesson = Lesson(
+        path=Path("/tmp/lessons/workflow/git-workflow.md"),
+        metadata=LessonMetadata(),
+        title="Git Workflow",
+        description="",
+        category="workflow",
+        body="",
+    )
+
+    assert matcher._effectiveness_score(lesson) == pytest.approx(0.7)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_effectiveness_score_default(monkeypatch):
+    """Test that effectiveness_score returns 0.5 without TS config."""
+    monkeypatch.delenv("GPTME_LESSONS_TS_STATE", raising=False)
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+    monkeypatch.setattr(Path, "home", lambda: Path("/nonexistent"))
+    config = HybridConfig(enable_semantic=False)
+    matcher = HybridLessonMatcher(config=config)
+    assert matcher._ts_posteriors == {}
+    # Verify the fallback path inside _effectiveness_score returns 0.5
+    lesson = Lesson(
+        path=Path("/tmp/lessons/some-lesson.md"),
+        metadata=LessonMetadata(),
+        title="Some Lesson",
+        description="",
+        category="workflow",
+        body="",
+    )
+    assert matcher._effectiveness_score(lesson) == pytest.approx(0.5)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_default_effectiveness_state_file_uses_env(monkeypatch):
+    """Env override should take precedence for TS state discovery."""
+    monkeypatch.setenv("GPTME_LESSONS_TS_STATE", "/tmp/custom-bandit.json")
+    monkeypatch.delenv("XDG_STATE_HOME", raising=False)
+
+    assert _default_effectiveness_state_file() == "/tmp/custom-bandit.json"
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_default_effectiveness_state_file_uses_xdg(monkeypatch):
+    """XDG state home should be used when env override is absent."""
+    monkeypatch.delenv("GPTME_LESSONS_TS_STATE", raising=False)
+    monkeypatch.setenv("XDG_STATE_HOME", "/tmp/xdg-state")
+
+    assert (
+        _default_effectiveness_state_file()
+        == "/tmp/xdg-state/gptme/lessons/bandit-state.json"
+    )
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_lesson_lookup_keys_include_id_and_path_forms():
+    """Lookup keys should prefer explicit id and keep legacy path variants."""
+    lesson = Lesson(
+        path=Path("/tmp/lessons/workflow/git-workflow.md"),
+        metadata=LessonMetadata(id="workflow.git-workflow"),
+        title="Git Workflow",
+        description="",
+        category="workflow",
+        body="",
+    )
+
+    assert _lesson_lookup_keys(lesson) == [
+        "workflow.git-workflow",
+        "/tmp/lessons/workflow/git-workflow.md",
+        "git-workflow.md",
+        "workflow/git-workflow.md",
+    ]
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_effectiveness_score_matches_explicit_lesson_id(tmp_path):
+    """Explicit lesson ids should provide a stable lookup key."""
+    state = {
+        "arms": {
+            "workflow.git-workflow": {"alpha": 8.0, "beta": 2.0},
+        }
+    }
+    state_file = tmp_path / "ts_state.json"
+    state_file.write_text(json.dumps(state))
+
+    matcher = HybridLessonMatcher(
+        config=HybridConfig(
+            enable_semantic=False,
+            effectiveness_state_file=str(state_file),
+        )
+    )
+    lesson = Lesson(
+        path=Path("/tmp/elsewhere/workflow/git-workflow.md"),
+        metadata=LessonMetadata(id="workflow.git-workflow"),
+        title="Git Workflow",
+        description="",
+        category="workflow",
+        body="",
+    )
+
+    assert matcher._effectiveness_score(lesson) == pytest.approx(0.8)

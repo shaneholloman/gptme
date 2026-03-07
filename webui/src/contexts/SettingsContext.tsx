@@ -1,10 +1,11 @@
-import React, { createContext, useContext, useEffect, useState } from 'react';
+import React, { createContext, useContext, useState } from 'react';
 
 export interface Settings {
   chimeEnabled: boolean;
   blocksDefaultOpen: boolean;
   showHiddenMessages: boolean;
   showInitialSystem: boolean;
+  hasCompletedSetup: boolean;
 }
 
 interface SettingsContextType {
@@ -18,7 +19,23 @@ const defaultSettings: Settings = {
   blocksDefaultOpen: true,
   showHiddenMessages: false,
   showInitialSystem: false,
+  hasCompletedSetup: false,
 };
+
+function loadSettingsFromStorage(): Settings {
+  try {
+    const savedSettings = localStorage.getItem('gptme-settings');
+    if (savedSettings) {
+      const parsed = JSON.parse(savedSettings);
+      // Existing users who pre-date hasCompletedSetup should not see the wizard
+      const hasCompletedSetup = parsed.hasCompletedSetup ?? true;
+      return { ...defaultSettings, ...parsed, hasCompletedSetup };
+    }
+  } catch (error) {
+    console.error('Failed to load settings from localStorage:', error);
+  }
+  return defaultSettings;
+}
 
 const SettingsContext = createContext<SettingsContextType | undefined>(undefined);
 
@@ -31,39 +48,34 @@ export const useSettings = () => {
 };
 
 export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ children }) => {
-  const [settings, setSettings] = useState<Settings>(defaultSettings);
-
-  // Load settings from localStorage on mount
-  useEffect(() => {
-    try {
-      const savedSettings = localStorage.getItem('gptme-settings');
-      if (savedSettings) {
-        const parsed = JSON.parse(savedSettings);
-        setSettings({ ...defaultSettings, ...parsed });
-      }
-    } catch (error) {
-      console.error('Failed to load settings from localStorage:', error);
-    }
-  }, []);
+  // Initialize synchronously from localStorage to prevent a flash of the setup wizard
+  const [settings, setSettings] = useState<Settings>(loadSettingsFromStorage);
 
   const updateSettings = (updates: Partial<Settings>) => {
-    const newSettings = { ...settings, ...updates };
-    setSettings(newSettings);
-
-    try {
-      localStorage.setItem('gptme-settings', JSON.stringify(newSettings));
-    } catch (error) {
-      console.error('Failed to save settings to localStorage:', error);
-    }
+    // Use functional updater to avoid stale closure if called in rapid succession.
+    setSettings((current) => {
+      const newSettings = { ...current, ...updates };
+      try {
+        localStorage.setItem('gptme-settings', JSON.stringify(newSettings));
+      } catch (error) {
+        console.error('Failed to save settings to localStorage:', error);
+      }
+      return newSettings;
+    });
   };
 
   const resetSettings = () => {
-    setSettings(defaultSettings);
-    try {
-      localStorage.removeItem('gptme-settings');
-    } catch (error) {
-      console.error('Failed to reset settings in localStorage:', error);
-    }
+    // Use functional updater to avoid stale closure on hasCompletedSetup.
+    // Preserve hasCompletedSetup so a settings reset doesn't re-trigger the wizard.
+    setSettings((current) => {
+      const newSettings = { ...defaultSettings, hasCompletedSetup: current.hasCompletedSetup };
+      try {
+        localStorage.setItem('gptme-settings', JSON.stringify(newSettings));
+      } catch (error) {
+        console.error('Failed to reset settings in localStorage:', error);
+      }
+      return newSettings;
+    });
   };
 
   return (

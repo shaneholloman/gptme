@@ -22,7 +22,9 @@ from rich.panel import Panel
 from rich.table import Table
 from rich.text import Text
 
-from ..config import config_path, get_config
+from ..__version__ import __version__
+from ..config import MCPServerConfig, config_path, get_config
+from ..info import get_config_info, get_installed_extras
 from ..llm import list_available_providers
 from ..llm.models import PROVIDERS
 from ..llm.validate import OAUTH_PROVIDERS, PROVIDER_DOCS, validate_api_key
@@ -222,33 +224,28 @@ def _check_tools(verbose: bool = False) -> list[CheckResult]:
 
 
 def _check_python_deps(verbose: bool = False) -> list[CheckResult]:
-    """Check Python optional dependencies."""
+    """Check Python optional dependencies (extras)."""
     results = []
 
-    optional_deps = [
-        ("playwright", "Browser automation for advanced web browsing"),
-        ("sentence_transformers", "Embedding models for RAG and lessons"),
-        ("torch", "PyTorch for ML features"),
-    ]
+    # Use shared info module to get extras status
+    extras = get_installed_extras()
 
-    for dep, desc in optional_deps:
-        spec = importlib.util.find_spec(dep)
-        if spec:
+    for extra in extras:
+        if extra.installed:
             results.append(
                 CheckResult(
-                    name=f"Python: {dep}",
+                    name=f"Python: {extra.name}",
                     status=CheckStatus.OK,
-                    message=desc,
-                    details=str(spec.origin) if verbose and spec.origin else None,
+                    message=extra.description,
                 )
             )
         else:
             results.append(
                 CheckResult(
-                    name=f"Python: {dep}",
-                    status=CheckStatus.WARNING,
-                    message=f"Not installed - {desc}",
-                    fix_hint=f"pip install {dep}",
+                    name=f"Python: {extra.name}",
+                    status=CheckStatus.SKIPPED,
+                    message=f"Not installed - {extra.description}",
+                    fix_hint=f"pip install 'gptme[{extra.name}]'",
                 )
             )
 
@@ -259,14 +256,17 @@ def _check_config(verbose: bool = False) -> list[CheckResult]:
     """Check configuration file status."""
     results = []
 
+    # Use shared info module
+    config_info = get_config_info()
+
     # Check user config
-    if Path(config_path).exists():
+    if config_info["config_exists"]:
         results.append(
             CheckResult(
                 name="Config: User",
                 status=CheckStatus.OK,
                 message="Found",
-                details=config_path if verbose else None,
+                details=config_info["config_path"] if verbose else None,
             )
         )
     else:
@@ -275,31 +275,22 @@ def _check_config(verbose: bool = False) -> list[CheckResult]:
                 name="Config: User",
                 status=CheckStatus.WARNING,
                 message="Not found (using defaults)",
-                fix_hint=f"Create {config_path} to customize settings",
+                fix_hint=f"Create {config_info['config_path']} to customize settings",
             )
         )
 
     # Check project config
-    cwd = Path.cwd()
-    project_config = cwd / "gptme.toml"
-    github_config = cwd / ".github" / "gptme.toml"
-
-    if project_config.exists():
+    if "project_config" in config_info:
+        project_path = config_info["project_config"]
+        name = Path(project_path).name
+        if ".github" in project_path:
+            name = ".github/gptme.toml"
         results.append(
             CheckResult(
                 name="Config: Project",
                 status=CheckStatus.OK,
-                message="Found gptme.toml",
-                details=str(project_config) if verbose else None,
-            )
-        )
-    elif github_config.exists():
-        results.append(
-            CheckResult(
-                name="Config: Project",
-                status=CheckStatus.OK,
-                message="Found .github/gptme.toml",
-                details=str(github_config) if verbose else None,
+                message=f"Found {name}",
+                details=project_path if verbose else None,
             )
         )
     else:
@@ -376,6 +367,298 @@ def _check_permissions(verbose: bool = False) -> list[CheckResult]:
     return results
 
 
+def _check_version(verbose: bool = False) -> list[CheckResult]:
+    """Check if gptme is up to date by comparing with PyPI."""
+    results = []
+
+    try:
+        from importlib.metadata import version as get_version
+
+        current = get_version("gptme")
+    except Exception:
+        current = __version__
+
+    # Skip version check for dev/editable installs
+    if ".dev" in current or "+g" in current:
+        results.append(
+            CheckResult(
+                name="Version: gptme",
+                status=CheckStatus.OK,
+                message=f"Development install ({current})",
+                details="Skipping PyPI check for dev installs" if verbose else None,
+            )
+        )
+        return results
+
+    try:
+        import json
+        import urllib.request
+
+        url = "https://pypi.org/pypi/gptme/json"
+        req = urllib.request.Request(url, headers={"Accept": "application/json"})
+        with urllib.request.urlopen(req, timeout=5) as resp:
+            data = json.loads(resp.read())
+            latest = data["info"]["version"]
+
+        if current == latest:
+            results.append(
+                CheckResult(
+                    name="Version: gptme",
+                    status=CheckStatus.OK,
+                    message=f"Up to date ({current})",
+                )
+            )
+        else:
+            # Compare versions to determine severity
+            from packaging.version import Version
+
+            try:
+                current_v = Version(current)
+                latest_v = Version(latest)
+                if latest_v <= current_v:
+                    # User is running a newer version than PyPI (pre-release, branch install)
+                    results.append(
+                        CheckResult(
+                            name="Version: gptme",
+                            status=CheckStatus.OK,
+                            message=f"Installed {current} (ahead of PyPI: {latest})",
+                        )
+                    )
+                else:
+                    is_major = latest_v.major > current_v.major
+                    is_minor = latest_v.minor > current_v.minor
+                    if is_major or is_minor:
+                        results.append(
+                            CheckResult(
+                                name="Version: gptme",
+                                status=CheckStatus.WARNING,
+                                message=f"Update available: {current} → {latest}",
+                                fix_hint="pip install --upgrade gptme",
+                            )
+                        )
+                    else:
+                        results.append(
+                            CheckResult(
+                                name="Version: gptme",
+                                status=CheckStatus.OK,
+                                message=f"Installed {current} (latest: {latest})",
+                                details="Patch update available" if verbose else None,
+                            )
+                        )
+            except Exception:
+                results.append(
+                    CheckResult(
+                        name="Version: gptme",
+                        status=CheckStatus.WARNING,
+                        message=f"Update available: {current} → {latest}",
+                        fix_hint="pip install --upgrade gptme",
+                    )
+                )
+    except Exception as e:
+        results.append(
+            CheckResult(
+                name="Version: gptme",
+                status=CheckStatus.OK,
+                message=f"Installed ({current})",
+                details=f"Could not check PyPI: {e}" if verbose else None,
+            )
+        )
+
+    return results
+
+
+def _check_browser(verbose: bool = False) -> list[CheckResult]:
+    """Check Playwright browser installation if browser extra is installed."""
+    results: list[CheckResult] = []
+
+    # Only check if playwright is installed
+    if not importlib.util.find_spec("playwright"):
+        return results
+
+    # Check if browsers are installed by looking at the standard cache directory
+    # Playwright stores browsers in PLAYWRIGHT_BROWSERS_PATH or a platform-specific default
+    browsers_path = os.environ.get("PLAYWRIGHT_BROWSERS_PATH")
+    if not browsers_path:
+        if sys.platform == "darwin":
+            browsers_path = str(Path.home() / "Library" / "Caches" / "ms-playwright")
+        else:
+            browsers_path = str(Path.home() / ".cache" / "ms-playwright")
+
+    browsers_dir = Path(browsers_path)
+    if browsers_dir.exists():
+        # Count installed browser directories (e.g., chromium-1148, firefox-1460)
+        browser_dirs = [
+            d.name
+            for d in browsers_dir.iterdir()
+            if d.is_dir() and not d.name.startswith(".")
+        ]
+        if browser_dirs:
+            results.append(
+                CheckResult(
+                    name="Browser: Playwright",
+                    status=CheckStatus.OK,
+                    message=f"{len(browser_dirs)} browser(s) installed",
+                    details=", ".join(sorted(browser_dirs)) if verbose else None,
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    name="Browser: Playwright",
+                    status=CheckStatus.WARNING,
+                    message="Playwright installed but no browsers found",
+                    fix_hint="playwright install chromium",
+                )
+            )
+    else:
+        results.append(
+            CheckResult(
+                name="Browser: Playwright",
+                status=CheckStatus.WARNING,
+                message="Playwright installed but no browsers found",
+                fix_hint="playwright install chromium",
+            )
+        )
+
+    return results
+
+
+def _check_mcp(verbose: bool = False) -> list[CheckResult]:
+    """Check MCP server configuration and connectivity."""
+    results: list[CheckResult] = []
+
+    config = get_config()
+
+    # Check if MCP is enabled
+    if not config.mcp.enabled:
+        results.append(
+            CheckResult(
+                name="MCP: Status",
+                status=CheckStatus.SKIPPED,
+                message="MCP not enabled",
+                fix_hint="Add [mcp] enabled = true to gptme.toml",
+            )
+        )
+        return results
+
+    results.append(
+        CheckResult(
+            name="MCP: Status",
+            status=CheckStatus.OK,
+            message=f"Enabled ({len(config.mcp.servers)} server(s) configured)",
+        )
+    )
+
+    if not config.mcp.servers:
+        return results
+
+    # Check each configured server
+    for server_config in config.mcp.servers:
+        if not server_config.enabled:
+            results.append(
+                CheckResult(
+                    name=f"MCP: {server_config.name}",
+                    status=CheckStatus.SKIPPED,
+                    message="Disabled in config",
+                )
+            )
+            continue
+
+        if server_config.is_http:
+            # HTTP server: check URL reachability
+            results.extend(_check_mcp_http_server(server_config, verbose))
+        else:
+            # stdio server: check command exists
+            results.extend(_check_mcp_stdio_server(server_config, verbose))
+
+    return results
+
+
+def _check_mcp_http_server(
+    server_config: MCPServerConfig, verbose: bool = False
+) -> list[CheckResult]:
+    """Check an HTTP-based MCP server."""
+    import urllib.request
+
+    try:
+        req = urllib.request.Request(
+            server_config.url,
+            method="HEAD",
+            headers=server_config.headers or {},
+        )
+        with urllib.request.urlopen(req, timeout=5):
+            pass
+        return [
+            CheckResult(
+                name=f"MCP: {server_config.name}",
+                status=CheckStatus.OK,
+                message="HTTP server reachable",
+                details=server_config.url if verbose else None,
+            )
+        ]
+    except Exception as e:
+        # Accept any HTTP response (even 4xx/5xx) as "reachable"
+        error_str = str(e)
+        if "HTTP Error" in error_str:
+            return [
+                CheckResult(
+                    name=f"MCP: {server_config.name}",
+                    status=CheckStatus.OK,
+                    message="HTTP server reachable",
+                    details=f"{server_config.url} ({error_str})" if verbose else None,
+                )
+            ]
+        return [
+            CheckResult(
+                name=f"MCP: {server_config.name}",
+                status=CheckStatus.ERROR,
+                message=f"Cannot reach server: {e}",
+                details=server_config.url if verbose else None,
+                fix_hint=f"Check that {server_config.url} is accessible",
+            )
+        ]
+
+
+def _check_mcp_stdio_server(
+    server_config: MCPServerConfig, verbose: bool = False
+) -> list[CheckResult]:
+    """Check a stdio-based MCP server."""
+    command = server_config.command
+    if not command:
+        return [
+            CheckResult(
+                name=f"MCP: {server_config.name}",
+                status=CheckStatus.ERROR,
+                message="No command configured",
+                fix_hint="Set 'command' in MCP server config",
+            )
+        ]
+
+    # Check if the command binary exists
+    cmd_path = shutil.which(command)
+    if cmd_path:
+        details = None
+        if verbose:
+            args_str = " ".join(server_config.args) if server_config.args else ""
+            details = f"{cmd_path} {args_str}".strip()
+        return [
+            CheckResult(
+                name=f"MCP: {server_config.name}",
+                status=CheckStatus.OK,
+                message=f"Command '{command}' found",
+                details=details,
+            )
+        ]
+    return [
+        CheckResult(
+            name=f"MCP: {server_config.name}",
+            status=CheckStatus.ERROR,
+            message=f"Command '{command}' not found",
+            fix_hint=f"Install {command} or check PATH",
+        )
+    ]
+
+
 def run_diagnostics(verbose: bool = False) -> tuple[list[CheckResult], dict]:
     """Run all diagnostic checks.
 
@@ -385,10 +668,13 @@ def run_diagnostics(verbose: bool = False) -> tuple[list[CheckResult], dict]:
     all_results: list[CheckResult] = []
 
     # Run all checks
+    all_results.extend(_check_version(verbose))
     all_results.extend(_check_config(verbose))
     all_results.extend(_check_api_keys(verbose))
     all_results.extend(_check_tools(verbose))
     all_results.extend(_check_python_deps(verbose))
+    all_results.extend(_check_browser(verbose))
+    all_results.extend(_check_mcp(verbose))
     all_results.extend(_check_permissions(verbose))
 
     # Calculate summary

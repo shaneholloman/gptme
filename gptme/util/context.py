@@ -1,6 +1,7 @@
 import errno
 import json
 import logging
+import mimetypes
 import os
 import re
 import shutil
@@ -55,6 +56,8 @@ def _confirm_urls(urls: list[str]) -> list[str]:
     """
     from rich import print as rprint
 
+    from .prompt import prompt_alert
+
     if not urls:
         return []
 
@@ -66,7 +69,7 @@ def _confirm_urls(urls: list[str]) -> list[str]:
             rprint(f"  {i}. {url}")
 
     try:
-        response = input("Read URL(s)? [Y/n/select numbers] ").strip().lower()
+        response = prompt_alert("Read URL(s)? [Y/n/select numbers]")
     except (EOFError, KeyboardInterrupt):
         return []
 
@@ -355,17 +358,25 @@ def git_status() -> str | None:
     """Get git status if in a repository."""
     try:
         git_status = subprocess.run(
-            ["git", "status", "-vv"], capture_output=True, text=True, check=True
+            ["git", "status"], capture_output=True, text=True, check=True
         )
         logger.debug("Including git status in context")
-        return md_codeblock("git status -vv", git_status.stdout)
+        output = git_status.stdout
+        if len(output) > 10000:
+            output = output[:10000] + "\n... (truncated)"
+        return md_codeblock("git status", output)
     except (subprocess.CalledProcessError, FileNotFoundError):
         logger.debug("Not in a git repository or git not available")
     return None
 
 
-def get_mentioned_files(msgs: list[Message], workspace: Path | None) -> list[Path]:
-    """Count files mentioned in messages."""
+def get_mentioned_files(msgs: list[Message], workspace: Path | None) -> dict[Path, int]:
+    """Get files mentioned in messages with their mention counts.
+
+    Returns:
+        Dict mapping file paths to mention counts,
+        ordered by (mention_count, mtime) descending.
+    """
     workspace_abs = workspace.resolve() if workspace else None
     files: Counter[Path] = Counter()
     for msg in msgs:
@@ -391,7 +402,7 @@ def get_mentioned_files(msgs: list[Message], workspace: Path | None) -> list[Pat
         except FileNotFoundError:
             return (files[f], 0)
 
-    return sorted(files.keys(), key=file_score, reverse=True)
+    return {f: files[f] for f in sorted(files.keys(), key=file_score, reverse=True)}
 
 
 # gather_fresh_context removal: Logic moved to gptme.hooks.context
@@ -605,6 +616,47 @@ def _find_potential_paths(content: str) -> list[str]:
     return paths
 
 
+def _binary_file_metadata(path: Path, prompt: str) -> str | None:
+    """Return metadata about a binary file as a codeblock instead of silently ignoring it."""
+    try:
+        size = path.stat().st_size
+        mime, _ = mimetypes.guess_type(str(path))
+
+        lines = [f"Binary file: {path.name}"]
+        lines.append(f"Size: {_human_readable_size(size)}")
+        if mime:
+            lines.append(f"Type: {mime}")
+
+        # Try the `file` command for richer metadata
+        if shutil.which("file"):
+            try:
+                result = subprocess.run(
+                    ["file", "--brief", str(path)],
+                    capture_output=True,
+                    text=True,
+                    timeout=5,
+                    check=False,
+                )
+                if result.returncode == 0 and result.stdout.strip():
+                    lines.append(f"Details: {result.stdout.strip()}")
+            except (subprocess.TimeoutExpired, OSError):
+                pass
+
+        return md_codeblock(prompt, "\n".join(lines))
+    except OSError:
+        return None
+
+
+def _human_readable_size(size_bytes: int) -> str:
+    """Format byte size as human-readable string."""
+    size = float(size_bytes)
+    for unit in ("B", "KB", "MB", "GB"):
+        if size < 1024:
+            return f"{int(size)} {unit}" if unit == "B" else f"{size:.1f} {unit}"
+        size /= 1024
+    return f"{size:.1f} TB"
+
+
 def _resource_to_codeblock(
     prompt: str, confirmed_urls: list[str] | None = None
 ) -> str | None:
@@ -631,9 +683,11 @@ def _resource_to_codeblock(
             return None
         raise
     except UnicodeDecodeError:
-        # some files are not text files (images, audio, PDFs, binaries, etc), so we can't read them
-        # TODO: but can we handle them better than just printing the path? maybe with metadata from `file`?
-        # logger.warning(f"Failed to read file {prompt}: not a text file")
+        # Binary file — return metadata instead of contents
+        # Skip visual formats (images, PDF) already handled via msg.files
+        f = Path(prompt).expanduser()
+        if f.suffix[1:].lower() not in ("png", "jpg", "jpeg", "gif", "webp", "pdf"):
+            return _binary_file_metadata(f, prompt)
         return None
 
     # check if any word in prompt is a path or URL,

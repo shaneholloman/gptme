@@ -21,6 +21,7 @@ from typing import TYPE_CHECKING, TypeVar
 from ..constants import DECLINED_CONTENT
 from ..hooks import ConfirmAction, get_confirmation
 from ..message import Message
+from ..util.context import md_codeblock
 from . import get_tools
 from .base import (
     Parameter,
@@ -195,7 +196,8 @@ def execute_python(
     elif kwargs is not None:
         code = kwargs.get("code", "").strip()
 
-    assert code is not None
+    if code is None:
+        raise ValueError("Code content is required to execute Python")
 
     # Get confirmation via hook system (hook will display preview)
     confirm_result = get_confirmation()
@@ -225,13 +227,13 @@ def execute_python(
         return
 
     if result.result is not None:
-        output += f"Result:\n```\n{result.result}\n```\n\n"
+        output += f"Result:\n{md_codeblock('', str(result.result))}\n\n"
 
     # only show stdout if there is no result
     elif captured_stdout:
-        output += f"```stdout\n{captured_stdout.rstrip()}\n```\n\n"
+        output += md_codeblock("stdout", captured_stdout.rstrip()) + "\n\n"
     if captured_stderr:
-        output += f"```stderr\n{captured_stderr.rstrip()}\n```\n\n"
+        output += md_codeblock("stderr", captured_stderr.rstrip()) + "\n\n"
     if result.error_in_exec:
         tb = result.error_in_exec.__traceback__
         while tb and tb.tb_next:

@@ -690,6 +690,7 @@ class ConversationMeta:
     workspace: str
     agent_name: str | None = None
     agent_path: str | None = None
+    agent_urls: dict[str, str] | None = None
 
     def format(self, metadata=False) -> str:
         """Format conversation metadata for display."""
@@ -711,9 +712,10 @@ def get_conversations() -> Generator[ConversationMeta, None, None]:
     """Returns all conversations, excluding ones used for testing, evals, etc."""
     for conv_fn in _conversation_files():
         log = Log.read_jsonl(conv_fn, limit=1)
-        # TODO: can we avoid reading the entire file? maybe wont even be used, due to user convo filtering
-        text = conv_fn.read_text()
-        len_msgs = (1 + text.count("}\n{")) if text.strip() else 0
+        # Count messages by counting non-empty lines (JSONL: one JSON object per line)
+        # Avoids reading entire file into memory for large conversations
+        with open(conv_fn, "rb") as f:
+            len_msgs = sum(1 for line in f if line.strip())
         assert len(log) <= 1
         modified = conv_fn.stat().st_mtime
         first_timestamp = log[0].timestamp.timestamp() if log else modified
@@ -731,6 +733,11 @@ def get_conversations() -> Generator[ConversationMeta, None, None]:
             if agent_project_config and agent_project_config.agent
             else None
         )
+        agent_urls = (
+            agent_project_config.agent.urls
+            if agent_project_config and agent_project_config.agent
+            else None
+        )
 
         yield ConversationMeta(
             id=conv_id,
@@ -743,6 +750,7 @@ def get_conversations() -> Generator[ConversationMeta, None, None]:
             workspace=str(chat_config.workspace),
             agent_name=agent_name,
             agent_path=str(agent_path) if agent_path else None,
+            agent_urls=agent_urls,
         )
 
 

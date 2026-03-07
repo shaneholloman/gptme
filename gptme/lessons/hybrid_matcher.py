@@ -1,7 +1,10 @@
 """Hybrid lesson matching using semantic similarity + effectiveness."""
 
+import json
 import logging
+import os
 from dataclasses import dataclass
+from pathlib import Path
 from typing import Any
 
 from .matcher import LessonMatcher, MatchContext, MatchResult, _match_keyword
@@ -48,6 +51,79 @@ class HybridConfig:
     enable_effectiveness: bool = True
     enable_recency: bool = True
 
+    # Thompson sampling state file for effectiveness scoring.
+    # JSON file with {"arms": {"lesson_name.md": {"alpha": N, "beta": M}, ...}}
+    # If omitted, a conventional default path or env var override may be used.
+    effectiveness_state_file: str | None = None
+
+
+def _default_effectiveness_state_file() -> str:
+    """Return the default Thompson sampling state file path.
+
+    Priority: GPTME_LESSONS_TS_STATE env var > XDG_STATE_HOME > ~/.local/state fallback.
+    Always returns a path string; callers should handle missing files gracefully.
+    """
+    if env_path := os.getenv("GPTME_LESSONS_TS_STATE"):
+        return env_path
+
+    xdg_state_home = os.getenv("XDG_STATE_HOME")
+    if xdg_state_home:
+        return str(Path(xdg_state_home) / "gptme" / "lessons" / "bandit-state.json")
+
+    return str(
+        Path.home() / ".local" / "state" / "gptme" / "lessons" / "bandit-state.json"
+    )
+
+
+def _load_ts_posteriors(state_file: str) -> dict[str, float]:
+    """Load Thompson sampling posterior means from a bandit state file.
+
+    The state file is a JSON file with the schema:
+        {"arms": {"lesson_name.md": {"alpha": N, "beta": M}, ...}}
+
+    Returns a dict mapping lesson identifiers to posterior means (alpha / (alpha + beta)).
+    """
+    path = Path(state_file).expanduser()
+    if not path.exists():
+        logger.debug(f"TS state file not found: {path}")
+        return {}
+
+    try:
+        data = json.loads(path.read_text())
+        arms = data.get("arms", {})
+        posteriors: dict[str, float] = {}
+        for arm_name, arm_data in arms.items():
+            try:
+                alpha = float(arm_data.get("alpha", 1.0))
+                beta = float(arm_data.get("beta", 1.0))
+                total = alpha + beta
+                posteriors[arm_name] = alpha / total if total > 0 else 0.5
+            except (AttributeError, TypeError, ValueError) as e:
+                logger.warning(f"Skipping malformed arm '{arm_name}': {e}")
+        logger.info(f"Loaded {len(posteriors)} TS posteriors from {path}")
+        return posteriors
+    except (json.JSONDecodeError, OSError) as e:
+        logger.warning(f"Failed to load TS state: {e}")
+        return {}
+
+
+def _lesson_lookup_keys(lesson: Lesson) -> list[str]:
+    """Return candidate identifiers for matching lesson TS state."""
+    keys: list[str] = []
+
+    if lesson.metadata.id:
+        keys.append(lesson.metadata.id)
+
+    keys.append(str(lesson.path))
+    keys.append(lesson.path.name)
+
+    parts = lesson.path.parts
+    if len(parts) >= 2:
+        keys.append(f"{parts[-2]}/{parts[-1]}")
+
+    # De-duplicate while preserving order
+    return list(dict.fromkeys(keys))
+
 
 class HybridLessonMatcher(LessonMatcher):
     """Hybrid lesson matcher combining keyword, semantic, and metadata signals."""
@@ -70,6 +146,12 @@ class HybridLessonMatcher(LessonMatcher):
             except Exception as e:
                 logger.warning(f"Failed to initialize embedder: {e}")
                 self.embedder = None
+
+        # Load Thompson sampling posteriors for effectiveness scoring
+        state_file = (
+            self.config.effectiveness_state_file or _default_effectiveness_state_file()
+        )
+        self._ts_posteriors = _load_ts_posteriors(state_file)
 
     def match(
         self, lessons: list[Lesson], context: MatchContext, threshold: float = 0.0
@@ -151,7 +233,7 @@ class HybridLessonMatcher(LessonMatcher):
                 semantic_score = self._semantic_score(query_embed, lesson, context)
 
             # Component 3: Effectiveness score
-            # NOTE: Neutral until ACE metadata implemented (Phase 1 schema)
+            # Falls back to 0.5 (neutral) when no TS data is configured or available
             effectiveness_score = 0.5
             if self.config.enable_effectiveness:
                 effectiveness_score = self._effectiveness_score(lesson)
@@ -227,15 +309,19 @@ class HybridLessonMatcher(LessonMatcher):
         return (similarity + 1.0) / 2.0
 
     def _effectiveness_score(self, lesson: Lesson) -> float:
-        """Effectiveness score from metadata (0.0-1.0).
+        """Effectiveness score from Thompson sampling posteriors (0.0-1.0).
 
-        NOTE: Returns neutral 0.5 until ACE metadata schema implemented.
-        Will use helpful_count/harmful_count when available (Phase 1).
+        If a Thompson sampling state file is configured, looks up the lesson's
+        posterior mean (alpha / (alpha + beta)). Falls back to neutral 0.5
+        if no data is available for this lesson.
         """
-        # TODO: Implement when ACE metadata available
-        # helpful = lesson.metadata.helpful_count
-        # harmful = lesson.metadata.harmful_count
-        # return helpful / (helpful + harmful + 1)
+        if not self._ts_posteriors:
+            return 0.5
+
+        for key in _lesson_lookup_keys(lesson):
+            if key in self._ts_posteriors:
+                return self._ts_posteriors[key]
+
         return 0.5
 
     def _recency_score(self, lesson: Lesson) -> float:

@@ -1,0 +1,5 @@
+[prompt]
+files = [
+  "README.md",
+  "../README.md",
+]

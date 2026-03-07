@@ -1,4 +1,4 @@
-.PHONY: test test-api docs build build-docker check-rst install-completions help
+.PHONY: test test-api docs build build-docker check-rst install-completions help tauri-dev tauri-build tauri-lint tauri-build-sidecar
 
 # set default shell
 SHELL := $(shell which bash)
@@ -133,8 +133,26 @@ site/dist/style.css: site/style.css
 site/dist/docs: docs
 	cp -r docs/_build/html site/dist/docs
 
-version:  ## Bump version using ./scripts/bump_version.sh
+version:  ## Bump version using ./scripts/bump_version.sh (interactive)
 	@./scripts/bump_version.sh
+
+version-auto:  ## Non-interactive version bump (TYPE=dev|patch|minor)
+	@./scripts/bump_version.sh --type $(or $(TYPE),patch)
+
+release-dev:  ## Create a dev pre-release (.devYYYYMMDD) — same as CI scheduled release
+	@./scripts/bump_version.sh --type dev
+	@make dist/CHANGELOG.md
+	@./scripts/publish_release.sh --notes-file dist/CHANGELOG.md
+
+release-patch:  ## Create a stable patch release (x.y.Z+1)
+	@./scripts/bump_version.sh --type patch
+	@make dist/CHANGELOG.md
+	@./scripts/publish_release.sh --publish-pypi --notes-file dist/CHANGELOG.md
+
+release-minor:  ## Create a stable minor release (x.Y+1.0)
+	@./scripts/bump_version.sh --type minor
+	@make dist/CHANGELOG.md
+	@./scripts/publish_release.sh --publish-pypi --notes-file dist/CHANGELOG.md
 
 ./scripts/build_changelog.py:
 	wget -O $@ https://raw.githubusercontent.com/ActivityWatch/activitywatch/master/scripts/build_changelog.py
@@ -156,15 +174,22 @@ dist/CHANGELOG.md: ./scripts/build_changelog.py
 docs/releases/%.md: ./scripts/build_changelog.py
 	@mkdir -p docs/changelog
 	# version is the % in the target
+	# For stable releases (no .dev suffix), find the previous stable tag to get a cumulative changelog.
+	# For dev releases, use the immediately preceding tag (incremental).
 	VERSION=$* && \
-	PREV_VERSION=$$(./scripts/get-last-version.sh $${VERSION}) && \
+	if echo "$$VERSION" | grep -qE '\.dev[0-9]+'; then \
+		PREV_VERSION=$$(./scripts/get-last-version.sh $${VERSION}); \
+	else \
+		PREV_VERSION=$$(git tag --sort=-version:refname | grep -v '\.dev' | grep -A 1 "$$VERSION" | tail -n 1); \
+	fi && \
 		./scripts/build_changelog.py --range $${PREV_VERSION}...$${VERSION} --project-title gptme --org gptme --repo gptme --output $@ --add-version-header
 
-release: version dist/CHANGELOG.md  ## Release new version
+release: version dist/CHANGELOG.md  ## Release new version (interactive)
 	# Insert new version at top of changelog toctree
 	# Stage changelog and release notes with version bump
 	# Amend version commit to include changelog
 	# Force-update tag to amended commit
+	# Then use shared publish script for push + GH release
 	@VERSION=v$$(poetry version --short) && \
 		echo "Releasing version $${VERSION}"; \
 		grep $${VERSION} docs/changelog.rst || (awk '/^   releases\// && !done { \
@@ -177,10 +202,8 @@ release: version dist/CHANGELOG.md  ## Release new version
 		git commit --amend --no-edit && \
 		git tag -f $${VERSION} && \
 		echo "✓ Updated commit and tag with changelog" && \
-		read -p "Press enter to push" && \
-		git push origin master && \
-		git push origin $${VERSION} --force && \
-		gh release create $${VERSION} -t $${VERSION} -F dist/CHANGELOG.md
+		read -p "Press enter to push and publish" && \
+		./scripts/publish_release.sh --notes-file dist/CHANGELOG.md
 
 install-completions: ## Install shell completions (Fish)
 	@echo "Installing shell completions..."
@@ -282,6 +305,26 @@ help:  ## Show this help message
 	@grep -E '^[a-zA-Z_-]+:.*?## .*$$' $(MAKEFILE_LIST) | sort | awk 'BEGIN {FS = ":.*?## "}; {printf "\033[36m%-30s\033[0m %s\n", $$1, $$2}'
 	@echo
 	@echo "Run 'make <command>' to execute a command."
+
+tauri-dev: ## Run gptme-tauri in development mode (hot-reload webui + Tauri window)
+	@mkdir -p tauri/bins && TRIPLE=$$(rustc -Vv | grep host | cut -f2 -d' ') && touch "tauri/bins/gptme-server-$${TRIPLE}"
+	cd webui && npm install
+	cd tauri && npm install && npm run tauri dev
+
+tauri-build: ## Build the gptme-tauri desktop app
+	cd webui && npm install && npm run build
+	cd tauri && npm install && \
+	if [ "$$(uname)" = "Linux" ]; then \
+		NO_STRIP=true npm run tauri build; \
+	else \
+		npm run tauri build; \
+	fi
+
+tauri-lint: ## Run Rust fmt + clippy on tauri/src-tauri
+	cd tauri/src-tauri && cargo fmt -- --check && cargo clippy -- -D warnings
+
+tauri-build-sidecar: ## Build the gptme-server sidecar binary for bundling
+	bash tauri/scripts/build-sidecar.sh
 
 build-docker-github-bot: ## Build Docker image for GitHub bot
 	docker build . -t gptme-github-bot:latest -f scripts/Dockerfile.github-bot

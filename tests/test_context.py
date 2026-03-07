@@ -91,10 +91,14 @@ def test_get_mentioned_files(tmp_path):
         Message("user", "check file2", files=[file2]),
     ]
 
-    # Should sort by mentions (file1 mentioned twice)
+    # Should return dict with counts, ordered by mentions (file1 mentioned twice)
     files = get_mentioned_files(msgs, tmp_path)
-    assert files[0] == file1
-    assert files[1] == file2
+    paths = list(files.keys())
+    assert paths[0] == file1
+    assert paths[1] == file2
+    # Verify counts are returned
+    assert files[file1.resolve()] == 2
+    assert files[file2.resolve()] == 1
 
 
 def test_use_fresh_context(monkeypatch):
@@ -291,6 +295,51 @@ def test_check_content_size():
     result = _check_content_size(very_large, "test.txt")
     assert len(result) <= CONTENT_SIZE_WARN_THRESHOLD
     assert "truncated" in result.lower()
+
+
+def test_binary_file_metadata(tmp_path):
+    """Test that binary files return metadata instead of None."""
+    from gptme.util.context import _binary_file_metadata, _human_readable_size
+
+    # Create a binary file
+    binary_file = tmp_path / "data.bin"
+    binary_file.write_bytes(b"\xff\xfe\x80\x81" * 256)  # 1KB binary
+
+    result = _binary_file_metadata(binary_file, str(binary_file))
+    assert result is not None
+    assert "Binary file: data.bin" in result
+    assert "Size:" in result
+
+    # Test with a known MIME type extension
+    zip_file = tmp_path / "archive.zip"
+    zip_file.write_bytes(b"PK\x03\x04" + b"\x00" * 100)
+    result = _binary_file_metadata(zip_file, str(zip_file))
+    assert result is not None
+    assert "application/zip" in result
+
+    # Test non-existent file returns None
+    missing = tmp_path / "missing.bin"
+    result = _binary_file_metadata(missing, str(missing))
+    assert result is None
+
+    # Test human_readable_size
+    assert _human_readable_size(500) == "500 B"
+    assert _human_readable_size(1024) == "1.0 KB"
+    assert _human_readable_size(1048576) == "1.0 MB"
+    assert _human_readable_size(1073741824) == "1.0 GB"
+
+
+def test_resource_to_codeblock_binary(tmp_path):
+    """Test that _resource_to_codeblock returns metadata for binary files."""
+    from gptme.util.context import _resource_to_codeblock
+
+    binary_file = tmp_path / "data.bin"
+    binary_file.write_bytes(b"\xff\xfe\x80\x81" * 100)
+
+    result = _resource_to_codeblock(str(binary_file))
+    assert result is not None
+    assert "Binary file" in result
+    assert "Size:" in result
 
 
 def test_is_interactive_mode():

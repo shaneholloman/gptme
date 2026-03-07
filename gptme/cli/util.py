@@ -17,7 +17,7 @@ from ..logmanager import LogManager
 from ..mcp.client import MCPClient
 from ..message import Message
 from ..tools import get_tools, init_tools
-from ..tools.chats import list_chats, search_chats
+from ..tools.chats import find_empty_conversations, list_chats, search_chats
 from ..util.context import include_paths
 
 
@@ -266,9 +266,6 @@ def mcp_search(query: str, registry: str, limit: int):
 @main.group()
 def chats():
     """Commands for managing chat logs."""
-    # needed since get_prompt() requires tools to be loaded
-    if not get_tools():
-        init_tools()
 
 
 @chats.command("list")
@@ -278,6 +275,7 @@ def chats():
 )
 def chats_list(limit: int, summarize: bool):
     """List conversation logs."""
+    _ensure_tools()
     if summarize:
         from gptme.init import init  # fmt: skip
 
@@ -299,6 +297,7 @@ def chats_list(limit: int, summarize: bool):
 )
 def chats_search(query: str, limit: int, summarize: bool):
     """Search conversation logs."""
+    _ensure_tools()
     if summarize:
         from gptme.init import init  # fmt: skip
 
@@ -316,6 +315,7 @@ def chats_search(query: str, limit: int, summarize: bool):
 @click.argument("id")
 def chats_read(id: str):
     """Read a specific chat log."""
+    _ensure_tools()
 
     logdir = get_logs_dir() / id
     if not logdir.exists():
@@ -326,6 +326,215 @@ def chats_read(id: str):
     for msg in log.log:
         if isinstance(msg, Message):
             print(f"{msg.role}: {msg.content}")
+
+
+@chats.command("export")
+@click.argument("id")
+@click.option(
+    "-f",
+    "--format",
+    "fmt",
+    type=click.Choice(["html", "markdown"]),
+    default="markdown",
+    help="Export format (default: markdown).",
+)
+@click.option(
+    "-o", "--output", type=click.Path(), default=None, help="Output file path."
+)
+def chats_export(id: str, fmt: str, output: str | None):
+    """Export a conversation to HTML or markdown.
+
+    Exports the conversation with the given ID to a file.
+    Use --format to choose between HTML (self-contained) and markdown.
+
+    Examples:
+
+        gptme-util chats export my-conversation
+
+        gptme-util chats export my-conversation -f html -o chat.html
+    """
+    _ensure_tools()
+    from ..util.export import export_chat_to_html, export_chat_to_markdown  # fmt: skip
+
+    logdir = get_logs_dir() / id
+    if not logdir.exists():
+        click.echo(f"Chat '{id}' not found")
+        raise SystemExit(1)
+
+    log = LogManager.load(logdir)
+
+    ext = "html" if fmt == "html" else "md"
+    output_path = Path(output) if output else Path(f"{id}.{ext}")
+
+    if fmt == "html":
+        export_chat_to_html(id, log.log, output_path)
+    else:
+        export_chat_to_markdown(id, log.log, output_path)
+
+    click.echo(f"Exported conversation to {output_path}")
+
+
+@chats.command("clean")
+@click.option(
+    "-n",
+    "--max-messages",
+    default=1,
+    help="Treat conversations with at most N messages as empty (default: 1).",
+)
+@click.option(
+    "--include-test",
+    is_flag=True,
+    help="Include test/eval conversations in scan.",
+)
+@click.option(
+    "--delete",
+    is_flag=True,
+    help="Actually delete empty conversations (default is dry-run).",
+)
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON.")
+def chats_clean(max_messages: int, include_test: bool, delete: bool, json_output: bool):
+    """Find and remove empty or trivial conversations.
+
+    By default, lists conversations with 0-1 messages (dry-run).
+    Use --delete to actually remove them.
+
+    \b
+    Examples:
+        gptme-util chats clean                  # List empty conversations
+        gptme-util chats clean -n 2             # Include conversations with <=2 messages
+        gptme-util chats clean --delete         # Delete empty conversations
+        gptme-util chats clean --include-test   # Include test/eval conversations
+    """
+    from ..logmanager import delete_conversation  # fmt: skip
+
+    _ensure_tools()
+
+    results = find_empty_conversations(
+        max_messages=max_messages,
+        include_test=include_test,
+    )
+
+    if not results:
+        if json_output:
+            import json
+
+            click.echo(
+                json.dumps(
+                    {
+                        "found": 0,
+                        "deleted": 0,
+                        "freed_bytes": 0,
+                        "total_bytes": 0,
+                        "conversations": [],
+                    }
+                )
+            )
+        else:
+            click.echo("No empty conversations found.")
+        return
+
+    total_size = sum(r["size_bytes"] for r in results)
+
+    if json_output:
+        import json
+
+        deleted_count = 0
+        freed_bytes = 0
+        if delete:
+            for r in results:
+                try:
+                    if delete_conversation(r["conversation"].id):
+                        deleted_count += 1
+                        freed_bytes += r["size_bytes"]
+                except PermissionError as e:
+                    click.echo(
+                        f"Warning: could not delete {r['conversation'].id}: {e}",
+                        err=True,
+                    )
+
+        output = {
+            "found": len(results),
+            "deleted": deleted_count,
+            "freed_bytes": freed_bytes,
+            "total_bytes": total_size,
+            "conversations": [
+                {
+                    "id": r["conversation"].id,
+                    "name": r["conversation"].name,
+                    "messages": r["conversation"].messages,
+                    "size_bytes": r["size_bytes"],
+                }
+                for r in results
+            ],
+        }
+        click.echo(json.dumps(output, indent=2))
+        return
+
+    click.echo(
+        f"Found {len(results)} conversation(s) with <={max_messages} messages "
+        f"({_format_size(total_size)} total):\n"
+    )
+
+    for r in results:
+        conv = r["conversation"]
+        size = _format_size(r["size_bytes"])
+        click.echo(f"  {conv.id}  {conv.messages} msg  {size}")
+
+    if delete:
+        click.echo()
+        deleted = 0
+        freed_bytes = 0
+        for r in results:
+            conv_id = r["conversation"].id
+            try:
+                if delete_conversation(conv_id):
+                    deleted += 1
+                    freed_bytes += r["size_bytes"]
+            except PermissionError as e:
+                click.echo(f"Warning: could not delete {conv_id}: {e}", err=True)
+
+        click.echo(
+            f"Deleted {deleted} conversation(s), freed {_format_size(freed_bytes)}."
+        )
+    else:
+        click.echo("\nDry run. Use --delete to remove these conversations.")
+
+
+@chats.command("stats")
+@click.option(
+    "--since",
+    default=None,
+    help="Only include conversations since this date (YYYY-MM-DD or Nd for N days ago).",
+)
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+def chats_stats(since: str | None, as_json: bool):
+    """Show conversation statistics.
+
+    Displays overview of conversation history including counts,
+    date ranges, message totals, and activity breakdown.
+    """
+    from ..tools.chats import conversation_stats  # fmt: skip
+
+    try:
+        conversation_stats(since=since, as_json=as_json)
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
+
+def _ensure_tools():
+    """Lazily initialize tools only when needed."""
+    if not get_tools():
+        init_tools()
+
+
+def _format_size(size_bytes: int) -> str:
+    """Format bytes as human-readable size."""
+    if size_bytes < 1024:
+        return f"{size_bytes} B"
+    if size_bytes < 1024 * 1024:
+        return f"{size_bytes / 1024:.1f} KB"
+    if size_bytes < 1024 * 1024 * 1024:
+        return f"{size_bytes / (1024 * 1024):.1f} MB"
+    return f"{size_bytes / (1024 * 1024 * 1024):.1f} GB"
 
 
 @main.group()
@@ -670,6 +879,191 @@ def skills_dirs():
         click.echo(f"  {icon} {d}  ({status})")
 
 
+@skills.command("check")
+@click.option(
+    "--workspace",
+    default=".",
+    show_default=True,
+    type=click.Path(exists=True, file_okay=False, path_type=Path),
+    help="Agent workspace to check (default: current directory).",
+)
+def skills_check(workspace: Path):
+    """Validate lesson/skill health: frontmatter, keywords, sizing."""
+    from ..agent.doctor import DoctorReport, check_lessons
+
+    report = DoctorReport()
+    check_lessons(workspace.resolve(), report)
+
+    if not report.results:
+        click.echo("No lesson directories found.")
+        sys.exit(1)
+
+    for result in report.results:
+        click.echo(f"  {result.emoji} {result.name}: {result.message}")
+
+    if report.errors:
+        sys.exit(1)
+
+
+@skills.command("install")
+@click.argument("source")
+@click.option("--name", "-n", help="Override skill name")
+@click.option("--force", "-f", is_flag=True, help="Overwrite existing installation")
+def skills_install(source: str, name: str | None, force: bool):
+    """Install a skill from a source.
+
+    SOURCE can be:
+
+    \b
+      - A skill name from the registry (e.g. 'code-review-helper')
+      - A git URL (e.g. 'https://github.com/user/skills.git#path/to/skill')
+      - A local path to a skill directory (e.g. './my-skill/')
+    """
+    from ..lessons.installer import install_skill
+
+    click.echo(f"Installing skill from '{source}'...")
+    success, message = install_skill(source, name=name, force=force)
+    if success:
+        click.echo(f"  {message}")
+    else:
+        click.echo(f"Error: {message}", err=True)
+        sys.exit(1)
+
+
+@skills.command("uninstall")
+@click.argument("name")
+def skills_uninstall(name: str):
+    """Uninstall a skill by name."""
+    from ..lessons.installer import uninstall_skill
+
+    success, message = uninstall_skill(name)
+    if success:
+        click.echo(message)
+    else:
+        click.echo(f"Error: {message}", err=True)
+        sys.exit(1)
+
+
+@skills.command("validate")
+@click.argument("path", type=click.Path(exists=True))
+def skills_validate(path: str):
+    """Validate a skill directory or SKILL.md file.
+
+    Checks for required frontmatter fields and marketplace metadata.
+    """
+    from ..lessons.installer import validate_skill
+
+    all_issues = validate_skill(Path(path))
+    # Separate "recommended" warnings from real errors, matching publish_skill behavior
+    real_errors = [e for e in all_issues if "recommended" not in e.lower()]
+    warnings = [e for e in all_issues if "recommended" in e.lower()]
+
+    if warnings:
+        click.echo(f"Warnings ({len(warnings)}):")
+        for w in warnings:
+            click.echo(f"  - {w}")
+    if real_errors:
+        click.echo(f"Validation errors ({len(real_errors)}):")
+        for error in real_errors:
+            click.echo(f"  - {error}")
+        sys.exit(1)
+    elif warnings:
+        click.echo("Skill is valid (with warnings).")
+    else:
+        click.echo("Skill is valid.")
+
+
+@skills.command("installed")
+@click.option("--json", "json_output", is_flag=True, help="Output as JSON")
+def skills_installed(json_output: bool):
+    """List installed skills from the user's skill directory."""
+    from ..lessons.installer import list_installed
+
+    installed = list_installed()
+
+    if not installed:
+        click.echo(
+            "No skills installed. Use 'gptme-util skills install <name>' to install."
+        )
+        return
+
+    if json_output:
+        import json
+
+        result = [
+            {
+                "name": s.name,
+                "version": s.version,
+                "source": s.source,
+                "path": s.install_path,
+                "installed_at": s.installed_at,
+            }
+            for s in installed
+        ]
+        click.echo(json.dumps(result, indent=2))
+        return
+
+    click.echo(f"Installed skills ({len(installed)}):\n")
+    for skill in sorted(installed, key=lambda s: s.name):
+        click.echo(f"  {skill.name:30s} v{skill.version:10s} ({skill.source})")
+
+
+@skills.command("init")
+@click.argument("path", type=click.Path())
+@click.option("--name", "-n", help="Skill name (defaults to directory name)")
+@click.option(
+    "--description", "-d", default="A new gptme skill", help="Short description"
+)
+@click.option("--author", "-a", default="", help="Author name")
+@click.option("--tags", "-t", default="", help="Comma-separated tags")
+def skills_init(path: str, name: str | None, description: str, author: str, tags: str):
+    """Create a new skill from a template.
+
+    PATH is the directory to create the skill in.
+
+    \b
+    Example:
+      gptme-util skills init ./my-skill --name my-skill -d "Does cool things"
+    """
+    from ..lessons.installer import init_skill
+
+    target = Path(path).resolve()
+    success, message = init_skill(
+        target, name=name, description=description, author=author, tags=tags
+    )
+    if success:
+        click.echo(f"  {message}")
+        click.echo("\n  Next steps:")
+        click.echo(f"    1. Edit {target}/SKILL.md with your instructions")
+        click.echo(f"    2. Add supporting scripts/files to {target}/")
+        click.echo(f"    3. Validate: gptme-util skills validate {target}")
+        click.echo(f"    4. Publish: gptme-util skills publish {target}")
+    else:
+        click.echo(f"Error: {message}", err=True)
+        sys.exit(1)
+
+
+@skills.command("publish")
+@click.argument("path", type=click.Path(exists=True))
+def skills_publish(path: str):
+    """Validate and package a skill for sharing.
+
+    PATH is the skill directory (containing SKILL.md).
+
+    Creates a .tar.gz archive and shows instructions for submitting
+    to the gptme-contrib registry.
+    """
+    from ..lessons.installer import publish_skill
+
+    target = Path(path).resolve()
+    success, message, _archive_path = publish_skill(target)
+    if success:
+        click.echo(message)
+    else:
+        click.echo(f"Error: {message}", err=True)
+        sys.exit(1)
+
+
 @main.group()
 def tools():
     """Tool-related utilities."""
@@ -680,59 +1074,68 @@ def tools():
     "--available/--all", default=True, help="Show only available tools or all tools"
 )
 @click.option("--langtags", is_flag=True, help="Show language tags for code execution")
-def tools_list(available: bool, langtags: bool):
-    """List available tools."""
-    from ..commands import _gen_help  # fmt: skip
-    from ..tools import get_tools, init_tools  # fmt: skip
+@click.option("--compact", is_flag=True, help="Compact single-line format")
+def tools_list(available: bool, langtags: bool, compact: bool):
+    """List available tools.
+
+    By default shows only available tools (dependencies installed).
+    Use --all to include unavailable tools as well.
+    """
+    from ..tools import get_available_tools, init_tools  # fmt: skip
+    from ..util.tool_format import format_langtags, format_tools_list  # fmt: skip
 
     # Initialize tools
     init_tools()
 
+    # get_available_tools() returns all discovered tools (loaded or not)
+    tools = get_available_tools()
+
     if langtags:
-        # Show language tags using existing help generator
-        for line in _gen_help(incl_langtags=True):
-            if line.startswith("Supported langtags:"):
-                print("\nSupported language tags:")
-                continue
-            if line.startswith("  - "):
-                print(line)
+        print(format_langtags(tools))
         return
 
-    print("Available tools:")
-    for tool in get_tools():
-        if not available or tool.is_available:
-            status = "✓" if tool.is_available else "✗"
-            print(
-                f"""
- {status} {tool.name}
-   {tool.desc}"""
-            )
+    print(format_tools_list(tools, show_all=not available, compact=compact))
 
 
 @tools.command("info")
 @click.argument("tool_name")
-def tools_info(tool_name: str):
-    """Show detailed information about a tool."""
-    from ..tools import get_tool, get_tools, init_tools  # fmt: skip
+@click.option("-v", "--verbose", is_flag=True, help="Show full output (not truncated)")
+@click.option("--no-examples", is_flag=True, help="Hide examples section")
+@click.option("--no-tokens", is_flag=True, help="Hide token estimates")
+def tools_info(tool_name: str, verbose: bool, no_examples: bool, no_tokens: bool):
+    """Show detailed information about a tool.
+
+    Displays tool instructions, examples, and token usage estimates.
+    Use this to understand how a tool works and how to use it.
+
+    Output is truncated by default. Use -v for full output.
+    """
+    from ..tools import get_available_tools, get_tool, init_tools  # fmt: skip
+    from ..util.tool_format import format_tool_info  # fmt: skip
 
     # Initialize tools
     init_tools()
 
+    # Look in both loaded and all available tools
     tool = get_tool(tool_name)
     if not tool:
-        print(f"Tool '{tool_name}' not found. Available tools:")
-        for t in get_tools():
-            print(f"- {t.name}")
-        sys.exit(1)
+        available_dict = {t.name: t for t in get_available_tools()}
+        if tool_name in available_dict:
+            tool = available_dict[tool_name]
+        else:
+            print(f"Tool '{tool_name}' not found. Available tools:")
+            for name in sorted(available_dict.keys()):
+                print(f"  - {name}")
+            sys.exit(1)
 
-    print(f"Tool: {tool.name}")
-    print(f"Description: {tool.desc}")
-    print(f"Available: {'Yes' if tool.is_available else 'No'}")
-    print("\nInstructions:")
-    print(tool.instructions)
-    if tool.get_examples():
-        print("\nExamples:")
-        print(tool.get_examples())
+    print(
+        format_tool_info(
+            tool,
+            include_examples=not no_examples,
+            include_tokens=not no_tokens,
+            truncate=not verbose,
+        )
+    )
 
 
 @tools.command("call")
@@ -827,6 +1230,11 @@ def models():
     is_flag=True,
     help="Include deprecated/sunset models in the listing",
 )
+@click.option(
+    "--available",
+    is_flag=True,
+    help="Only show models from providers with configured API keys",
+)
 def models_list(
     provider: str | None,
     pricing: bool,
@@ -834,6 +1242,7 @@ def models_list(
     reasoning: bool,
     simple: bool,
     include_deprecated: bool,
+    available: bool,
 ):
     """List available models."""
 
@@ -845,6 +1254,7 @@ def models_list(
         include_deprecated=include_deprecated,
         simple_format=simple,
         dynamic_fetch=True,
+        available_only=available,
     )
 
 

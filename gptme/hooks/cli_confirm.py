@@ -27,7 +27,7 @@ from rich.console import Console
 
 from ..util.ask_execute import print_confirmation_help, print_preview
 from ..util.clipboard import copy
-from ..util.prompt import get_prompt_session
+from ..util.prompt import prompt_alert
 from ..util.sound import print_bell
 from ..util.terminal import terminal_state_title
 from ..util.useredit import edit_text_with_editor
@@ -80,7 +80,7 @@ def cli_confirm_hook(
     """
     # Get preview content - use provided preview or generate from tool_use
     content = preview or tool_use.content
-    lang = _get_lang_for_tool(tool_use.tool)
+    lang = _get_lang_for_tool(tool_use.tool, content)
 
     # Determine if content is editable/copiable
     editable = bool(content)
@@ -117,20 +117,8 @@ def cli_confirm_hook(
     question = f"Execute {tool_use.tool}?"
 
     with terminal_state_title("❓ waiting for confirmation"):
-        session = get_prompt_session()
         prompt = f"{question} {choicestr}"
-
-        style_prompt_toolkit = "bold fg:ansiyellow bg:ansired"
-        answer = (
-            session.prompt(
-                [
-                    (style_prompt_toolkit, " " + prompt + " "),
-                    ("", " "),
-                ]
-            )
-            .lower()
-            .strip()
-        )
+        answer = prompt_alert(prompt)
 
     # Handle the response
     return _handle_response(answer, content, editable, copiable, tool_use)
@@ -189,8 +177,66 @@ def _handle_response(
     return ConfirmationResult.skip(f"Unknown response: {answer}")
 
 
-def _get_lang_for_tool(tool: str) -> str:
-    """Get the syntax highlighting language for a tool."""
+def _looks_like_diff(content: str | None) -> bool:
+    """Check if content looks like unified diff output.
+
+    Save/append previews currently come from ``Patch.diff_minimal()``, which strips
+    unified-diff headers (``---``, ``+++``, ``@@``). So we rely on the body shape:
+    mostly diff-like lines plus either mixed +/- changes or context lines.
+    """
+    if not content:
+        return False
+
+    lines = content.splitlines()
+    if not lines:
+        return False
+
+    # Most lines should look like diff body lines.
+    diff_lines = sum(
+        1 for line in lines if line.startswith((" ", "+", "-")) or line == ""
+    )
+    if diff_lines < len(lines) * 0.8:
+        return False
+
+    has_plus = any(line.startswith("+") for line in lines)
+    has_minus = any(line.startswith("-") for line in lines)
+    has_context = any(line.startswith(" ") for line in lines)
+
+    # Must contain actual change markers.
+    if not (has_plus or has_minus):
+        return False
+
+    # Avoid false positives on plain markdown/yaml lists (mostly '-' lines).
+    # Real diff previews usually have either mixed +/- lines or context lines.
+    if (has_plus and has_minus) or has_context:
+        return True
+
+    # Accept plus-only diffs (e.g. append to empty file produces all-'+' output
+    # from Patch.diff_minimal). Require every non-empty line to start with '+'
+    # and at least one non-"+ " line to avoid matching markdown/yaml '+' lists.
+    if has_plus and not has_minus:
+        non_empty = [line for line in lines if line.strip()]
+        all_plus = non_empty and all(line.startswith("+") for line in non_empty)
+        # Markdown '+ item' lists always have a space after '+'.  Real diffs from
+        # diff_minimal() use '+content' (no space) for most lines.
+        has_tight_plus = any(
+            line.startswith("+") and (len(line) == 1 or line[1] != " ")
+            for line in non_empty
+        )
+        if all_plus and has_tight_plus:
+            return True
+
+    return False
+
+
+def _get_lang_for_tool(tool: str, content: str | None = None) -> str:
+    """Get the syntax highlighting language for a tool.
+
+    For save/append, detects if the preview content is a diff and
+    highlights accordingly.
+    """
+    if tool in ("save", "append") and _looks_like_diff(content):
+        return "diff"
     lang_map = {
         "python": "python",
         "ipython": "python",

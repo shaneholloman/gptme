@@ -9,13 +9,17 @@ from gptme.cli.doctor import (
     CheckResult,
     CheckStatus,
     _check_api_keys,
+    _check_browser,
     _check_config,
+    _check_mcp,
     _check_permissions,
     _check_python_deps,
     _check_tools,
+    _check_version,
     main,
     run_diagnostics,
 )
+from gptme.config import MCPConfig, MCPServerConfig
 
 
 class TestCheckStatus:
@@ -56,6 +60,133 @@ class TestCheckResult:
         )
         assert result.details == "Detailed info"
         assert result.fix_hint == "Try this fix"
+
+
+class TestCheckVersion:
+    """Test _check_version function."""
+
+    def test_returns_results(self):
+        """Test that version check returns results."""
+        results = _check_version()
+        assert len(results) == 1
+        assert "Version" in results[0].name
+
+    @patch("gptme.cli.doctor.__version__", "0.31.0")
+    def test_dev_install_skips_pypi(self):
+        """Test that dev installs skip PyPI check."""
+        with patch("importlib.metadata.version", return_value="0.31.0.dev123"):
+            results = _check_version()
+            assert len(results) == 1
+            assert results[0].status == CheckStatus.OK
+            assert "Development" in results[0].message
+
+    @patch("gptme.cli.doctor.__version__", "0.31.0")
+    def test_up_to_date(self):
+        """Test that matching version shows OK."""
+        import io
+        import json as json_mod
+
+        mock_resp = io.BytesIO(json_mod.dumps({"info": {"version": "0.31.0"}}).encode())
+        mock_cm = patch("urllib.request.urlopen")
+        with (
+            patch("importlib.metadata.version", return_value="0.31.0"),
+            mock_cm as mock_urlopen,
+        ):
+            mock_urlopen.return_value.__enter__ = lambda s: mock_resp
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+
+            results = _check_version()
+            assert len(results) == 1
+            assert results[0].status == CheckStatus.OK
+            assert "Up to date" in results[0].message
+
+    @patch("gptme.cli.doctor.__version__", "0.30.0")
+    def test_update_available(self):
+        """Test that newer version triggers warning."""
+        import io
+        import json as json_mod
+
+        mock_resp = io.BytesIO(json_mod.dumps({"info": {"version": "0.31.0"}}).encode())
+        mock_cm = patch("urllib.request.urlopen")
+        with (
+            patch("importlib.metadata.version", return_value="0.30.0"),
+            mock_cm as mock_urlopen,
+        ):
+            mock_urlopen.return_value.__enter__ = lambda s: mock_resp
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+
+            results = _check_version()
+            assert len(results) == 1
+            assert results[0].status == CheckStatus.WARNING
+            assert "0.31.0" in results[0].message
+            assert results[0].fix_hint is not None
+
+    @patch("gptme.cli.doctor.__version__", "0.32.0")
+    def test_current_ahead_of_pypi(self):
+        """Test that installed version newer than PyPI shows OK (no spurious warning)."""
+        import io
+        import json as json_mod
+
+        mock_resp = io.BytesIO(json_mod.dumps({"info": {"version": "0.31.0"}}).encode())
+        mock_cm = patch("urllib.request.urlopen")
+        with (
+            patch("importlib.metadata.version", return_value="0.32.0"),
+            mock_cm as mock_urlopen,
+        ):
+            mock_urlopen.return_value.__enter__ = lambda s: mock_resp
+            mock_urlopen.return_value.__exit__ = lambda s, *a: None
+
+            results = _check_version()
+            assert len(results) == 1
+            assert results[0].status == CheckStatus.OK
+            assert results[0].fix_hint is None
+            assert "0.32.0" in results[0].message
+
+    @patch("gptme.cli.doctor.__version__", "0.31.0")
+    def test_network_error_graceful(self):
+        """Test that network errors are handled gracefully."""
+        with (
+            patch("importlib.metadata.version", return_value="0.31.0"),
+            patch("urllib.request.urlopen", side_effect=Exception("Network error")),
+        ):
+            results = _check_version()
+            assert len(results) == 1
+            # Should still report OK (installed version) not ERROR
+            assert results[0].status == CheckStatus.OK
+            assert "0.31.0" in results[0].message
+
+
+class TestCheckBrowser:
+    """Test _check_browser function."""
+
+    @patch("importlib.util.find_spec", return_value=None)
+    def test_no_playwright_returns_empty(self, mock_find):
+        """Test that missing playwright returns no results."""
+        results = _check_browser()
+        assert len(results) == 0
+
+    @patch("importlib.util.find_spec", return_value=True)
+    def test_playwright_no_browsers(self, mock_find, tmp_path):
+        """Test warning when playwright installed but no browsers."""
+        with patch.dict("os.environ", {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path)}):
+            results = _check_browser()
+            assert len(results) == 1
+            assert results[0].status == CheckStatus.WARNING
+            assert "no browsers" in results[0].message.lower()
+            assert results[0].fix_hint is not None
+
+    @patch("importlib.util.find_spec", return_value=True)
+    def test_playwright_with_browsers(self, mock_find, tmp_path):
+        """Test OK when playwright has browsers installed."""
+        # Create fake browser directories
+        (tmp_path / "chromium-1148").mkdir()
+        (tmp_path / "firefox-1460").mkdir()
+
+        with patch.dict("os.environ", {"PLAYWRIGHT_BROWSERS_PATH": str(tmp_path)}):
+            results = _check_browser()
+            assert len(results) == 1
+            assert results[0].status == CheckStatus.OK
+            assert "2 browser(s)" in results[0].message
 
 
 class TestCheckTools:
@@ -132,9 +263,10 @@ class TestCheckPythonDeps:
         results = _check_python_deps()
         dep_names = [r.name for r in results]
 
-        # Should check common optional deps
-        assert any("playwright" in name for name in dep_names)
-        assert any("sentence_transformers" in name for name in dep_names)
+        # Should check common optional deps (extras)
+        # Names from info.py EXTRAS list (synced with pyproject.toml)
+        assert any("browser" in name for name in dep_names)
+        assert any("dspy" in name for name in dep_names)
 
 
 class TestCheckConfig:
@@ -422,3 +554,165 @@ class TestCheckApiKeys:
         auth_results = [r for r in results if r.name.startswith("Auth:")]
         assert len(auth_results) == 1
         assert auth_results[0].status == CheckStatus.OK
+
+
+class TestCheckMCP:
+    """Test _check_mcp function."""
+
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_disabled(self, mock_config):
+        """Test that disabled MCP is reported as SKIPPED."""
+        mock_config.return_value.mcp = MCPConfig(enabled=False)
+
+        results = _check_mcp()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.SKIPPED
+        assert "not enabled" in results[0].message.lower()
+
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_enabled_no_servers(self, mock_config):
+        """Test MCP enabled but no servers configured."""
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=[])
+
+        results = _check_mcp()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.OK
+        assert "0 server(s)" in results[0].message
+
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_disabled_server(self, mock_config):
+        """Test that disabled servers are reported as SKIPPED."""
+        server = MCPServerConfig(name="test-server", enabled=False, command="echo")
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=[server])
+
+        results = _check_mcp()
+        assert len(results) == 2  # status + server
+        server_result = results[1]
+        assert server_result.status == CheckStatus.SKIPPED
+        assert "Disabled" in server_result.message
+
+    @patch("shutil.which", return_value="/usr/bin/npx")
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_stdio_server_found(self, mock_config, mock_which):
+        """Test that stdio server with available command is OK."""
+        server = MCPServerConfig(
+            name="test-mcp", command="npx", args=["-y", "some-mcp-server"]
+        )
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=[server])
+
+        results = _check_mcp()
+        server_result = [r for r in results if "test-mcp" in r.name][0]
+        assert server_result.status == CheckStatus.OK
+        assert "'npx' found" in server_result.message
+
+    @patch("shutil.which", return_value=None)
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_stdio_server_not_found(self, mock_config, mock_which):
+        """Test that stdio server with missing command is ERROR."""
+        server = MCPServerConfig(name="test-mcp", command="nonexistent-binary")
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=[server])
+
+        results = _check_mcp()
+        server_result = [r for r in results if "test-mcp" in r.name][0]
+        assert server_result.status == CheckStatus.ERROR
+        assert "not found" in server_result.message
+        assert server_result.fix_hint is not None
+
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_stdio_server_no_command(self, mock_config):
+        """Test that stdio server with no command is ERROR."""
+        server = MCPServerConfig(name="test-mcp", command="")
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=[server])
+
+        results = _check_mcp()
+        server_result = [r for r in results if "test-mcp" in r.name][0]
+        assert server_result.status == CheckStatus.ERROR
+        assert "No command" in server_result.message
+
+    @patch("urllib.request.urlopen")
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_http_server_reachable(self, mock_config, mock_urlopen):
+        """Test that reachable HTTP server is OK."""
+        server = MCPServerConfig(name="remote-mcp", url="http://localhost:8080/mcp")
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=[server])
+
+        # Mock successful HTTP response
+        mock_urlopen.return_value.__enter__ = lambda s: None
+        mock_urlopen.return_value.__exit__ = lambda s, *a: None
+
+        results = _check_mcp()
+        server_result = [r for r in results if "remote-mcp" in r.name][0]
+        assert server_result.status == CheckStatus.OK
+        assert "reachable" in server_result.message.lower()
+
+    @patch("urllib.request.urlopen", side_effect=ConnectionRefusedError("refused"))
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_http_server_unreachable(self, mock_config, mock_urlopen):
+        """Test that unreachable HTTP server is ERROR."""
+        server = MCPServerConfig(name="remote-mcp", url="http://localhost:9999/mcp")
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=[server])
+
+        results = _check_mcp()
+        server_result = [r for r in results if "remote-mcp" in r.name][0]
+        assert server_result.status == CheckStatus.ERROR
+        assert "Cannot reach" in server_result.message
+
+    @patch("urllib.request.urlopen")
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_http_server_error_status_still_reachable(
+        self, mock_config, mock_urlopen
+    ):
+        """Test that HTTP errors (4xx/5xx) still count as reachable."""
+        from email.message import Message
+        from urllib.error import HTTPError
+
+        server = MCPServerConfig(name="remote-mcp", url="http://localhost:8080/mcp")
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=[server])
+
+        mock_urlopen.side_effect = HTTPError(
+            "http://localhost:8080/mcp", 404, "Not Found", Message(), None
+        )
+
+        results = _check_mcp()
+        server_result = [r for r in results if "remote-mcp" in r.name][0]
+        assert server_result.status == CheckStatus.OK
+        assert "reachable" in server_result.message.lower()
+
+    @patch("shutil.which")
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_multiple_servers(self, mock_config, mock_which):
+        """Test checking multiple MCP servers."""
+        servers = [
+            MCPServerConfig(name="server-a", command="npx", args=["-y", "mcp-a"]),
+            MCPServerConfig(name="server-b", command="missing-cmd"),
+        ]
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=servers)
+
+        def which_side_effect(cmd):
+            return "/usr/bin/npx" if cmd == "npx" else None
+
+        mock_which.side_effect = which_side_effect
+
+        results = _check_mcp()
+        # 1 status + 2 servers
+        assert len(results) == 3
+
+        a_result = [r for r in results if "server-a" in r.name][0]
+        b_result = [r for r in results if "server-b" in r.name][0]
+        assert a_result.status == CheckStatus.OK
+        assert b_result.status == CheckStatus.ERROR
+
+    @patch("shutil.which", return_value="/usr/bin/npx")
+    @patch("gptme.cli.doctor.get_config")
+    def test_mcp_verbose_shows_details(self, mock_config, mock_which):
+        """Test that verbose mode shows command args."""
+        server = MCPServerConfig(
+            name="test-mcp", command="npx", args=["-y", "some-server"]
+        )
+        mock_config.return_value.mcp = MCPConfig(enabled=True, servers=[server])
+
+        results = _check_mcp(verbose=True)
+        server_result = [r for r in results if "test-mcp" in r.name][0]
+        assert server_result.details is not None
+        assert "npx" in server_result.details
+        assert "-y" in server_result.details

@@ -117,6 +117,18 @@ def _discover_tools(module_names: list[str]) -> list[ToolSpec]:
 _tools_init_lock = threading.Lock()
 
 
+def _init_single_tool(tool: ToolSpec) -> ToolSpec:
+    """Initialize a single tool: run its init(), register hooks and commands.
+
+    Caller is responsible for acquiring _tools_init_lock if needed.
+    """
+    if tool.init:
+        tool = tool.init()
+    tool.register_hooks()
+    tool.register_commands()
+    return tool
+
+
 def init_tools(
     allowlist: list[str] | None = None,
 ) -> list[ToolSpec]:
@@ -127,6 +139,9 @@ def init_tools(
 
     If allowlist is not provided, it will be loaded from the environment variable
     TOOL_ALLOWLIST or the chat config (if set).
+
+    Items in allowlist can be tool names (e.g. "shell") or paths to .py files
+    containing ToolSpec definitions (e.g. "path/to/mytool.py").
     """
     from ..config import get_config  # fmt: skip
 
@@ -141,19 +156,37 @@ def init_tools(
             elif config.chat and config.chat.tools:
                 allowlist = config.chat.tools
 
-        for tool in get_toolchain(allowlist):
+        # Partition allowlist into file paths and tool names
+        file_paths: list[str] = []
+        tool_names: list[str] = []
+        for item in allowlist or []:
+            if item.endswith(".py") or "/" in item or "\\" in item:
+                file_paths.append(item)
+            else:
+                tool_names.append(item)
+
+        # Load tools from file paths first
+        if file_paths:
+            from .base import load_from_file
+
+            for file_path in file_paths:
+                path = Path(file_path).expanduser()
+                for tool in load_from_file(path):
+                    if not has_tool(tool.name):
+                        tool = _init_single_tool(tool)
+                        loaded_tools.append(tool)
+
+        # Load built-in tools by name
+        # When file paths are present, only load explicitly named built-in tools
+        # (file_paths + no names = only file tools; file_paths + names = both)
+        name_allowlist = tool_names if (tool_names or file_paths) else allowlist
+        for tool in get_toolchain(name_allowlist):
             if has_tool(tool.name):
                 continue
-            if tool.init:
-                tool = tool.init()
-
-            # Register tool's hooks and commands
-            tool.register_hooks()
-            tool.register_commands()
-
+            tool = _init_single_tool(tool)
             loaded_tools.append(tool)
 
-        for tool_name in allowlist or []:
+        for tool_name in tool_names:
             if not has_tool(tool_name):
                 # if the tool is found but unavailable, we log a warning
                 if tool_name in [tool.name for tool in get_available_tools()]:
@@ -332,3 +365,40 @@ def get_tool(tool_name: str) -> ToolSpec | None:
 def has_tool(tool_name: str) -> bool:
     """Returns True if a tool is loaded."""
     return any(tool.name == tool_name for tool in _get_loaded_tools())
+
+
+def load_tool(tool_name: str) -> ToolSpec:
+    """Load a single tool by name mid-conversation.
+
+    Finds the tool in available tools, initializes it, registers hooks/commands,
+    and adds it to the loaded tools list.
+
+    Thread-safe: uses _tools_init_lock to match init_tools() behavior.
+
+    Raises:
+        ValueError: If tool not found or already loaded.
+    """
+    with _tools_init_lock:
+        if has_tool(tool_name):
+            raise ValueError(f"Tool '{tool_name}' is already loaded")
+
+        available = {t.name: t for t in get_available_tools()}
+        if tool_name not in available:
+            raise ValueError(
+                f"Tool '{tool_name}' not found. Available: {', '.join(sorted(available.keys()))}"
+            )
+
+        tool = available[tool_name]
+        if not tool.is_available:
+            raise ValueError(
+                f"Tool '{tool_name}' is unavailable (likely missing dependencies)"
+            )
+
+        # Initialize, register hooks/commands (shared logic)
+        tool = _init_single_tool(tool)
+
+        # Add to loaded tools
+        _get_loaded_tools().append(tool)
+        logger.info("Loaded tool '%s' mid-conversation", tool_name)
+
+        return tool

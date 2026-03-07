@@ -1,14 +1,15 @@
 import html
 import json
+from datetime import datetime
 from pathlib import Path
 
 from ..logmanager import Log
 
 
-def replace_or_fail(html: str, old: str, new: str, desc: str = "") -> str:
+def replace_or_fail(content: str, old: str, new: str, desc: str = "") -> str:
     """Replace a string and fail if nothing was replaced"""
-    result = html.replace(old, new)
-    if result == html:
+    result = content.replace(old, new)
+    if result == content:
         raise ValueError(f"Failed to replace {desc or old!r}")
     return result
 
@@ -126,3 +127,40 @@ window.CHAT_DATA = {chat_data_json};
     # Write the file
     with open(output_path, "w", encoding="utf-8") as f:
         f.write(standalone_html)
+
+
+def _format_timestamp(timestamp: datetime | None) -> str:
+    """Format a message timestamp for display."""
+    if timestamp is None:
+        return ""
+    return timestamp.strftime("%Y-%m-%d %H:%M:%S")
+
+
+def _role_label(role: str) -> str:
+    """Map role to a readable label."""
+    labels = {"user": "User", "assistant": "Assistant", "system": "System"}
+    return labels.get(role, role.capitalize())
+
+
+def export_chat_to_markdown(name: str, chat_data: Log, output_path: Path) -> None:
+    """Export a chat log to a markdown file."""
+    lines: list[str] = []
+    lines.append(f"# {name}")
+
+    for msg in chat_data.messages:
+        # Skip hidden messages (markdown is static so hidden messages are excluded)
+        if msg.hide:
+            continue
+
+        role = _role_label(msg.role)
+        ts = _format_timestamp(msg.timestamp)
+        header = f"## {role}"
+        if ts:
+            header += f"  ({ts})"
+        lines.append(header)
+        lines.append("")
+        lines.append(msg.content)
+        lines.append("")
+
+    with open(output_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines))

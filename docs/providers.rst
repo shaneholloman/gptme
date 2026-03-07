@@ -26,6 +26,7 @@ To select a provider and model, run ``gptme`` with the ``-m``/``--model`` flag s
     gptme "hello" -m groq/llama-3.3-70b-versatile
     gptme "hello" -m xai/grok-4
     gptme "hello" -m local/llama3.2:1b
+    gptme "hello" -m gptme/claude-sonnet-4-6
 
 You can list the models known to gptme using ``gptme '/models' - '/exit'``
 
@@ -60,20 +61,22 @@ Access tokens are automatically refreshed before expiry, so you only need to aut
 
 .. code-block:: sh
 
+    gptme "hello" -m openai-subscription/gpt-5.4
     gptme "hello" -m openai-subscription/gpt-5.2
-    gptme "hello" -m openai-subscription/gpt-5.2-codex
-    gptme "hello" -m openai-subscription/gpt-5.1
 
 You can also append reasoning levels: ``:low``, ``:medium``, ``:high``, or ``:xhigh``:
 
 .. code-block:: sh
 
-    gptme "solve this problem" -m openai-subscription/gpt-5.2:high
+    gptme "solve this problem" -m openai-subscription/gpt-5.4:high
 
 **Available Models:**
 
-- ``gpt-5.2`` - Latest GPT model with reasoning capabilities
-- ``gpt-5.2-codex`` - Optimized for code tasks
+- ``gpt-5.4`` - Latest GPT model with reasoning capabilities (recommended)
+- ``gpt-5.3-codex`` - Previous code-optimized variant
+- ``gpt-5.3-codex-spark`` - Faster variant of gpt-5.3-codex
+- ``gpt-5.2`` - Previous generation GPT model
+- ``gpt-5.2-codex`` - Previous code-optimized variant
 - ``gpt-5.1-codex-max`` - Maximum capability variant
 - ``gpt-5.1-codex`` - Code-optimized
 - ``gpt-5.1-codex-mini`` - Smaller code-optimized variant
@@ -84,6 +87,43 @@ You can also append reasoning levels: ``:low``, ``:medium``, ``:high``, or ``:xh
     This is for **personal development use** with your own ChatGPT Plus/Pro subscription.
     For production or multi-user applications, use the OpenAI Platform API.
     OAuth credentials are stored locally and access tokens are refreshed automatically.
+
+.. rubric:: gptme Managed Service
+
+The ``gptme`` provider connects to the `gptme.ai <https://gptme.ai>`_ managed service, which acts as an OpenAI-compatible LLM proxy/gateway. This gives you access to multiple model providers (Anthropic, OpenAI, etc.) through a single account.
+
+**Setup:**
+
+Authenticate using the Device Flow command:
+
+.. code-block:: sh
+
+    gptme-auth login
+
+This opens your browser to approve access, then stores a token locally at ``~/.config/gptme/auth/gptme-cloud-<hash>.json``. Tokens are refreshed automatically.
+
+**Usage:**
+
+.. code-block:: sh
+
+    gptme "hello" -m gptme/claude-sonnet-4-6
+    gptme "hello" -m gptme                    # uses default model
+
+Models are pass-through: ``gptme/<model>`` proxies to the corresponding backend provider.
+
+**Environment variables** (alternative to Device Flow login):
+
+- ``GPTME_CLOUD_API_KEY``: API key for the managed service
+- ``GPTME_CLOUD_BASE_URL``: Custom service URL (default: ``https://fleet.gptme.ai/v1``)
+
+**Auth commands:**
+
+.. code-block:: sh
+
+    gptme-auth login               # Login via Device Flow (opens browser)
+    gptme-auth login --no-browser  # Print URL instead of opening browser
+    gptme-auth status              # Show current login status
+    gptme-auth logout              # Remove stored credentials
 
 .. rubric:: Local
 

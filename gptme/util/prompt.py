@@ -89,7 +89,6 @@ def check_cwd() -> None:
             _last_cwd = current
 
 
-# TODO: this should prob have a cache, but breaks tests which mutate files, so maybe not
 @lru_cache(maxsize=1024)
 def is_valid_path(path_str: str) -> bool:
     """Check if a string represents a valid path.
@@ -418,6 +417,34 @@ Only 10 lines.""",
 
 
 _prompt_session: PromptSession | None = None
+
+# Alert style for confirmation prompts (yellow text on red background)
+STYLE_ALERT = "bold fg:ansiyellow bg:ansired"
+
+
+def prompt_alert(prompt: str) -> str:
+    """Display an alert-style prompt with yellow text on red background.
+
+    Used for confirmation prompts that need to catch the user's attention,
+    like tool execution confirmation and URL reading confirmation.
+
+    Args:
+        prompt: The prompt text to display
+
+    Returns:
+        The user's response, lowercased and stripped
+    """
+    session = get_prompt_session()
+    return (
+        session.prompt(
+            [
+                (STYLE_ALERT, " " + prompt + " "),
+                ("", " "),
+            ]
+        )
+        .lower()
+        .strip()
+    )
 
 
 def get_prompt_session() -> PromptSession:
