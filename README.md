@@ -86,7 +86,7 @@ One of the first agent CLIs created (Spring 2023) — and still in very active d
 ## 📢 News
 
 - **Coming soon** - [gptme.ai](https://gptme.ai) service for running agents in the cloud; [gptme desktop](https://github.com/gptme/gptme-tauri) app for easy local use.
-- **2026-01** - [gptme-agent-template](https://github.com/gptme/gptme-agent-template) v0.4: [Bob](https://github.com/TimeToBuildBob) reaches 1000+ autonomous sessions, autonomous run loops, enhanced context generation
+- **2026-01** - [gptme-agent-template](https://github.com/gptme/gptme-agent-template) v0.4: [Bob](https://github.com/TimeToBuildBob) reaches 1700+ autonomous sessions, autonomous run loops, enhanced context generation
 - **2025-12** - [v0.31.0](https://github.com/gptme/gptme/releases/tag/v0.31.0): Background jobs, form tool, cost tracking, content-addressable storage
 - **2025-11** - [v0.30.0](https://github.com/gptme/gptme/releases/tag/v0.30.0): Plugin system, context compression, subagent planner mode
 - **2025-10** - [v0.29.0](https://github.com/gptme/gptme/releases/tag/v0.29.0): Lessons system for contextual guidance, MCP discovery & dynamic loading, token awareness; [Bob](https://github.com/TimeToBuildBob) begins autonomous runs with GitHub monitoring
@@ -331,15 +331,27 @@ This makes gptme available as a drop-in coding agent in [Zed](https://zed.dev/) 
 
 ### 🤖 Autonomous Agents
 
-gptme is designed to run not just interactively but as a **persistent autonomous agent**. The [gptme-agent-template][agent-template] provides a complete scaffold for building your own:
+gptme is designed to run not just interactively but as a **persistent autonomous agent** — an AI that runs continuously, remembers everything, and gets better over time. The [gptme-agent-template][agent-template] provides a complete scaffold:
 
-- **Persistent workspace** — git-tracked brain across sessions
-- **Run loops** — scheduled or event-driven autonomous operation
-- **Task management** — structured task queue with GTD-style metadata
-- **Meta-learning** — lessons system captures patterns and improves over time
+- **Persistent workspace** — git-tracked "brain" with journal, tasks, knowledge base, and lessons
+- **Run loops** — scheduled (systemd/launchd) or event-driven autonomous operation
+- **Task management** — structured task queue with YAML metadata and GTD-style workflows
+- **Meta-learning** — lessons system captures behavioral patterns and improves over time
 - **Multi-agent coordination** — file leases, message bus, and work claiming for concurrent agents
+- **External integrations** — GitHub, email, Discord, Twitter, RSS, and more
 
-[Bob](https://github.com/TimeToBuildBob) is the reference implementation — an autonomous AI agent that has completed 1000+ sessions, contributes to open source, and manages its own tasks. Bob and [Alice](https://github.com/TimeToLearnAlice) are sibling agents forked from the same architecture — each improving themselves and collaborating with each other, hinting at the broader team of AI agents gptme enables.
+```sh
+# Create and run your own agent
+gptme-agent create ~/my-agent --name MyAgent
+gptme-agent install   # runs on a schedule
+gptme-agent status    # check on it
+```
+
+[**Bob**](https://github.com/TimeToBuildBob) is the reference implementation — a production autonomous agent with 1700+ completed sessions. Bob opens PRs, reviews code, fixes CI, manages his own task queue, maintains 100+ behavioral lessons, posts on [Twitter](https://twitter.com/TimeToBuildBob), responds on Discord, and writes [blog posts](https://timetobuildbob.github.io/).
+
+Multiple specialized agents can run in parallel — e.g. Bob (engineering) and [Alice](https://github.com/TimeToLearnAlice) (personal assistant & orchestration) — coordinating through shared infrastructure.
+
+See the [Autonomous Agents docs](https://gptme.org/docs/agents.html) for the full guide.
 
 ### 🛠 Use Cases
 
@@ -547,8 +559,8 @@ gptme is more than a CLI — it's a platform with a growing ecosystem:
 | [gptme.ai](https://gptme.ai) | Managed cloud service (WIP) |
 
 **Community agents powered by gptme:**
-- [Bob](https://github.com/TimeToBuildBob) — autonomous AI agent, 1000+ sessions, contributes to open source
-- [Alice](https://github.com/TimeToLearnAlice) — sibling agent forked from the same architecture, collaborates with Bob
+- [Bob](https://github.com/TimeToBuildBob) — autonomous AI agent, 1700+ sessions, contributes to open source, manages his own tasks
+- [Alice](https://github.com/TimeToLearnAlice) — personal assistant & agent orchestrator, forked from the same architecture
 
 ## 💬 Community
 

@@ -29,6 +29,26 @@ from .signatures import GptmeTaskSignature, PromptImprovementSignature
 logger = logging.getLogger(__name__)
 
 
+def is_quota_error(e: Exception) -> bool:
+    """Check if an exception is due to API quota exhaustion or rate limiting."""
+    try:
+        from anthropic import BadRequestError, RateLimitError
+
+        if isinstance(e, RateLimitError):
+            return True
+        if isinstance(e, BadRequestError) and "usage limits" in str(e).lower():
+            return True
+    except ImportError:
+        pass
+    # Also check by message for wrapped errors (litellm, DSPy wrappers).
+    # Use specific phrases to avoid false positives (e.g. "disk quota exceeded").
+    msg = str(e).lower()
+    return any(
+        phrase in msg
+        for phrase in ["usage limits", "api quota", "rate limit", "rate_limit"]
+    )
+
+
 class ModelNameMapper:
     """Handles mapping between gptme and DSPy model names."""
 
@@ -167,6 +187,8 @@ class GptmeModule(dspy.Module):
             )
 
         except Exception as e:
+            if is_quota_error(e):
+                raise
             logger.error(f"Error in GptmeModule forward: {e}")
             return dspy.Prediction(response=f"Error: {e!s}", messages=[])
 
@@ -333,6 +355,8 @@ class PromptOptimizer:
             return optimized_prompt, results
 
         except Exception as e:
+            if is_quota_error(e):
+                raise
             logger.error(f"Optimization failed: {e}")
             return base_prompt, {"error": str(e)}
 
