@@ -34,7 +34,7 @@ build-docker-full: ## Build full Docker images with Rust and Playwright
 	docker build . -t gptme-eval:latest -f scripts/Dockerfile.eval --build-arg RUST=yes --build-arg PLAYWRIGHT=no
 
 build-server-exe: ## Build gptme-server executable with PyInstaller
-	./scripts/build_server_executable.sh
+	bash ./scripts/build_server_executable.sh
 
 test: ## Run tests
 	@# if SLOW is not set, pass `-m "not slow"` to skip slow tests
@@ -147,15 +147,15 @@ release-dev:  ## Create a dev pre-release (.devYYYYMMDD) — same as CI schedule
 release-patch:  ## Create a stable patch release (x.y.Z+1)
 	@./scripts/bump_version.sh --type patch
 	@make dist/CHANGELOG.md
-	@./scripts/publish_release.sh --publish-pypi --notes-file dist/CHANGELOG.md
+	@./scripts/publish_release.sh --notes-file dist/CHANGELOG.md
 
 release-minor:  ## Create a stable minor release (x.Y+1.0)
 	@./scripts/bump_version.sh --type minor
 	@make dist/CHANGELOG.md
-	@./scripts/publish_release.sh --publish-pypi --notes-file dist/CHANGELOG.md
+	@./scripts/publish_release.sh --notes-file dist/CHANGELOG.md
 
 ./scripts/build_changelog.py:
-	wget -O $@ https://raw.githubusercontent.com/ActivityWatch/activitywatch/master/scripts/build_changelog.py
+	wget -O $@ https://raw.githubusercontent.com/ActivityWatch/activitywatch/ade74fd7636abb2b675591682b4f753e289deb72/scripts/build_changelog.py
 	chmod +x $@
 
 .PHONY: dist/CHANGELOG.md

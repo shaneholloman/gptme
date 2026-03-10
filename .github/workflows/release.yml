@@ -1,44 +1,272 @@
 name: Release
 
+# Unified release pipeline for gptme.
+#
+# Triggers:
+#   - schedule        — automated dev pre-releases (Mon + Thu at noon UTC)
+#   - workflow_dispatch — manual dev/patch/minor releases from GitHub UI
+#   - release: created — manual releases via `make release-*` (user credentials)
+#
+# For schedule/dispatch: runs preflight checks, bumps version, generates
+# changelog, creates GH release, then publishes packages and triggers builds.
+#
+# For release:created: skips preparation (already done by `make release-*`)
+# and goes straight to publishing packages and triggering builds.
+#
+# Scripts shared with `make release` / `make release-dev`:
+#   - scripts/bump_version.sh    — version bump, commit, tag
+#   - scripts/publish_release.sh — push, GH release
+#
+# Step ordering: PyPI publish is last because it's non-idempotent (rejects
+# duplicates). All steps before it are safe to re-run.
+
 on:
+  schedule:
+    # Twice weekly: Monday and Thursday at 12:00 UTC
+    - cron: '0 12 * * 1,4'
   release:
     types: [created]
+  workflow_dispatch:
+    inputs:
+      release_type:
+        description: 'Release type'
+        required: true
+        default: 'dev'
+        type: choice
+        options:
+          - dev      # Development pre-release (.devYYYYMMDD)
+          - patch    # Stable patch release (x.y.Z+1)
+          - minor    # Stable minor release (x.Y+1.0)
+
+permissions:
+  contents: write
+  actions: write
+
+concurrency:
+  group: release
+  cancel-in-progress: false
 
 jobs:
-  publish-pypi:
-    name: Publish to PyPi
+  # ── Preflight ─────────────────────────────────────────────────────────
+  # Only for schedule/dispatch. Checks for new commits and green CI.
+  check:
+    name: Pre-flight checks
+    if: github.event_name != 'release'
     runs-on: ubuntu-latest
+    outputs:
+      should_release: ${{ steps.check.outputs.should_release }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          fetch-depth: 0
+
+      - name: Check for changes and CI status
+        id: check
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          # Find last stable release tag (no pre-release suffix)
+          LAST_STABLE=$(git tag --sort=-version:refname | grep -E '^v[0-9]+\.[0-9]+\.[0-9]+$' | head -1)
+          # Find last tag of any kind (including dev tags on detached commits).
+          # NOTE: `git describe --tags` only finds tags reachable from HEAD, but dev
+          # release tags live on version-bump commits that aren't pushed to master.
+          LAST_TAG=$(git tag --sort=-version:refname | head -1 || echo "")
+
+          COMMITS_SINCE_TAG=0
+          if [ -n "$LAST_TAG" ]; then
+            # Use merge-base to handle dev tags on detached commits correctly.
+            # For dev tags (one commit off master), this finds the master commit
+            # they branched from. For stable tags (on master), it's the tag itself.
+            BASE=$(git merge-base "${LAST_TAG}" HEAD 2>/dev/null || echo "")
+            if [ -n "$BASE" ]; then
+              COMMITS_SINCE_TAG=$(git rev-list "${BASE}..HEAD" --count)
+            else
+              echo "WARNING: could not find merge-base for ${LAST_TAG} — commit count unavailable, treating as 0."
+            fi
+          fi
+
+          echo "last_stable=$LAST_STABLE" >> "$GITHUB_OUTPUT"
+          echo "last_tag=$LAST_TAG" >> "$GITHUB_OUTPUT"
+          echo "commits=$COMMITS_SINCE_TAG" >> "$GITHUB_OUTPUT"
+          echo "Last stable: $LAST_STABLE | Last tag: $LAST_TAG | Commits since tag: $COMMITS_SINCE_TAG"
+
+          # Skip if no new commits
+          if [ "$COMMITS_SINCE_TAG" -eq 0 ]; then
+            echo "No new commits since $LAST_TAG — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Verify CI is green on HEAD
+          HEAD_SHA=$(git rev-parse HEAD)
+          echo "Checking CI status for $HEAD_SHA..."
+
+          # Check individual check runs (not suites) to avoid blocking on
+          # flaky/optional checks like external API tests.
+          # Exclude: API tests (external, flaky), and this workflow's own runs.
+          CONCLUSIONS=$(gh api "repos/${{ github.repository }}/commits/${HEAD_SHA}/check-runs" \
+            --paginate \
+            --jq '[.check_runs[] | select(
+              .app.slug == "github-actions" and
+              (.name | test("API tests|^Pre-flight checks$|^Create release$|^Publish release$") | not)
+            )] | map(.conclusion) | unique | .[]' 2>/dev/null || echo "unknown")
+
+          echo "CI conclusions (excluding API tests): $CONCLUSIONS"
+
+          # If any required check has failed, skip
+          if echo "$CONCLUSIONS" | grep -qE "failure|action_required|timed_out"; then
+            echo "CI has failures on HEAD — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if echo "$CONCLUSIONS" | grep -qE "null|pending"; then
+            echo "CI is still running on HEAD — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          # Require explicit success — skip if unknown or empty (API failure)
+          if [ -z "$CONCLUSIONS" ] || [ "$CONCLUSIONS" = "unknown" ]; then
+            echo "CI status unavailable on HEAD — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          if ! echo "$CONCLUSIONS" | grep -q "success"; then
+            echo "No successful CI checks found on HEAD — skipping release."
+            echo "should_release=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+
+          echo "should_release=true" >> "$GITHUB_OUTPUT"
+
+  # ── Prepare ───────────────────────────────────────────────────────────
+  # Only for schedule/dispatch. Bumps version, generates changelog, creates
+  # the GitHub release via publish_release.sh.
+  prepare:
+    name: Create release
+    needs: check
+    if: needs.check.outputs.should_release == 'true'
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.version.outputs.tag }}
+    steps:
+      - uses: actions/checkout@v6
+        with:
+          ref: master
+          fetch-depth: 0
+          token: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Configure git
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+
+      - name: Install poetry
+        run: pipx install poetry
+
+      - name: Bump version
+        id: version
+        run: |
+          TYPE="${{ github.event.inputs.release_type || 'dev' }}"
+          bash scripts/bump_version.sh --type "$TYPE"
+
+      - name: Generate changelog
+        run: |
+          # Download the shared changelog generator (same as `make dist/CHANGELOG.md`)
+          # Pinned to specific commit to avoid supply-chain risk from mutable master branch
+          wget -q -O scripts/build_changelog.py \
+            https://raw.githubusercontent.com/ActivityWatch/activitywatch/ade74fd7636abb2b675591682b4f753e289deb72/scripts/build_changelog.py
+          chmod +x scripts/build_changelog.py
+          pip install -q requests
+
+          TAG="${{ steps.version.outputs.tag }}"
+          PRERELEASE="${{ steps.version.outputs.prerelease }}"
+
+          # Use appropriate range: dev→since last tag, stable→since last stable
+          if [ "$PRERELEASE" = "true" ]; then
+            SINCE="${{ steps.version.outputs.last_tag }}"
+          else
+            SINCE="${{ steps.version.outputs.last_stable }}"
+          fi
+
+          echo "Generating changelog: ${SINCE}...${TAG}"
+          python3 scripts/build_changelog.py \
+            --range "${SINCE}...${TAG}" \
+            --project-title gptme \
+            --org gptme \
+            --repo gptme \
+            --output /tmp/changelog.md \
+            --add-version-header
+
+          echo "--- Generated changelog preview ---"
+          head -50 /tmp/changelog.md
+
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          bash scripts/publish_release.sh --notes-file /tmp/changelog.md
+
+  # ── Publish ───────────────────────────────────────────────────────────
+  # Runs for ALL triggers:
+  #   - schedule/dispatch: after prepare creates the GH release
+  #   - release:created: directly (make release-* already created the release)
+  #
+  # Builds Python packages, uploads to GH release, triggers artifact builds,
+  # and publishes to PyPI (last, since it's non-idempotent).
+  publish:
+    name: Publish release
+    needs: [prepare]
+    # Run if: prepare succeeded (schedule/dispatch), OR release:created (manual)
+    if: >-
+      !cancelled() &&
+      (needs.prepare.result == 'success' || github.event_name == 'release')
+    runs-on: ubuntu-latest
+    env:
+      TAG: ${{ needs.prepare.outputs.tag || github.event.release.tag_name || github.ref_name }}
 
     steps:
     - uses: actions/checkout@v6
+      with:
+        ref: ${{ env.TAG }}
+
     - name: Set up Python
       uses: actions/setup-python@v6
       with:
         python-version: '3.x'
-    - name: Install dependencies
+
+    - name: Install poetry
+      run: pipx install poetry
+
+    - name: Build Python packages
       run: |
-        python -m pip install --upgrade pip
-        pip install poetry
-    # NOTE: we cannot do this here, as we're on a tag and not a branch
-    #- name: Bump version
-    #  run: |
-    #    # set pyproject.toml version to github.ref_name (without v prefix)
-    #    VERSION=$(echo "${{ github.ref_name }}" | sed 's/^v//')
-    #    poetry version $VERSION
-    #- name: Commit version bump
-    #  run: |
-    #    git config --global user.name github-actions
-    #    git config --global user.email github-actions@github.com
-    #    if git diff --quiet; then
-    #      echo "No changes to commit"
-    #    else
-    #      git add pyproject.toml
-    #      git commit -m "chore: bump version to $(poetry version)"
-    #      git push
-    #    fi
-    - name: Build
-      run: poetry build
-    - name: Publish
+        rm -f dist/*.whl dist/*.tar.gz
+        poetry build
+
+    - name: Upload packages to GitHub release
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        # Wait for release to be visible (handles propagation delay for release:created)
+        for i in 1 2 3 4 5; do
+          gh release view "$TAG" &>/dev/null && break
+          echo "Waiting for release $TAG to become visible... ($i/5)"
+          sleep 5
+        done
+        gh release upload "$TAG" dist/*.whl dist/*.tar.gz --clobber
+
+    - name: Trigger artifact builds
+      env:
+        GH_TOKEN: ${{ github.token }}
+      run: |
+        echo "Triggering Build workflow for ${TAG}..."
+        gh workflow run build.yml -f tag="${TAG}"
+        echo "Triggering Tauri workflow for ${TAG}..."
+        gh workflow run tauri.yml -f tag="${TAG}"
+
+    - name: Publish to PyPI
       env:
         PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
       run: poetry publish --username=__token__ --password=$PYPI_TOKEN

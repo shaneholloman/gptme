@@ -16,7 +16,9 @@ try:
         HybridLessonMatcher,
         _default_effectiveness_state_file,
         _lesson_lookup_keys,
-        _load_ts_posteriors,
+        _load_effectiveness_scores,
+        _score_from_judge_arm,
+        _score_from_ts_arm,
     )
 
     HYBRID_AVAILABLE = True
@@ -66,7 +68,7 @@ def test_backward_compatibility():
 
 
 @pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
-def test_load_ts_posteriors(tmp_path):
+def test_load_effectiveness_scores(tmp_path):
     """Test loading Thompson sampling posteriors from JSON state file."""
     state = {
         "arms": {
@@ -76,7 +78,7 @@ def test_load_ts_posteriors(tmp_path):
     }
     state_file = tmp_path / "ts_state.json"
     state_file.write_text(json.dumps(state))
-    posteriors = _load_ts_posteriors(str(state_file))
+    posteriors = _load_effectiveness_scores(str(state_file))
 
     assert len(posteriors) == 2
     assert posteriors["git-workflow.md"] == pytest.approx(0.8)
@@ -84,14 +86,14 @@ def test_load_ts_posteriors(tmp_path):
 
 
 @pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
-def test_load_ts_posteriors_missing_file():
+def test_load_effectiveness_scores_missing_file():
     """Test graceful handling of missing state file."""
-    posteriors = _load_ts_posteriors("/nonexistent/path.json")
+    posteriors = _load_effectiveness_scores("/nonexistent/path.json")
     assert posteriors == {}
 
 
 @pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
-def test_load_ts_posteriors_zero_total_defaults_to_neutral(tmp_path):
+def test_load_effectiveness_scores_zero_total_defaults_to_neutral(tmp_path):
     """Test zero-count arms fall back to neutral 0.5 instead of crashing."""
     state = {
         "arms": {
@@ -101,13 +103,13 @@ def test_load_ts_posteriors_zero_total_defaults_to_neutral(tmp_path):
     state_file = tmp_path / "ts_state.json"
     state_file.write_text(json.dumps(state))
 
-    posteriors = _load_ts_posteriors(str(state_file))
+    posteriors = _load_effectiveness_scores(str(state_file))
 
     assert posteriors == {"empty-arm.md": 0.5}
 
 
 @pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
-def test_load_ts_posteriors_invalid_numeric_data_returns_empty(tmp_path):
+def test_load_effectiveness_scores_invalid_numeric_data_returns_empty(tmp_path):
     """Test malformed alpha/beta values are handled gracefully."""
     state = {
         "arms": {
@@ -117,28 +119,98 @@ def test_load_ts_posteriors_invalid_numeric_data_returns_empty(tmp_path):
     state_file = tmp_path / "ts_state.json"
     state_file.write_text(json.dumps(state))
 
-    posteriors = _load_ts_posteriors(str(state_file))
+    posteriors = _load_effectiveness_scores(str(state_file))
 
     assert posteriors == {}
 
 
 @pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
-def test_load_ts_posteriors_non_dict_arm_skipped(tmp_path):
+def test_score_from_ts_arm_returns_none_without_ts_fields():
+    """Judge-only arms should not be misread as TS arms."""
+    assert _score_from_ts_arm({"helpful": 3, "harmful": 1}) is None
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_score_from_judge_arm_returns_none_without_judge_fields():
+    """TS-only arms should not be misread as judge arms."""
+    assert _score_from_judge_arm({"alpha": 2.0, "beta": 1.0}) is None
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_score_from_judge_arm_uses_false_positive_and_noop():
+    """Judge score should count both false_positive and noop as non-helpful."""
+    arm = {
+        "helpful": 3.0,
+        "harmful": 1.0,
+        "false_positive": 2.0,
+        "noop": 4.0,
+    }
+
+    # With Laplace smoothing: (helpful+1) / (total+2) = (3+1) / (10+2) = 4/12
+    assert _score_from_judge_arm(arm) == pytest.approx(4 / 12)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores_non_dict_arm_skipped(tmp_path):
     """Test non-dict arm values (e.g. scalars) are skipped without crashing."""
     state = {
         "arms": {
-            "bad-arm.md": 0.9,  # not a dict — would raise AttributeError without guard
+            "bad-arm.md": 0.9,  # not a dict — would raise TypeError without guard
             "good-arm.md": {"alpha": 8.0, "beta": 2.0},
         }
     }
     state_file = tmp_path / "ts_state.json"
     state_file.write_text(json.dumps(state))
 
-    posteriors = _load_ts_posteriors(str(state_file))
+    posteriors = _load_effectiveness_scores(str(state_file))
 
     # bad-arm skipped, good-arm still parsed
     assert "bad-arm.md" not in posteriors
     assert posteriors.get("good-arm.md") == pytest.approx(0.8)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores_judge_only_arm(tmp_path):
+    """Judge-only state files should still produce lesson effectiveness scores."""
+    state = {
+        "arms": {
+            "workflow/git-workflow.md": {
+                "helpful": 6.0,
+                "harmful": 2.0,
+                "false_positive": 2.0,
+            },
+        }
+    }
+    state_file = tmp_path / "judge_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_effectiveness_scores(str(state_file))
+
+    # With Laplace smoothing: (helpful+1) / (total+2) = (6+1) / (10+2) = 7/12
+    assert posteriors["workflow/git-workflow.md"] == pytest.approx(7 / 12)
+
+
+@pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")
+def test_load_effectiveness_scores_combines_ts_and_judge_scores(tmp_path):
+    """Combined state should average session-level TS and lesson-level judge signal."""
+    state = {
+        "arms": {
+            "workflow/git-workflow.md": {
+                "alpha": 9.0,
+                "beta": 1.0,
+                "helpful": 2.0,
+                "harmful": 2.0,
+                "noop": 2.0,
+            },
+        }
+    }
+    state_file = tmp_path / "combined_state.json"
+    state_file.write_text(json.dumps(state))
+
+    posteriors = _load_effectiveness_scores(str(state_file))
+
+    # TS = 0.9, judge (with Laplace) = (2+1)/(6+2) = 3/8 = 0.375, combined = avg
+    assert posteriors["workflow/git-workflow.md"] == pytest.approx((0.9 + (3 / 8)) / 2)
 
 
 @pytest.mark.skipif(not HYBRID_AVAILABLE, reason="Hybrid matching not available")

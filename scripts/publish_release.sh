@@ -1,13 +1,16 @@
 #!/bin/bash
-# Shared release publishing — push, create GitHub release, optional PyPI publish.
+# Shared release publishing — push tag and create GitHub release.
 # Used by both `make release` and scheduled-release CI workflow.
+#
+# Package building, PyPI publishing, and artifact builds are handled
+# by the release.yml workflow (triggered by the release:created event
+# or explicitly via workflow_dispatch).
 #
 # Prerequisites: bump_version.sh has already been run (version committed + tagged).
 #
 # Usage:
 #   ./scripts/publish_release.sh                      # Push + GH release (auto-generated notes)
 #   ./scripts/publish_release.sh --notes-file FILE    # Use structured changelog file
-#   ./scripts/publish_release.sh --publish-pypi       # Also build + publish to PyPI
 #   ./scripts/publish_release.sh --dry-run            # Print what would happen
 #
 # The script reads version metadata from the current git state (tag on HEAD, pyproject.toml).
@@ -15,13 +18,11 @@
 set -euo pipefail
 
 NOTES_FILE=""
-PUBLISH_PYPI=false
 DRY_RUN=false
 
 while [[ $# -gt 0 ]]; do
     case $1 in
         --notes-file)    NOTES_FILE="$2"; shift 2 ;;
-        --publish-pypi)  PUBLISH_PYPI=true; shift ;;
         --dry-run)       DRY_RUN=true; shift ;;
         *)               echo "Unknown argument: $1" >&2; exit 1 ;;
     esac
@@ -92,11 +93,14 @@ else
     echo "  [dry-run] git push origin ${TAG}"
 fi
 
-# --- Step 2: Create GitHub release ---
+# --- Step 2: Create GitHub release (idempotent) ---
 
 echo "Creating GitHub release: ${TAG}..."
 if [ "$DRY_RUN" = "false" ]; then
-    if [ -n "$NOTES_FILE" ] && [ -f "$NOTES_FILE" ]; then
+    # Idempotency guard: skip creation if the release already exists (safe for re-runs)
+    if gh release view "$TAG" &>/dev/null; then
+        echo "  Release ${TAG} already exists — skipping creation."
+    elif [ -n "$NOTES_FILE" ] && [ -f "$NOTES_FILE" ]; then
         # Truncate changelog if it exceeds GitHub API limit (125000 chars)
         GH_BODY_LIMIT=120000
         NOTES_SIZE=$(wc -c < "$NOTES_FILE")
@@ -133,18 +137,6 @@ if [ "$DRY_RUN" = "false" ]; then
     fi
 else
     echo "  [dry-run] gh release create ${TAG} ..."
-fi
-
-# --- Step 3: PyPI publish (optional) ---
-
-if [ "$PUBLISH_PYPI" = "true" ]; then
-    echo "Building and publishing to PyPI..."
-    if [ "$DRY_RUN" = "false" ]; then
-        poetry build
-        poetry publish --username=__token__ --password="${PYPI_TOKEN:?PYPI_TOKEN not set}"
-    else
-        echo "  [dry-run] poetry build && poetry publish"
-    fi
 fi
 
 echo "✓ Release published: ${TAG}"
