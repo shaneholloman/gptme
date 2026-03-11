@@ -769,10 +769,18 @@ class ToolUse:
         if self.args is not None and self.content is not None:
             # match positional args with kwargs
             if tool := get_tool(self.tool):
-                if self.args:
-                    args = [*self.args, self.content]
-                else:
-                    args = [self.content]
+                args = list(self.args) if self.args else []
+                # Only append content as a positional parameter if the next
+                # parameter slot is *required*. This prevents display-only
+                # content from leaking into optional parameters (e.g. read's
+                # start_line/end_line) while correctly mapping content for
+                # tools like save/append/shell where the body IS required.
+                next_idx = len(args)
+                if (
+                    next_idx < len(tool.parameters)
+                    and tool.parameters[next_idx].required
+                ):
+                    args.append(self.content)
 
                 json_parameters: dict[str, str] = {}
                 for index, param in enumerate(tool.parameters):
