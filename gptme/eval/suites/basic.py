@@ -288,6 +288,93 @@ def check_fix_import_exit(ctx):
     return ctx.exit_code == 0
 
 
+# --- count-words checks ---
+
+
+def check_count_words_file(ctx):
+    return "wordcount.py" in ctx.files
+
+
+def check_count_words_output(ctx):
+    """Output should contain '17' as a whole token on a line with 'words:'."""
+    for line in ctx.stdout.splitlines():
+        if "words" in line.lower() and "17" in line.split():
+            return True
+    return False
+
+
+def check_count_words_exit(ctx):
+    return ctx.exit_code == 0
+
+
+# --- json-filter checks ---
+
+
+def check_json_filter_file(ctx):
+    return "filter.py" in ctx.files
+
+
+def check_json_filter_output(ctx):
+    """Output should contain Alice, Carol, Eve (score >= 80), one per line, sorted."""
+    lines = [line.strip() for line in ctx.stdout.splitlines() if line.strip()]
+    try:
+        alice_idx = lines.index("Alice")
+        carol_idx = lines.index("Carol")
+        eve_idx = lines.index("Eve")
+    except ValueError:
+        return False
+    # Bob (71) and Dave (60) must not appear
+    if "Bob" in lines or "Dave" in lines:
+        return False
+    # Must be sorted alphabetically: Alice < Carol < Eve
+    return alice_idx < carol_idx < eve_idx
+
+
+def check_json_filter_exit(ctx):
+    return ctx.exit_code == 0
+
+
+# --- implement-class checks ---
+
+
+def check_implement_class_has_circle(ctx):
+    """shapes.py must contain a Circle class definition."""
+    content = ctx.files.get("shapes.py", "")
+    return "class Circle" in content
+
+
+def check_implement_class_has_rectangle(ctx):
+    """shapes.py must contain a Rectangle class definition."""
+    content = ctx.files.get("shapes.py", "")
+    return "class Rectangle" in content
+
+
+def check_implement_class_tests_pass(ctx):
+    """All tests in test_shapes.py must pass."""
+    return ctx.exit_code == 0 and "passed" in ctx.stdout
+
+
+def check_implement_class_no_failures(ctx):
+    """No test failures and tests actually ran (exit_code guards against error-only pytest runs)."""
+    return ctx.exit_code == 0 and "FAILED" not in ctx.stdout and "passed" in ctx.stdout
+
+
+# --- optimize-performance checks ---
+
+
+def check_optimize_perf_output(ctx):
+    """fibonacci(35) should output 9227465."""
+    return "9227465" in ctx.stdout.split()
+
+
+def check_optimize_perf_fast(ctx):
+    """Should complete in under 2 seconds (checked by the script's own timing logic)."""
+    # The script itself raises SystemExit('Too slow!') if elapsed > 2s,
+    # and the run command wraps with `timeout 10` as a hard backstop.
+    # Check both: exit_code 0 AND no 'Too slow' message in stderr.
+    return ctx.exit_code == 0 and "Too slow" not in ctx.stderr
+
+
 tests: list["EvalSpec"] = [
     {
         "name": "hello",
@@ -682,6 +769,140 @@ tests: list["EvalSpec"] = [
             "math_ops.py created": check_fix_import_created,
             "correct output": check_fix_import_output,
             "clean exit": check_fix_import_exit,
+        },
+    },
+    {
+        "name": "count-words",
+        "files": {
+            "words.txt": "the quick brown fox jumps over the lazy dog\npack my box with five dozen liquor jugs\n",
+        },
+        "run": "python wordcount.py",
+        "prompt": (
+            "Write a Python script wordcount.py that reads words.txt and prints "
+            "the total number of words on a single line like: 'words: N'"
+        ),
+        "tools": ["read", "save", "shell"],
+        "expect": {
+            "file exists": check_count_words_file,
+            "correct output": check_count_words_output,
+            "clean exit": check_count_words_exit,
+        },
+    },
+    {
+        "name": "json-filter",
+        "files": {
+            "data.json": '[{"name": "Alice", "score": 92}, {"name": "Bob", "score": 71}, {"name": "Carol", "score": 85}, {"name": "Dave", "score": 60}, {"name": "Eve", "score": 95}]\n',
+        },
+        "run": "python filter.py",
+        "prompt": (
+            "Read data.json (a list of objects with 'name' and 'score' fields). "
+            "Write a Python script filter.py that reads data.json and prints the names "
+            "of people with score >= 80, sorted alphabetically, one per line."
+        ),
+        "tools": ["read", "save", "shell"],
+        "expect": {
+            "file exists": check_json_filter_file,
+            "correct output": check_json_filter_output,
+            "clean exit": check_json_filter_exit,
+        },
+    },
+    {
+        "name": "implement-class",
+        "files": {
+            "shapes.py": (
+                "from abc import ABC, abstractmethod\n"
+                "import math\n"
+                "\n"
+                "\n"
+                "class Shape(ABC):\n"
+                '    """Abstract base class for geometric shapes."""\n'
+                "\n"
+                "    @abstractmethod\n"
+                "    def area(self) -> float:\n"
+                "        pass\n"
+                "\n"
+                "    @abstractmethod\n"
+                "    def perimeter(self) -> float:\n"
+                "        pass\n"
+            ),
+            "test_shapes.py": (
+                "from shapes import Shape, Circle, Rectangle\n"
+                "\n"
+                "\n"
+                "def test_circle_area():\n"
+                "    c = Circle(5)\n"
+                "    assert abs(c.area() - 25 * 3.14159265) < 0.01\n"
+                "\n"
+                "\n"
+                "def test_circle_perimeter():\n"
+                "    c = Circle(5)\n"
+                "    assert abs(c.perimeter() - 10 * 3.14159265) < 0.01\n"
+                "\n"
+                "\n"
+                "def test_rectangle_area():\n"
+                "    r = Rectangle(3, 4)\n"
+                "    assert r.area() == 12.0\n"
+                "\n"
+                "\n"
+                "def test_rectangle_perimeter():\n"
+                "    r = Rectangle(3, 4)\n"
+                "    assert r.perimeter() == 14.0\n"
+                "\n"
+                "\n"
+                "def test_isinstance():\n"
+                "    assert isinstance(Circle(1), Shape)\n"
+                "    assert isinstance(Rectangle(1, 1), Shape)\n"
+            ),
+        },
+        "run": "python -m pytest test_shapes.py -v",
+        "prompt": (
+            "Read shapes.py and test_shapes.py. The Shape abstract base class "
+            "is defined but Circle and Rectangle classes are missing. "
+            "Implement both classes in shapes.py so they inherit from Shape "
+            "and all tests pass. Circle takes a radius, Rectangle takes width and height."
+        ),
+        "tools": ["read", "save", "patch", "shell"],
+        "expect": {
+            "Circle defined": check_implement_class_has_circle,
+            "Rectangle defined": check_implement_class_has_rectangle,
+            "tests pass": check_implement_class_tests_pass,
+            "no failures": check_implement_class_no_failures,
+        },
+    },
+    {
+        "name": "optimize-performance",
+        "files": {
+            "main.py": (
+                "import time\n"
+                "\n"
+                "\n"
+                "def fibonacci(n):\n"
+                "    if n <= 1:\n"
+                "        return n\n"
+                "    return fibonacci(n - 1) + fibonacci(n - 2)\n"
+                "\n"
+                "\n"
+                "start = time.time()\n"
+                "result = fibonacci(35)\n"
+                "elapsed = time.time() - start\n"
+                "print(result)\n"
+                "print(f'Time: {elapsed:.2f}s')\n"
+                "if elapsed > 2:\n"
+                "    raise SystemExit('Too slow! fibonacci(35) took more than 2 seconds')\n"
+            ),
+        },
+        "run": "timeout 10 python main.py",
+        "prompt": (
+            "Running main.py computes fibonacci(35) but it's extremely slow due to "
+            "exponential recursion. Optimize the fibonacci function so it completes "
+            "in under 2 seconds. You can use any optimization technique (memoization, "
+            "iteration, etc.) but the function must still produce the correct result. "
+            "Do not change the timing or validation logic at the bottom."
+        ),
+        "tools": ["read", "save", "patch"],
+        "expect": {
+            "correct output": check_optimize_perf_output,
+            "runs fast": check_optimize_perf_fast,
         },
     },
 ]
