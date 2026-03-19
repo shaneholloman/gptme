@@ -462,6 +462,12 @@ Assistant: Certainly! I'll search our past conversations for mentions of "python
 tool = ToolSpec(
     name="chats",
     desc="List, search, and summarize past conversation logs",
+    instructions_format={
+        # Compact description for OpenAI tool format (full docstrings exceed 1024 chars)
+        "tool": "Access past conversations: list recent chats with list_chats(), "
+        "search chat history by content with search_chats(), "
+        "or read a specific conversation by ID with read_chat().",
+    },
     examples=examples,
     functions=[list_chats, search_chats, read_chat],
 )

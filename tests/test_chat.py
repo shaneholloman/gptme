@@ -1,4 +1,7 @@
 from pathlib import Path
+from unittest.mock import MagicMock, patch
+
+import pytest
 
 from gptme.util.context import _find_potential_paths
 
@@ -294,3 +297,157 @@ def test_image_auto_attach_end_to_end(tmp_path):
     dicts = msgs2dicts([msg])
     assert "files" in dicts[0], "files should be present in message dict"
     assert len(dicts[0]["files"]) == 1, "image file should survive serialization"
+
+
+def test_chained_prompts_continue_after_complete():
+    """When the complete tool fires mid-way through chained prompts, remaining
+    prompts should still be processed.
+
+    Regression test for: gptme 'prompt1' - 'prompt2' exits after prompt1 if
+    the LLM calls the complete tool, never processing prompt2.
+    """
+    import sys
+
+    from gptme.chat import _run_chat_loop
+    from gptme.message import Message
+    from gptme.tools.complete import SessionCompleteException
+
+    # gptme/__init__.py does `from .chat import chat`, which shadows the
+    # gptme.chat MODULE attribute with the chat FUNCTION on the gptme package.
+    # patch("gptme.chat.X") resolves gptme.chat via getattr(gptme, 'chat') and
+    # gets the function, not the module. Use sys.modules to get the real module.
+    _chat_mod = sys.modules["gptme.chat"]
+
+    manager = MagicMock()
+    manager.log = MagicMock()
+    manager.workspace = Path("/tmp")
+    manager.logdir = Path("/tmp/logdir")
+
+    call_count = 0
+
+    def mock_process(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            # First prompt: LLM calls complete tool
+            raise SessionCompleteException("first prompt done")
+        # Second prompt: completes normally
+
+    prompt_queue = [Message("user", "first prompt"), Message("user", "second prompt")]
+
+    with (
+        patch.object(
+            _chat_mod, "_process_message_conversation", side_effect=mock_process
+        ),
+        patch.object(_chat_mod, "trigger_hook", return_value=[]),
+        patch.object(_chat_mod, "include_paths", side_effect=lambda msg, ws: msg),
+        patch.object(_chat_mod, "execute_cmd", return_value=False),
+    ):
+        # Should NOT raise — queue has a second prompt, so complete should not exit
+        _run_chat_loop(
+            manager=manager,
+            prompt_queue=prompt_queue,
+            stream=False,
+            tool_format="markdown",
+            model=None,
+            interactive=False,
+        )
+
+    assert call_count == 2, "Both chained prompts should have been processed"
+
+
+def test_chained_prompts_complete_exits_when_last():
+    """When complete fires on the last (or only) chained prompt, exit normally."""
+    import sys
+
+    from gptme.chat import _run_chat_loop
+    from gptme.message import Message
+    from gptme.tools.complete import SessionCompleteException
+
+    # See test_chained_prompts_continue_after_complete for why we use sys.modules.
+    _chat_mod = sys.modules["gptme.chat"]
+
+    manager = MagicMock()
+    manager.log = MagicMock()
+    manager.workspace = Path("/tmp")
+    manager.logdir = Path("/tmp/logdir")
+
+    def mock_process(*args, **kwargs):
+        raise SessionCompleteException("done")
+
+    prompt_queue = [Message("user", "only prompt")]
+
+    with (
+        patch.object(
+            _chat_mod, "_process_message_conversation", side_effect=mock_process
+        ),
+        patch.object(_chat_mod, "trigger_hook", return_value=[]),
+        patch.object(_chat_mod, "include_paths", side_effect=lambda msg, ws: msg),
+        patch.object(_chat_mod, "execute_cmd", return_value=False),
+        pytest.raises(SessionCompleteException),
+    ):
+        # Should raise — no more prompts in queue after this one
+        _run_chat_loop(
+            manager=manager,
+            prompt_queue=prompt_queue,
+            stream=False,
+            tool_format="markdown",
+            model=None,
+            interactive=False,
+        )
+
+
+def test_complete_hook_does_not_refire_on_next_prompt():
+    """complete_hook must not raise when the complete tool call is in a prior turn.
+
+    Regression: complete_hook scanned the entire conversation history and would
+    re-raise SessionCompleteException on the second chained prompt because the
+    last assistant message still contained the `complete` tool call from turn 1.
+    Fix: only look at assistant messages AFTER the most recent user message.
+    """
+    from gptme.message import Message
+    from gptme.tools import init_tools
+    from gptme.tools.complete import complete_hook
+
+    # complete tool is disabled_by_default — init with it enabled so
+    # ToolUse.iter_from_content can recognise the ```complete``` block.
+    init_tools(allowlist=["complete"])
+
+    # Simulate message history after processing the first chained prompt:
+    #   user1 → assistant1 (calls `complete`) → system ("Task complete") → user2
+    # When GENERATION_PRE fires for user2, these are the messages in the log.
+    messages = [
+        Message("system", "You are an assistant."),
+        Message("user", "first prompt"),
+        Message("assistant", "```complete\n```"),
+        Message("system", "Task complete. Autonomous session finished."),
+        Message("user", "second prompt"),  # current turn starts here
+    ]
+
+    # complete_hook must NOT raise — the complete call belongs to the previous turn.
+    result = list(complete_hook(messages))
+    assert result == []
+
+
+def test_complete_hook_fires_in_current_turn():
+    """complete_hook must raise when the complete tool call is in the current turn."""
+    from gptme.message import Message
+    from gptme.tools import init_tools
+    from gptme.tools.complete import SessionCompleteException, complete_hook
+
+    # complete tool is disabled_by_default — init with it enabled.
+    init_tools(allowlist=["complete"])
+
+    # Simulate history where LLM has just called `complete` in the current turn:
+    #   user1 → assistant1 (calls `complete`) → system ("Task complete")
+    # When GENERATION_PRE fires again (loop continuing), these are the messages.
+    messages = [
+        Message("system", "You are an assistant."),
+        Message("user", "first prompt"),
+        Message("assistant", "```complete\n```"),
+        Message("system", "Task complete. Autonomous session finished."),
+    ]
+
+    # complete_hook MUST raise — complete was called in the current turn.
+    with pytest.raises(SessionCompleteException):
+        list(complete_hook(messages))

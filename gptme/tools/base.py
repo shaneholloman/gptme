@@ -352,14 +352,20 @@ class ToolSpec:
             instructions.append(self.instructions)
 
         if tool_format in self.instructions_format:
+            # A format-specific override replaces the auto-generated function listing
+            # for that format. This is intentional: if a tool defines
+            # instructions_format["tool"], it takes responsibility for providing a
+            # concise summary (needed to stay within OpenAI's 1024-char limit, #1697).
+            # The same applies to any other format that has an override.
             instructions.append(self.instructions_format[tool_format])
-
-        if self.functions:
+        elif self.functions:
             instructions.append(self.get_functions_description())
 
         return "\n\n".join(instructions)
 
     def get_tool_prompt(self, examples: bool, tool_format: ToolFormat):
+        if tool_format == "xml":
+            return self._get_tool_prompt_xml(examples, tool_format)
         prompt = ""
         prompt += f"\n\n## {self.name}"
         prompt += f"\n\n**Description:** {self.desc}" if self.desc else ""
@@ -373,6 +379,26 @@ class ToolSpec:
         ):
             prompt += f"\n\n### Examples\n\n{examples_content}"
         return prompt
+
+    def _get_tool_prompt_xml(self, examples: bool, tool_format: ToolFormat):
+        """Generate tool prompt with XML-sectioned structure."""
+        parts = [f"\n<tool name={quoteattr(self.name)}>"]
+        if self.desc:
+            parts.append(f"<description>{xml_escape(self.desc)}</description>")
+        # Note: xml_escape is applied here, so any instructions_format["xml"] entry
+        # should NOT embed raw XML markup — it would be double-escaped.
+        # If a future tool needs unescaped XML in instructions, add a separate tag here.
+        instructions = self.get_instructions(tool_format)
+        if instructions:
+            parts.append(f"<instructions>\n{xml_escape(instructions)}\n</instructions>")
+        if examples and (
+            examples_content := self.get_examples(
+                tool_format, quote=True, strip_system=True
+            ).strip()
+        ):
+            parts.append(f"<examples>\n{examples_content}\n</examples>")
+        parts.append("</tool>")
+        return "\n".join(parts)
 
     def get_examples(
         self,

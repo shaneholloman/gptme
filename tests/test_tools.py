@@ -389,6 +389,27 @@ def test_get_toolchain_nonstrict_skips_missing():
     assert "nonexistent_tool_xyz" not in tool_names
 
 
+def test_tool_descriptions_within_openai_limit():
+    """All tool descriptions must fit within OpenAI's 1024-char function description limit.
+
+    When using --tool-format tool, descriptions > 1024 chars cause a WARNING and
+    are truncated, which can silently degrade tool quality. See #1697.
+    """
+    init_tools()
+    MAX_CHARS = 1024
+    # Mirror the composite expression used in _spec2tool (llm_openai.py) to catch
+    # tools whose spec.desc alone would exceed the limit (e.g. no instructions set).
+    over_limit = [
+        (tool.name, len(tool.get_instructions("tool") or tool.desc or ""))
+        for tool in get_tools()
+        if len(tool.get_instructions("tool") or tool.desc or "") > MAX_CHARS
+    ]
+    assert not over_limit, (
+        f"Tools with descriptions exceeding {MAX_CHARS} chars: "
+        + ", ".join(f"{name} ({length})" for name, length in over_limit)
+    )
+
+
 def test_get_toolchain_nonstrict_skips_unavailable():
     """Test that get_toolchain skips unavailable tools when strict=False."""
     from gptme.tools.base import ToolSpec

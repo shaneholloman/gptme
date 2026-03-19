@@ -549,6 +549,14 @@ def read_logs() -> str:
 tool = ToolSpec(
     name="browser",
     desc="Browse, search or screenshot the web",
+    instructions_format={
+        # Compact description for OpenAI tool format (full docstrings exceed 1024 chars)
+        "tool": "Browse the web: read any URL or PDF with read_url(), "
+        "search the web via Perplexity with search(), "
+        "capture screenshots with screenshot_url(), "
+        "check browser console errors with read_logs(), "
+        "or convert a local PDF to images with pdf_to_images().",
+    },
     examples=examples,
     functions=[read_url, search, screenshot_url, read_logs, pdf_to_images],
     available=has_browser_tool,

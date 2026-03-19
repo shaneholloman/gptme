@@ -105,17 +105,59 @@ def _extract_codeblocks(
     # dont extract codeblocks from thinking blocks
     # (since claude sometimes forgets to close codeblocks in its thinking,
     #  and gemini uses </thinking> instead of </think>)
+    # Only strip when the closing tag is genuine: the corresponding opening tag
+    # must be either (a) standalone at a line boundary, or (b) absent entirely
+    # (Gemini uses "```thinking>" with no "<" before "thinking>", so no <thinking>
+    # appears in the prefix at all).  We must NOT strip when <think> appears only
+    # concatenated with a fence closer (e.g. "```<think>") — that is handled later
+    # by the inner-loop fence-recovery logic.
+    _concatenated_end_found = False
+    _concatenated_end_pos = -1
     for _think_end_tag in ["</thinking>", "</think>"]:
         _think_end = markdown.find(_think_end_tag)
         if _think_end != -1:
-            # remove anything before and including the closing thinking tag
-            markdown = markdown[_think_end + len(_think_end_tag) :]
-            break
+            _think_start_tag = _think_end_tag.replace("/", "")  # e.g. "<think>"
+            _prefix = markdown[:_think_end]
+            _has_standalone = bool(
+                re.search(r"(?:^|\n)" + re.escape(_think_start_tag), _prefix)
+            )
+            _has_any = _think_start_tag in _prefix
+            # Strip if standalone opening exists, or if there is no opening tag at
+            # all in the prefix (covers the Gemini "```thinking>" malformed case).
+            if _has_standalone or not _has_any:
+                # remove anything before and including the closing thinking tag
+                markdown = markdown[_think_end + len(_think_end_tag) :]
+                break
+            # Found </think> but didn't strip: opening was concatenated (e.g. "```<think>").
+            # Inner-loop fence-recovery handles this; track position of the closing tag.
+            # NOTE: if both </thinking> and </think> appear concatenated in the same message,
+            # _concatenated_end_pos is overwritten by the second iteration (the later position).
+            # This means the _after_concat scan misses standalone think blocks between the two
+            # concatenated end-tags. Emitting both concatenated closers in one message is
+            # extremely unlikely in practice so this edge case is acceptable.
+            _concatenated_end_found = True
+            _concatenated_end_pos = _think_end + len(_think_end_tag)
     else:
-        # if start thinking tag but no end, early exit
-        for _think_start_tag in ["<thinking>", "<think>"]:
-            if _think_start_tag in markdown:
-                return
+        # if start thinking tag but no end, early exit (only for standalone tags;
+        # concatenated occurrences like "```<think>" are handled by inner-loop logic).
+        if not _concatenated_end_found:
+            for _think_start_tag in ["<thinking>", "<think>"]:
+                if re.search(r"(?:^|\n)" + re.escape(_think_start_tag), markdown):
+                    return
+        else:
+            # A concatenated </think> was found (not stripped). Check if any standalone
+            # <think> appearing AFTER that closing tag is genuinely unclosed. If so,
+            # early-exit to avoid extracting blocks from inside an unclosed thinking section.
+            _after_concat = markdown[_concatenated_end_pos:]
+            for _think_start_tag in ["<thinking>", "<think>"]:
+                _standalone_match = re.search(
+                    r"(?:^|\n)" + re.escape(_think_start_tag), _after_concat
+                )
+                if _standalone_match:
+                    _close_tag = _think_start_tag.replace("<", "</")
+                    _rest = _after_concat[_standalone_match.start() :]
+                    if _close_tag not in _rest:
+                        return  # genuinely unclosed standalone think block
 
     # speed check (early exit): check if message contains a code block
     # Check for at least 2 fence markers (3+ backticks each)
@@ -138,6 +180,7 @@ def _extract_codeblocks(
             lang = line[fence_len:].strip()
             content_lines: list[str] = []
             i += 1
+            reprocess_current_line = False
 
             # Track nesting depth to handle nested code blocks
             nesting_depth = 1
@@ -145,6 +188,39 @@ def _extract_codeblocks(
             # Collect content until we find the matching closing ```
             while i < len(lines):
                 line = lines[i]
+
+                # Recover from malformed adjacent fences where a closing fence for the
+                # current block is directly concatenated with the opening fence of the
+                # next block, e.g. "``````shell" instead of "```\n```shell".
+                if nesting_depth == 1 and line.startswith("`" * fence_len):
+                    rest = line[fence_len:]
+                    # Only treat as adjacent fences when the remainder starts a new fence
+                    # followed immediately by a non-whitespace character (e.g. a language
+                    # tag like "shell"). The `{3,}` quantifier is greedy: it consumes all
+                    # leading backticks in `rest`, so if `rest` consists solely of backticks
+                    # (e.g. rest="```" from a content line like "``````") `\S` has no char
+                    # left to match and the guard correctly falls through. Only when the
+                    # backtick run is followed by a non-whitespace char (a language tag or
+                    # similar) does this match — preventing false splits on bare-backtick
+                    # content lines.
+                    if re.match(r"^`{3,}\S", rest):
+                        yield Codeblock(
+                            lang, "\n".join(content_lines), start=start_line
+                        )
+                        lines[i] = rest
+                        reprocess_current_line = True
+                        break
+
+                    # Some models concatenate the closing fence with a thinking tag,
+                    # e.g. "```<think>". Recover by treating the leading fence as the
+                    # closing delimiter and reprocessing the remainder on the same line.
+                    if rest.startswith(("<think>", "<thinking>")):
+                        yield Codeblock(
+                            lang, "\n".join(content_lines), start=start_line
+                        )
+                        lines[i] = rest
+                        reprocess_current_line = True
+                        break
 
                 # Check if this line starts with backticks (potential opening or closing)
                 line_fence_match = re.match(r"^(`{3,})", line)
@@ -309,5 +385,7 @@ def _extract_codeblocks(
 
             # If we reached the end without completing the block, don't yield it
             # (this handles the unfinished nested test case)
+            if reprocess_current_line:
+                continue
         else:
             i += 1

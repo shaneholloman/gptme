@@ -154,6 +154,19 @@ echo "second"
     assert codeblocks[1].start == 3
 
 
+def test_extract_codeblocks_concatenated_adjacent_fences():
+    """Recover when a closing fence and the next opening fence are concatenated."""
+    markdown = """```shell
+pwd && ls -la
+``````shell
+find /tmp/x -maxdepth 2 -type f | sort
+```"""
+    codeblocks = Codeblock.iter_from_markdown(markdown)
+    assert len(codeblocks) == 2
+    assert codeblocks[0] == Codeblock("shell", "pwd && ls -la")
+    assert codeblocks[1] == Codeblock("shell", "find /tmp/x -maxdepth 2 -type f | sort")
+
+
 def test_extract_codeblocks_streaming_interrupted():
     """
     Test case based on real interruption during streaming.
@@ -1285,6 +1298,31 @@ def test_thinking_block_with_closing_thinking_tag():
     assert "print('hello')" in blocks[0].content
 
 
+def test_thinking_tag_concatenated_to_closing_fence():
+    """A closing fence concatenated with <think> should not swallow later tool blocks."""
+    markdown = "```shell\npwd\n```<think>\nbrief reasoning\n</think>\n```save pipeline.py\nprint('hello')\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 2
+    assert blocks[0].lang == "shell"
+    assert blocks[0].content == "pwd"
+    assert blocks[1].lang.startswith("save")
+    assert "print('hello')" in blocks[1].content
+
+
+def test_thinking_tag_concatenated_then_standalone_closed():
+    """Concatenated <think> followed by a standalone closed <think> block should yield all tool blocks."""
+    # Edge case: first block closes with ```<think> (concatenated, handled by inner-loop),
+    # followed by a properly-closed standalone <think>...</think>, then another tool block.
+    # The for-else early-exit must NOT fire here — standalone <think> is closed.
+    markdown = "```shell\npwd\n```<think>\nbrief reasoning\n</think>\n<think>\nmore thinking\n</think>\n```save pipeline.py\nprint('hello')\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 2
+    assert blocks[0].lang == "shell"
+    assert blocks[0].content == "pwd"
+    assert blocks[1].lang.startswith("save")
+    assert "print('hello')" in blocks[1].content
+
+
 def test_thinking_block_with_closing_think_tag():
     """Existing </think> tag variant still works after refactor."""
     markdown = "<think>\nsome thinking\n</think>\n```save result.py\nx = 1\n```"
@@ -1299,3 +1337,25 @@ def test_thinking_block_unclosed_thinking_tag_early_exit():
     markdown = "<thinking>\nmodel is still reasoning...\n```save pipeline.py\nprint('hello')\n```"
     blocks = list(_extract_codeblocks(markdown))
     assert len(blocks) == 0
+
+
+def test_thinking_tag_concatenated_then_unclosed_standalone():
+    """Concatenated <think> followed by a genuinely unclosed standalone <think> should early-exit."""
+    # After the concatenated closing (```<think>...</think>), a new standalone <think>
+    # block is opened but never closed — no tool blocks should be extracted.
+    markdown = "```shell\npwd\n```<think>\nbrief reasoning\n</think>\n<think>\nstill thinking...\n```save pipeline.py\nprint('hello')\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 0
+
+
+def test_adjacent_fences_bare_multifence_content_line():
+    """A content line of bare 6 backticks inside a block must NOT trigger adjacent-fence recovery."""
+    # "``````" (6 backticks) is a valid content line, not a pair of adjacent fences.
+    # With fence_len=3, the adjacent-fence guard must require a non-backtick char after
+    # the fence prefix; otherwise it incorrectly splits the block.
+    markdown = "```shell\nsome code\n``````\nmore code\n```"
+    blocks = list(_extract_codeblocks(markdown))
+    assert len(blocks) == 1
+    assert blocks[0].lang == "shell"
+    assert "``````" in blocks[0].content
+    assert "more code" in blocks[0].content
