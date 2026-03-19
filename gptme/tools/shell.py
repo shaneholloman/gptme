@@ -870,11 +870,28 @@ class ShellSession:
                             continue
 
                         if "ReturnCode:" in line and self.delimiter in line:
+                            # Extract any command output that precedes the
+                            # delimiter on the same line.  This happens when
+                            # command output lacks a trailing newline (e.g.
+                            # printf "yes", echo -n "data").
+                            # Use rfind to get the LAST "ReturnCode:" occurrence,
+                            # which is always the shell-injected marker (not
+                            # command output that itself contains "ReturnCode:").
+                            rc_pos = line.rfind("ReturnCode:")
+                            if rc_pos > 0:
+                                prefix = line[:rc_pos]
+                                stdout.append(prefix)
+                                if output:
+                                    print(prefix, end="", file=sys.stdout)
+
                             logger.debug(
                                 f"Shell: Delimiter detected in line: {line.strip()[:200]}"
                             )
-                            if match := re_returncode.search(line):
-                                return_code = int(match.group(1))
+                            # Use findall+last to avoid matching "ReturnCode:N"
+                            # in command output that precedes the marker.
+                            rc_matches = re_returncode.findall(line)
+                            if rc_matches:
+                                return_code = int(rc_matches[-1])
                             if command.startswith("cd ") and return_code == 0:
                                 ex, pwd, _ = self._run("pwd", output=False)
                                 if ex == 0:
@@ -1015,6 +1032,20 @@ class ShellSession:
                             continue
 
                         if "ReturnCode:" in line and self.delimiter in line:
+                            # Extract any command output that precedes the
+                            # delimiter on the same line.  This happens when
+                            # command output lacks a trailing newline (e.g.
+                            # printf "yes", echo -n "data").
+                            # Use rfind to get the LAST "ReturnCode:" occurrence,
+                            # which is always the shell-injected marker (not
+                            # command output that itself contains "ReturnCode:").
+                            rc_pos = line.rfind("ReturnCode:")
+                            if rc_pos > 0:
+                                prefix = line[:rc_pos]
+                                stdout.append(prefix)
+                                if output:
+                                    print(prefix, end="", file=sys.stdout)
+
                             # Diagnostic logging for Issue #408
                             logger.debug(
                                 f"Shell: Delimiter detected in line: "
@@ -1030,8 +1061,11 @@ class ShellSession:
                                     f"{last_stdout}"
                                 )
 
-                            if match := re_returncode.search(line):
-                                return_code = int(match.group(1))
+                            # Use findall+last to avoid matching "ReturnCode:N"
+                            # in command output that precedes the marker.
+                            rc_matches = re_returncode.findall(line)
+                            if rc_matches:
+                                return_code = int(rc_matches[-1])
                             # if command is cd, update working directory
                             if command.startswith("cd ") and return_code == 0:
                                 ex, pwd, _ = self._run("pwd", output=False)
@@ -2075,19 +2109,27 @@ def _shorten_stdout(
         and len(lines) > pre_lines + post_lines
     )
     will_truncate_by_tokens = False
+    tokenizer = None
+    tokens: list[int] = []
     if pre_tokens is not None and post_tokens is not None:
         from ..llm.models import get_default_model  # fmt: skip
 
         model = get_default_model()
         tokenizer = get_tokenizer(model.model if model else "gpt-4")
-        tokens = tokenizer.encode(stdout)
-        will_truncate_by_tokens = len(tokens) > pre_tokens + post_tokens
+        if tokenizer is not None:
+            tokens = tokenizer.encode(stdout)
+            will_truncate_by_tokens = len(tokens) > pre_tokens + post_tokens
+        else:
+            # Char-based approximation (~4 chars/token) when tokenizer unavailable
+            will_truncate_by_tokens = len(stdout) > (pre_tokens + post_tokens) * 4
 
     # If truncation will happen, save full output to file
     saved_path = None
     if (will_truncate_by_lines or will_truncate_by_tokens) and logdir:
         command_info = f"Command: {cmd}" if cmd else None
-        original_tokens = len(tokens) if will_truncate_by_tokens else None
+        original_tokens = (
+            len(tokens) if (will_truncate_by_tokens and tokenizer is not None) else None
+        )
         _, saved_path = save_large_output(
             content=stdout,
             logdir=logdir,
@@ -2138,8 +2180,9 @@ def _shorten_stdout(
 
             model = get_default_model()
             tokenizer = get_tokenizer(model.model if model else "gpt-4")
-            tokens = tokenizer.encode(stdout)
-        if len(tokens) > pre_tokens + post_tokens:
+            if tokenizer is not None:
+                tokens = tokenizer.encode(stdout)
+        if tokenizer is not None and len(tokens) > pre_tokens + post_tokens:
             truncation_msg = "... (output truncated"
             if saved_path:
                 truncation_msg += f", full output saved to {saved_path}"
@@ -2149,6 +2192,15 @@ def _shorten_stdout(
                 + [truncation_msg]
                 + [tokenizer.decode(tokens[-post_tokens:])]
             )
+        elif tokenizer is None and will_truncate_by_tokens:
+            # Char-based fallback when tokenizer unavailable (~4 chars/token)
+            pre_chars = pre_tokens * 4
+            post_chars = post_tokens * 4
+            truncation_msg = "... (output truncated"
+            if saved_path:
+                truncation_msg += f", full output saved to {saved_path}"
+            truncation_msg += ") ..."
+            lines = [stdout[:pre_chars]] + [truncation_msg] + [stdout[-post_chars:]]
 
     return "\n".join(lines)
 
