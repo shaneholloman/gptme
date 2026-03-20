@@ -1,4 +1,3 @@
-import concurrent.futures
 import io
 import logging
 import multiprocessing
@@ -7,7 +6,13 @@ import signal
 import sys
 import time
 from collections import defaultdict
-from concurrent.futures import Future, ProcessPoolExecutor, as_completed
+from concurrent.futures import (
+    CancelledError,
+    Future,
+    ProcessPoolExecutor,
+    TimeoutError,
+    as_completed,
+)
 from multiprocessing import Manager, Process
 from pathlib import Path
 from typing import TypedDict
@@ -105,6 +110,15 @@ def run_evals(
         cleanup_on_sigterm()
 
     n_runs = len(evals) * len(model_configs)
+    if n_runs == 0:
+        if not model_configs:
+            logger.warning(
+                "No models configured. Pass --model or set API keys "
+                "(OPENAI_API_KEY, ANTHROPIC_API_KEY, etc.)"
+            )
+        if not evals:
+            logger.warning("No evals to run")
+        return {}
     model_results: dict[ModelConfig, dict[str, EvalResult]] = defaultdict(dict)
     parallel = min(n_runs, parallel)
     with ProcessPoolExecutor(parallel) as executor:
@@ -140,9 +154,7 @@ def run_evals(
             except Exception as e:
                 gen_time = 0
                 error_detail = ""
-                if isinstance(e, concurrent.futures.TimeoutError) or isinstance(
-                    e, concurrent.futures.CancelledError
-                ):
+                if isinstance(e, TimeoutError | CancelledError):
                     status: Status = "timeout"
                     gen_time = timeout
                     error_detail = f"Process-level {type(e).__name__}"
@@ -181,7 +193,7 @@ def run_evals(
             ):
                 _handle_future(future)
                 completed.add(future)
-        except concurrent.futures.TimeoutError:
+        except TimeoutError:
             # NOTE: this should rarely happen, as `execute` should handle timeouts
             logger.warning(
                 "Timeout reached in top-level (shouldnt happen). Cancelling remaining futures..."
@@ -278,14 +290,19 @@ def execute(
 
                 cost = CostSummary.from_dict(cost_dict)
         else:
-            logger.error("No result in shared dictionary")
+            exit_code = p.exitcode
+            error_msg = (
+                f"Subprocess exited with code {exit_code} "
+                f"without writing result to shared dict"
+            )
+            logger.error(error_msg)
             return EvalResult(
                 name=test["name"],
-                status="error",
+                status=status if status == "timeout" else "error",
                 results=[],
                 timings={"gen": time_gen, "run": time_run, "eval": time_eval},
                 gen_stdout="",
-                gen_stderr="",
+                gen_stderr=error_msg,
                 run_stdout="",
                 run_stderr="",
                 log_dir=agent.log_dir,
@@ -294,7 +311,7 @@ def execute(
 
         logger.debug("Got result")
 
-        if status != "timeout" and status != "error":
+        if status not in ("timeout", "error"):
             # check and collect results
             run_start = time.time()
             env = DockerExecutionEnv() if use_docker else SimpleExecutionEnv()

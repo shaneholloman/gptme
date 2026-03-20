@@ -306,8 +306,20 @@ def aggregate_and_display_results(result_files: list[str]):
     multiple=True,
     help="Model to use, can be passed multiple times. Can include tool format with @, e.g. 'gpt-4@tool'",
 )
-@click.option("--timeout", "-t", default=30, help="Timeout for code generation")
-@click.option("--parallel", "-p", default=10, help="Number of parallel evals to run")
+@click.option(
+    "--timeout",
+    "-t",
+    default=30,
+    type=click.IntRange(min=1),
+    help="Timeout for code generation (seconds)",
+)
+@click.option(
+    "--parallel",
+    "-p",
+    default=10,
+    type=click.IntRange(min=1),
+    help="Number of parallel evals to run",
+)
 @click.option(
     "--tool-format",
     type=click.Choice(get_args(ToolFormat)),
@@ -541,11 +553,11 @@ def write_results(model_results: dict[ModelConfig, list[EvalResult]]):
         commit_hash = git_result.stdout.strip()
     else:
         # not in a git repo, use package version
-        from importlib.metadata import version
+        from importlib.metadata import PackageNotFoundError, version
 
         try:
             commit_hash = f"v{version('gptme')}"
-        except Exception:
+        except PackageNotFoundError:
             commit_hash = "unknown"
     eval_results_dir = Path(
         os.environ.get("EVAL_RESULTS_DIR", project_dir / "eval_results")
