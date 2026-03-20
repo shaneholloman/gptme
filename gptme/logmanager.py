@@ -693,6 +693,11 @@ class ConversationMeta:
     agent_name: str | None = None
     agent_path: str | None = None
     agent_urls: dict[str, str] | None = None
+    model: str | None = None
+    total_cost: float = 0.0
+    total_input_tokens: int = 0
+    total_output_tokens: int = 0
+    total_cache_read_tokens: int = 0
 
     def format(self, metadata=False) -> str:
         """Format conversation metadata for display."""
@@ -714,10 +719,42 @@ def get_conversations() -> Generator[ConversationMeta, None, None]:
     """Returns all conversations, excluding ones used for testing, evals, etc."""
     for conv_fn in _conversation_files():
         log = Log.read_jsonl(conv_fn, limit=1)
-        # Count messages by counting non-empty lines (JSONL: one JSON object per line)
-        # Avoids reading entire file into memory for large conversations
+        # Count messages and extract model/cost/token metadata in a single pass.
+        # Only JSON-parses lines containing "metadata" for efficiency.
+        len_msgs = 0
+        conv_model: str | None = None
+        conv_cost = 0.0
+        conv_input_tokens = 0
+        conv_output_tokens = 0
+        conv_cache_read_tokens = 0
         with open(conv_fn, "rb") as f:
-            len_msgs = sum(1 for line in f if line.strip())
+            for line in f:
+                line = line.strip()
+                if not line:
+                    continue
+                len_msgs += 1
+                if b'"metadata"' in line:
+                    try:
+                        msg = json.loads(line)
+                        meta = msg.get("metadata")
+                        if meta:
+                            if not conv_model and meta.get("model"):
+                                conv_model = meta["model"]
+                            conv_cost += meta.get("cost", 0) or 0
+                            # Token counts: nested under "usage" (new) or top-level (old)
+                            usage = meta.get("usage", {})
+                            src = usage or meta
+                            # Input = uncached + cache_read + cache_creation
+                            cache_read = src.get("cache_read_tokens", 0) or 0
+                            conv_input_tokens += (
+                                (src.get("input_tokens", 0) or 0)
+                                + cache_read
+                                + (src.get("cache_creation_tokens", 0) or 0)
+                            )
+                            conv_output_tokens += src.get("output_tokens", 0) or 0
+                            conv_cache_read_tokens += cache_read
+                    except (json.JSONDecodeError, TypeError):
+                        pass
         assert len(log) <= 1
         modified = conv_fn.stat().st_mtime
         first_timestamp = log[0].timestamp.timestamp() if log else modified
@@ -753,6 +790,11 @@ def get_conversations() -> Generator[ConversationMeta, None, None]:
             agent_name=agent_name,
             agent_path=str(agent_path) if agent_path else None,
             agent_urls=agent_urls,
+            model=conv_model,
+            total_cost=conv_cost,
+            total_input_tokens=conv_input_tokens,
+            total_output_tokens=conv_output_tokens,
+            total_cache_read_tokens=conv_cache_read_tokens,
         )
 
 
@@ -897,6 +939,9 @@ def check_for_modifications(log: Log) -> bool:
 def _gen_read_jsonl(path: PathLike) -> Generator[Message, None, None]:
     from .util.uri import parse_file_reference
 
+    # Pre-compute file mtime as fallback for messages without timestamps
+    _file_mtime = datetime.fromtimestamp(Path(path).stat().st_mtime, tz=timezone.utc)
+
     with open(path) as file:
         for line in file:
             line = line.strip()
@@ -911,6 +956,11 @@ def _gen_read_jsonl(path: PathLike) -> Generator[Message, None, None]:
             file_hashes = json_data.pop("file_hashes", {})
             if "timestamp" in json_data:
                 json_data["timestamp"] = isoparse(json_data["timestamp"])
+            else:
+                # Old messages lack timestamps; use file mtime instead of
+                # datetime.now() (the Message default) to avoid making old
+                # conversations appear as created "today".
+                json_data["timestamp"] = _file_mtime
             # Migrate flat metadata format to nested usage format
             if json_data.get("metadata"):
                 json_data["metadata"] = _migrate_metadata(json_data["metadata"])

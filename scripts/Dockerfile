@@ -27,7 +27,7 @@ RUN /opt/poetry/bin/poetry self add poetry-plugin-export && \
 FROM python:3.12-slim
 
 # Install runtime dependencies and GitHub CLI
-# Note: gpg is only needed for GitHub CLI keyring verification, removed after install
+# Note: gpg is only needed for keyring verification, removed after install
 RUN apt-get update && apt-get install -y --no-install-recommends \
     git \
     tmux \
@@ -43,6 +43,15 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
     && apt-get purge -y gpg \
     && apt-get autoremove -y \
     && rm -rf /var/lib/apt/lists/*
+
+# Install Node.js 20 (Claude Code CLI requires >= 18; pin to 20.x for reproducibility)
+RUN curl -fsSL https://deb.nodesource.com/setup_20.x | bash - \
+    && apt-get install -y --no-install-recommends nodejs \
+    && rm -rf /var/lib/apt/lists/*
+
+# Install Claude Code CLI for cross-harness evaluation
+# Uses ANTHROPIC_API_KEY env var (passed at runtime via -e flag)
+RUN npm install -g @anthropic-ai/claude-code@2.1.80
 
 WORKDIR /app
 

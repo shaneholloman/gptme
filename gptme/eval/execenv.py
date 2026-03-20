@@ -322,12 +322,16 @@ class DockerGPTMeEnv(DockerExecutionEnv):
         self.env_passthrough = env_passthrough or DOCKER_ENV_PASSTHROUGH
 
     def _get_env_args(self) -> list[str]:
-        """Get Docker -e arguments for environment variable passthrough."""
+        """Get Docker -e arguments for environment variable passthrough.
+
+        Uses ``-e VAR`` (without ``=value``) so Docker reads the value from the
+        host environment at runtime.  This keeps secrets out of the process
+        argument list visible via ``ps aux`` or ``/proc/<pid>/cmdline``.
+        """
         env_args: list[str] = []
         for var in self.env_passthrough:
-            value = os.environ.get(var)
-            if value:
-                env_args.extend(["-e", f"{var}={value}"])
+            if os.environ.get(var):
+                env_args.extend(["-e", var])
         return env_args
 
     def start_container(self) -> None:
@@ -481,7 +485,8 @@ class DockerGPTMeEnv(DockerExecutionEnv):
         duration = time.time() - start
         print(f"--- Finished gptme execution (Docker) in {duration:.1f}s ---\n")
 
-        return stdout_full, stderr_full, p.returncode if p.returncode is not None else 0
+        assert p.returncode is not None
+        return stdout_full, stderr_full, p.returncode
 
     def get_logs(self) -> dict[str, str]:
         """
@@ -498,3 +503,199 @@ class DockerGPTMeEnv(DockerExecutionEnv):
             except (OSError, UnicodeDecodeError):
                 pass
         return logs
+
+
+# Claude Code only needs the Anthropic API key for Docker passthrough
+CLAUDE_CODE_ENV_PASSTHROUGH = [
+    "ANTHROPIC_API_KEY",
+]
+
+
+class DockerClaudeCodeEnv(DockerExecutionEnv):
+    """
+    Docker-based execution environment for running Claude Code CLI inside Docker.
+
+    Mirrors :class:`DockerGPTMeEnv` but runs ``claude -p`` instead of
+    ``python -m gptme``, providing full isolation for Claude Code eval runs.
+
+    The Docker image must have the Claude Code CLI installed
+    (``npm install -g @anthropic-ai/claude-code``).
+
+    Args:
+        image: Docker image with Claude Code installed (default: gptme-eval:latest)
+        working_dir: Working directory inside container (default: /workspace)
+        host_dir: Host directory to mount (default: temp directory)
+        timeout: Timeout for Claude Code execution in seconds (default: 600)
+        env_passthrough: List of env vars to pass to container
+    """
+
+    def __init__(
+        self,
+        image: str = "gptme-eval:latest",
+        working_dir: str = "/workspace",
+        host_dir: Path | None = None,
+        timeout: int = 600,
+        env_passthrough: list[str] | None = None,
+    ):
+        super().__init__(image=image, working_dir=working_dir, host_dir=host_dir)
+        self.timeout = timeout
+        self.env_passthrough = env_passthrough or CLAUDE_CODE_ENV_PASSTHROUGH
+
+    def _get_env_args(self) -> list[str]:
+        """Get Docker -e arguments for environment variable passthrough.
+
+        Uses ``-e VAR`` (without ``=value``) so Docker reads the value from the
+        host environment at runtime.  This keeps secrets out of the process
+        argument list visible via ``ps aux`` or ``/proc/<pid>/cmdline``.
+        """
+        env_args: list[str] = []
+        for var in self.env_passthrough:
+            if os.environ.get(var):
+                env_args.extend(["-e", var])
+        return env_args
+
+    def start_container(self) -> None:
+        """Start Docker container with volume mount and env passthrough."""
+        try:
+            cmd = [
+                "docker",
+                "run",
+                "-d",
+                "-v",
+                f"{self.host_dir}:{self.working_dir}",
+            ]
+            cmd.extend(self._get_env_args())
+            cmd.extend(
+                [
+                    self.image,
+                    "tail",
+                    "-f",
+                    "/dev/null",
+                ]
+            )
+
+            result = subprocess.run(
+                cmd,
+                capture_output=True,
+                text=True,
+                check=True,
+                timeout=120,  # 2 min cap for docker startup / image pull
+            )
+            self.container_id = result.stdout.strip()
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"Docker container startup timed out after 120s for image '{self.image}'. "
+                "The image may need to be pre-pulled: docker pull gptme-eval:latest"
+            ) from e
+        except subprocess.CalledProcessError as e:
+            error_msg = f"Failed to start Docker container with image '{self.image}'.\n"
+            if "Unable to find image" in e.stderr or "No such image" in e.stderr:
+                error_msg += (
+                    "Docker image not found. Build it with: make build-docker\n"
+                    "Ensure the image includes Claude Code CLI "
+                    "(npm install -g @anthropic-ai/claude-code)"
+                )
+            else:
+                error_msg += f"Error: {e.stderr}"
+            raise RuntimeError(error_msg) from e
+
+    def run_claude_code(
+        self,
+        prompt: str,
+        model: str,
+        max_turns: int = 30,
+        tools: list[str] | None = None,
+    ) -> tuple[str, str, int]:
+        """
+        Run Claude Code CLI inside the Docker container.
+
+        Args:
+            prompt: The user prompt to process
+            model: Model identifier (e.g., "claude-sonnet-4-6")
+            max_turns: Maximum number of conversation turns (default: 30)
+            tools: List of allowed tools (default: all)
+
+        Returns:
+            Tuple of (stdout, stderr, exit_code)
+        """
+        if not self.container_id:
+            self.start_container()
+
+        assert self.container_id is not None
+
+        cmd_parts = [
+            "claude",
+            "-p",
+            shlex.quote(prompt),
+            "--output-format",
+            "json",
+            "--model",
+            shlex.quote(model),
+            "--max-turns",
+            str(max_turns),
+        ]
+
+        if tools:
+            cmd_parts.extend(["--allowedTools", shlex.quote(",".join(tools))])
+
+        command = " ".join(cmd_parts)
+
+        start = time.time()
+        print("\n--- Start of Claude Code execution (Docker) ---")
+        print(f"Model: {model}")
+        print(
+            f"Prompt: {prompt[:100]}..." if len(prompt) > 100 else f"Prompt: {prompt}"
+        )
+
+        p = subprocess.Popen(
+            [
+                "docker",
+                "exec",
+                "-i",
+                "-w",
+                self.working_dir,
+                self.container_id,
+                "/bin/bash",
+                "-c",
+                command,
+            ],
+            stdout=subprocess.PIPE,
+            stderr=subprocess.PIPE,
+            text=True,
+        )
+
+        timed_out = False
+        try:
+            # Use communicate() to read both pipes concurrently, avoiding the
+            # deadlock that sequential readline() causes when one pipe's buffer
+            # fills while the other is blocked waiting for data.
+            stdout_full, stderr_full = p.communicate(timeout=self.timeout)
+        except subprocess.TimeoutExpired:
+            print(f"Timeout after {self.timeout}s!")
+            timed_out = True
+            p.kill()
+            if self.container_id:
+                subprocess.run(
+                    ["docker", "stop", self.container_id],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=5,
+                )
+            stdout_full, stderr_full = p.communicate()
+
+        if stdout_full:
+            print(stdout_full, end="")
+        if stderr_full:
+            print(stderr_full, end="")
+
+        duration = time.time() - start
+        print(f"--- Finished Claude Code execution (Docker) in {duration:.1f}s ---\n")
+
+        if timed_out:
+            raise subprocess.TimeoutExpired(
+                cmd="docker exec claude -p ...", timeout=self.timeout
+            )
+
+        assert p.returncode is not None
+        return stdout_full, stderr_full, p.returncode

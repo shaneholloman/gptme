@@ -3,6 +3,7 @@ import logging
 import multiprocessing
 import os
 import signal
+import subprocess
 import sys
 import time
 from collections import defaultdict
@@ -20,6 +21,7 @@ from typing import TypedDict
 from tqdm import tqdm
 
 from .agents import Agent, GPTMe
+from .agents.claude_code import ClaudeCodeAgent, is_claude_code_model
 from .cost import get_eval_costs
 from .execenv import DockerExecutionEnv, SimpleExecutionEnv
 from .types import (
@@ -129,12 +131,21 @@ def run_evals(
                 tools = test.get(
                     "tools"
                 )  # Get tools from test spec, None if not specified
-                agent = GPTMe(
-                    model=config.model,
-                    tool_format=config.tool_format,
-                    tools=tools,
-                    use_docker=use_docker,
-                )
+                agent: Agent
+                if is_claude_code_model(config.model):
+                    agent = ClaudeCodeAgent(
+                        model=config.model,
+                        tools=tools,
+                        timeout=timeout,
+                        use_docker=use_docker,
+                    )
+                else:
+                    agent = GPTMe(
+                        model=config.model,
+                        tool_format=config.tool_format,
+                        tools=tools,
+                        use_docker=use_docker,
+                    )
                 future = executor.submit(
                     execute,
                     test,
@@ -447,6 +458,25 @@ def act_process(
     subprocess_logger.info("Started")
     try:
         files = agent.act(files, prompt)
+    except subprocess.TimeoutExpired as e:
+        # ClaudeCodeAgent re-raises TimeoutExpired when the claude CLI times out.
+        # Catch it before the generic handler so eval reports show "timeout" rather
+        # than "error", keeping ClaudeCodeAgent results comparable to GPTMe timeouts.
+        duration = time.time() - start
+        subprocess_logger.error(f"Agent subprocess timed out: {e}")
+        result_timeout: ProcessError = {
+            "status": "timeout",
+            "message": str(e),
+            "stdout": stdout.getvalue(),
+            "stderr": stderr.getvalue(),
+            "duration": duration,
+        }
+        sync_dict["result"] = result_timeout
+        # Reset SIGTERM handler before cleanup to prevent self-SIGTERM
+        # from overwriting the timeout result (same guard as the success path).
+        signal.signal(signal.SIGTERM, signal.SIG_IGN)
+        _graceful_killpg(pgrp)
+        return
     except Exception as e:
         error_handler(e)
         return
