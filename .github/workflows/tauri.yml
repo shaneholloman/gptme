@@ -394,6 +394,64 @@ jobs:
           SIGNING_IDENTITY=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
           echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
 
+      - name: Set Tauri bundle version from release tag
+        shell: bash
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          export VERSION="${TAG#v}"
+          python3 - <<'PY'
+          import json
+          import os
+          import re
+          from pathlib import Path
+
+          pep440_version = os.environ["VERSION"]
+
+          def pep440_to_semver(version: str) -> str:
+              patterns = [
+                  (r"^(\d+\.\d+\.\d+)\.dev(\d+)$", "dev"),
+                  (r"^(\d+\.\d+\.\d+)\.(a|b|rc)(\d+)$", None),
+                  (r"^(\d+\.\d+\.\d+)(a|b|rc)(\d+)$", None),
+              ]
+              for pattern, fixed_label in patterns:
+                  match = re.match(pattern, version)
+                  if not match:
+                      continue
+                  base = match.group(1)
+                  label = fixed_label or match.group(2)
+                  number = match.group(2 if fixed_label else 3)
+                  return f"{base}-{label}.{number}"
+              return version
+
+          semver_version = pep440_to_semver(pep440_version)
+
+          version_pattern = re.compile(
+              r'(^\s*"version"\s*:\s*")[^"]+(",?$)',
+              flags=re.MULTILINE,
+          )
+          json_paths = [Path("tauri/src-tauri/tauri.conf.json"), Path("tauri/package.json")]
+          for path in json_paths:
+              original = path.read_text()
+              data = json.loads(original)
+              if "version" not in data:
+                  raise RuntimeError(f"Missing version field in {path}")
+              if not version_pattern.search(original):
+                  raise RuntimeError(f"Failed to locate version field in {path}")
+              updated = version_pattern.sub(rf'\g<1>{semver_version}\2', original, count=1)
+              path.write_text(updated)
+
+          cargo = Path("tauri/src-tauri/Cargo.toml")
+          cargo_text = cargo.read_text()
+          cargo_pattern = re.compile(r'^version = ".*"$', flags=re.MULTILINE)
+          if not cargo_pattern.search(cargo_text):
+              raise RuntimeError("Failed to locate Cargo.toml version")
+          cargo_updated = cargo_pattern.sub(f'version = "{semver_version}"', cargo_text, count=1)
+          cargo.write_text(cargo_updated)
+
+          print(f"Release tag version: {pep440_version}")
+          print(f"Tauri semver version: {semver_version}")
+          PY
+
       - name: Build and publish release
         uses: tauri-apps/tauri-action@v0
         env:

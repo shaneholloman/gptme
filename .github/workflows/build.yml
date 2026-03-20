@@ -203,12 +203,19 @@ jobs:
         GH_TOKEN: ${{ github.token }}
       run: |
         TAG="${{ inputs.tag || github.ref_name }}"
+        VERSION="${TAG#v}"
         OS_SUFFIX="${{ runner.os }}-${{ runner.arch }}"
-        # Rename with OS suffix for the release asset
+        OS_SUFFIX="${OS_SUFFIX,,}"
+        ASSET_BASE="gptme-server-bin-${VERSION}-${OS_SUFFIX}"
+        # Include version + lowercase platform in release asset names so scheduled
+        # dev releases don't publish ambiguous binaries like `gptme-server-Linux-X64`.
+        # Wrap Unix binaries in tar.gz so downloads have an obvious file type.
         for f in dist/gptme-server dist/gptme-server.exe; do
           [ -f "$f" ] || continue
-          EXT=""
-          [[ "$f" == *.exe ]] && EXT=".exe"
-          cp "$f" "dist/gptme-server-${OS_SUFFIX}${EXT}"
+          if [[ "$f" == *.exe ]]; then
+            cp "$f" "dist/${ASSET_BASE}.exe"
+          else
+            tar -C dist -czf "dist/${ASSET_BASE}.tar.gz" "$(basename "$f")"
+          fi
         done
-        gh release upload "$TAG" dist/gptme-server-${OS_SUFFIX}* --clobber
+        gh release upload "$TAG" "dist/${ASSET_BASE}"* --clobber
