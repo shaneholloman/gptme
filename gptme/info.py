@@ -43,12 +43,11 @@ _EXTRA_DESCRIPTIONS = {
     "browser": "Web browsing with Playwright",
     "server": "REST API server",
     "datascience": "Data science tools (numpy, pandas, matplotlib)",
-    "tts": "Text-to-speech with Kokoro",
     "dspy": "DSPy & embeddings for RAG/lessons",
     "telemetry": "OpenTelemetry instrumentation",
-    "youtube": "YouTube transcript extraction",
     "acp": "Agent Communication Protocol support",
     "computer": "Computer use (system tools)",
+    "sounds": "Tool sound notifications (sounddevice + scipy)",
 }
 
 # Internal/build extras that aren't useful to show in --version

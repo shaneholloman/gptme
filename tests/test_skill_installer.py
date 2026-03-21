@@ -7,6 +7,8 @@ import pytest
 from gptme.lessons.installer import (
     InstalledSkill,
     SkillManifest,
+    check_dependencies,
+    dependency_graph,
     get_manifest,
     get_skills_dir,
     init_skill,
@@ -377,3 +379,373 @@ class TestPublishSkill:
         assert archive is not None
         # Minimal skills should publish but show warnings
         assert "Warnings" in msg or "metadata" in msg.lower()
+
+
+class TestSkillDependencies:
+    """Tests for skill dependency declarations."""
+
+    def test_valid_depends_in_skill(self, tmp_path: Path):
+        """Skill with valid depends list should pass validation."""
+        skill = tmp_path / "dep-skill"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """---
+name: dep-skill
+description: A skill with dependencies
+depends:
+  - other-skill
+  - another-skill
+metadata:
+  author: test
+  version: "1.0.0"
+  tags: test
+---
+
+# Dep Skill
+
+Needs other skills.
+"""
+        )
+        errors = validate_skill(skill)
+        real_errors = [e for e in errors if "recommended" not in e.lower()]
+        assert not real_errors, f"Unexpected errors: {real_errors}"
+
+    def test_depends_string_auto_converts(self, tmp_path: Path):
+        """Single depends string should be accepted (auto-converts to list)."""
+        skill = tmp_path / "single-dep"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """---
+name: single-dep
+description: Skill with single string depends
+depends: other-skill
+metadata:
+  author: test
+  version: "1.0.0"
+  tags: test
+---
+
+# Single Dep
+"""
+        )
+        errors = validate_skill(skill)
+        real_errors = [e for e in errors if "recommended" not in e.lower()]
+        assert not real_errors, f"Unexpected errors: {real_errors}"
+
+    def test_invalid_depends_type(self, tmp_path: Path):
+        """Non-list/non-string depends should fail validation."""
+        skill = tmp_path / "bad-deps"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """---
+name: bad-deps
+description: Skill with invalid depends
+depends: 42
+metadata:
+  author: test
+  version: "1.0.0"
+  tags: test
+---
+
+# Bad Deps
+"""
+        )
+        errors = validate_skill(skill)
+        dep_errors = [e for e in errors if "depends" in e.lower()]
+        assert any("must be a list" in e for e in dep_errors)
+
+    def test_invalid_depends_characters(self, tmp_path: Path):
+        """Dependency with invalid characters should fail."""
+        skill = tmp_path / "char-deps"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """---
+name: char-deps
+description: Skill with bad dependency names
+depends:
+  - "../evil"
+  - "has spaces"
+metadata:
+  author: test
+  version: "1.0.0"
+  tags: test
+---
+
+# Char Deps
+"""
+        )
+        errors = validate_skill(skill)
+        dep_errors = [
+            e for e in errors if "depends" in e.lower() or "invalid" in e.lower()
+        ]
+        assert len(dep_errors) >= 2, f"Expected 2+ dependency errors, got: {dep_errors}"
+
+    def test_empty_depends_entry(self, tmp_path: Path):
+        """Empty string dependency should fail."""
+        skill = tmp_path / "empty-dep"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """---
+name: empty-dep
+description: Skill with empty dep
+depends:
+  - ""
+metadata:
+  author: test
+  version: "1.0.0"
+  tags: test
+---
+
+# Empty Dep
+"""
+        )
+        errors = validate_skill(skill)
+        dep_errors = [e for e in errors if "Invalid dependency" in e]
+        assert len(dep_errors) == 1
+
+    def test_no_depends_is_valid(self, skill_dir: Path):
+        """Skill without depends field should be valid."""
+        errors = validate_skill(skill_dir)
+        real_errors = [e for e in errors if "recommended" not in e.lower()]
+        assert not real_errors
+
+    def test_dependency_graph_from_index(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """dependency_graph should return skills with dependencies."""
+        from gptme.lessons.index import LessonIndex
+        from gptme.lessons.parser import parse_lesson
+
+        skill1 = tmp_path / "skill-a"
+        skill1.mkdir()
+        (skill1 / "SKILL.md").write_text(
+            """---
+name: skill-a
+description: Depends on skill-b
+depends:
+  - skill-b
+---
+
+# Skill A
+"""
+        )
+        skill2 = tmp_path / "skill-b"
+        skill2.mkdir()
+        (skill2 / "SKILL.md").write_text(
+            """---
+name: skill-b
+description: No dependencies
+---
+
+# Skill B
+"""
+        )
+
+        parsed_a = parse_lesson(skill1 / "SKILL.md")
+        parsed_b = parse_lesson(skill2 / "SKILL.md")
+
+        # Monkeypatch LessonIndex and manifest to use our test skills
+        fake_index = LessonIndex.__new__(LessonIndex)
+        fake_index.lessons = [parsed_a, parsed_b]
+        monkeypatch.setattr("gptme.lessons.index.LessonIndex", lambda: fake_index)
+        monkeypatch.setattr(
+            "gptme.lessons.installer.get_manifest", lambda: SkillManifest()
+        )
+
+        graph = dependency_graph()
+
+        assert graph == {"skill-a": ["skill-b"]}
+        assert "skill-b" not in graph  # No deps, not included
+
+    def test_depends_with_dots_and_hyphens(self, tmp_path: Path):
+        """Dependencies with dots and hyphens should be valid."""
+        skill = tmp_path / "deps-dots"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            """---
+name: deps-dots
+description: Skill with dotted dependencies
+depends:
+  - org.other-skill
+  - my-skill.v2
+metadata:
+  author: test
+  version: "1.0.0"
+  tags: test
+---
+
+# Dots Deps
+"""
+        )
+        errors = validate_skill(skill)
+        real_errors = [e for e in errors if "recommended" not in e.lower()]
+        assert not real_errors, f"Unexpected errors: {real_errors}"
+
+    def test_dependency_graph_raises_on_cycle(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """dependency_graph() should raise ValueError when circular deps exist."""
+        from gptme.lessons.index import LessonIndex
+        from gptme.lessons.parser import parse_lesson
+
+        skill_a = tmp_path / "cycle-a"
+        skill_a.mkdir()
+        (skill_a / "SKILL.md").write_text(
+            "---\nname: cycle-a\ndescription: Cycle A\ndepends:\n  - cycle-b\n---\n# Cycle A\n"
+        )
+        skill_b = tmp_path / "cycle-b"
+        skill_b.mkdir()
+        (skill_b / "SKILL.md").write_text(
+            "---\nname: cycle-b\ndescription: Cycle B\ndepends:\n  - cycle-a\n---\n# Cycle B\n"
+        )
+
+        parsed_a = parse_lesson(skill_a / "SKILL.md")
+        parsed_b = parse_lesson(skill_b / "SKILL.md")
+
+        # Monkeypatch LessonIndex at the source module
+        fake_index = LessonIndex.__new__(LessonIndex)
+        fake_index.lessons = [parsed_a, parsed_b]
+        monkeypatch.setattr("gptme.lessons.index.LessonIndex", lambda: fake_index)
+
+        with pytest.raises(ValueError, match="Circular"):
+            dependency_graph()
+
+    def test_check_dependencies_includes_manifest_only_skills(
+        self, tmp_path: Path, skill_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """check_dependencies(None) should check manifest-only skills too."""
+        from gptme.lessons.index import LessonIndex
+
+        # Install a skill so it's in the manifest but not the index
+        install_skill(str(skill_dir))
+
+        # Mock an empty index (no indexed lessons)
+        fake_index = LessonIndex.__new__(LessonIndex)
+        fake_index.lessons = []
+        monkeypatch.setattr("gptme.lessons.index.LessonIndex", lambda: fake_index)
+
+        # Patch the installed skill's SKILL.md to declare a missing dependency
+        installed_md = get_skills_dir() / "test-skill" / "SKILL.md"
+        installed_md.write_text(
+            "---\nname: test-skill\ndescription: Test\ndepends:\n  - missing-dep\n---\n# Test\n"
+        )
+
+        missing = check_dependencies()
+        assert any(m["skill"] == "test-skill" for m in missing), (
+            f"Manifest-only skill not checked: {missing}"
+        )
+
+    def test_check_dependencies_raises_on_unknown_skill(
+        self, monkeypatch: pytest.MonkeyPatch
+    ):
+        """check_dependencies() should raise KeyError for unknown skill names."""
+        from gptme.lessons.index import LessonIndex
+
+        fake_index = LessonIndex.__new__(LessonIndex)
+        fake_index.lessons = []
+        monkeypatch.setattr("gptme.lessons.index.LessonIndex", lambda: fake_index)
+        monkeypatch.setattr(
+            "gptme.lessons.installer.get_manifest", lambda: SkillManifest()
+        )
+
+        with pytest.raises(KeyError, match="Unknown skill"):
+            check_dependencies(["nonexistent-skill"])
+
+    def test_check_dependencies_explicit_skill_names(
+        self, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """check_dependencies() with explicit names returns satisfied deps."""
+        from gptme.lessons.index import LessonIndex
+        from gptme.lessons.parser import parse_lesson
+
+        skill = tmp_path / "has-dep"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: has-dep\ndescription: D\ndepends:\n  - other\n---\n# D\n"
+        )
+        other = tmp_path / "other"
+        other.mkdir()
+        (other / "SKILL.md").write_text("---\nname: other\ndescription: O\n---\n# O\n")
+
+        parsed_dep = parse_lesson(skill / "SKILL.md")
+        parsed_other = parse_lesson(other / "SKILL.md")
+
+        fake_index = LessonIndex.__new__(LessonIndex)
+        fake_index.lessons = [parsed_dep, parsed_other]
+        monkeypatch.setattr("gptme.lessons.index.LessonIndex", lambda: fake_index)
+        monkeypatch.setattr(
+            "gptme.lessons.installer.get_manifest", lambda: SkillManifest()
+        )
+
+        # All deps satisfied — should return empty
+        missing = check_dependencies(["has-dep"])
+        assert missing == []
+
+    def test_depends_null_does_not_crash_check_dependencies(
+        self, tmp_path: Path, skill_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """depends: null (YAML) should not crash check_dependencies."""
+        from gptme.lessons.index import LessonIndex
+
+        install_skill(str(skill_dir))
+
+        fake_index = LessonIndex.__new__(LessonIndex)
+        fake_index.lessons = []
+        monkeypatch.setattr("gptme.lessons.index.LessonIndex", lambda: fake_index)
+
+        # Patch SKILL.md to have depends: null
+        installed_md = get_skills_dir() / "test-skill" / "SKILL.md"
+        installed_md.write_text(
+            "---\nname: test-skill\ndescription: Test\ndepends:\n---\n# Test\n"
+        )
+
+        # Should not crash — depends: (bare) parses as None in YAML
+        missing = check_dependencies()
+        assert isinstance(missing, list)
+
+    def test_depends_null_does_not_crash_dependency_graph(
+        self, tmp_path: Path, skill_dir: Path, monkeypatch: pytest.MonkeyPatch
+    ):
+        """depends: null (YAML) should not crash dependency_graph."""
+        from gptme.lessons.index import LessonIndex
+
+        install_skill(str(skill_dir))
+
+        fake_index = LessonIndex.__new__(LessonIndex)
+        fake_index.lessons = []
+        monkeypatch.setattr("gptme.lessons.index.LessonIndex", lambda: fake_index)
+
+        installed_md = get_skills_dir() / "test-skill" / "SKILL.md"
+        installed_md.write_text(
+            "---\nname: test-skill\ndescription: Test\ndepends:\n---\n# Test\n"
+        )
+
+        # Should not crash
+        graph = dependency_graph()
+        assert isinstance(graph, dict)
+
+    def test_depends_null_does_not_crash_parse_lesson(self, tmp_path: Path):
+        """depends: null should not crash parse_lesson."""
+        from gptme.lessons.parser import parse_lesson
+
+        skill = tmp_path / "null-dep"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: null-dep\ndescription: Null\ndepends:\n---\n# Null\n"
+        )
+
+        parsed = parse_lesson(skill / "SKILL.md")
+        assert parsed.metadata.depends == []
+
+    def test_depends_integer_does_not_crash_parse_lesson(self, tmp_path: Path):
+        """depends: 42 should not crash parse_lesson."""
+        from gptme.lessons.parser import parse_lesson
+
+        skill = tmp_path / "int-dep"
+        skill.mkdir()
+        (skill / "SKILL.md").write_text(
+            "---\nname: int-dep\ndescription: Int\ndepends: 42\n---\n# Int\n"
+        )
+
+        parsed = parse_lesson(skill / "SKILL.md")
+        assert parsed.metadata.depends == []

@@ -65,7 +65,7 @@ PromptType = Literal["full", "short"]
 logger = logging.getLogger(__name__)
 
 
-ContextMode = Literal["full", "instructions-only", "selective"]
+ContextMode = Literal["full", "selective"]
 
 
 def get_prompt(
@@ -120,7 +120,7 @@ def get_prompt(
         model: Model to use
         workspace: Project workspace directory
         agent_path: Agent identity workspace (if different from project workspace)
-        context_mode: Context mode (full, selective; instructions-only deprecated)
+        context_mode: Context mode (full or selective)
         context_include: Components to include in selective mode
 
     Returns a list of messages: [core_system_prompt, workspace_prompt, ...].
@@ -133,10 +133,6 @@ def get_prompt(
     # Default context_mode to "full" if not specified
     effective_mode = context_mode or "full"
     include_set = set(context_include or [])
-
-    # "instructions-only" is a deprecated alias for "selective" with no includes
-    if effective_mode == "instructions-only":
-        effective_mode = "selective"
 
     # Determine what to include based on context_mode
     # Expand aliases
@@ -1083,7 +1079,14 @@ def prompt_skills_summary(
                     raw_desc = raw_desc[:77] + "..."
                 desc = xml_escape(raw_desc)
                 path = quoteattr(str(skill.path))
-                skill_entries.append(f"  <skill name={name} path={path}>{desc}</skill>")
+                depends_attr = ""
+                if skill.metadata.depends:
+                    depends_attr = (
+                        f" depends={quoteattr(', '.join(skill.metadata.depends))}"
+                    )
+                skill_entries.append(
+                    f"  <skill name={name} path={path}{depends_attr}>{desc}</skill>"
+                )
             content = "\n".join(skill_entries)
             yield Message("system", _xml_section("skills", content))
         else:
@@ -1096,7 +1099,11 @@ def prompt_skills_summary(
                 # Truncate description to keep it compact
                 if len(desc) > 80:
                     desc = desc[:77] + "..."
-                lines.append(f"- **{name}**: {desc}")
+                entry = f"- **{name}**: {desc}"
+                if skill.metadata.depends:
+                    deps_str = ", ".join(skill.metadata.depends)
+                    entry += f" (depends: {deps_str})"
+                lines.append(entry)
                 lines.append(f"  `{skill.path}`")
 
             lines.append(f"\n*{len(skills)} skills available*")

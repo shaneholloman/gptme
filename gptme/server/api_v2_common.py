@@ -1,14 +1,42 @@
 """
-Common types and utilities for V2 API.
+Common types and utilities for the gptme server API.
 """
 
+import os
 from pathlib import Path
 from typing import Literal, TypedDict
 
 from typing_extensions import NotRequired
 
 from ..message import Message
-from .api import _abs_to_rel_workspace
+from ..util.uri import URI
+
+
+def _is_debug_errors_enabled() -> bool:
+    """Check if detailed error messages should be shown.
+
+    When GPTME_DEBUG_ERRORS is set to '1', 'true', or 'yes' (case-insensitive),
+    detailed error messages with exception information will be returned to clients.
+    This is useful for development, testing, CI, and staging environments.
+
+    In production, this should be disabled (default) to prevent information leakage.
+    """
+    return os.environ.get("GPTME_DEBUG_ERRORS", "").lower() in ("1", "true", "yes")
+
+
+def _abs_to_rel_workspace(path: str | Path | URI, workspace: Path) -> str:
+    """Convert an absolute path to a relative path.
+
+    URIs are returned as-is since they are not workspace-relative.
+    """
+    # URIs should be returned as-is (they're not workspace-relative)
+    if isinstance(path, URI):
+        return str(path)
+
+    path = Path(path).resolve()
+    if path.is_relative_to(workspace):
+        return str(path.relative_to(workspace))
+    return str(path)
 
 
 class MessageDict(TypedDict):

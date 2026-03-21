@@ -454,6 +454,22 @@ def validate_skill(path: Path) -> list[str]:
     elif not isinstance(fm["description"], str):
         errors.append("Field 'description' must be a string")
 
+    # Dependency declarations (optional — validated if present)
+    depends = fm.get("depends", [])
+    if isinstance(depends, str):
+        depends = [depends]
+    if not isinstance(depends, list):
+        errors.append("Field 'depends' must be a list of strings")
+    elif depends:
+        for dep in depends:
+            if not isinstance(dep, str) or not dep.strip():
+                errors.append(f"Invalid dependency entry: {dep!r}")
+            elif not re.match(r"^[a-zA-Z0-9][\w.\-]*$", dep.strip()):
+                errors.append(
+                    f"Dependency '{dep}' contains invalid characters. "
+                    "Use skill names (alphanumeric, underscores, hyphens, dots)."
+                )
+
     # Marketplace metadata (recommended but not required)
     metadata = fm.get("metadata", {})
     if isinstance(metadata, dict):
@@ -473,12 +489,172 @@ def list_installed() -> list[InstalledSkill]:
     return list(manifest.skills.values())
 
 
+def _extract_depends(fm: dict) -> list[str]:
+    """Extract and normalise the ``depends`` field from parsed SKILL.md frontmatter.
+
+    Handles ``str``, ``list``, ``None`` (YAML null), and other scalars gracefully.
+    """
+    raw = fm.get("depends", [])
+    if isinstance(raw, str):
+        raw = [raw]
+    elif not isinstance(raw, list):
+        # YAML null parses as None; other scalars (int, float) are also invalid
+        raw = []
+    return [d for d in raw if isinstance(d, str) and d.strip()]
+
+
+def check_dependencies(
+    skill_names: list[str] | None = None,
+) -> list[dict[str, str]]:
+    """Check if all skill dependencies are satisfied.
+
+    Args:
+        skill_names: Specific skills to check (None = check all installed)
+
+    Returns:
+        List of dicts with unsatisfied dependencies:
+        [{"skill": "my-skill", "depends": "missing-dep"}, ...]
+
+    Raises:
+        KeyError: If any name in ``skill_names`` is not a known installed skill.
+    """
+    from .index import LessonIndex
+
+    index = LessonIndex()
+    manifest = get_manifest()
+
+    # Build set of available skill names
+    available: set[str] = set()
+    for item in index.lessons:
+        if item.metadata.name:
+            available.add(item.metadata.name)
+    for name in manifest.skills:
+        available.add(name)
+
+    missing: list[dict[str, str]] = []
+
+    if skill_names is not None:
+        unknown = [n for n in skill_names if n not in available]
+        if unknown:
+            raise KeyError(
+                f"Unknown skill(s): {', '.join(sorted(unknown))}. "
+                "Check installed skills with `gptme --list-skills`."
+            )
+        targets = skill_names
+    else:
+        # Include all known skills: indexed + manifest-only
+        indexed_names = {
+            item.metadata.name for item in index.lessons if item.metadata.name
+        }
+        targets = list(indexed_names) + [
+            name for name in manifest.skills if name not in indexed_names
+        ]
+
+    for skill_name in targets:
+        if not skill_name:
+            continue
+        # Find the skill in index or manifest
+        deps: list[str] = []
+        found_in_index = False
+        for item in index.lessons:
+            if item.metadata.name == skill_name:
+                deps = item.metadata.depends
+                found_in_index = True
+                break
+        if not found_in_index and skill_name in manifest.skills:
+            # Check manifest entry's SKILL.md
+            skill_path = Path(manifest.skills[skill_name].install_path)
+            skill_md = _find_skill_md(skill_path)
+            if skill_md:
+                fm = _parse_skill_frontmatter(skill_md)
+                deps = _extract_depends(fm)
+
+        missing.extend(
+            {"skill": skill_name, "depends": dep}
+            for dep in deps
+            if dep not in available
+        )
+
+    return missing
+
+
+def dependency_graph() -> dict[str, list[str]]:
+    """Build a dependency graph of all skills with dependencies.
+
+    Returns:
+        Dict mapping skill name to its dependency list.
+        Only includes skills that have dependencies.
+
+    Raises:
+        ValueError: If circular dependencies are detected.
+    """
+    from .index import LessonIndex
+
+    index = LessonIndex()
+    manifest = get_manifest()
+    graph: dict[str, list[str]] = {}
+
+    indexed_names: set[str] = set()
+    for item in index.lessons:
+        if item.metadata.name and item.metadata.depends:
+            graph[item.metadata.name] = list(item.metadata.depends)
+        if item.metadata.name:
+            indexed_names.add(item.metadata.name)
+
+    # Include manifest-only skills (installed via git URL or local path, not in index)
+    for name, skill_info in manifest.skills.items():
+        if name not in indexed_names:
+            skill_path = Path(skill_info.install_path)
+            skill_md = _find_skill_md(skill_path)
+            if skill_md:
+                fm = _parse_skill_frontmatter(skill_md)
+                deps = _extract_depends(fm)
+                if deps:
+                    graph[name] = deps
+
+    # Detect circular dependencies (iterative DFS — no recursion limit risk)
+    cycles: list[str] = []
+    visited: set[str] = set()
+
+    for start in graph:
+        if start in visited:
+            continue
+        stack: list[tuple[str, int]] = [(start, 0)]
+        path: set[str] = set()
+        while stack:
+            node, idx = stack.pop()
+            if idx == 0:
+                if node in path:
+                    # Back-edge — cycle detected
+                    cycle = f"{stack[-1][0]} -> {node}" if stack else node
+                    cycles.append(cycle)
+                    logger.warning(f"Circular dependency detected: {cycle}")
+                    continue
+                if node in visited:
+                    continue
+                visited.add(node)
+                path.add(node)
+            deps = graph.get(node, [])
+            if idx < len(deps):
+                # Push current node back with incremented index, then push child
+                stack.append((node, idx + 1))
+                stack.append((deps[idx], 0))
+            else:
+                path.discard(node)
+
+    if cycles:
+        raise ValueError(f"Circular dependencies detected: {', '.join(cycles)}")
+
+    return graph
+
+
 # --- Skill template for init ---
 
 SKILL_TEMPLATE = """\
 ---
 name: {name}
 description: {description}
+# depends: [other-skill]  # Optional: list skill dependencies
 metadata:
   author: {author}
   version: "0.1.0"

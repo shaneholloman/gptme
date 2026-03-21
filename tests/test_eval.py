@@ -1,5 +1,7 @@
+import importlib
 import os
 import subprocess
+import sys
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
@@ -12,6 +14,11 @@ from gptme.eval.agents import Agent, GPTMe
 from gptme.eval.main import main
 from gptme.eval.run import ProcessError, SyncedDict, act_process
 from gptme.eval.suites import suites, tests_map
+
+# importlib.import_module returns the actual module object from sys.modules,
+# not the 'main' Click-command attribute exposed via gptme/eval/__init__.py.
+# 'import gptme.eval.main as x' would also get the Click command via IMPORT_FROM.
+_eval_main_module = importlib.import_module("gptme.eval.main")
 
 if TYPE_CHECKING:
     from gptme.eval.types import EvalSpec
@@ -44,6 +51,68 @@ def test_no_duplicate_test_names():
         f"tests_map has {len(tests_map)} entries but {total_tests} tests exist "
         f"— some names are duplicated and being shadowed"
     )
+
+
+def test_eval_module_loading(tmp_path):
+    """Test that --eval-module loads and registers tests from an external module."""
+    # Write a minimal eval module with a tests list
+    module_file = tmp_path / "my_feature_eval.py"
+    module_file.write_text(
+        """\
+def check_file_exists(ctx):
+    return "main.py" in ctx.files
+
+FEATURE = "my-feature"
+PROMPT = "Create a main.py file."
+CHECKS = [check_file_exists]
+tests = [
+    {
+        "name": FEATURE or "spec-kit-eval",
+        "files": {},
+        "run": "python main.py",
+        "prompt": PROMPT,
+        "expect": {fn.__name__: fn for fn in CHECKS},
+    }
+]
+"""
+    )
+
+    captured_evals: list = []
+
+    def fake_run_evals(evals, *args, **kwargs):
+        captured_evals.extend(evals)
+        return {}
+
+    runner = CliRunner()
+    saved_path = list(sys.path)
+    modules_before = frozenset(sys.modules)
+    try:
+        with (
+            # Use patch.object to avoid mock._importer resolving "gptme.eval.main"
+            # via getattr(gptme.eval, "main") which returns the Click command instead
+            # of the submodule (gptme/eval/__init__.py overrides the attribute).
+            patch.object(_eval_main_module, "run_evals", side_effect=fake_run_evals),
+            runner.isolated_filesystem(),
+        ):
+            result = runner.invoke(
+                main,
+                ["--eval-module", str(module_file), "--model", "anthropic"],
+                catch_exceptions=False,
+            )
+    finally:
+        # Restore global state mutated by the module loader (sys.path / sys.modules).
+        # Only remove newly added modules — clearing all of sys.modules is too
+        # aggressive and can corrupt pytest's import state in xdist workers.
+        sys.path[:] = saved_path
+        for key in list(sys.modules):
+            if key not in modules_before:
+                del sys.modules[key]
+    # Module loaded without error and the test was passed to run_evals
+    assert result.exit_code == 0, f"Unexpected exit: {result.output}"
+    assert len(captured_evals) == 1, f"Expected 1 eval, got {captured_evals}"
+    assert captured_evals[0]["name"] == "my-feature"
+    # Key: should NOT fail with "module must define a 'tests' list"
+    assert "must define a 'tests' list" not in (result.output or "")
 
 
 def _detect_model():

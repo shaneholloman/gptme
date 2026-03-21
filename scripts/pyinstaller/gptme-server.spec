@@ -26,7 +26,6 @@ hiddenimports = [
     '_json',
     # gptme modules
     'gptme.server.cli',
-    'gptme.server.api',
     'gptme.server.api_v2',
     'gptme.server.workspace_api',
     'gptme.tools',
@@ -43,8 +42,6 @@ hiddenimports = [
     'gptme.tools.tmux',
     'gptme.tools.chats',
     'gptme.tools.rag',
-    'gptme.tools.tts',
-    'gptme.tools.youtube',
     'gptme.tools.subagent',
     'gptme.llm.llm_openai',
     'gptme.llm.llm_anthropic',
