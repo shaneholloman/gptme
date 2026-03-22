@@ -14,6 +14,7 @@ from contextlib import contextmanager
 import pytest
 import requests
 
+import gptme.init as _gptme_init
 from gptme.config import get_config
 from gptme.init import init
 from gptme.tools import clear_tools
@@ -158,6 +159,10 @@ def reduce_anthropic_retries(monkeypatch):
 def clear_tools_before():
     # Clear all tools and cache to prevent test conflicts
     clear_tools()
+    # Reset init state so tools are fully re-registered on next init() call.
+    # Without this, the _init_done guard prevents init_tools() from re-running
+    # after clear_tools(), leaving get_tool() returning None for all tools.
+    _gptme_init._init_done = False
 
 
 @pytest.fixture(autouse=True)
@@ -225,7 +230,12 @@ def temp_file():
 
 @pytest.fixture(autouse=True)
 def init_():
-    init(None, interactive=False, tool_allowlist=None, tool_format="markdown")
+    # Pass MODEL from env explicitly to avoid picking up stale config.chat.model
+    # values left by server tests (e.g. "gpt-4o-mini" from test_v2_chat_config).
+    # When _init_done is reset per-test, init_model() re-runs and would otherwise
+    # read the contaminated config instead of the test environment's MODEL.
+    model = os.environ.get("MODEL")
+    init(model, interactive=False, tool_allowlist=None, tool_format="markdown")
 
 
 @pytest.fixture

@@ -82,6 +82,7 @@ def test_cd(shell):
 
 def test_shell_cd_chdir(shell):
     # make a tmp dir
+    original_cwd = os.getcwd()
     tmpdir = tempfile.TemporaryDirectory()
     # test that running cd in the shell changes the directory
     shell.run(f"cd {tmpdir.name}")
@@ -91,6 +92,7 @@ def test_shell_cd_chdir(shell):
         assert cwd == os.path.realpath(tmpdir.name)
         assert cwd == os.path.realpath(output.strip())
     finally:
+        os.chdir(original_cwd)  # restore before cleanup to avoid broken cwd
         tmpdir.cleanup()
 
 
@@ -1354,5 +1356,22 @@ def test_needs_tty_sudo_detection():
             assert shell._needs_tty(
                 "DEBIAN_FRONTEND=noninteractive sudo apt install vim"
             )
+    finally:
+        shell.close()
+
+
+def test_shell_cwd_parameter(tmp_path):
+    """ShellSession(cwd=...) should start in the specified directory.
+
+    This is the thread-safe way for the server to set the shell's
+    initial working directory without os.chdir().
+    """
+    target_dir = tmp_path / "workspace"
+    target_dir.mkdir()
+    shell = ShellSession(cwd=str(target_dir))
+    try:
+        ret, out, err = shell.run("pwd")
+        assert ret == 0
+        assert out.strip() == str(target_dir)
     finally:
         shell.close()
