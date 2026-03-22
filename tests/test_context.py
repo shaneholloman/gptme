@@ -342,6 +342,160 @@ def test_resource_to_codeblock_binary(tmp_path):
     assert "Size:" in result
 
 
+def test_dir_to_listing(tmp_path):
+    """Test that _dir_to_listing generates file listings for directories."""
+    from gptme.util.context import _dir_to_listing
+
+    # Create a directory with some files
+    subdir = tmp_path / "project"
+    subdir.mkdir()
+    (subdir / "main.py").write_text("print('hello')")
+    (subdir / "utils.py").write_text("def helper(): pass")
+    (subdir / "README.md").write_text("# Project")
+
+    result = _dir_to_listing(subdir, str(subdir))
+    assert result is not None
+    assert "main.py" in result
+    assert "utils.py" in result
+    assert "README.md" in result
+
+
+def test_dir_to_listing_empty(tmp_path):
+    """Test that empty directories produce a meaningful message."""
+    from gptme.util.context import _dir_to_listing
+
+    empty = tmp_path / "empty"
+    empty.mkdir()
+
+    result = _dir_to_listing(empty, str(empty))
+    assert result is not None
+    assert "(empty directory)" in result
+
+
+def test_dir_to_listing_all_gitignored(tmp_path, monkeypatch):
+    """Test that files are not exposed when git returns empty output (all gitignored)."""
+    from unittest.mock import MagicMock, patch
+
+    from gptme.util.context import _dir_to_listing
+
+    # Create a directory with a file that would be found by rglob
+    gitdir = tmp_path / "gitrepo"
+    gitdir.mkdir()
+    (gitdir / "secret.env").write_text("API_KEY=hunter2")
+
+    # Simulate git returning returncode=0 with empty stdout (all files gitignored)
+    mock_result = MagicMock()
+    mock_result.returncode = 0
+    mock_result.stdout = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        result = _dir_to_listing(gitdir, str(gitdir))
+
+    # When git reports success with no files, should return empty listing, NOT rglob files
+    assert result is not None
+    assert "secret.env" not in result
+    assert "(empty directory)" in result
+
+
+def test_dir_to_listing_truncation(tmp_path):
+    """Test that large directories are truncated."""
+    from gptme.util.context import _dir_to_listing
+
+    bigdir = tmp_path / "big"
+    bigdir.mkdir()
+    for i in range(60):
+        (bigdir / f"file_{i:03d}.txt").write_text(f"content {i}")
+
+    result = _dir_to_listing(bigdir, str(bigdir), max_entries=50)
+    assert result is not None
+    assert "10 more files" in result
+    # First 50 should be included
+    assert "file_000.txt" in result
+    assert "file_049.txt" in result
+
+
+def test_dir_to_listing_nested(tmp_path):
+    """Test that nested directory structures are listed."""
+    from gptme.util.context import _dir_to_listing
+
+    project = tmp_path / "nested"
+    project.mkdir()
+    src = project / "src"
+    src.mkdir()
+    (src / "app.py").write_text("app")
+    tests = project / "tests"
+    tests.mkdir()
+    (tests / "test_app.py").write_text("test")
+    (project / "pyproject.toml").write_text("[project]")
+
+    result = _dir_to_listing(project, str(project))
+    # Should include full relative paths (not just bare filenames)
+    assert "src/app.py" in result
+    assert "tests/test_app.py" in result
+    assert "pyproject.toml" in result
+
+
+def test_dir_to_listing_includes_dotfiles(tmp_path):
+    """Test that rglob fallback includes dotfiles like .pre-commit-config.yml and .github/."""
+    from unittest.mock import MagicMock, patch
+
+    from gptme.util.context import _dir_to_listing
+
+    project = tmp_path / "project"
+    project.mkdir()
+    (project / ".pre-commit-config.yaml").write_text("repos: []")
+    (project / ".gitignore").write_text("*.pyc")
+    (project / "main.py").write_text("print('hello')")
+    gh = project / ".github" / "workflows"
+    gh.mkdir(parents=True)
+    (gh / "test.yml").write_text("on: push")
+
+    # Simulate git not available so we exercise the rglob fallback
+    mock_result = MagicMock()
+    mock_result.returncode = 1  # git fails → fall through to rglob
+    mock_result.stdout = ""
+
+    with patch("subprocess.run", return_value=mock_result):
+        result = _dir_to_listing(project, str(project))
+
+    assert ".pre-commit-config.yaml" in result
+    assert ".gitignore" in result
+    assert ".github/workflows/test.yml" in result
+    assert "main.py" in result
+    # .git internals should never appear (none created here, but guard is correct)
+
+
+def test_resource_to_codeblock_directory(tmp_path):
+    """Test that _resource_to_codeblock handles directories."""
+    from gptme.util.context import _resource_to_codeblock
+
+    subdir = tmp_path / "mydir"
+    subdir.mkdir()
+    (subdir / "file.txt").write_text("content")
+
+    result = _resource_to_codeblock(str(subdir))
+    assert result is not None
+    assert "file.txt" in result
+
+
+def test_include_paths_directory(tmp_path, monkeypatch):
+    """Test that include_paths expands directory references."""
+    from gptme.util.context import include_paths
+
+    # Create a directory with files
+    subdir = tmp_path / "src"
+    subdir.mkdir()
+    (subdir / "main.py").write_text("print('hello')")
+    (subdir / "utils.py").write_text("def helper(): pass")
+
+    monkeypatch.chdir(tmp_path)
+    msg = Message("user", f"review the code in {subdir}")
+    result = include_paths(msg)
+
+    assert "main.py" in result.content
+    assert "utils.py" in result.content
+
+
 def test_is_interactive_mode():
     """Test interactive mode detection."""
     from gptme.util.context import _is_interactive_mode

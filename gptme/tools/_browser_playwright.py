@@ -12,20 +12,38 @@ from dataclasses import dataclass
 from pathlib import Path
 from typing import TypeVar
 
-from playwright.sync_api import Browser, ElementHandle
+from playwright.sync_api import (
+    Browser,
+    BrowserContext,
+    ElementHandle,
+    Page,
+)
+from playwright.sync_api import (
+    TimeoutError as PlaywrightTimeoutError,
+)
 
+from ._browser_format import format_snapshot as _format_snapshot
 from ._browser_thread import BrowserThread, _is_connection_error
 
 _browser: BrowserThread | None = None
 _last_logs: dict = {"logs": [], "errors": [], "url": None}
+# Persistent page state for interactive browsing (open_page/click/fill/scroll)
+_current_page: Page | None = None
+_current_context: BrowserContext | None = None
 logger = logging.getLogger(__name__)
 
 
 def _restart_browser() -> None:
     """Restart the browser by resetting the global instance"""
 
-    global _browser
+    global _browser, _current_page, _current_context
     start_time = time.time()
+
+    # Clear persistent page globals — after a restart, old Page/BrowserContext objects
+    # are dead. Resetting here ensures callers get a clear "no page open" error rather
+    # than silently failing with a low-level Playwright "Target closed" error.
+    _current_page = None
+    _current_context = None
 
     if _browser is not None:
         try:
@@ -335,6 +353,218 @@ def _list_results_duckduckgo(page) -> str:
             desc = result.query_selector("span").inner_text().strip().split("\n")[0]
             hits.append(SearchResult(title, url, desc))
     return titleurl_to_list(hits)
+
+
+def _get_aria_snapshot(browser: Browser, url: str) -> str:
+    """Load a page and return its ARIA accessibility snapshot."""
+    context = browser.new_context(
+        locale="en-US",
+    )
+    page = context.new_page()
+    try:
+        page.goto(
+            url
+        )  # waits for "load" state by default; networkidle can hang on SPAs/analytics
+        snapshot = page.locator("body").aria_snapshot()
+        if not snapshot:
+            return "Error: Could not get accessibility snapshot for this page."
+        return _format_snapshot(snapshot, page.url, page.title())
+    finally:
+        page.close()
+        context.close()
+
+
+def aria_snapshot(url: str) -> str:
+    """Get the ARIA accessibility snapshot of a webpage."""
+    logger.info(f"Getting ARIA snapshot of '{url}'")
+    return _execute_with_retry(_get_aria_snapshot, url)
+
+
+# --- Interactive browser functions (persistent page state) ---
+
+
+def _close_current_page() -> None:
+    """Close the current persistent page and context if open."""
+    global _current_page, _current_context
+    if _current_page is not None:
+        try:
+            _current_page.close()
+        except Exception:
+            pass
+        _current_page = None
+    if _current_context is not None:
+        try:
+            _current_context.close()
+        except Exception:
+            pass
+        _current_context = None
+
+
+def _page_snapshot() -> str:
+    """Get ARIA snapshot of the current persistent page."""
+    if _current_page is None:
+        raise RuntimeError("No page is currently open")
+    snapshot = _current_page.locator("body").aria_snapshot()
+    if not snapshot:
+        raise RuntimeError("Could not get accessibility snapshot.")
+    return _format_snapshot(snapshot, _current_page.url, _current_page.title())
+
+
+def _read_page_text(browser: Browser) -> str:
+    """Read the text content of the current persistent page as Markdown."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    body_html = _current_page.inner_html("body")
+    return html_to_markdown(body_html)
+
+
+def read_page_text() -> str:
+    """Read the full text content of the current interactive page as Markdown.
+
+    Returns the page content converted to Markdown, preserving text formatting.
+    Useful for reading article text, documentation, or other content after
+    navigating with open_page()/click_element().
+    """
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    logger.info("Reading text content of current page")
+    return _execute_with_retry(_read_page_text)
+
+
+def _open_page(browser: Browser, url: str) -> str:
+    """Open a page for interactive browsing and return its ARIA snapshot."""
+    global _current_page, _current_context
+    _close_current_page()
+
+    _current_context = browser.new_context(
+        locale="en-US",
+        geolocation={"latitude": 37.773972, "longitude": 13.39},
+        permissions=["geolocation"],
+        extra_http_headers={
+            "Accept": "text/markdown, text/plain, text/html;q=0.9, */*;q=0.8"
+        },
+    )
+    _current_page = _current_context.new_page()
+
+    try:
+        _current_page.goto(url)
+    except Exception as e:
+        _close_current_page()
+        raise RuntimeError(f"Failed to navigate to {url}: {e}") from e
+
+    return _page_snapshot()
+
+
+def _do_close_page(browser: Browser) -> str:
+    """Close the current page on the browser thread."""
+    _close_current_page()
+    return "Page closed."
+
+
+def close_page() -> str:
+    """Close the current interactive browsing page."""
+    if _current_page is None:
+        return "No page is currently open."
+    return _execute_with_retry(_do_close_page)
+
+
+def open_page(url: str) -> str:
+    """Open a page for interactive browsing. Returns ARIA accessibility snapshot.
+
+    Use this instead of read_url() when you need to interact with the page
+    (click buttons, fill forms, scroll). The page stays open for subsequent
+    click_element(), fill_element(), and scroll_page() calls.
+    """
+    logger.info(f"Opening page for interaction: '{url}'")
+    return _execute_with_retry(_open_page, url)
+
+
+def _click(browser: Browser, selector: str) -> str:
+    """Click an element on the current page."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    _current_page.locator(selector).click(timeout=10000)
+    # Wait for page to settle after click (navigation or dynamic update)
+    try:
+        _current_page.wait_for_load_state("domcontentloaded", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass  # Timeout is fine — page may not navigate
+    return _page_snapshot()
+
+
+def click_element(selector: str) -> str:
+    """Click an element on the current page and return updated ARIA snapshot.
+
+    Args:
+        selector: Playwright selector to find the element. Supports:
+            - CSS: "#submit-btn", ".nav-link", "button"
+            - Text: "text=Submit", "text=Log in"
+            - Role: "role=button[name='Submit']"
+            - Chained: "form >> text=Submit"
+
+    Note:
+        Links with ``target="_blank"`` open a new tab, but ``_current_page`` is not
+        updated to point to it. The returned snapshot reflects the *original* tab.
+    """
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    logger.info(f"Clicking element: '{selector}'")
+    return _execute_with_retry(_click, selector)
+
+
+def _fill(browser: Browser, selector: str, value: str) -> str:
+    """Fill a form field on the current page."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    _current_page.locator(selector).fill(value, timeout=10000)
+    return _page_snapshot()
+
+
+def fill_element(selector: str, value: str) -> str:
+    """Fill a form field on the current page and return updated ARIA snapshot.
+
+    Clears any existing value before filling.
+
+    Args:
+        selector: Playwright selector for the input/textarea element.
+        value: Text to fill into the field.
+    """
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    logger.info(f"Filling element '{selector}' with value")
+    return _execute_with_retry(_fill, selector, value)
+
+
+def _scroll(browser: Browser, direction: str, amount: int) -> str:
+    """Scroll the current page."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    if direction not in ("up", "down"):
+        raise ValueError(f"direction must be 'up' or 'down', got: {direction!r}")
+    if amount <= 0:
+        raise ValueError(f"amount must be positive, got: {amount!r}")
+    pixels = amount if direction == "down" else -amount
+    _current_page.mouse.wheel(0, pixels)
+    # Brief wait for lazy-loaded content
+    _current_page.wait_for_timeout(300)
+    return _page_snapshot()
+
+
+def scroll_page(direction: str = "down", amount: int = 500) -> str:
+    """Scroll the current page and return updated ARIA snapshot.
+
+    Args:
+        direction: "up" or "down" (default: "down")
+        amount: Pixels to scroll — must be positive (default: 500)
+    """
+    if direction not in ("up", "down"):
+        raise ValueError(f"direction must be 'up' or 'down', got: {direction!r}")
+    if amount <= 0:
+        raise ValueError(f"amount must be positive, got: {amount!r}")
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    logger.info(f"Scrolling {direction} by {amount}px")
+    return _execute_with_retry(_scroll, direction, amount)
 
 
 def _take_screenshot(

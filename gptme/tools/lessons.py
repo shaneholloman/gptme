@@ -12,6 +12,7 @@ Commands provided:
 - ``/lesson refresh`` - Reload lessons from disk
 """
 
+import importlib
 import logging
 from collections.abc import Generator
 from contextvars import ContextVar
@@ -39,13 +40,12 @@ def _get_ace_components() -> tuple[type | None, type | None]:
         Tuple of (LessonEmbedder class, GptmeHybridMatcher class), or (None, None) if unavailable.
     """
     try:
-        from ace.embedder import LessonEmbedder  # type: ignore[import-not-found]
-        from ace.gptme_integration import (  # type: ignore[import-not-found]
-            GptmeHybridMatcher,
-        )
-
+        _embedder_mod = importlib.import_module("ace.embedder")
+        _integration_mod = importlib.import_module("ace.gptme_integration")
+        LessonEmbedder = _embedder_mod.LessonEmbedder
+        GptmeHybridMatcher = _integration_mod.GptmeHybridMatcher
         return LessonEmbedder, GptmeHybridMatcher
-    except ImportError:
+    except (ImportError, AttributeError):
         logger.debug("ACE not available - sentence-transformers not installed")
         return None, None
 

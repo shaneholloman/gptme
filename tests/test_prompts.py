@@ -145,3 +145,142 @@ files = ["../outside/secret.txt", "README.md"]
         "secret.txt should NOT be attached (path traversal)"
     )
     assert "../outside/secret.txt" not in content, "Path traversal should be blocked"
+
+
+def test_workspace_git_status_in_git_repo(tmp_path):
+    """Test that git status is included in workspace prompt for git repos."""
+    import subprocess
+
+    from gptme.prompts.workspace import _get_git_status
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+
+    # Initialize a git repo on a test branch (avoids master-protection hooks)
+    subprocess.run(
+        ["git", "init", "-b", "test-branch"],
+        cwd=workspace,
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=workspace,
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=workspace,
+        capture_output=True,
+        check=True,
+    )
+
+    # Clean repo (no commits yet, but git status should still work)
+    result = _get_git_status(workspace)
+    assert result is not None
+    assert "Branch" in result
+
+    # Add a file and check status shows it
+    (workspace / "hello.txt").write_text("hello")
+    result = _get_git_status(workspace)
+    assert result is not None
+    assert "hello.txt" in result
+    assert "Branch" in result
+
+    # Commit and verify clean status
+    subprocess.run(
+        ["git", "add", "hello.txt"], cwd=workspace, capture_output=True, check=True
+    )
+    subprocess.run(
+        ["git", "commit", "-m", "init", "--no-verify"],
+        cwd=workspace,
+        capture_output=True,
+        check=True,
+    )
+    result = _get_git_status(workspace)
+    assert result is not None
+    assert "(clean)" in result
+    assert "test-branch" in result
+
+
+def test_dynamic_context_after_static(tmp_path):
+    """Test that context_cmd output comes after static workspace content.
+
+    This ordering improves prompt caching: static/semi-static content first
+    (cacheable prefix), dynamic context last (changes every session).
+    """
+    from gptme.prompts import get_prompt
+
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# Test Project")
+    (workspace / "gptme.toml").write_text(
+        '[prompt]\nfiles = ["README.md"]\ncontext_cmd = "echo DYNAMIC_MARKER_123"\n'
+    )
+
+    msgs = get_prompt(
+        get_tools(),
+        prompt="full",
+        workspace=workspace,
+    )
+
+    # Find the indices of workspace file content and dynamic context
+    file_idx = None
+    dynamic_idx = None
+    for i, msg in enumerate(msgs):
+        if "README.md" in msg.content:
+            file_idx = i
+        if "DYNAMIC_MARKER_123" in msg.content:
+            dynamic_idx = i
+
+    assert file_idx is not None, "Should include workspace files"
+    assert dynamic_idx is not None, "Should include context_cmd output"
+    assert dynamic_idx > file_idx, (
+        f"Dynamic context (msg {dynamic_idx}) should come after "
+        f"static workspace files (msg {file_idx})"
+    )
+
+
+def test_workspace_git_status_not_git_repo(tmp_path):
+    """Test that git status returns None for non-git directories."""
+    from gptme.prompts.workspace import _get_git_status
+
+    result = _get_git_status(tmp_path)
+    assert result is None
+
+
+def test_workspace_git_status_in_prompt(tmp_path):
+    """Test that git status section appears in workspace prompt messages."""
+    import subprocess
+
+    from gptme.prompts import prompt_workspace
+
+    workspace = tmp_path / "repo"
+    workspace.mkdir()
+    subprocess.run(
+        ["git", "init", "-b", "test-branch"],
+        cwd=workspace,
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.email", "test@test.com"],
+        cwd=workspace,
+        capture_output=True,
+        check=True,
+    )
+    subprocess.run(
+        ["git", "config", "user.name", "Test"],
+        cwd=workspace,
+        capture_output=True,
+        check=True,
+    )
+
+    # Add an untracked file so status shows something
+    (workspace / "README.md").write_text("# Test")
+
+    msgs = list(prompt_workspace(workspace))
+    content = "\n".join(msg.content for msg in msgs)
+    assert "Git Status" in content
+    assert "Branch" in content

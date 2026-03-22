@@ -3,6 +3,7 @@ import logging
 import shutil
 import sys
 import textwrap
+from collections.abc import Iterable
 from dataclasses import dataclass, field
 from datetime import datetime
 from typing import Literal, TypedDict
@@ -87,11 +88,11 @@ def _migrate_metadata(meta: dict) -> MessageMetadata:
     if "usage" in meta or not any(k in meta for k in _TOKEN_KEYS):
         return MessageMetadata(**meta)
 
-    usage: UsageData = {}
+    usage: dict[str, int] = {}
     remaining: dict = {}
     for k, v in meta.items():
         if k in _TOKEN_KEYS:
-            usage[k] = v  # type: ignore[literal-required]
+            usage[k] = v
         else:
             remaining[k] = v
     if usage:
@@ -489,7 +490,7 @@ def print_msg(
         )
 
 
-def msgs_to_toml(msgs: list[Message]) -> str:
+def msgs_to_toml(msgs: Iterable[Message]) -> str:
     """Converts a list of messages to a TOML string, for easy editing by hand in editor to then be parsed back."""
     t = ""
     for msg in msgs:

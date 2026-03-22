@@ -8,8 +8,15 @@ playwright = pytest.importorskip("playwright")
 # noreorder
 from gptme.tools.browser import (  # fmt: skip
     _available_search_engines,
+    click_element,
+    close_page,
+    fill_element,
+    open_page,
+    read_page_text,
     read_url,
+    scroll_page,
     search,
+    snapshot_url,
 )
 
 
@@ -22,6 +29,27 @@ def test_read_url_with_links():
 
     # check that link to activitywatch is present
     assert "https://activitywatch.net/" in s
+
+
+@pytest.mark.slow
+def test_snapshot_url():
+    """Test ARIA accessibility snapshot of a webpage."""
+    snapshot = snapshot_url("https://example.com")
+
+    # Should return non-empty string
+    assert snapshot, "Snapshot should not be empty"
+    assert len(snapshot) > 50, f"Snapshot too short: {len(snapshot)} chars"
+
+    # Should contain page metadata header
+    assert snapshot.startswith("Page: "), "Snapshot should start with page metadata"
+    assert "URL: " in snapshot, "Snapshot should include current URL"
+
+    # Should contain typical ARIA elements
+    # example.com has a heading and a link
+    assert "Example Domain" in snapshot, "Should contain the page title/heading"
+    assert "link" in snapshot.lower() or "heading" in snapshot.lower(), (
+        "Should contain ARIA role information"
+    )
 
 
 @pytest.mark.slow
@@ -248,3 +276,95 @@ def test_pdf_vision_hint():
     assert "garbled" in content.lower() or "incomplete" in content.lower(), (
         "Missing context for when to use vision"
     )
+
+
+@pytest.mark.slow
+def test_open_page():
+    """Test opening a page for interactive browsing."""
+    snapshot = open_page("https://example.com")
+
+    # Should return ARIA snapshot with metadata
+    assert snapshot, "Snapshot should not be empty"
+    assert snapshot.startswith("Page: "), "Should include page metadata header"
+    assert "URL: " in snapshot, "Should include current URL"
+    assert "Example Domain" in snapshot, "Should contain the page title"
+
+
+@pytest.mark.slow
+def test_click_element():
+    """Test clicking an element on an open page."""
+    # Open example.com which has a link
+    open_page("https://example.com")
+
+    # Click the link using CSS selector (more reliable than text matching)
+    snapshot = click_element("a")
+    assert snapshot, "Click should return a valid snapshot"
+
+
+@pytest.mark.slow
+def test_scroll_page():
+    """Test scrolling the current page."""
+    open_page("https://example.com")
+
+    # Scroll down — should return valid snapshot
+    snapshot = scroll_page("down", 300)
+    assert snapshot, "Scroll should return a valid snapshot"
+
+
+@pytest.mark.slow
+def test_fill_element():
+    """Test filling a form field on an open page."""
+    # Use DuckDuckGo which has a simple search input
+    open_page("https://duckduckgo.com")
+
+    # Fill the search box
+    snapshot = fill_element("input[name='q']", "gptme test")
+    assert snapshot, "Fill should return a valid snapshot"
+    assert "gptme test" in snapshot, "Snapshot should reflect filled value"
+
+
+def test_click_without_open_page():
+    """Test that click_element fails gracefully without open_page."""
+    close_page()  # Ensure no page is open
+    with pytest.raises(RuntimeError, match="No page is open"):
+        click_element("#some-button")
+
+
+def test_fill_without_open_page():
+    """Test that fill_element fails gracefully without open_page."""
+    close_page()  # Ensure no page is open
+    with pytest.raises(RuntimeError, match="No page is open"):
+        fill_element("#some-input", "value")
+
+
+def test_scroll_without_open_page():
+    """Test that scroll_page fails gracefully without open_page."""
+    close_page()  # Ensure no page is open
+    with pytest.raises(RuntimeError, match="No page is open"):
+        scroll_page("down", 300)
+
+
+@pytest.mark.slow
+def test_read_page_text():
+    """Test reading text content of the current interactive page."""
+    open_page("https://example.com")
+
+    text = read_page_text()
+    assert text, "Text content should not be empty"
+    assert "Example Domain" in text, "Should contain the page heading"
+
+
+def test_read_page_text_without_open_page():
+    """Test that read_page_text fails gracefully without open_page."""
+    close_page()  # Ensure no page is open
+    with pytest.raises(RuntimeError, match="No page is open"):
+        read_page_text()
+
+
+def test_scroll_invalid_amount():
+    """Test that scroll_page raises ValueError for non-positive amount."""
+    # Argument validation runs before page-state check, so no browser needed
+    with pytest.raises(ValueError, match="amount must be positive"):
+        scroll_page("down", -100)
+    with pytest.raises(ValueError, match="amount must be positive"):
+        scroll_page("down", 0)
