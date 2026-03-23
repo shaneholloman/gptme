@@ -16,9 +16,9 @@ import click
 from click.core import ParameterSource
 
 try:
-    from pick import pick
-except ImportError:
-    pick = None  # type: ignore[assignment]
+    pick = importlib.import_module("pick").pick
+except (ImportError, AttributeError):
+    pick = None
 
 import gptme
 

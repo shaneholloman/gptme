@@ -79,7 +79,11 @@ def find_agent_files_in_tree(
     directory: Path,
     exclude: set[str] | None = None,
 ) -> list[Path]:
-    """Find AGENTS.md/CLAUDE.md/GEMINI.md files from home down to the given directory.
+    """Find agent instruction files from home down to the given directory.
+
+    Discovers instruction files from multiple AI coding tools (AGENTS.md, CLAUDE.md,
+    COPILOT.md, GEMINI.md, .github/copilot-instructions.md, .cursorrules,
+    .windsurfrules) for cross-tool compatibility.
 
     Walks from home -> directory (most general first, most specific last), checking
     each directory for agent instruction files. Returns files whose resolved paths
@@ -104,12 +108,22 @@ def find_agent_files_in_tree(
     # Reverse: most general (home) first, most specific (target) last
     dirs_to_check.reverse()
 
+    # Files authored for other AI tools — loaded for cross-tool compatibility,
+    # but users should be aware they may contain instructions not intended for gptme.
+    _cross_tool_files = frozenset({".cursorrules", ".windsurfrules"})
+
     for dir_path in dirs_to_check:
         for filename in AGENT_FILES:
             agent_file = dir_path / filename
             if agent_file.exists():
                 resolved = str(agent_file.resolve())
                 if resolved not in _exclude:
+                    if filename in _cross_tool_files:
+                        logger.debug(
+                            "Loading cross-tool instruction file %s"
+                            " (authored for a different AI tool — instructions may not be gptme-compatible)",
+                            agent_file,
+                        )
                     result.append(agent_file)
 
     return result

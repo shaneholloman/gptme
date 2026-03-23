@@ -52,6 +52,7 @@ Provider Native Search:
     This is an experimental feature. It needs some work to be more robust and useful.
 """
 
+import importlib
 import importlib.metadata
 import importlib.util
 import logging
@@ -286,12 +287,13 @@ def _convert_with_vips(
 
 # Check for Perplexity availability
 try:
-    from ._browser_perplexity import has_perplexity_key, search_perplexity  # fmt: skip
-
+    _perplexity_mod = importlib.import_module("._browser_perplexity", __package__)
+    has_perplexity_key = _perplexity_mod.has_perplexity_key
+    search_perplexity = _perplexity_mod.search_perplexity
     has_perplexity = has_perplexity_key()
-except ImportError:
+except (ImportError, AttributeError):
     has_perplexity = False
-    search_perplexity = None  # type: ignore[assignment]
+    search_perplexity = None
 
 # noreorder
 if browser == "playwright":

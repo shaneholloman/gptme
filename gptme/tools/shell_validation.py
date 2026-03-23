@@ -7,6 +7,7 @@ quote/heredoc parsing helpers for safe command execution.
 import logging
 import os
 import re
+import shlex
 import shutil
 import subprocess
 import tempfile
@@ -288,13 +289,19 @@ def is_allowlisted(cmd: str) -> bool:
 
     # Check for dangerous flags within allowlisted commands
     # These are rare exceptions where an allowlisted command has dangerous dual-use flags
-    dangerous_patterns = [
+    # Uses token-based matching (not substring) to avoid false positives like
+    # -executable being caught by -exec
+    dangerous_flags = {
         "-exec",  # find -exec can execute arbitrary commands
         "-execdir",  # find -execdir can execute arbitrary commands in target dir
         "-delete",  # find -delete can delete files
         "-ok",  # find -ok prompts but can be automated
-    ]
-    return all(pattern not in cmd for pattern in dangerous_patterns)
+    }
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        tokens = cmd.split()
+    return not any(token in dangerous_flags for token in tokens)
 
 
 def is_denylisted(cmd: str) -> tuple[bool, str | None, str | None]:
