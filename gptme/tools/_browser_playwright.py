@@ -145,10 +145,125 @@ def _load_page(browser: Browser, url: str) -> str:
     _last_logs = {"logs": logs, "errors": page_errors, "url": url}
 
     try:
-        return page.inner_html("body")
+        # Try to extract main content area first, falling back to body
+        html = _extract_main_content(page)
+        return html
     finally:
         page.close()
         context.close()
+
+
+def _extract_main_content(page: Page) -> str:
+    """Extract main content from a page, stripping noise like nav, sidebar, footer.
+
+    This reduces token waste and improves LLM consumption by focusing on actual content.
+    """
+    # Selectors for main content areas (in priority order)
+    content_selectors = [
+        "main",
+        "[role='main']",
+        "article",
+        # GitHub-specific
+        ".markdown-body",
+        ".blob-wrapper",
+        # Generic
+        ".content-body",
+        "#content",
+        ".main-content",
+        ".article-content",
+        # GitHub SPA containers
+        "#repo-content-pjax-container",
+        ".repository-content",
+        "[data-pjax-container]",
+    ]
+
+    # Selectors for noise elements to remove when falling back to body
+    noise_selectors = [
+        "nav",
+        "header:not(article header)",
+        "footer",
+        "aside",
+        ".sidebar",
+        ".navigation",
+        ".nav",
+        ".menu",
+        ".header",
+        ".footer",
+        ".toc",
+        ".table-of-contents",
+        "script",
+        "style",
+        "noscript",
+        ".clipboard-copy",
+        ".share-button",
+        ".social-share",
+        "[aria-hidden='true']",
+        # GitHub noise
+        ".gh-header",
+        ".repohead",
+        ".file-navigation",
+        ".BtnGroup",
+        ".d-none",
+        "[data-hide-on-error]",
+    ]
+
+    # Find the first matching content selector
+    main_content = None
+    found_content_selector = False
+    for selector in content_selectors:
+        try:
+            elem = page.query_selector(selector)
+            if elem and elem.inner_text().strip():
+                main_content = elem
+                found_content_selector = True
+                logger.debug(f"Found main content with selector: {selector}")
+                break
+        except Exception:
+            continue
+
+    # For SPAs: if nothing found yet, wait briefly and retry
+    if not found_content_selector:
+        try:
+            page.wait_for_timeout(1000)
+        except Exception:
+            pass
+        for selector in content_selectors:
+            try:
+                elem = page.query_selector(selector)
+                if elem and elem.inner_text().strip():
+                    main_content = elem
+                    found_content_selector = True
+                    logger.debug(f"Found content after wait with selector: {selector}")
+                    break
+            except Exception:
+                continue
+
+    if main_content is None:
+        # Fall back to body
+        main_content = page.query_selector("body")
+        logger.debug("No main content selector found, using body")
+
+    if main_content is None:
+        return ""
+
+    # If we found a dedicated content selector, return that directly (already clean)
+    if found_content_selector:
+        return main_content.inner_html()
+
+    # Fell back to body: strip noise elements first
+    for selector in noise_selectors:
+        try:
+            page.evaluate(
+                "(selector) => document.querySelectorAll(selector).forEach((el) => el.remove())",
+                selector,
+            )
+        except Exception:
+            pass
+    try:
+        return page.inner_html("body")
+    except Exception as e:
+        logger.warning(f"Error getting body after noise removal: {e}")
+        return main_content.inner_html()
 
 
 def read_url(url: str) -> str:

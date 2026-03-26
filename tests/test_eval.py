@@ -1,7 +1,9 @@
 import importlib
+import json
 import os
 import subprocess
 import sys
+from pathlib import Path
 from typing import TYPE_CHECKING, cast
 from unittest.mock import patch
 
@@ -11,9 +13,10 @@ from click.testing import CliRunner
 from gptme.config import get_config
 from gptme.eval import execute, tests
 from gptme.eval.agents import Agent, GPTMe
-from gptme.eval.main import main
+from gptme.eval.main import main, results_to_json
 from gptme.eval.run import ProcessError, SyncedDict, act_process
 from gptme.eval.suites import suites, tests_map
+from gptme.eval.types import CaseResult, EvalResult, ModelConfig
 
 # importlib.import_module returns the actual module object from sys.modules,
 # not the 'main' Click-command attribute exposed via gptme/eval/__init__.py.
@@ -53,6 +56,40 @@ def test_no_duplicate_test_names():
     )
 
 
+def test_suite_autodiscovery():
+    """Verify auto-discovery finds all practical suites and preserves ordering."""
+    # All practical suites should be discovered
+    practical_suites = [name for name in suites if name.startswith("practical")]
+    assert len(practical_suites) >= 14, (
+        f"Expected at least 14 practical suites, got {len(practical_suites)}: {practical_suites}"
+    )
+
+    # Verify numeric ordering for the first 14 suites
+    expected_prefix = ["practical"] + [f"practical{i}" for i in range(2, 15)]
+    assert practical_suites[:14] == expected_prefix, (
+        f"Practical suites not in expected order.\n"
+        f"  Expected prefix: {expected_prefix}\n"
+        f"  Got:             {practical_suites}"
+    )
+    # Any suites beyond 14 should also follow the same numeric pattern
+    for i, name in enumerate(practical_suites[14:], start=15):
+        assert name == f"practical{i}", f"Unexpected suite at position {i}: {name!r}"
+
+    # Core suites should always be present
+    for core_suite in ("basic", "init_projects", "browser"):
+        assert core_suite in suites, f"Core suite '{core_suite}' missing"
+
+    # Every suite should have at least one test
+    for name, suite_tests in suites.items():
+        assert len(suite_tests) > 0, f"Suite '{name}' has no tests"
+
+    # Verify total test count matches flattened list
+    total_from_suites = sum(len(t) for t in suites.values())
+    assert len(tests) == total_from_suites, (
+        f"Flattened tests ({len(tests)}) != sum of suites ({total_from_suites})"
+    )
+
+
 def test_list_tests():
     """Test that --list prints available suites and tests."""
     runner = CliRunner()
@@ -63,6 +100,108 @@ def test_list_tests():
     assert "hello *" in result.output
     assert "Total:" in result.output
     assert "Default suite:" in result.output
+
+
+def test_list_tests_json():
+    """Test that --list --json outputs valid JSON with suite info."""
+    runner = CliRunner()
+    result = runner.invoke(main, ["--list", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert "suites" in data
+    assert "total_tests" in data
+    assert "default_suite" in data
+    assert len(data["suites"]) > 0
+    # Check suite structure
+    suite = data["suites"][0]
+    assert "name" in suite
+    assert "tests" in suite
+    assert len(suite["tests"]) > 0
+    # Check test structure
+    test = suite["tests"][0]
+    assert "name" in test
+    assert "default" in test
+
+
+def test_results_to_json():
+    """Test that results_to_json produces valid, well-structured output."""
+    config = ModelConfig(model="test-model", tool_format="markdown")
+    results = [
+        EvalResult(
+            name="test-hello",
+            status="success",
+            results=[
+                CaseResult(name="check_output", passed=True, duration=1.5),
+                CaseResult(name="check_file", passed=False, duration=0.3),
+            ],
+            timings={"gen": 5.0, "run": 1.0, "eval": 0.5},
+            gen_stdout="output",
+            gen_stderr="",
+            run_stdout="result",
+            run_stderr="",
+            log_dir=Path("/tmp/log"),
+            workspace_dir=Path("/tmp/ws"),
+        ),
+    ]
+    data = results_to_json({config: results}, commit_hash="abc123")
+
+    assert data["commit"] == "abc123"
+    assert "timestamp" in data
+    assert len(data["models"]) == 1
+
+    model_data = data["models"][0]
+    assert model_data["model"] == "test-model"
+    assert model_data["tool_format"] == "markdown"
+    assert model_data["total"] == 1
+    assert model_data["passed"] == 0  # not all cases passed
+    assert model_data["pass_rate"] == 0.0
+
+    result_data = model_data["results"][0]
+    assert result_data["name"] == "test-hello"
+    assert result_data["status"] == "success"
+    assert result_data["passed"] is False  # one case failed
+    assert len(result_data["cases"]) == 2
+    assert result_data["cases"][0]["passed"] is True
+    assert result_data["timings"]["gen"] == 5.0
+
+    # Verify JSON-serializable
+    json_str = json.dumps(data)
+    assert json.loads(json_str) == data
+
+
+def test_results_to_json_all_passing():
+    """Test pass rate calculation when all cases pass."""
+    config = ModelConfig(model="good-model", tool_format="tool")
+    results = [
+        EvalResult(
+            name="test-1",
+            status="success",
+            results=[CaseResult(name="c1", passed=True, duration=1.0)],
+            timings={"gen": 1.0, "run": 0.5, "eval": 0.1},
+            gen_stdout="",
+            gen_stderr="",
+            run_stdout="",
+            run_stderr="",
+            log_dir=Path("/tmp/log"),
+            workspace_dir=Path("/tmp/ws"),
+        ),
+        EvalResult(
+            name="test-2",
+            status="success",
+            results=[CaseResult(name="c1", passed=True, duration=1.0)],
+            timings={"gen": 1.0, "run": 0.5, "eval": 0.1},
+            gen_stdout="",
+            gen_stderr="",
+            run_stdout="",
+            run_stderr="",
+            log_dir=Path("/tmp/log"),
+            workspace_dir=Path("/tmp/ws"),
+        ),
+    ]
+    data = results_to_json({config: results})
+    assert data["models"][0]["pass_rate"] == 1.0
+    assert data["models"][0]["passed"] == 2
+    assert data["models"][0]["total"] == 2
 
 
 def test_eval_module_loading(tmp_path):

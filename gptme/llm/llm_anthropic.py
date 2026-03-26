@@ -19,6 +19,7 @@ from ..constants import TEMPERATURE, TOP_P
 from ..message import Message, MessageMetadata, UsageData, msgs2dicts
 from ..telemetry import record_llm_request
 from ..tools.base import ToolSpec
+from .constants import _MIN_RESPONSE_TOKENS
 from .models import ModelMeta, get_model
 from .utils import (
     apply_cache_control,
@@ -156,6 +157,45 @@ def _record_usage(
     if cost > 0:
         metadata["cost"] = cost
     return metadata
+
+
+def _adjust_thinking_budget(
+    max_tokens: int, thinking_budget: int, use_thinking: bool
+) -> tuple[int, bool]:
+    """Clamp thinking_budget to fit within max_tokens for Anthropic's extended thinking.
+
+    Anthropic requires max_tokens > budget_tokens when extended thinking is active.
+    We honor the caller's max_tokens limit by reducing thinking_budget to fit,
+    rather than inflating max_tokens (which defeats cost-saving intent).
+
+    Always reserves at least _MIN_RESPONSE_TOKENS for the actual response;
+    disables thinking entirely when max_tokens is too small to be useful.
+    """
+    if not use_thinking or max_tokens >= thinking_budget + _MIN_RESPONSE_TOKENS:
+        return thinking_budget, use_thinking
+    new_budget = max_tokens - _MIN_RESPONSE_TOKENS
+    if new_budget <= 0:
+        # Not enough room for thinking AND a useful response — disable thinking.
+        logger.warning(
+            "max_tokens=%d is too small to accommodate thinking tokens "
+            "and a useful response (min %d tokens); "
+            "disabling extended thinking. Increase max_tokens or unset %s.",
+            max_tokens,
+            _MIN_RESPONSE_TOKENS,
+            ENV_REASONING_BUDGET,
+        )
+        return thinking_budget, False
+    logger.warning(
+        "max_tokens=%d cannot accommodate thinking_budget=%d; "
+        "reducing thinking_budget to %d (reserving %d tokens for response). "
+        "Set %s to a smaller value to avoid this.",
+        max_tokens,
+        thinking_budget,
+        new_budget,
+        _MIN_RESPONSE_TOKENS,
+        ENV_REASONING_BUDGET,
+    )
+    return new_budget, use_thinking
 
 
 def _should_use_thinking(model_meta: ModelMeta, tools: list[ToolSpec] | None) -> bool:
@@ -364,6 +404,7 @@ def chat(
     model: str,
     tools: list[ToolSpec] | None,
     output_schema: type[BaseModel] | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[str, MessageMetadata | None]:
     from anthropic import NOT_GIVEN  # fmt: skip
 
@@ -408,7 +449,12 @@ def chat(
             f"Invalid {ENV_REASONING_BUDGET} value: {thinking_budget_str!r}. "
             "Must be a valid integer."
         ) from parse_err
-    max_tokens = model_meta.max_output or 4096
+    max_tokens = (
+        max_tokens if max_tokens is not None else (model_meta.max_output or 4096)
+    )
+    thinking_budget, use_thinking = _adjust_thinking_budget(
+        max_tokens, thinking_budget, use_thinking
+    )
 
     response = _anthropic.messages.create(
         model=api_model,
@@ -454,6 +500,7 @@ def stream(
     model: str,
     tools: list[ToolSpec] | None,
     output_schema: type[BaseModel] | None = None,
+    max_tokens: int | None = None,
 ) -> Generator[str, None, MessageMetadata | None]:
     import anthropic.types  # fmt: skip
     from anthropic import NOT_GIVEN  # fmt: skip
@@ -506,7 +553,12 @@ def stream(
             f"Invalid {ENV_REASONING_BUDGET} value: {thinking_budget_str!r}. "
             "Must be a valid integer."
         ) from parse_err
-    max_tokens = model_meta.max_output or 4096
+    max_tokens = (
+        max_tokens if max_tokens is not None else (model_meta.max_output or 4096)
+    )
+    thinking_budget, use_thinking = _adjust_thinking_budget(
+        max_tokens, thinking_budget, use_thinking
+    )
 
     with _anthropic.messages.stream(
         model=api_model,

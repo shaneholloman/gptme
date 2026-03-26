@@ -1,21 +1,21 @@
-"""Tests for the eval leaderboard aggregation script."""
+"""Tests for the eval leaderboard aggregation module."""
 
 import csv
-
-# Add scripts to path so we can import the module
-import sys
+import json
 from pathlib import Path
 
 import pytest
 
-sys.path.insert(0, str(Path(__file__).parent.parent / "scripts"))
-
-from eval_leaderboard import (
+from gptme.eval.leaderboard import (
     aggregate_results,
     format_csv_table,
+    format_html_page,
+    format_json,
     format_markdown_table,
     format_rst_table,
+    generate_leaderboard,
     load_results,
+    main,
     normalize_model,
     parse_model_format,
 )
@@ -46,6 +46,8 @@ def test_normalize_model():
     """Known models get human-readable names."""
     assert normalize_model("openai/gpt-4o") == "GPT-4o"
     assert normalize_model("anthropic/claude-sonnet-4-20250514") == "Claude Sonnet 4"
+    assert normalize_model("anthropic/claude-sonnet-4-5") == "Claude Sonnet 4.5"
+    assert normalize_model("openrouter/openai/gpt-4o-mini") == "GPT-4o Mini (OR)"
     # Unknown models pass through unchanged
     assert normalize_model("some/unknown-model") == "some/unknown-model"
 
@@ -406,3 +408,268 @@ def test_suite_classification(tmp_path):
     assert ranked[0]["basic_total"] == 3
     assert ranked[0]["practical_passed"] == 1
     assert ranked[0]["practical_total"] == 2
+
+
+def test_format_json(tmp_path):
+    """JSON output format produces valid JSON with expected structure."""
+    _create_eval_results(
+        tmp_path,
+        [
+            {
+                "dir": "run1",
+                "rows": [
+                    ("openai/gpt-4o", "markdown", "hello", "true"),
+                    ("openai/gpt-4o", "markdown", "prime100", "true"),
+                    ("openai/gpt-4o", "markdown", "build-api", "false"),
+                    ("openai/gpt-4o", "markdown", "hello-patch", "true"),
+                ],
+            }
+        ],
+    )
+    results = load_results(tmp_path)
+    ranked = aggregate_results(results, min_tests=3)
+    output = format_json(ranked)
+    data = json.loads(output)
+    assert "models" in data
+    assert len(data["models"]) == 1
+    model = data["models"][0]
+    assert model["model"] == "openai/gpt-4o"
+    assert model["display_name"] == "GPT-4o"
+    assert model["format"] == "markdown"
+    assert model["pass_rate"] == 0.75
+    assert model["total_passed"] == 3
+    assert model["total_tests"] == 4
+    assert model["basic"]["passed"] == 3
+    assert model["basic"]["total"] == 3
+    assert model["practical"]["passed"] == 0
+    assert model["practical"]["total"] == 1
+
+
+def test_generate_leaderboard_markdown(tmp_path):
+    """generate_leaderboard() produces markdown output."""
+    _create_eval_results(
+        tmp_path,
+        [
+            {
+                "dir": "run1",
+                "rows": [
+                    ("openai/gpt-4o", "tool", "hello", "true"),
+                    ("openai/gpt-4o", "tool", "prime100", "true"),
+                    ("openai/gpt-4o", "tool", "fix-bug", "true"),
+                    ("openai/gpt-4o", "tool", "hello-patch", "false"),
+                ],
+            }
+        ],
+    )
+    output = generate_leaderboard(
+        results_dir=tmp_path,
+        output_format="markdown",
+        min_tests=3,
+    )
+    assert "| GPT-4o |" in output
+    assert "3/4" in output
+
+
+def test_generate_leaderboard_json(tmp_path):
+    """generate_leaderboard() produces valid JSON output."""
+    _create_eval_results(
+        tmp_path,
+        [
+            {
+                "dir": "run1",
+                "rows": [
+                    ("openai/gpt-4o", "tool", "hello", "true"),
+                    ("openai/gpt-4o", "tool", "prime100", "true"),
+                    ("openai/gpt-4o", "tool", "fix-bug", "false"),
+                    ("openai/gpt-4o", "tool", "hello-patch", "true"),
+                ],
+            }
+        ],
+    )
+    output = generate_leaderboard(
+        results_dir=tmp_path,
+        output_format="json",
+        min_tests=3,
+    )
+    data = json.loads(output)
+    assert data["models"][0]["pass_rate"] == 0.75
+
+
+def test_generate_leaderboard_invalid_format(tmp_path):
+    """generate_leaderboard() raises ValueError for unknown format strings."""
+    _create_eval_results(
+        tmp_path,
+        [
+            {
+                "dir": "run1",
+                "rows": [
+                    ("openai/gpt-4o", "tool", "hello", "true"),
+                    ("openai/gpt-4o", "tool", "prime100", "true"),
+                    ("openai/gpt-4o", "tool", "fix-bug", "false"),
+                    ("openai/gpt-4o", "tool", "hello-patch", "true"),
+                ],
+            }
+        ],
+    )
+    with pytest.raises(ValueError, match="Unknown format"):
+        generate_leaderboard(
+            results_dir=tmp_path,
+            output_format="xml",
+            min_tests=3,
+        )
+
+
+def test_format_html_page(tmp_path):
+    """HTML output produces a self-contained page with expected structure."""
+    _create_eval_results(
+        tmp_path,
+        [
+            {
+                "dir": "run1",
+                "rows": [
+                    ("openai/gpt-4o", "markdown", "hello", "true"),
+                    ("openai/gpt-4o", "markdown", "prime100", "true"),
+                    ("openai/gpt-4o", "markdown", "hello-patch", "false"),
+                    ("openai/gpt-4o", "markdown", "hello-ask", "true"),
+                    ("anthropic/claude-sonnet-4-20250514", "tool", "hello", "true"),
+                    ("anthropic/claude-sonnet-4-20250514", "tool", "prime100", "true"),
+                    (
+                        "anthropic/claude-sonnet-4-20250514",
+                        "tool",
+                        "hello-patch",
+                        "true",
+                    ),
+                    ("anthropic/claude-sonnet-4-20250514", "tool", "hello-ask", "true"),
+                ],
+            }
+        ],
+    )
+    results = load_results(tmp_path)
+    ranked = aggregate_results(results, min_tests=3)
+    html = format_html_page(ranked)
+    # Valid HTML structure
+    assert "<!DOCTYPE html>" in html
+    assert "<title>gptme Eval Leaderboard</title>" in html
+    assert "</html>" in html
+    # Contains model names (normalized)
+    assert "GPT-4o" in html
+    assert "Claude Sonnet 4" in html
+    # Contains pass rate badges
+    assert "badge-green" in html
+    # Contains ranking numbers
+    assert "<td class='rank'>1</td>" in html
+    assert "<td class='rank'>2</td>" in html
+    # Claude should be #1 (100% > 75%)
+    assert html.index("Claude Sonnet 4") < html.index("GPT-4o")
+
+
+def test_format_html_escapes_model_names(tmp_path):
+    """HTML output escapes special characters in model names."""
+    _create_eval_results(
+        tmp_path,
+        [
+            {
+                "dir": "run1",
+                "rows": [
+                    ("some/<script>evil</script>", "tool", f"test-{i}", "true")
+                    for i in range(5)
+                ],
+            }
+        ],
+    )
+    results = load_results(tmp_path)
+    ranked = aggregate_results(results, min_tests=3)
+    html = format_html_page(ranked)
+    assert "<script>" not in html
+    assert "&lt;script&gt;" in html
+
+
+def test_main_graceful_on_missing_results(tmp_path, capsys, monkeypatch):
+    """CLI main() prints placeholder instead of crashing when no results exist."""
+    monkeypatch.setattr(
+        "sys.argv",
+        [
+            "leaderboard",
+            "--results-dir",
+            str(tmp_path / "nonexistent"),
+            "--format",
+            "rst",
+        ],
+    )
+    # main() should not raise or sys.exit
+    main()
+    captured = capsys.readouterr()
+    assert "No eval results available" in captured.out
+
+
+def test_generate_leaderboard_html(tmp_path):
+    """generate_leaderboard() with html format produces valid HTML."""
+    _create_eval_results(
+        tmp_path,
+        [
+            {
+                "dir": "run1",
+                "rows": [
+                    ("openai/gpt-4o", "tool", "hello", "true"),
+                    ("openai/gpt-4o", "tool", "prime100", "true"),
+                    ("openai/gpt-4o", "tool", "fix-bug", "true"),
+                    ("openai/gpt-4o", "tool", "hello-patch", "false"),
+                ],
+            }
+        ],
+    )
+    output = generate_leaderboard(
+        results_dir=tmp_path,
+        output_format="html",
+        min_tests=3,
+    )
+    assert "<!DOCTYPE html>" in output
+    assert "GPT-4o" in output
+    assert "gptme Eval Leaderboard" in output
+
+
+def test_practical_tests_sync():
+    """PRACTICAL_TESTS set stays in sync with actual practical suite definitions.
+
+    If this test fails, a new practical suite was added but its test names
+    weren't added to PRACTICAL_TESTS in leaderboard.py.
+    """
+    from gptme.eval.leaderboard import BASIC_TESTS, PRACTICAL_TESTS
+    from gptme.eval.suites import suites
+
+    # Collect test names from all practical suites
+    actual_practical = set()
+    for suite_name, suite_tests in suites.items():
+        if suite_name.startswith("practical"):
+            for test in suite_tests:
+                actual_practical.add(test["name"])
+
+    # Collect test names from basic suite
+    actual_basic = set()
+    for test in suites.get("basic", []):
+        actual_basic.add(test["name"])
+
+    missing_practical = actual_practical - PRACTICAL_TESTS
+    extra_practical = PRACTICAL_TESTS - actual_practical
+    missing_basic = actual_basic - BASIC_TESTS
+    extra_basic = BASIC_TESTS - actual_basic
+
+    errors = []
+    if missing_practical:
+        errors.append(
+            f"Tests in practical suites but not in PRACTICAL_TESTS: {sorted(missing_practical)}"
+        )
+    if extra_practical:
+        errors.append(
+            f"Tests in PRACTICAL_TESTS but not in any practical suite: {sorted(extra_practical)}"
+        )
+    if missing_basic:
+        errors.append(
+            f"Tests in basic suite but not in BASIC_TESTS: {sorted(missing_basic)}"
+        )
+    if extra_basic:
+        errors.append(
+            f"Tests in BASIC_TESTS but not in any basic suite: {sorted(extra_basic)}"
+        )
+
+    assert not errors, "\n".join(errors)

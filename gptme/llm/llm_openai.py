@@ -17,6 +17,7 @@ from ..constants import TEMPERATURE, TOP_P
 from ..message import Message, MessageMetadata, UsageData, msgs2dicts
 from ..telemetry import _calculate_llm_cost, record_llm_request
 from ..tools import ToolSpec
+from .constants import _MIN_RESPONSE_TOKENS
 from .models import (
     CustomProvider,
     ModelMeta,
@@ -513,6 +514,7 @@ def chat(
     model: str,
     tools: list[ToolSpec] | None,
     output_schema=None,
+    max_tokens: int | None = None,
 ) -> tuple[str, MessageMetadata | None]:
     # This will generate code and such, so we need appropriate temperature and top_p params
     # top_p controls diversity, temperature controls randomness
@@ -545,12 +547,14 @@ def chat(
         optional_kwargs["tools"] = tools_dict
     if response_format is not None:
         optional_kwargs["response_format"] = response_format
+    if max_tokens is not None:
+        optional_kwargs["max_tokens"] = max_tokens
 
     response = client.chat.completions.create(
         model=api_model.split("@")[0],
         messages=cast(list, messages_dicts),
         extra_headers=extra_headers(provider),
-        extra_body=extra_body(provider, model_meta),
+        extra_body=extra_body(provider, model_meta, max_tokens=max_tokens),
         **optional_kwargs,
     )
     metadata = _record_usage(response.usage, model)
@@ -587,7 +591,12 @@ def extra_headers(provider: Provider) -> dict[str, str]:
     return headers
 
 
-def extra_body(provider: Provider, model_meta: ModelMeta) -> dict[str, Any]:
+_OPENROUTER_REASONING_DEFAULT = 20000
+
+
+def extra_body(
+    provider: Provider, model_meta: ModelMeta, max_tokens: int | None = None
+) -> dict[str, Any]:
     """Return extra body for the OpenAI API based on the model."""
     body: dict[str, Any] = {}
     if provider == "openrouter":
@@ -595,7 +604,31 @@ def extra_body(provider: Provider, model_meta: ModelMeta) -> dict[str, Any]:
         # See: https://openrouter.ai/docs/guides/usage-accounting
         body["usage"] = {"include": True}
         if model_meta.supports_reasoning:
-            body["reasoning"] = {"enabled": True, "max_tokens": 20000}
+            reasoning_budget = _OPENROUTER_REASONING_DEFAULT
+            if max_tokens is not None:
+                available = max_tokens - _MIN_RESPONSE_TOKENS
+                if available <= 0:
+                    # Not enough room for reasoning AND a useful response
+                    logger.warning(
+                        "max_tokens=%d is too small to accommodate reasoning tokens "
+                        "and a useful response (min %d tokens); "
+                        "disabling OpenRouter extended reasoning.",
+                        max_tokens,
+                        _MIN_RESPONSE_TOKENS,
+                    )
+                    reasoning_budget = 0
+                elif available < reasoning_budget:
+                    logger.warning(
+                        "max_tokens=%d cannot accommodate reasoning_budget=%d; "
+                        "reducing to %d (reserving %d tokens for response).",
+                        max_tokens,
+                        reasoning_budget,
+                        available,
+                        _MIN_RESPONSE_TOKENS,
+                    )
+                    reasoning_budget = available
+            if reasoning_budget > 0:
+                body["reasoning"] = {"enabled": True, "max_tokens": reasoning_budget}
         if "@" in model_meta.model:
             provider_override = model_meta.model.split("@")[1]
             body["provider"] = {
@@ -611,6 +644,7 @@ def stream(
     model: str,
     tools: list[ToolSpec] | None,
     output_schema=None,
+    max_tokens: int | None = None,
 ) -> Generator[str, None, MessageMetadata | None]:
     from . import _get_base_model, get_provider_from_model  # fmt: skip
     from .models import get_model  # fmt: skip
@@ -643,13 +677,15 @@ def stream(
         optional_kwargs["tools"] = tools_dict
     if response_format is not None:
         optional_kwargs["response_format"] = response_format
+    if max_tokens is not None:
+        optional_kwargs["max_tokens"] = max_tokens
 
     for chunk_raw in client.chat.completions.create(
         model=api_model.split("@")[0],
         messages=cast(list, messages_dicts),
         stream=True,
         extra_headers=extra_headers(provider),
-        extra_body=extra_body(provider, model_meta),
+        extra_body=extra_body(provider, model_meta, max_tokens=max_tokens),
         stream_options={"include_usage": True},
         **optional_kwargs,
     ):

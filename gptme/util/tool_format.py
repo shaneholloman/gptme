@@ -33,10 +33,28 @@ The unified format ensures consistency across:
 - Generated system prompts
 """
 
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, Any
 
 if TYPE_CHECKING:
     from ..tools.base import ToolSpec
+
+
+def tool_to_dict(tool: "ToolSpec") -> dict[str, Any]:
+    """Convert a ToolSpec to a JSON-serializable dictionary.
+
+    Returns a dict with tool metadata suitable for machine consumption.
+    """
+    return {
+        "name": tool.name,
+        "desc": tool.desc,
+        "available": tool.is_available,
+        "disabled_by_default": tool.disabled_by_default,
+        "block_types": tool.block_types,
+        "has_execute": bool(tool.execute),
+        "functions": [f.__name__ for f in tool.functions] if tool.functions else [],
+        "commands": list(tool.commands.keys()) if tool.commands else [],
+        "is_mcp": bool(tool.is_mcp),
+    }
 
 
 def format_tool_summary(

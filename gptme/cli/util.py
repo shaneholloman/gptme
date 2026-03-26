@@ -13,7 +13,7 @@ import logging
 import os
 import sys
 import time
-from contextlib import redirect_stderr
+from contextlib import redirect_stderr, redirect_stdout
 from pathlib import Path
 
 import click
@@ -366,20 +366,36 @@ def tools():
 )
 @click.option("--langtags", is_flag=True, help="Show language tags for code execution")
 @click.option("--compact", is_flag=True, help="Compact single-line format")
-def tools_list(available: bool, langtags: bool, compact: bool):
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+def tools_list(available: bool, langtags: bool, compact: bool, as_json: bool):
     """List available tools.
 
     By default shows only available tools (dependencies installed).
     Use --all to include unavailable tools as well.
     """
     from ..tools import get_available_tools, init_tools  # fmt: skip
-    from ..util.tool_format import format_langtags, format_tools_list  # fmt: skip
+    from ..util.tool_format import (  # fmt: skip
+        format_langtags,
+        format_tools_list,
+        tool_to_dict,
+    )
 
-    # Initialize tools
-    init_tools()
+    # Suppress console output during init for JSON mode (e.g. rich console.log)
+    if as_json:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            init_tools()
+    else:
+        init_tools()
 
     # get_available_tools() returns all discovered tools (loaded or not)
     tools = get_available_tools()
+
+    if as_json:
+        tool_list = sorted(tools, key=lambda t: t.name)
+        if available:
+            tool_list = [t for t in tool_list if t.is_available]
+        print(json.dumps([tool_to_dict(t) for t in tool_list], indent=2))
+        return
 
     if langtags:
         print(format_langtags(tools))
@@ -393,7 +409,10 @@ def tools_list(available: bool, langtags: bool, compact: bool):
 @click.option("-v", "--verbose", is_flag=True, help="Show full output (not truncated)")
 @click.option("--no-examples", is_flag=True, help="Hide examples section")
 @click.option("--no-tokens", is_flag=True, help="Hide token estimates")
-def tools_info(tool_name: str, verbose: bool, no_examples: bool, no_tokens: bool):
+@click.option("--json", "as_json", is_flag=True, help="Output as JSON.")
+def tools_info(
+    tool_name: str, verbose: bool, no_examples: bool, no_tokens: bool, as_json: bool
+):
     """Show detailed information about a tool.
 
     Displays tool instructions, examples, and token usage estimates.
@@ -402,10 +421,14 @@ def tools_info(tool_name: str, verbose: bool, no_examples: bool, no_tokens: bool
     Output is truncated by default. Use -v for full output.
     """
     from ..tools import get_available_tools, get_tool, init_tools  # fmt: skip
-    from ..util.tool_format import format_tool_info  # fmt: skip
+    from ..util.tool_format import format_tool_info, tool_to_dict  # fmt: skip
 
-    # Initialize tools
-    init_tools()
+    # Suppress console output during init for JSON mode (e.g. rich console.log)
+    if as_json:
+        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+            init_tools()
+    else:
+        init_tools()
 
     # Look in both loaded and all available tools
     tool = get_tool(tool_name)
@@ -418,6 +441,15 @@ def tools_info(tool_name: str, verbose: bool, no_examples: bool, no_tokens: bool
             for name in sorted(available_dict.keys()):
                 print(f"  - {name}")
             sys.exit(1)
+
+    if as_json:
+        d = tool_to_dict(tool)
+        # Include full instructions and examples for info output
+        d["instructions"] = tool.instructions.strip() if tool.instructions else ""
+        examples = tool.get_examples()
+        d["examples"] = examples.strip() if examples else ""
+        print(json.dumps(d, indent=2))
+        return
 
     print(
         format_tool_info(
@@ -470,10 +502,20 @@ def tools_call(tool_name: str, function_name: str, arg: list[str]):
         # Parse arguments into a dictionary, ensuring proper typing
         kwargs = {}
         for arg_str in arg:
+            if "=" not in arg_str:
+                click.echo(
+                    f"Error: Argument must be in key=value format, got: {arg_str}",
+                    err=True,
+                )
+                sys.exit(1)
             key, value = arg_str.split("=", 1)
             kwargs[key] = value
-        return_val = function[0](**kwargs)
-        print(return_val)
+        try:
+            return_val = function[0](**kwargs)
+            print(return_val)
+        except TypeError as e:
+            click.echo(f"Error calling function: {e}", err=True)
+            sys.exit(1)
 
 
 @main.group()

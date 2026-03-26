@@ -5,7 +5,20 @@ import time
 from collections.abc import Generator
 
 from ..message import Message
-from ..util.gh import get_github_pr_content, parse_github_url
+from ..util.gh import (
+    _get_repo_from_git_remote,
+    get_github_issue_content,
+    get_github_issue_list,
+    get_github_pr_content,
+    get_github_pr_diff,
+    get_github_pr_list,
+    get_github_run_logs,
+    merge_github_pr,
+    parse_github_ref,
+    parse_github_url,
+    search_github_issues,
+    search_github_prs,
+)
 from . import Parameter, ToolSpec, ToolUse
 
 
@@ -288,10 +301,24 @@ def _format_check_results(check_runs: list, head_sha: str, pr_number: int) -> st
     return output
 
 
-def _extract_pr_url(
+def _parse_list_flags(args: list[str], start: int = 2) -> dict[str, str]:
+    """Parse --flag value pairs from args starting at given index."""
+    flags: dict[str, str] = {}
+    i = start
+    while i < len(args):
+        if args[i].startswith("--") and i + 1 < len(args):
+            key = args[i][2:]  # Strip --
+            flags[key] = args[i + 1]
+            i += 2
+        else:
+            i += 1
+    return flags
+
+
+def _extract_url(
     args: list[str] | None, kwargs: dict[str, str] | None, arg_offset: int = 2
 ) -> str | None:
-    """Extract PR URL from args or kwargs."""
+    """Extract a GitHub URL from args or kwargs."""
     if args and len(args) > arg_offset:
         return args[arg_offset]
     if kwargs:
@@ -299,28 +326,79 @@ def _extract_pr_url(
     return None
 
 
+def _resolve_ref(
+    args: list[str] | None,
+    kwargs: dict[str, str] | None,
+    default_type: str,
+    entity_name: str = "reference",
+) -> tuple[dict[str, str] | None, Message | None]:
+    """Extract and parse a GitHub reference from args/kwargs.
+
+    Returns (github_info, error_message). If github_info is None,
+    the caller should yield the error message and return.
+    """
+    ref = _extract_url(args, kwargs)
+    if not ref:
+        return None, Message("system", f"Error: No {entity_name} provided")
+
+    github_info = parse_github_ref(ref, default_type=default_type)
+    if not github_info:
+        return None, Message(
+            "system",
+            f"Error: Could not parse GitHub reference: {ref}\n\n"
+            "Accepted formats: URL, owner/repo#N, #N, or N",
+        )
+
+    return github_info, None
+
+
+def _resolve_repo_for_list(
+    args: list[str],
+) -> tuple[str | None, str | None, dict[str, str], Message | None]:
+    """Parse repo and flags for list commands.
+
+    Returns (owner, repo, flags, error_message). If owner is None,
+    the caller should yield the error message and return.
+    """
+    flags = _parse_list_flags(args)
+    owner: str | None = None
+    repo: str | None = None
+    repo_flag = flags.get("repo")
+    if repo_flag and "/" in repo_flag:
+        owner, repo = repo_flag.split("/", 1)
+    else:
+        repo_info = _get_repo_from_git_remote()
+        if repo_info:
+            owner, repo = repo_info
+
+    if not owner or not repo:
+        return (
+            None,
+            None,
+            flags,
+            Message(
+                "system",
+                "Error: Could not determine repository. Use --repo owner/repo or run from a git repo.",
+            ),
+        )
+
+    return owner, repo, flags, None
+
+
 def _handle_pr_status(
     args: list[str] | None, kwargs: dict[str, str] | None
 ) -> Generator[Message, None, None]:
-    """Handle `gh pr status <url> [commit_sha]` command."""
-    url = _extract_pr_url(args, kwargs)
-    if not url:
-        yield Message("system", "Error: No PR URL provided")
+    """Handle `gh pr status <ref> [commit_sha]` command."""
+    info, err = _resolve_ref(args, kwargs, "pull", "PR reference")
+    if err:
+        yield err
         return
 
+    assert info is not None
     commit_sha = args[3] if args and len(args) > 3 else None
-
-    github_info = parse_github_url(url)
-    if not github_info:
-        yield Message(
-            "system",
-            f"Error: Invalid GitHub URL: {url}\n\nExpected format: https://github.com/owner/repo/pull/number",
-        )
-        return
-
-    pr_number = int(github_info["number"])
-    owner = github_info["owner"]
-    repo = github_info["repo"]
+    pr_number = int(info["number"])
+    owner = info["owner"]
+    repo = info["repo"]
 
     if commit_sha:
         try:
@@ -358,106 +436,371 @@ def _handle_pr_status(
         yield Message("system", f"Error: Failed to parse check data: {e}")
 
 
+def _handle_pr_merge(
+    args: list[str] | None, kwargs: dict[str, str] | None
+) -> Generator[Message, None, None]:
+    """Handle `gh pr merge <ref> [--squash|--rebase|--merge] [--auto] [--delete-branch] [--match-head-commit SHA]`."""
+    info, err = _resolve_ref(args, kwargs, "pull", "PR reference")
+    if err:
+        yield err
+        return
+
+    assert info is not None
+    pr_number = info["number"]
+    owner = info["owner"]
+    repo = info["repo"]
+
+    # Parse flags from remaining args (index 3+)
+    # Boolean flags (no value): --squash, --rebase, --merge, --auto, --delete-branch
+    # Value flags: --match-head-commit SHA
+    method = "squash"  # Default
+    auto = False
+    delete_branch = False
+    match_head: str | None = None
+
+    if args:
+        i = 3
+        while i < len(args):
+            arg = args[i]
+            if arg in ("--squash", "--rebase", "--merge"):
+                method = arg[2:]
+            elif arg == "--auto":
+                auto = True
+            elif arg == "--delete-branch":
+                delete_branch = True
+            elif arg == "--match-head-commit":
+                if i + 1 < len(args):
+                    match_head = args[i + 1]
+                    i += 1
+                else:
+                    yield Message(
+                        "system", "Error: --match-head-commit requires a SHA value"
+                    )
+                    return
+            i += 1
+
+    result = merge_github_pr(
+        owner,
+        repo,
+        pr_number,
+        method=method,
+        auto=auto,
+        delete_branch=delete_branch,
+        match_head_commit=match_head,
+    )
+
+    if result["success"]:
+        output = str(result["message"])
+        if "sha" in result:
+            output += f"\nMerge commit: {result['sha']}"
+        yield Message("system", output)
+    else:
+        yield Message("system", f"Error: {result['message']}")
+
+
 def execute_gh(
     code: str | None,
     args: list[str] | None,
     kwargs: dict[str, str] | None,
 ) -> Generator[Message, None, None]:
     """Execute GitHub operations."""
-    if args and len(args) >= 2 and args[0] == "pr" and args[1] == "status":
+    if args and len(args) >= 2 and args[0] == "pr" and args[1] == "merge":
+        yield from _handle_pr_merge(args, kwargs)
+
+    elif args and len(args) >= 2 and args[0] == "pr" and args[1] == "status":
         yield from _handle_pr_status(args, kwargs)
 
     elif args and len(args) >= 2 and args[0] == "pr" and args[1] == "checks":
-        url = _extract_pr_url(args, kwargs)
-        if not url:
-            yield Message("system", "Error: No PR URL provided")
+        info, err = _resolve_ref(args, kwargs, "pull", "PR reference")
+        if err:
+            yield err
             return
 
+        assert info is not None
         commit_sha = args[3] if args and len(args) > 3 else None
+        url = f"https://github.com/{info['owner']}/{info['repo']}/pull/{info['number']}"
+        yield from _wait_for_checks(
+            info["owner"], info["repo"], url, commit_sha=commit_sha
+        )
 
-        github_info = parse_github_url(url)
-        if not github_info:
+    elif args and len(args) >= 2 and args[0] == "pr" and args[1] == "diff":
+        info, err = _resolve_ref(args, kwargs, "pull", "PR reference")
+        if err:
+            yield err
+            return
+
+        assert info is not None
+        if info["type"] != "pull":
             yield Message(
                 "system",
-                f"Error: Invalid GitHub URL: {url}\n\nExpected format: https://github.com/owner/repo/pull/number",
+                f"Error: Reference is not a GitHub PR (got {info['type']}). Use `gh issue view` for issues.",
             )
             return
 
-        yield from _wait_for_checks(
-            github_info["owner"], github_info["repo"], url, commit_sha=commit_sha
-        )
+        content = get_github_pr_diff(info["owner"], info["repo"], info["number"])
+        if content:
+            yield Message("system", content)
+        else:
+            yield Message(
+                "system",
+                "Error: Failed to fetch PR diff. Make sure 'gh' CLI is installed and authenticated.",
+            )
 
     elif args and len(args) >= 2 and args[0] == "pr" and args[1] == "view":
-        url = _extract_pr_url(args, kwargs)
-        if not url:
-            yield Message("system", "Error: No PR URL provided")
+        info, err = _resolve_ref(args, kwargs, "pull", "PR reference")
+        if err:
+            yield err
             return
 
+        assert info is not None
+        if info["type"] != "pull":
+            yield Message(
+                "system",
+                f"Error: Reference is not a GitHub PR (got {info['type']}). Use `gh issue view` for issues.",
+            )
+            return
+
+        url = f"https://github.com/{info['owner']}/{info['repo']}/pull/{info['number']}"
         content = get_github_pr_content(url)
         if content:
             yield Message("system", content)
         else:
-            github_info = parse_github_url(url)
-            if not github_info:
-                yield Message(
-                    "system",
-                    f"Error: Invalid GitHub URL: {url}\n\nExpected format: https://github.com/owner/repo/pull/number",
-                )
-            else:
-                yield Message(
-                    "system",
-                    "Error: Failed to fetch PR content. Make sure 'gh' CLI is installed and authenticated.",
-                )
+            yield Message(
+                "system",
+                "Error: Failed to fetch PR content. Make sure 'gh' CLI is installed and authenticated.",
+            )
+
+    elif args and len(args) >= 2 and args[0] == "issue" and args[1] == "list":
+        owner, repo, flags, err = _resolve_repo_for_list(args)
+        if err:
+            yield err
+            return
+
+        assert owner is not None and repo is not None
+        state = flags.get("state", "open")
+        limit_str = flags.get("limit", "20")
+        limit = int(limit_str) if limit_str.isdecimal() else 20
+        labels = flags.get("label", "").split(",") if flags.get("label") else None
+
+        content = get_github_issue_list(
+            owner, repo, state=state, labels=labels, limit=limit
+        )
+        if content:
+            yield Message("system", content)
+        else:
+            yield Message(
+                "system",
+                f"Error: Failed to list issues for {owner}/{repo}.",
+            )
+
+    elif args and len(args) >= 2 and args[0] == "pr" and args[1] == "list":
+        owner, repo, flags, err = _resolve_repo_for_list(args)
+        if err:
+            yield err
+            return
+
+        assert owner is not None and repo is not None
+        state = flags.get("state", "open")
+        limit_str = flags.get("limit", "20")
+        limit = int(limit_str) if limit_str.isdecimal() else 20
+
+        content = get_github_pr_list(owner, repo, state=state, limit=limit)
+        if content:
+            yield Message("system", content)
+        else:
+            yield Message(
+                "system",
+                f"Error: Failed to list pull requests for {owner}/{repo}.",
+            )
+
+    elif args and len(args) >= 2 and args[0] == "issue" and args[1] == "view":
+        info, err = _resolve_ref(args, kwargs, "issues", "issue reference")
+        if err:
+            yield err
+            return
+
+        assert info is not None
+        if info["type"] != "issues":
+            yield Message(
+                "system",
+                f"Error: URL is not a GitHub issue URL (got {info['type']}). Use `gh pr view` for pull requests.",
+            )
+            return
+
+        content = get_github_issue_content(info["owner"], info["repo"], info["number"])
+        if content:
+            yield Message("system", content)
+        else:
+            yield Message(
+                "system",
+                "Error: Failed to fetch issue content. Make sure 'gh' CLI is installed and authenticated.",
+            )
+    elif args and len(args) >= 2 and args[0] == "run" and args[1] == "view":
+        if len(args) < 3:
+            yield Message(
+                "system", "Error: No run ID provided. Usage: gh run view <run-id>"
+            )
+            return
+
+        run_id = args[2]
+        if not run_id.isdigit():
+            yield Message(
+                "system",
+                f"Error: Invalid run ID '{run_id}'. Run IDs are numeric (e.g. 12345678).",
+            )
+            return
+
+        content = get_github_run_logs(run_id)
+        if content:
+            yield Message("system", content)
+        else:
+            yield Message(
+                "system",
+                f"Error: Failed to fetch run {run_id}. Make sure 'gh' CLI is installed and authenticated.",
+            )
+
+    elif (
+        args and len(args) >= 2 and args[0] == "search" and args[1] in ("issues", "prs")
+    ):
+        search_type = args[1]
+        # Parse query and search_flags from remaining args
+        query_parts: list[str] = []
+        search_flags: dict[str, str] = {}
+        i = 2
+        while i < len(args):
+            arg = args[i]
+            if arg.startswith("--"):
+                if i + 1 >= len(args) or args[i + 1].startswith("--"):
+                    yield Message(
+                        "system",
+                        f"Error: Flag {arg} requires a value. Usage: gh search {search_type} <query> [--repo owner/repo] [--state open|closed] [--author user] [--label name] [--limit N]",
+                    )
+                    return
+                flag_name = arg[2:]
+                search_flags[flag_name] = args[i + 1]
+                i += 2
+                continue
+
+            query_parts.append(arg)
+            i += 1
+
+        query = " ".join(query_parts)
+        if not query:
+            yield Message(
+                "system",
+                f"Error: No search query provided. Usage: gh search {search_type} <query> [--repo owner/repo] [--state open|closed] [--author user] [--label name] [--limit N]",
+            )
+            return
+
+        limit_str = search_flags.get("limit", "20")
+        if not limit_str.isdecimal():
+            yield Message(
+                "system",
+                f"Error: --limit requires a positive integer, got {limit_str!r}.",
+            )
+            return
+        limit = int(limit_str)
+
+        if search_type == "prs" and search_flags.get("assignee"):
+            yield Message(
+                "system",
+                "Error: --assignee is not supported for PR search (GitHub API limitation). Use --author to filter by PR author.",
+            )
+            return
+
+        if search_type == "issues":
+            content = search_github_issues(
+                query,
+                repo=search_flags.get("repo"),
+                state=search_flags.get("state"),
+                author=search_flags.get("author"),
+                assignee=search_flags.get("assignee"),
+                label=search_flags.get("label"),
+                limit=limit,
+            )
+        else:
+            content = search_github_prs(
+                query,
+                repo=search_flags.get("repo"),
+                state=search_flags.get("state"),
+                author=search_flags.get("author"),
+                label=search_flags.get("label"),
+                limit=limit,
+            )
+
+        if content:
+            yield Message("system", content)
+        else:
+            yield Message(
+                "system",
+                f"Error: Failed to search {search_type}. Make sure 'gh' CLI is installed and authenticated.",
+            )
+
     else:
         yield Message(
             "system",
-            "Error: Unknown gh command. Available: gh pr view <url>, gh pr status <url>, gh pr checks <url>",
+            "Error: Unknown gh command. Available: gh issue list, gh issue view, gh pr list, gh pr view, gh pr diff, gh pr merge, gh pr status, gh pr checks, gh run view, gh search issues, gh search prs\n\nReferences can be URLs, owner/repo#N, #N, or bare numbers.",
         )
 
 
 instructions = """Interact with GitHub via the GitHub CLI (gh).
 
-For reading PRs with full context (review comments, code context, suggestions), use:
-```gh pr view <pr_url>
+Refs: full URLs, `owner/repo#N`, `#N`, or bare `N` (when in a git repo).
+
+List issues/PRs:
+```gh issue list --repo owner/repo --state open --limit 20
+gh pr list --repo owner/repo --state open --limit 20
 ```
 
-To get a quick status check of CI checks (with run IDs for failed checks):
-```gh pr status <pr_url> [commit_sha]
+Search issues/PRs across repos:
+```gh search issues "bug fix" --repo owner/repo --state open --limit 10
+gh search prs "feature" --author username --state open
 ```
 
-To wait for all CI checks to complete:
-```gh pr checks <pr_url> [commit_sha]
+Read issue/PR:
+```gh issue view owner/repo#42
+gh pr view owner/repo#123
 ```
 
-The optional commit_sha allows checking a specific commit instead of the PR head.
-This is useful for checking previous commits without waiting for new builds.
+Inspect code changes:
+```gh pr diff owner/repo#123
+```
 
-For multi-line comments, use `--body-file` with a single-quoted heredoc:
+Merge a pull request (default: squash):
+```gh pr merge owner/repo#123
+gh pr merge owner/repo#123 --rebase
+gh pr merge owner/repo#123 --squash --auto --delete-branch --match-head-commit abc1234
+```
+
+CI status:
+```gh pr status <ref> [commit_sha]
+gh pr checks <ref> [commit_sha]
+gh run view <run-id>
+```
+
+Multi-line comments:
 ```shell
 gh issue comment NUM --repo owner/repo --body-file - << 'EOF'
-## Summary
-Line 1
-
-Line 2
+Body here
 EOF
 ```
-Never use `--body "text\\nmore text"`:
-- `\\n` in double-quoted strings is literal backslash-n, not a newline.
-- `$` in double-quoted strings triggers variable expansion (e.g. `$42,000` → `,000`).
-The single-quoted `<< 'EOF'` heredoc prevents both issues.
 
-For other operations, use the `shell` tool with the `gh` command."""
+For other operations, use the `shell` tool with `gh`."""
 
 
 def examples(tool_format):
     return f"""
-> User: read PR with full context including review comments
+> User: read issue #42 on owner/repo
 > Assistant:
-{
-        ToolUse(
-            "gh", ["pr", "view", "https://github.com/owner/repo/pull/123"], None
-        ).to_output(tool_format)
-    }
+{ToolUse("gh", ["issue", "view", "owner/repo#42"], None).to_output(tool_format)}
+
+> User: read PR #123 on owner/repo
+> Assistant:
+{ToolUse("gh", ["pr", "view", "owner/repo#123"], None).to_output(tool_format)}
+
+> User: show the code changes in this PR
+> Assistant:
+{ToolUse("gh", ["pr", "diff", "owner/repo#123"], None).to_output(tool_format)}
 
 > User: check CI status for this PR
 > Assistant:
@@ -489,7 +832,23 @@ def examples(tool_format):
 
 > User: show me the failed build logs
 > Assistant:
-{ToolUse("shell", [], "gh run view 12345678 --log-failed").to_output(tool_format)}
+{ToolUse("gh", ["run", "view", "12345678"], None).to_output(tool_format)}
+> System: ## Run 12345678: Fix auth flow
+> System:
+> System: **Workflow**: CI
+> System: **Branch**: fix/auth
+> System: **Status**: completed (failure)
+> System:
+> System: ### Jobs
+> System:   ✅ lint: success
+> System:   ❌ test: failure
+> System:
+> System: ### Failed Job Logs
+> System:
+> System: #### test
+> System:   ❌ Failed step: Run tests
+> System:
+> System: [extracted error sections with context]
 
 > User: wait for CI checks to complete on a PR
 > Assistant:
@@ -502,6 +861,23 @@ def examples(tool_format):
 > System: [12:34:56] ✅ 4 passed, ❌ 2 failed, 🔄 3 in progress
 > System: ...
 > System: ❌ Checks failed: 2 failed, 4 passed
+
+> User: merge PR #123 on owner/repo
+> Assistant:
+{ToolUse("gh", ["pr", "merge", "owner/repo#123"], None).to_output(tool_format)}
+> System: ✓ Squashed and merged pull request #123
+> System: Merge commit: abc1234def5678
+
+> User: auto-merge PR when checks pass, and delete the branch
+> Assistant:
+{
+        ToolUse(
+            "gh",
+            ["pr", "merge", "owner/repo#123", "--squash", "--auto", "--delete-branch"],
+            None,
+        ).to_output(tool_format)
+    }
+> System: ✓ Pull request #123 will be automatically merged via squash when all checks pass
 
 > User: create a public repo from the current directory, and push. Note that --confirm and -y are deprecated, and no longer needed.
 > Assistant:
@@ -536,14 +912,26 @@ EOF''',
 
 > User: show issues
 > Assistant:
-{ToolUse("shell", [], "gh issue list --repo $REPO").to_output(tool_format)}
+{ToolUse("gh", ["issue", "list", "--repo", "owner/repo"], None).to_output(tool_format)}
 
-> User: read issue with comments
+> User: show open PRs
+> Assistant:
+{ToolUse("gh", ["pr", "list", "--repo", "owner/repo"], None).to_output(tool_format)}
+
+> User: search for authentication issues in owner/repo
 > Assistant:
 {
-        ToolUse("shell", [], "gh issue view $ISSUE --repo $REPO --comments").to_output(
-            tool_format
-        )
+        ToolUse(
+            "gh", ["search", "issues", "authentication", "--repo", "owner/repo"], None
+        ).to_output(tool_format)
+    }
+
+> User: find my open PRs
+> Assistant:
+{
+        ToolUse(
+            "gh", ["search", "prs", "fix", "--author", "@me", "--state", "open"], None
+        ).to_output(tool_format)
     }
 
 > User: show recent workflows
@@ -572,7 +960,7 @@ tool: ToolSpec = ToolSpec(
         Parameter(
             name="url",
             type="string",
-            description="GitHub PR URL (e.g., https://github.com/owner/repo/pull/123)",
+            description="GitHub reference: URL, owner/repo#N, #N, or bare number",
             required=True,
         ),
     ],

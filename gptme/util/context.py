@@ -579,24 +579,44 @@ def _find_potential_paths(content: str) -> list[str]:
     paths = []
 
     def is_path_like(word: str) -> bool:
-        """Helper to check if a word looks like a path"""
+        """Helper to check if a word looks like a path.
+
+        Supports the ``@`` prefix convention (e.g. ``@src/file.py``) used by
+        Claude Code and other AI tools to reference files and directories.
+        """
+        # Strip one leading @ for detection (actual stripping happens in caller)
+        w = word.removeprefix("@") if word.startswith("@") else word
+
+        def _is_path_like_bare(s: str) -> bool:
+            return (
+                # Absolute/home/relative paths
+                any(s.startswith(p) for p in ["/", "~/", "./"])
+                # URLs
+                or s.startswith("http")
+                # Contains slash (for backtick-wrapped paths)
+                or "/" in s
+                # Files in current directory or subdirectories
+                or any(s.split("/", 1)[0] == file for file in cwd_files)
+            )
+
         return (
-            # Absolute/home/relative paths
-            any(word.startswith(s) for s in ["/", "~/", "./"])
-            # URLs
-            or word.startswith("http")
-            # Contains slash (for backtick-wrapped paths)
-            or "/" in word
-            # Files in current directory or subdirectories
-            or any(word.split("/", 1)[0] == file for file in cwd_files)
+            # @-prefixed reference: stripped form must also look like a path
+            # (prevents @username social handles from matching)
+            (word.startswith("@") and _is_path_like_bare(w))
+            # Plain path reference
+            or _is_path_like_bare(w)
         )
+
+    def _strip_at_prefix(word: str) -> str:
+        """Strip leading @ from path references (e.g. @src/file.py -> src/file.py)."""
+        return word.removeprefix("@")
 
     # First find backtick-wrapped content
     for match in re.finditer(r"`([^`]+)`", content_no_xml):
         word = match.group(1).strip()
         word = word.rstrip("?").rstrip(".").rstrip(",").rstrip("!")
         if is_path_like(word):
-            paths.append(word)
+            paths.append(_strip_at_prefix(word))
 
     # Then find non-backtick-wrapped words
     # Remove backtick-wrapped content first to avoid double-processing
@@ -608,7 +628,7 @@ def _find_potential_paths(content: str) -> list[str]:
             continue
 
         if is_path_like(word):
-            paths.append(word)
+            paths.append(_strip_at_prefix(word))
 
     return paths
 

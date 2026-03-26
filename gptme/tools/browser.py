@@ -52,11 +52,16 @@ Provider Native Search:
     This is an experimental feature. It needs some work to be more robust and useful.
 """
 
+import base64
+import binascii
 import importlib
 import importlib.metadata
 import importlib.util
+import json
 import logging
+import re
 import shutil
+import subprocess
 from dataclasses import replace
 from functools import lru_cache
 from io import BytesIO
@@ -67,6 +72,12 @@ import requests
 
 from ..util import console
 from ..util.context import md_codeblock
+from ..util.gh import (
+    get_github_issue_content,
+    get_github_pr_content,
+    parse_github_url,
+    transform_github_url,
+)
 from .base import ToolSpec, ToolUse
 
 try:
@@ -656,11 +667,138 @@ def read_url(url: str, max_pages: int | None = None) -> str:
     if _is_pdf_url(url):
         return _read_pdf_url(url, max_pages)
 
+    # GitHub: issues and PRs
+    github_info = parse_github_url(url)
+    if github_info:
+        if github_info["type"] == "pull":
+            content = get_github_pr_content(url)
+            if content:
+                return f"<!-- Source: gh pr view (GitHub CLI) -->\n\n{content}"
+        else:
+            content = get_github_issue_content(
+                github_info["owner"], github_info["repo"], github_info["number"]
+            )
+            if content:
+                return f"<!-- Source: gh issue view (GitHub CLI) -->\n\n{content}"
+
+    # GitHub: repo root
+    if _is_github_repo_url(url):
+        return _read_github_repo(url)
+
+    # GitHub: blob URLs → convert to raw content URL
+    raw_url = transform_github_url(url)
+    if raw_url != url:
+        url = raw_url
+        # Note: will be served as raw content without browser rendering
+
     # Otherwise use normal browser reading (max_pages ignored)
-    assert browser
+    return _read_url_with_browser(url)
+
+
+def _is_github_repo_url(url: str) -> bool:
+    """Check if URL is a GitHub repository URL that gh can handle."""
+    # Match github.com/owner/repo patterns (not raw files, issues, PRs, etc.)
+    pattern = r"^https?://github\.com/[^/]+/[^/]+/?$"
+    return bool(re.match(pattern, url.rstrip("/")))
+
+
+def _read_github_repo(url: str) -> str:
+    """Read a GitHub repo using gh CLI for clean, structured output."""
+    match = re.match(r"https?://github\.com/([^/]+)/([^/]+)/?", url)
+    if not match:
+        return _read_url_with_browser(url)
+
+    owner, repo = match.groups()
+    repo = repo.rstrip("/")
+    full_repo = f"{owner}/{repo}"
+
+    try:
+        result = subprocess.run(
+            [
+                "gh",
+                "repo",
+                "view",
+                full_repo,
+                "--json",
+                "name,description,url,stargazerCount,forkCount,licenseInfo,repositoryTopics,homepageUrl,defaultBranchRef",
+            ],
+            capture_output=True,
+            text=True,
+            timeout=30,
+            check=False,
+        )
+
+        if result.returncode != 0:
+            logger.warning(f"gh repo view failed: {result.stderr}")
+            return _read_url_with_browser(url)
+
+        data = json.loads(result.stdout)
+
+        lines = [f"# {data['name']}", ""]
+
+        if data.get("description"):
+            lines += [data["description"], ""]
+
+        lines.append(f"**URL**: {data['url']}")
+        lines.append(f"**Stars**: {data.get('stargazerCount', 'N/A')}")
+        lines.append(f"**Forks**: {data.get('forkCount', 'N/A')}")
+
+        if data.get("licenseInfo"):
+            lines.append(f"**License**: {data['licenseInfo'].get('name', 'N/A')}")
+
+        topics = [t["name"] for t in data.get("repositoryTopics", [])]
+        if topics:
+            lines.append(f"**Topics**: {', '.join(topics)}")
+
+        if data.get("homepageUrl"):
+            lines.append(f"**Homepage**: {data['homepageUrl']}")
+
+        branch = (data.get("defaultBranchRef") or {}).get("name", "main")
+        lines += [f"**Default branch**: {branch}", ""]
+
+        # Fetch README
+        readme_result = subprocess.run(
+            ["gh", "api", f"repos/{full_repo}/readme"],
+            capture_output=True,
+            text=True,
+            timeout=15,
+            check=False,
+        )
+        if readme_result.returncode == 0:
+            try:
+                readme_data = json.loads(readme_result.stdout)
+                readme_content = base64.b64decode(readme_data["content"]).decode(
+                    "utf-8"
+                )
+            except (
+                binascii.Error,
+                json.JSONDecodeError,
+                KeyError,
+                UnicodeDecodeError,
+            ) as e:
+                logger.warning(f"Failed to parse README for {full_repo}: {e}")
+            else:
+                lines += ["## README", "", readme_content]
+        else:
+            logger.debug(f"No README found: {readme_result.stderr}")
+
+        return "<!-- Source: gh repo view (GitHub CLI) -->\n\n" + "\n".join(lines)
+
+    except FileNotFoundError:
+        logger.warning("gh CLI not found, falling back to browser")
+    except Exception as e:
+        logger.warning(f"Error reading GitHub repo with gh: {e}")
+
+    return _read_url_with_browser(url)
+
+
+def _read_url_with_browser(url: str) -> str:
+    """Read a URL using the available browser backend (no PDF/GitHub special-casing)."""
     if browser == "playwright":
         return read_url_playwright(url)
-    return read_url_lynx(url)
+    if browser == "lynx":
+        return read_url_lynx(url)
+    raise RuntimeError("No browser backend available")
 
 
 def search(query: str, engine: EngineType | None = None) -> str:

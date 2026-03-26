@@ -96,7 +96,10 @@ def reply(
     workspace: Path | None = None,
     output_schema: type | None = None,
     on_token: Callable[[str], None] | None = None,
+    max_tokens: int | None = None,
 ) -> Message:
+    if max_tokens is not None and max_tokens <= 0:
+        raise ValueError(f"max_tokens must be a positive integer, got {max_tokens}")
     # Trigger GENERATION_PRE hooks and collect context messages
     from ..hooks import HookType, trigger_hook
 
@@ -134,10 +137,15 @@ def reply(
             agent_name=agent_name,
             output_schema=output_schema,
             on_token=on_token,
+            max_tokens=max_tokens,
         )
     rprint(f"{prompt_assistant(agent_name)}: Thinking...", end="\r")
     response, metadata = _chat_complete(
-        generation_msgs, model, tools, output_schema=output_schema
+        generation_msgs,
+        model,
+        tools,
+        output_schema=output_schema,
+        max_tokens=max_tokens,
     )
     rprint(" " * shutil.get_terminal_size().columns, end="\r")
     rprint(f"{prompt_assistant(agent_name)}: {response}")
@@ -177,19 +185,30 @@ def _chat_complete(
     model: str,
     tools: list[ToolSpec] | None,
     output_schema: type | None = None,
+    max_tokens: int | None = None,
 ) -> tuple[str, MessageMetadata | None]:
+    if max_tokens is not None and max_tokens <= 0:
+        raise ValueError(f"max_tokens must be a positive integer, got {max_tokens}")
     provider = get_provider_from_model(model)
 
     # Providers with native constrained decoding support
     # Custom providers are OpenAI-compatible, so route them through the OpenAI path
     if provider in PROVIDERS_OPENAI or is_custom_provider(provider):
-        return chat_openai(messages, model, tools, output_schema=output_schema)
+        return chat_openai(
+            messages, model, tools, output_schema=output_schema, max_tokens=max_tokens
+        )
     if provider == "anthropic":
         return chat_anthropic(
-            messages, _get_base_model(model), tools, output_schema=output_schema
+            messages,
+            _get_base_model(model),
+            tools,
+            output_schema=output_schema,
+            max_tokens=max_tokens,
         )
     if provider == "openai-subscription":
-        content = chat_subscription(messages, _get_base_model(model), tools)
+        content = chat_subscription(
+            messages, _get_base_model(model), tools, max_tokens=max_tokens
+        )
         return content, {"model": model}
 
     # Unsupported provider - OpenAI and Anthropic are handled above
@@ -223,24 +242,32 @@ def _stream(
     model: str,
     tools: list[ToolSpec] | None,
     output_schema: type | None = None,
+    max_tokens: int | None = None,
 ) -> _StreamWithMetadata:
     provider = get_provider_from_model(model)
     # Custom providers are OpenAI-compatible, so route them through the OpenAI path
     if provider in PROVIDERS_OPENAI or is_custom_provider(provider):
-        gen = stream_openai(messages, model, tools, output_schema=output_schema)
+        gen = stream_openai(
+            messages, model, tools, output_schema=output_schema, max_tokens=max_tokens
+        )
         return _StreamWithMetadata(gen, model)
     if provider == "anthropic":
         gen = stream_anthropic(
-            messages, _get_base_model(model), tools, output_schema=output_schema
+            messages,
+            _get_base_model(model),
+            tools,
+            output_schema=output_schema,
+            max_tokens=max_tokens,
         )
         return _StreamWithMetadata(gen, model)
     if provider == "openai-subscription":
-        gen = stream_subscription(messages, _get_base_model(model), tools)
+        gen = stream_subscription(
+            messages, _get_base_model(model), tools, max_tokens=max_tokens
+        )
         return _StreamWithMetadata(gen, model)
     # Note: Validation-only fallback for streaming is complex
     # For now, unsupported providers don't support output_schema in streaming mode
     if output_schema is not None:
-        logger = logging.getLogger(__name__)
         logger.warning(
             f"Provider {provider} does not support output_schema in streaming mode"
         )
@@ -256,6 +283,7 @@ def _reply_stream(
     agent_name: str | None = None,
     output_schema: type | None = None,
     on_token: Callable[[str], None] | None = None,
+    max_tokens: int | None = None,
 ) -> Message:
     rprint(f"{prompt_assistant(agent_name)}: Thinking...", end="\r")
 
@@ -276,7 +304,9 @@ def _reply_stream(
     line_buffer: list[str] = []
 
     # Create stream wrapper to capture metadata
-    stream = _stream(messages, model, tools, output_schema=output_schema)
+    stream = _stream(
+        messages, model, tools, output_schema=output_schema, max_tokens=max_tokens
+    )
 
     try:
         for char in (char for chunk in stream for char in chunk):

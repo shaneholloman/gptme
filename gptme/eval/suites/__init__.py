@@ -1,41 +1,71 @@
+import importlib
+import logging
+import pkgutil
+from pathlib import Path
+
 from ..types import EvalSpec
+
+logger = logging.getLogger(__name__)
+
+# Explicitly registered suites (non-practical, stable)
 from .basic import tests as tests_basic
 from .browser import tests as tests_browser
 from .init_projects import tests as tests_init_projects
-from .practical import tests as tests_practical
-from .practical2 import tests as tests_practical2
-from .practical3 import tests as tests_practical3
-from .practical4 import tests as tests_practical4
-from .practical5 import tests as tests_practical5
-from .practical6 import tests as tests_practical6
-from .practical7 import tests as tests_practical7
-from .practical8 import tests as tests_practical8
-from .practical9 import tests as tests_practical9
-from .practical10 import tests as tests_practical10
-from .practical11 import tests as tests_practical11
-from .practical12 import tests as tests_practical12
-from .practical13 import tests as tests_practical13
-from .practical14 import tests as tests_practical14
 
 suites: dict[str, list[EvalSpec]] = {
     "basic": tests_basic,
     "init_projects": tests_init_projects,
     "browser": tests_browser,
-    "practical": tests_practical,
-    "practical2": tests_practical2,
-    "practical3": tests_practical3,
-    "practical4": tests_practical4,
-    "practical5": tests_practical5,
-    "practical6": tests_practical6,
-    "practical7": tests_practical7,
-    "practical8": tests_practical8,
-    "practical9": tests_practical9,
-    "practical10": tests_practical10,
-    "practical11": tests_practical11,
-    "practical12": tests_practical12,
-    "practical13": tests_practical13,
-    "practical14": tests_practical14,
 }
+
+# Auto-discover all other suite modules in this package.
+# Any module that exports a `tests` list of EvalSpec dicts is registered.
+# This makes adding new eval suites as simple as creating a new file.
+_package_dir = Path(__file__).parent
+_explicit = {"basic", "browser", "init_projects", "__init__"}
+
+
+def _suite_sort_key(m: pkgutil.ModuleInfo) -> tuple[int, str]:
+    """Sort key: practical suites sorted numerically, others grouped at 0.
+
+    Numeric practical suites (practical, practical2, ...) sort first among
+    practical suites (keys 1..N). Non-numeric practical* names (e.g.
+    practical_bonus) sort after all numeric ones (key 10000). All other
+    suites sort before practical suites (key 0).
+    """
+    if m.name.startswith("practical"):
+        suffix = m.name.removeprefix("practical")
+        if not suffix or suffix.isdigit():
+            return (int(suffix) if suffix else 1, m.name)
+        # non-numeric practical* — sort after all numeric practical suites
+        return (10000, m.name)
+    return (0, m.name)
+
+
+def _discover_suites() -> None:
+    """Auto-discover and register suite modules from this package directory.
+
+    Wrapped in a function to avoid leaking loop variables into module namespace.
+    """
+    for info in sorted(pkgutil.iter_modules([str(_package_dir)]), key=_suite_sort_key):
+        if info.name in _explicit:
+            continue
+        try:
+            mod = importlib.import_module(f".{info.name}", __package__)
+        except Exception:
+            logger.warning(
+                "Failed to import eval suite module %s", info.name, exc_info=True
+            )
+            continue
+        mod_tests = getattr(mod, "tests", None)
+        if mod_tests is not None and isinstance(mod_tests, list):
+            suites[info.name] = mod_tests
+        else:
+            logger.debug("Skipping %s: no 'tests' list found", info.name)
+
+
+_discover_suites()
+
 
 tests: list[EvalSpec] = [test for suite in suites.values() for test in suite]
 

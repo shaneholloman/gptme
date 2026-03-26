@@ -145,6 +145,8 @@ def test_context_index_and_retrieve(tmp_path):
 
 def test_tools_list():
     """Test the tools list command."""
+    import json
+
     runner = CliRunner()
 
     # Test basic list
@@ -157,9 +159,41 @@ def test_tools_list():
     assert result.exit_code == 0
     assert "language tags" in result.output.lower()
 
+    # Test JSON output
+    result = runner.invoke(main, ["tools", "list", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert isinstance(data, list)
+    assert len(data) > 0
+    # Check required fields (stable schema — all keys always present)
+    tool = data[0]
+    assert "name" in tool
+    assert "desc" in tool
+    assert "available" in tool
+    assert isinstance(tool["available"], bool)
+    assert "block_types" in tool
+    assert isinstance(tool["block_types"], list)
+    assert "functions" in tool
+    assert isinstance(tool["functions"], list)
+    assert "commands" in tool
+    assert isinstance(tool["commands"], list)
+    assert "is_mcp" in tool
+    assert isinstance(tool["is_mcp"], bool)
+    # Default --available filter: all tools should be available
+    assert all(t["available"] for t in data)
+
+    # Test JSON with --all (includes unavailable)
+    result = runner.invoke(main, ["tools", "list", "--all", "--json"])
+    assert result.exit_code == 0
+    data_all = json.loads(result.output)
+    assert isinstance(data_all, list)
+    assert len(data_all) >= len(data)
+
 
 def test_tools_info():
     """Test the tools info command."""
+    import json
+
     runner = CliRunner()
 
     # Test valid tool
@@ -173,6 +207,20 @@ def test_tools_info():
     result = runner.invoke(main, ["tools", "info", "nonexistent-tool"])
     assert result.exit_code != 0  # returns non-zero for not found tool
     assert "not found" in result.output
+
+    # Test JSON output (stable schema — instructions/examples always present)
+    result = runner.invoke(main, ["tools", "info", "shell", "--json"])
+    assert result.exit_code == 0
+    data = json.loads(result.output)
+    assert data["name"] == "shell"
+    assert data["available"] is True
+    assert "instructions" in data
+    assert isinstance(data["instructions"], str)
+    assert len(data["instructions"]) > 0
+    assert "examples" in data
+    assert isinstance(data["examples"], str)
+    assert "is_mcp" in data
+    assert isinstance(data["is_mcp"], bool)
 
 
 def test_models_list():
