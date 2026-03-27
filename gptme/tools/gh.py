@@ -7,6 +7,8 @@ from collections.abc import Generator
 from ..message import Message
 from ..util.gh import (
     _get_repo_from_git_remote,
+    comment_on_github,
+    create_github_issue,
     get_github_issue_content,
     get_github_issue_list,
     get_github_pr_content,
@@ -498,6 +500,129 @@ def _handle_pr_merge(
         yield Message("system", f"Error: {result['message']}")
 
 
+def _parse_flags(args: list[str], start: int = 2) -> tuple[list[str], dict[str, str]]:
+    """Parse positional args and --flag value pairs from args starting at index."""
+    positional: list[str] = []
+    flags: dict[str, str] = {}
+    i = start
+    while i < len(args):
+        arg = args[i]
+        if arg.startswith("--"):
+            flag_name = arg[2:]
+            if i + 1 < len(args) and not args[i + 1].startswith("--"):
+                flags[flag_name] = args[i + 1]
+                i += 2
+            else:
+                # Boolean flag
+                flags[flag_name] = "true"
+                i += 1
+        else:
+            positional.append(arg)
+            i += 1
+    return positional, flags
+
+
+def _handle_issue_create(
+    args: list[str],
+) -> Generator[Message, None, None]:
+    """Handle `gh issue create --repo owner/repo --title "..." --body "..." [--label ...]`."""
+    _, flags = _parse_flags(args, start=2)
+
+    # Resolve repo
+    repo_flag = flags.get("repo", "")
+    owner, repo = "", ""
+    if repo_flag:
+        if "/" not in repo_flag:
+            yield Message(
+                "system",
+                "Error: --repo must be in owner/repo format.",
+            )
+            return
+        owner, repo = repo_flag.split("/", 1)
+    else:
+        repo_info = _get_repo_from_git_remote()
+        if repo_info:
+            owner, repo = repo_info
+
+    if not owner or not repo:
+        yield Message(
+            "system",
+            "Error: Could not determine repository. Use --repo owner/repo or run from a git repo.",
+        )
+        return
+
+    title = flags.get("title", "")
+    if not title:
+        yield Message(
+            "system",
+            'Error: --title is required. Usage: gh issue create --repo owner/repo --title "Title" [--body "Body"] [--label label1,label2] [--assignee user]',
+        )
+        return
+
+    body = flags.get("body", "")
+    labels = flags["label"].split(",") if flags.get("label") else None
+    assignees = flags["assignee"].split(",") if flags.get("assignee") else None
+
+    result = create_github_issue(
+        owner, repo, title, body, labels=labels, assignees=assignees
+    )
+    if result["success"]:
+        yield Message("system", f"✓ {result['message']}\n{result['url']}")
+    else:
+        yield Message("system", f"Error: {result['message']}")
+
+
+def _handle_comment(
+    args: list[str],
+) -> Generator[Message, None, None]:
+    """Handle `gh issue comment <ref> --body "..."` and `gh pr comment <ref> --body "..."`."""
+    kind = args[0]  # "issue" or "pr"
+    ref_type = "issues" if kind == "issue" else "pull"
+
+    # Need at least: gh issue/pr comment <ref> --body "..."
+    if len(args) < 3 or args[2].startswith("--"):
+        yield Message(
+            "system",
+            f'Error: Missing reference. Usage: gh {kind} comment <owner/repo#N> --body "Comment text"',
+        )
+        return
+
+    # The reference is the next positional arg after "comment"
+    ref_str = args[2]
+
+    # Parse remaining args for --body and other flags
+    _, flags = _parse_flags(args, start=3)
+
+    body = flags.get("body", "")
+    if not body:
+        yield Message(
+            "system",
+            f'Error: --body is required. Usage: gh {kind} comment <owner/repo#N> --body "Comment text"',
+        )
+        return
+
+    # Parse the reference to get owner/repo/number
+    info = parse_github_ref(ref_str, default_type=ref_type)
+    if not info:
+        yield Message(
+            "system",
+            f"Error: Could not parse reference '{ref_str}'. Use owner/repo#N, #N, or a full URL.",
+        )
+        return
+
+    result = comment_on_github(
+        info["owner"], info["repo"], int(info["number"]), body, kind=kind
+    )
+    if result["success"]:
+        msg = str(result["message"])
+        url = result.get("url", "")
+        if url:
+            msg += f"\n{url}"
+        yield Message("system", f"✓ {msg}")
+    else:
+        yield Message("system", f"Error: {result['message']}")
+
+
 def execute_gh(
     code: str | None,
     args: list[str] | None,
@@ -736,10 +861,18 @@ def execute_gh(
                 f"Error: Failed to search {search_type}. Make sure 'gh' CLI is installed and authenticated.",
             )
 
+    elif args and len(args) >= 2 and args[0] == "issue" and args[1] == "create":
+        yield from _handle_issue_create(args)
+
+    elif (
+        args and len(args) >= 2 and args[0] in ("issue", "pr") and args[1] == "comment"
+    ):
+        yield from _handle_comment(args)
+
     else:
         yield Message(
             "system",
-            "Error: Unknown gh command. Available: gh issue list, gh issue view, gh pr list, gh pr view, gh pr diff, gh pr merge, gh pr status, gh pr checks, gh run view, gh search issues, gh search prs\n\nReferences can be URLs, owner/repo#N, #N, or bare numbers.",
+            "Error: Unknown gh command. Available: gh issue create, gh issue list, gh issue view, gh issue comment, gh pr list, gh pr view, gh pr diff, gh pr merge, gh pr comment, gh pr status, gh pr checks, gh run view, gh search issues, gh search prs\n\nReferences can be URLs, owner/repo#N, #N, or bare numbers.",
         )
 
 
@@ -747,19 +880,25 @@ instructions = """Interact with GitHub via the GitHub CLI (gh).
 
 Refs: full URLs, `owner/repo#N`, `#N`, or bare `N` (when in a git repo).
 
+Create/read issues and PRs:
+```gh issue create --repo owner/repo --title "Title" --body "Details"
+gh issue view owner/repo#42
+gh pr view owner/repo#123
+```
+
 List issues/PRs:
 ```gh issue list --repo owner/repo --state open --limit 20
 gh pr list --repo owner/repo --state open --limit 20
 ```
 
 Search issues/PRs across repos:
-```gh search issues "bug fix" --repo owner/repo --state open --limit 10
-gh search prs "feature" --author username --state open
+```gh search issues "query" --repo owner/repo --state open
+gh search prs "query" --author username --state open
 ```
 
-Read issue/PR:
-```gh issue view owner/repo#42
-gh pr view owner/repo#123
+Comment on issues/PRs:
+```gh issue comment owner/repo#42 --body "Comment"
+gh pr comment owner/repo#123 --body "LGTM"
 ```
 
 Inspect code changes:
@@ -767,22 +906,12 @@ Inspect code changes:
 ```
 
 Merge a pull request (default: squash):
-```gh pr merge owner/repo#123
-gh pr merge owner/repo#123 --rebase
-gh pr merge owner/repo#123 --squash --auto --delete-branch --match-head-commit abc1234
+```gh pr merge owner/repo#123 --squash --auto --delete-branch
 ```
 
 CI status:
-```gh pr status <ref> [commit_sha]
-gh pr checks <ref> [commit_sha]
+```gh pr checks <ref>
 gh run view <run-id>
-```
-
-Multi-line comments:
-```shell
-gh issue comment NUM --repo owner/repo --body-file - << 'EOF'
-Body here
-EOF
 ```
 
 For other operations, use the `shell` tool with `gh`."""
@@ -892,23 +1021,62 @@ gh repo create $REPO --public --source . --push
         ).to_output(tool_format)
     }
 
-> User: post a multi-line comment on issue 42
+> User: create an issue to track this bug
 > Assistant:
 {
         ToolUse(
-            "shell",
-            [],
-            '''gh issue comment 42 --repo $REPO --body-file - << 'EOF'
-## Summary
-
-Work is complete. Here are the details:
-- Fixed the bug
-- Added tests
-
-See PR #123 for the implementation.
-EOF''',
+            "gh",
+            [
+                "issue",
+                "create",
+                "--repo",
+                "owner/repo",
+                "--title",
+                "Fix login timeout",
+                "--body",
+                "Login times out after 30s on slow connections.",
+                "--label",
+                "bug",
+            ],
+            None,
         ).to_output(tool_format)
     }
+> System: ✓ Created issue #42: Fix login timeout
+> System: https://github.com/owner/repo/issues/42
+
+> User: comment on issue 42 that the fix is ready
+> Assistant:
+{
+        ToolUse(
+            "gh",
+            [
+                "issue",
+                "comment",
+                "owner/repo#42",
+                "--body",
+                "Fix implemented in PR #50. Ready for review.",
+            ],
+            None,
+        ).to_output(tool_format)
+    }
+> System: ✓ Commented on issue #42
+
+> User: leave a review comment on PR 123
+> Assistant:
+{
+        ToolUse(
+            "gh",
+            [
+                "pr",
+                "comment",
+                "owner/repo#123",
+                "--body",
+                "LGTM! Tests pass and code looks clean.",
+            ],
+            None,
+        ).to_output(tool_format)
+    }
+> System: ✓ Commented on pr #123
 
 > User: show issues
 > Assistant:

@@ -7,6 +7,57 @@ We support LLMs from several providers, including OpenAI, Anthropic, OpenRouter,
 
     We are in the process of adding support for configurable `custom providers <custom-providers>`_.
 
+.. rubric:: Provider Plugins (Entry Points)
+
+Third-party packages can register LLM providers via Python entry points, making them available immediately after ``pip install`` without any configuration changes.
+
+**How it works:** A plugin package declares an entry point in the ``gptme.providers`` group::
+
+    [project.entry-points."gptme.providers"]
+    minimax = "gptme_provider_minimax:provider"
+
+Where ``provider`` is a ``ProviderPlugin`` instance.
+
+**Usage:** Once installed, use the provider name as the model prefix::
+
+    pip install gptme-provider-minimax
+    gptme "hello" -m minimax/abab6.5s-chat
+
+**Creating a provider plugin:**
+
+.. code-block:: python
+
+    from gptme.llm.models import ModelMeta, ProviderPlugin
+
+    provider = ProviderPlugin(
+        name="minimax",                          # Unique provider name
+        api_key_env="MINIMAX_API_KEY",           # Env var for API key
+        base_url="https://api.minimax.chat/v1",  # OpenAI-compatible endpoint
+        models=[
+            ModelMeta(provider="unknown", model="minimax/abab6.5s-chat", context=245_760),
+        ],
+    )
+
+**ProviderPlugin fields:**
+
+================= ======== ==========================================================
+Field             Required Description
+================= ======== ==========================================================
+``name``           Yes      Unique provider name (e.g. ``"minimax"``)
+``api_key_env``    Yes      Environment variable holding the API key
+``base_url``       Yes      OpenAI-compatible API base URL
+``models``         No       List of ``ModelMeta`` objects
+``init``           No       Custom ``(Config) -> None``; ``None`` = auto-init OpenAI client
+================= ======== ==========================================================
+
+If ``init`` is provided, it **must** register an OpenAI-compatible client before returning, or gptme will raise a ``RuntimeError``.
+
+Plugin providers are auto-initialised on first use and routed through the OpenAI client path.
+
+.. note::
+
+   For new plugins, consider using the :ref:`unified plugin system <unified-plugins>` (``gptme.plugins`` entry-point group) instead. It lets a single package provide tools, hooks, commands, **and** a provider together. The ``gptme.providers`` group still works and is supported for backward compatibility.
+
 You can find our model recommendations on the :doc:`evals` page.
 
 .. toctree::
