@@ -1,9 +1,10 @@
 import { useEffect, useState, useCallback } from 'react';
-import { Loader2 } from 'lucide-react';
+import { Download, Loader2 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { useWorkspaceApi } from '@/utils/workspaceApi';
 import type { FileType, FilePreview } from '@/types/workspace';
 import { CodeDisplay } from '@/components/CodeDisplay';
+import { Button } from '@/components/ui/button';
 import { MarkdownPreviewTabs } from './MarkdownPreviewTabs';
 
 // Helper function to check if a file is a markdown file
@@ -11,6 +12,36 @@ function isMarkdownFileType(file: FileType): boolean {
   const fileName = file.name.toLowerCase();
   return (
     fileName.endsWith('.md') || fileName.endsWith('.markdown') || file.mime_type === 'text/markdown'
+  );
+}
+
+function FileHeader({
+  file,
+  onDownload,
+  downloadError,
+}: {
+  file: FileType;
+  onDownload: () => void;
+  downloadError?: string | null;
+}) {
+  return (
+    <div className="flex flex-col border-b">
+      <div className="flex items-start justify-between p-2">
+        <div>
+          <h3 className="font-medium">{file.name}</h3>
+          <div className="space-y-1 text-sm text-muted-foreground">
+            <div>
+              {(file.size / 1024).toFixed(1)} KB • {file.mime_type || 'Unknown type'}
+            </div>
+            <div>Modified {formatDistanceToNow(new Date(file.modified), { addSuffix: true })}</div>
+          </div>
+        </div>
+        <Button variant="ghost" size="icon" title="Download file" onClick={onDownload}>
+          <Download className="h-4 w-4" />
+        </Button>
+      </div>
+      {downloadError && <div className="px-2 pb-2 text-sm text-destructive">{downloadError}</div>}
+    </div>
   );
 }
 
@@ -22,14 +53,16 @@ interface FilePreviewProps {
 export function FilePreview({ file, conversationId }: FilePreviewProps) {
   const [preview, setPreview] = useState<FilePreview | null>(null);
   const [error, setError] = useState<string | null>(null);
+  const [downloadError, setDownloadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
 
-  const { previewFile } = useWorkspaceApi();
+  const { previewFile, downloadFile } = useWorkspaceApi();
 
   const loadPreview = useCallback(async () => {
     try {
       setLoading(true);
       setError(null);
+      setDownloadError(null);
       const data = await previewFile(conversationId, file.path);
       setPreview(data);
     } catch (err) {
@@ -38,6 +71,15 @@ export function FilePreview({ file, conversationId }: FilePreviewProps) {
       setLoading(false);
     }
   }, [file.path, conversationId, previewFile]);
+
+  const handleDownload = useCallback(async () => {
+    try {
+      setDownloadError(null);
+      await downloadFile(conversationId, file.path);
+    } catch (err) {
+      setDownloadError(err instanceof Error ? err.message : 'Download failed');
+    }
+  }, [downloadFile, conversationId, file.path]);
 
   useEffect(() => {
     loadPreview();
@@ -59,24 +101,13 @@ export function FilePreview({ file, conversationId }: FilePreviewProps) {
     return null;
   }
 
-  // Check if this is a markdown file
   const isMarkdownFile = isMarkdownFileType(file);
 
   switch (preview.type) {
     case 'text':
       return (
         <div className="flex h-full flex-col">
-          <div className="border-b p-2">
-            <h3 className="font-medium">{file.name}</h3>
-            <div className="space-y-1 text-sm text-muted-foreground">
-              <div>
-                {(file.size / 1024).toFixed(1)} KB • {file.mime_type || 'Unknown type'}
-              </div>
-              <div>
-                Modified {formatDistanceToNow(new Date(file.modified), { addSuffix: true })}
-              </div>
-            </div>
-          </div>
+          <FileHeader file={file} onDownload={handleDownload} downloadError={downloadError} />
           <div className="flex-1 overflow-auto">
             {isMarkdownFile ? (
               <MarkdownPreviewTabs
@@ -96,17 +127,7 @@ export function FilePreview({ file, conversationId }: FilePreviewProps) {
     case 'image':
       return (
         <div className="flex h-full flex-col">
-          <div className="border-b p-2">
-            <h3 className="font-medium">{file.name}</h3>
-            <div className="space-y-1 text-sm text-muted-foreground">
-              <div>
-                {(file.size / 1024).toFixed(1)} KB • {file.mime_type || 'Unknown type'}
-              </div>
-              <div>
-                Modified {formatDistanceToNow(new Date(file.modified), { addSuffix: true })}
-              </div>
-            </div>
-          </div>
+          <FileHeader file={file} onDownload={handleDownload} downloadError={downloadError} />
           <div className="flex flex-1 items-center justify-center overflow-auto p-4">
             <img
               src={preview.content}
@@ -119,19 +140,9 @@ export function FilePreview({ file, conversationId }: FilePreviewProps) {
     case 'binary':
       return (
         <div className="flex h-full flex-col">
-          <div className="border-b p-2">
-            <h3 className="font-medium">{file.name}</h3>
-            <div className="space-y-1 text-sm text-muted-foreground">
-              <div>
-                {(file.size / 1024).toFixed(1)} KB • {file.mime_type || 'Unknown type'}
-              </div>
-              <div>
-                Modified {formatDistanceToNow(new Date(file.modified), { addSuffix: true })}
-              </div>
-            </div>
-          </div>
+          <FileHeader file={file} onDownload={handleDownload} downloadError={downloadError} />
           <div className="flex flex-1 items-center justify-center">
-            <p className="text-muted-foreground">Binary file</p>
+            <p className="text-muted-foreground">Binary file — use the download button above</p>
           </div>
         </div>
       );

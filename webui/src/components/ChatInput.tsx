@@ -1,7 +1,17 @@
-import { Send, Loader2, Settings, X, Bot, Folder, Clock } from 'lucide-react';
+import { Send, Loader2, Settings, X, Bot, Folder, Clock, Paperclip, File } from 'lucide-react';
+import { toast } from 'sonner';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
-import { useState, useEffect, useRef, type FC, type FormEvent, type KeyboardEvent } from 'react';
+import {
+  useState,
+  useEffect,
+  useRef,
+  useCallback,
+  type FC,
+  type FormEvent,
+  type KeyboardEvent,
+  type DragEvent,
+} from 'react';
 import { useApi } from '@/contexts/ApiContext';
 import { Badge } from '@/components/ui/badge';
 import { ModelSelector } from '@/components/ModelSelector';
@@ -24,6 +34,7 @@ export interface ChatOptions {
   model?: string;
   stream?: boolean;
   workspace?: string;
+  files?: string[];
 }
 
 interface Props {
@@ -243,6 +254,25 @@ const QueuedMessageBadge: FC<{ message: string; onClear: () => void }> = ({ mess
   );
 };
 
+const AttachedFileBadge: FC<{ name: string; onRemove: () => void }> = ({ name, onRemove }) => (
+  <Badge variant="secondary" className="flex items-center gap-1.5 pr-1">
+    <div className="flex items-center gap-1.5">
+      <File className="h-3 w-3" />
+      <span className="max-w-[120px] truncate text-xs" title={name}>
+        {name}
+      </span>
+    </div>
+    <Button
+      variant="ghost"
+      size="sm"
+      onClick={onRemove}
+      className="h-4 w-4 p-0 hover:bg-destructive/20"
+    >
+      <X className="h-2.5 w-2.5" />
+    </Button>
+  </Badge>
+);
+
 export const ChatInput: FC<Props> = ({
   conversationId,
   onSend,
@@ -253,7 +283,7 @@ export const ChatInput: FC<Props> = ({
   value,
   onChange,
 }) => {
-  const { isConnected$ } = useApi();
+  const { api, isConnected$ } = useApi();
   const sidebarSelectedWorkspace = use$(selectedWorkspace$);
   const sidebarSelectedAgent = use$(selectedAgent$);
 
@@ -324,6 +354,79 @@ export const ChatInput: FC<Props> = ({
     !conversationId && !!sidebarSelectedWorkspace
   );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
+  const fileInputRef = useRef<HTMLInputElement>(null);
+  const currentConversationIdRef = useRef(conversationId);
+
+  // File attachment state
+  interface AttachedFile {
+    name: string;
+    path: string; // absolute path returned by the upload endpoint
+  }
+  const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
+  const [isUploading, setIsUploading] = useState(false);
+  const [isDragOver, setIsDragOver] = useState(false);
+
+  useEffect(() => {
+    currentConversationIdRef.current = conversationId;
+    setAttachedFiles([]);
+    setIsDragOver(false);
+  }, [conversationId]);
+
+  const uploadAndAttach = useCallback(
+    async (files: FileList | File[]) => {
+      if (!conversationId || files.length === 0) return;
+      const uploadConversationId = conversationId;
+      setIsUploading(true);
+      try {
+        const result = await api.uploadFiles(uploadConversationId, Array.from(files));
+        if (currentConversationIdRef.current !== uploadConversationId) {
+          return;
+        }
+        setAttachedFiles((prev) => [
+          ...prev,
+          ...result.files.map((f) => ({ name: f.name, path: f.path })),
+        ]);
+      } catch (error) {
+        if (currentConversationIdRef.current !== uploadConversationId) {
+          return;
+        }
+        console.error('[ChatInput] File upload failed:', error);
+        const message = error instanceof Error ? error.message : 'Upload failed';
+        toast.error(`File upload failed: ${message}`);
+      } finally {
+        setIsUploading(false);
+      }
+    },
+    [conversationId, api]
+  );
+
+  const handleDragOver = useCallback((e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    setIsDragOver(true);
+  }, []);
+
+  const handleDragLeave = useCallback((e: DragEvent) => {
+    e.preventDefault();
+    e.stopPropagation();
+    const relatedTarget = e.relatedTarget;
+    if (relatedTarget instanceof Node && e.currentTarget.contains(relatedTarget)) {
+      return;
+    }
+    setIsDragOver(false);
+  }, []);
+
+  const handleDrop = useCallback(
+    (e: DragEvent) => {
+      e.preventDefault();
+      e.stopPropagation();
+      setIsDragOver(false);
+      if (e.dataTransfer.files.length > 0) {
+        uploadAndAttach(e.dataTransfer.files);
+      }
+    },
+    [uploadAndAttach]
+  );
 
   const isConnected = use$(isConnected$);
 
@@ -411,9 +514,11 @@ export const ChatInput: FC<Props> = ({
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
+    const filePaths = attachedFiles.length > 0 ? attachedFiles.map((f) => f.path) : undefined;
+
     if (isGenerating) {
       // If there's a message, queue it instead of interrupting
-      if (message.trim()) {
+      if (message.trim() || attachedFiles.length > 0) {
         console.log('[ChatInput] Queueing message for after generation completes', {
           queueLength: messageQueue.length + 1,
         });
@@ -426,10 +531,12 @@ export const ChatInput: FC<Props> = ({
               model: effectiveModel === 'default' ? undefined : effectiveModel,
               stream: streamingEnabled,
               workspace: selectedWorkspace || undefined,
+              files: filePaths,
             },
           },
         ]);
         setMessage('');
+        setAttachedFiles([]);
         // Clear localStorage draft since we're queueing it
         if (typeof window !== 'undefined') {
           localStorage.removeItem(storageKey);
@@ -448,13 +555,15 @@ export const ChatInput: FC<Props> = ({
           console.error('[ChatInput] Error interrupting generation:', error);
         }
       }
-    } else if (message.trim()) {
+    } else if (message.trim() || attachedFiles.length > 0) {
       onSend(message, {
         model: effectiveModel === 'default' ? undefined : effectiveModel,
         stream: streamingEnabled,
         workspace: selectedWorkspace || undefined,
+        files: filePaths,
       });
       setMessage('');
+      setAttachedFiles([]);
       // Reset textarea height to default by removing inline style
       if (textareaRef.current) {
         textareaRef.current.style.height = '';
@@ -518,7 +627,33 @@ export const ChatInput: FC<Props> = ({
 
   return (
     <form onSubmit={handleSubmit} className="p-4">
+      {/* Hidden file input */}
+      <input
+        ref={fileInputRef}
+        type="file"
+        multiple
+        className="hidden"
+        onChange={(e) => {
+          if (e.target.files && e.target.files.length > 0) {
+            uploadAndAttach(e.target.files);
+          }
+          // Reset so the same file can be selected again
+          e.target.value = '';
+        }}
+      />
       <div className="flex flex-col gap-2">
+        {/* Show attached files */}
+        {attachedFiles.length > 0 && (
+          <div className="flex flex-wrap items-center gap-1">
+            {attachedFiles.map((file, index) => (
+              <AttachedFileBadge
+                key={`${file.path}-${index}`}
+                name={file.name}
+                onRemove={() => setAttachedFiles((prev) => prev.filter((_, i) => i !== index))}
+              />
+            ))}
+          </div>
+        )}
         {/* Show queued messages indicator */}
         {messageQueue.length > 0 && (
           <div className="flex flex-wrap items-center gap-1">
@@ -534,7 +669,18 @@ export const ChatInput: FC<Props> = ({
         <div className="flex">
           <Computed>
             {() => (
-              <div className="relative flex flex-1">
+              <div
+                className={`relative flex flex-1 ${isDragOver ? 'rounded-md ring-2 ring-primary ring-offset-2' : ''}`}
+                onDragOver={conversationId ? handleDragOver : undefined}
+                onDragLeave={conversationId ? handleDragLeave : undefined}
+                onDrop={conversationId ? handleDrop : undefined}
+              >
+                {/* Drag overlay */}
+                {isDragOver && (
+                  <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-md bg-primary/10">
+                    <span className="text-sm font-medium text-primary">Drop files to attach</span>
+                  </div>
+                )}
                 {/* File autocomplete dropdown */}
                 <FileAutocomplete
                   files={fileAutocomplete.state.files}
@@ -580,6 +726,26 @@ export const ChatInput: FC<Props> = ({
                     />
                   </OptionsButton>
 
+                  {/* File upload button (only for existing conversations) */}
+                  {conversationId && (
+                    <Button
+                      type="button"
+                      variant="ghost"
+                      size="sm"
+                      className="h-5 rounded-sm px-1.5 text-[10px] text-muted-foreground transition-all hover:bg-accent hover:text-muted-foreground hover:opacity-100"
+                      disabled={isDisabled || isUploading}
+                      onClick={() => fileInputRef.current?.click()}
+                      title="Attach files"
+                    >
+                      {isUploading ? (
+                        <Loader2 className="mr-0.5 h-2.5 w-2.5 animate-spin" />
+                      ) : (
+                        <Paperclip className="mr-0.5 h-2.5 w-2.5" />
+                      )}
+                      {isUploading ? 'Uploading...' : 'Attach'}
+                    </Button>
+                  )}
+
                   {/* Agent badge for new conversations */}
                   {!conversationId && sidebarSelectedAgent && (
                     <AgentBadge
@@ -606,7 +772,7 @@ export const ChatInput: FC<Props> = ({
                 <SubmitButton
                   isGenerating={isGenerating}
                   isDisabled={isDisabled}
-                  hasText={!!message.trim()}
+                  hasText={!!message.trim() || attachedFiles.length > 0}
                 />
               </div>
             )}

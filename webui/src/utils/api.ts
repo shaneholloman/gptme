@@ -583,6 +583,22 @@ export class ApiClient {
     }
   }
 
+  async searchConversations(query: string, limit: number = 20): Promise<ConversationSummary[]> {
+    if (!this.isConnected) {
+      throw new ApiClientError('Not connected to API');
+    }
+    try {
+      return await this.fetchJson<ConversationSummary[]>(
+        `${this.baseUrl}/api/v2/conversations?search=${encodeURIComponent(query)}&limit=${limit}`
+      );
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new ApiClientError('Request aborted', 499);
+      }
+      throw error;
+    }
+  }
+
   async getConversationsPaginated(
     pageParam: number = 0,
     pageSize: number = 20
@@ -761,6 +777,49 @@ export class ApiClient {
       }
       throw error;
     }
+  }
+
+  async uploadFiles(
+    conversationId: string,
+    files: File[]
+  ): Promise<{
+    files: Array<{
+      name: string;
+      path: string;
+      type: string;
+      size: number;
+      modified: string;
+      mime_type: string | null;
+    }>;
+  }> {
+    if (!this.isConnected) {
+      throw new ApiClientError('Not connected to API');
+    }
+
+    const formData = new FormData();
+    for (const file of files) {
+      formData.append('file', file, file.name);
+    }
+
+    const headers: Record<string, string> = {};
+    if (this.authHeader) {
+      headers['Authorization'] = this.authHeader;
+    }
+    // Note: do NOT set Content-Type — browser sets it with boundary for multipart
+
+    const response = await fetch(
+      `${this.baseUrl}/api/v2/conversations/${conversationId}/workspace/upload`,
+      { method: 'POST', headers, body: formData }
+    );
+
+    const data = await response.json();
+    if (!response.ok) {
+      throw new ApiClientError(
+        isApiErrorResponse(data) ? data.error : `Upload failed: ${response.status}`,
+        response.status
+      );
+    }
+    return data;
   }
 
   async step(

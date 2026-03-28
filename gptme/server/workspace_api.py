@@ -51,6 +51,25 @@ class FileListResponse(BaseModel):
     files: list[FileMetadata] = Field(..., description="List of files and directories")
 
 
+class UploadedFileMetadata(BaseModel):
+    """Metadata for an uploaded file."""
+
+    name: str = Field(..., description="File name")
+    path: str = Field(
+        ..., description="Absolute filesystem path for use in message files"
+    )
+    type: Literal["file", "directory"] = Field(..., description="File type")
+    size: int = Field(..., description="File size in bytes")
+    modified: str = Field(..., description="Last modified timestamp (ISO format)")
+    mime_type: str | None = Field(None, description="MIME type (files only)")
+
+
+class UploadFileResponse(BaseModel):
+    """Response for file upload."""
+
+    files: list[UploadedFileMetadata] = Field(..., description="List of uploaded files")
+
+
 class FilePreviewResponse(BaseModel):
     """Response for file preview."""
 
@@ -149,6 +168,28 @@ def safe_workspace_path(workspace: Path, path: str | None = None) -> Path:
     return full_path
 
 
+def allocate_attachment_path(
+    attachments_dir: Path, filename: str, reserved_names: set[str] | None = None
+) -> Path:
+    """Allocate a non-conflicting path inside the attachments directory."""
+    reserved_names = reserved_names or set()
+    candidate = filename
+    candidate_path = attachments_dir / candidate
+    if candidate not in reserved_names and not candidate_path.exists():
+        return candidate_path
+
+    path = Path(filename)
+    suffix = "".join(path.suffixes)
+    stem = path.name[: -len(suffix)] if suffix else path.name
+    counter = 1
+    while True:
+        candidate = f"{stem}-{counter}{suffix}"
+        candidate_path = attachments_dir / candidate
+        if candidate not in reserved_names and not candidate_path.exists():
+            return candidate_path
+        counter += 1
+
+
 def list_directory(
     path: Path, workspace: Path, show_hidden: bool = False
 ) -> list[FileType]:
@@ -227,6 +268,108 @@ def browse_workspace(conversation_id: str, subpath: str | None = None):
         return flask.jsonify({"error": "Conversation not found"}), 404
     except Exception as e:
         logger.exception("Error browsing workspace")
+        return flask.jsonify({"error": str(e)}), 500
+
+
+@workspace_api.route(
+    "/api/v2/conversations/<string:conversation_id>/workspace/upload",
+    methods=["POST"],
+)
+@require_auth
+@api_doc_simple(
+    responses={
+        200: UploadFileResponse,
+        400: ErrorResponse,
+        404: ErrorResponse,
+        413: ErrorResponse,
+        500: ErrorResponse,
+    },
+    tags=["workspace"],
+)
+def upload_files(conversation_id: str):
+    """Upload files to conversation attachments.
+
+    Upload one or more files to a conversation's attachments directory
+    (<logdir>/attachments/). Accepts multipart/form-data with file fields.
+    Uploaded files are intended for the agent to read as context; the agent can
+    move them into the workspace if it needs to modify them.
+    Returns absolute file paths so they can be included directly in message files.
+    """
+    try:
+        manager = LogManager.load(conversation_id, lock=False)
+        attachments_dir = manager.logdir / "attachments"
+
+        if not request.files:
+            return flask.jsonify({"error": "No files provided"}), 400
+
+        # Size limit: 50MB per file
+        max_size = 50 * 1024 * 1024
+
+        # Collect files from all form field names (MultiDict may have duplicates)
+        all_files = []
+        for key in request.files:
+            all_files.extend(request.files.getlist(key))
+
+        # First pass: validate all files before writing any (prevents partial-upload state)
+        validated: list[tuple[Path, bytes]] = []
+        reserved_names: set[str] = set()
+        for file in all_files:
+            if not file.filename:
+                continue
+
+            # Sanitize filename (prevent path traversal via filename)
+            filename = Path(file.filename).name
+            if not filename or filename.startswith("."):
+                continue
+
+            # Check file size by reading into memory
+            content = file.read()
+            if len(content) > max_size:
+                return (
+                    flask.jsonify(
+                        {
+                            "error": f"File '{filename}' exceeds 50MB limit "
+                            f"({len(content) / 1024 / 1024:.1f}MB)"
+                        }
+                    ),
+                    413,
+                )
+            file_path = allocate_attachment_path(
+                attachments_dir, filename, reserved_names
+            )
+            reserved_names.add(file_path.name)
+            validated.append((file_path, content))
+
+        if not validated:
+            return flask.jsonify({"error": "No valid files uploaded"}), 400
+
+        # Second pass: write all files (only reached if all files passed validation)
+        attachments_dir.mkdir(parents=True, exist_ok=True)
+        uploaded: list[FileType] = []
+        for file_path, content in validated:
+            file_path.write_bytes(content)
+            stat = file_path.stat()
+            uploaded.append(
+                {
+                    "name": file_path.name,
+                    "path": str(file_path),  # absolute path for unambiguous resolution
+                    "type": "file",
+                    "size": stat.st_size,
+                    "modified": datetime.fromtimestamp(
+                        stat.st_mtime, tz=timezone.utc
+                    ).isoformat(),
+                    "mime_type": mimetypes.guess_type(file_path)[0],
+                }
+            )
+
+        return flask.jsonify({"files": uploaded})
+
+    except FileNotFoundError:
+        return flask.jsonify({"error": "Conversation not found"}), 404
+    except ValueError as e:
+        return flask.jsonify({"error": str(e)}), 400
+    except Exception as e:
+        logger.exception("Error uploading files")
         return flask.jsonify({"error": str(e)}), 500
 
 
