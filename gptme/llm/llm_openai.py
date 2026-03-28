@@ -609,6 +609,7 @@ def extra_headers(provider: Provider) -> dict[str, str]:
 
 
 _OPENROUTER_REASONING_DEFAULT = 20000
+_VALID_QUANTIZATIONS = {"fp16", "bf16", "fp8", "int8", "int4", "unknown"}
 
 
 def extra_body(
@@ -665,6 +666,23 @@ def extra_body(
         # Users can override with OPENROUTER_DATA_COLLECTION env var or config.
         data_collection = get_config().get_env("OPENROUTER_DATA_COLLECTION", "deny")
         provider_prefs["data_collection"] = data_collection
+
+        # Quantization preferences: restrict to specific precision levels.
+        # Useful for controlling quality (fp16) or cost (int4/int8).
+        # Set via OPENROUTER_QUANTIZATION env var as comma-separated values.
+        # See: https://openrouter.ai/docs/provider-routing#quantization
+        quantization = get_config().get_env("OPENROUTER_QUANTIZATION")
+        if quantization:
+            parsed = [q.strip() for q in quantization.split(",") if q.strip()]
+            if parsed:
+                invalid = [q for q in parsed if q not in _VALID_QUANTIZATIONS]
+                if invalid:
+                    logger.warning(
+                        "Unknown OPENROUTER_QUANTIZATION value(s): %s. Valid values are: %s",
+                        ", ".join(invalid),
+                        ", ".join(sorted(_VALID_QUANTIZATIONS)),
+                    )
+                provider_prefs["quantizations"] = parsed
 
         body["provider"] = provider_prefs
     return body
