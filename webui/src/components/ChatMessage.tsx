@@ -8,6 +8,37 @@ import { ObservableHint, type Observable } from '@legendapp/state';
 import { Memo, useObservable, useObserveEffect } from '@legendapp/state/react';
 import * as smd from '@/utils/smd';
 import { customRenderer, type CustomRenderer } from '@/utils/markdownRenderer';
+import { Clipboard, Check } from 'lucide-react';
+import { Button } from '@/components/ui/button';
+import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
+
+function formatTimestamp(timestamp: string): { short: string; full: string } {
+  const date = new Date(timestamp);
+  if (isNaN(date.getTime())) return { short: '', full: '' };
+  const now = new Date();
+  const isToday = date.toDateString() === now.toDateString();
+  const isThisYear = date.getFullYear() === now.getFullYear();
+
+  const timeStr = date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+  const full = date.toLocaleString([], {
+    year: 'numeric',
+    month: 'short',
+    day: 'numeric',
+    hour: '2-digit',
+    minute: '2-digit',
+    second: '2-digit',
+  });
+
+  if (isToday) {
+    return { short: timeStr, full };
+  }
+  const dateStr = date.toLocaleDateString([], {
+    month: 'short',
+    day: 'numeric',
+    ...(isThisYear ? {} : { year: 'numeric' }),
+  });
+  return { short: `${dateStr}, ${timeStr}`, full };
+}
 
 interface Props {
   message$: Observable<Message | StreamingMessage>;
@@ -179,6 +210,21 @@ export const ChatMessage: FC<Props> = ({
     );
   });
 
+  const copied$ = useObservable(false);
+
+  const handleCopy = async () => {
+    const content = message$.content.peek();
+    if (content) {
+      try {
+        await navigator.clipboard.writeText(content);
+        copied$.set(true);
+        setTimeout(() => copied$.set(false), 2000);
+      } catch (err) {
+        console.error('Failed to copy to clipboard:', err);
+      }
+    }
+  };
+
   const chainType$ = useMessageChainType(message$, previousMessage$, nextMessage$);
   const messageClasses$ = useObservable(
     () => `
@@ -233,7 +279,16 @@ export const ChatMessage: FC<Props> = ({
                   userName={api.userInfo$.name?.get()}
                 />
                 <div className="md:px-12">
-                  <div className={messageClasses$.get()}>
+                  <div className={`group/message relative ${messageClasses$.get()}`}>
+                    <Button
+                      variant="ghost"
+                      size="sm"
+                      onClick={handleCopy}
+                      className="absolute right-1 top-1 z-10 h-7 w-7 p-0 opacity-0 transition-opacity hover:!opacity-100 group-hover/message:opacity-50"
+                      aria-label="Copy message"
+                    >
+                      {copied$.get() ? <Check size={14} /> : <Clipboard size={14} />}
+                    </Button>
                     <div className="px-3 py-1.5">
                       <Memo>
                         {() => {
@@ -253,6 +308,26 @@ export const ChatMessage: FC<Props> = ({
                         }}
                       </Memo>
                       {renderFiles()}
+                      <Memo>
+                        {() => {
+                          const timestamp = (message$.get() as Message)?.timestamp;
+                          if (!timestamp) return null;
+                          const { short, full } = formatTimestamp(timestamp);
+                          if (!short) return null;
+                          return (
+                            <TooltipProvider>
+                              <Tooltip>
+                                <TooltipTrigger asChild>
+                                  <div className="mt-0.5 select-none text-right text-[10px] text-muted-foreground/50 opacity-0 transition-opacity group-hover/message:opacity-100">
+                                    {short}
+                                  </div>
+                                </TooltipTrigger>
+                                <TooltipContent side="bottom">{full}</TooltipContent>
+                              </Tooltip>
+                            </TooltipProvider>
+                          );
+                        }}
+                      </Memo>
                     </div>
                   </div>
                 </div>

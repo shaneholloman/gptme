@@ -6,11 +6,12 @@ import { useConversation } from '@/hooks/useConversation';
 
 import { InlineToolConfirmation } from './InlineToolConfirmation';
 import { InlineToolExecution } from './InlineToolExecution';
-import { For, useObservable, useObserveEffect } from '@legendapp/state/react';
+import { For, use$, useObservable, useObserveEffect } from '@legendapp/state/react';
 import { getObservableIndex } from '@legendapp/state';
 import { useApi } from '@/contexts/ApiContext';
 import { useSettings } from '@/contexts/SettingsContext';
 import { useModels } from '@/hooks/useModels';
+import { ArrowDown } from 'lucide-react';
 
 interface Props {
   conversationId: string;
@@ -115,6 +116,10 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
   // Observable for if the user scrolled during generation
   const autoScrollAborted$ = useObservable(false);
 
+  // Observable for if the user is scrolled away from the bottom
+  // (used to show the scroll-to-bottom button)
+  const isScrolledUp$ = useObservable(false);
+
   // Reset the autoScrollAborted flag when generation is complete or starts again
   useObserveEffect(conversation$?.isGenerating, () => {
     autoScrollAborted$.set(false);
@@ -165,6 +170,21 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
     await confirmTool('auto', { count });
   };
 
+  const handleScrollToBottom = () => {
+    if (scrollContainerRef.current) {
+      isAutoScrolling$.set(true);
+      scrollContainerRef.current.scrollTo({
+        top: scrollContainerRef.current.scrollHeight,
+        behavior: 'smooth',
+      });
+      scrollContainerRef.current.addEventListener('scrollend', () => isAutoScrolling$.set(false), {
+        once: true,
+      });
+    }
+    autoScrollAborted$.set(false);
+    isScrolledUp$.set(false);
+  };
+
   if (!conversation$) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -187,8 +207,10 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
             ) <= 1;
           if (isBottom) {
             autoScrollAborted$.set(false);
+            isScrolledUp$.set(false);
           } else {
             autoScrollAborted$.set(true);
+            isScrolledUp$.set(true);
           }
         }}
       >
@@ -271,6 +293,17 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
         {/* Add padding at the bottom to account for the floating input */}
         <div className="mb-40" />
       </div>
+
+      {/* Scroll-to-bottom button — appears when user scrolls up from bottom */}
+      {use$(isScrolledUp$) && (
+        <button
+          onClick={handleScrollToBottom}
+          className="absolute bottom-44 right-6 z-10 flex h-8 w-8 items-center justify-center rounded-full border border-border/50 bg-background/90 text-muted-foreground shadow-md transition-colors hover:bg-accent hover:text-accent-foreground"
+          aria-label="Scroll to bottom"
+        >
+          <ArrowDown className="h-4 w-4" />
+        </button>
+      )}
 
       <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-background via-background/80 to-transparent">
         <div className=" mx-auto max-w-2xl">
