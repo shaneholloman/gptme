@@ -7,8 +7,10 @@ Session management, tool execution, and agent creation are handled by separate m
 
 import logging
 import shutil
+from dataclasses import replace
 from datetime import datetime, timezone
 from itertools import islice
+from pathlib import Path
 from typing import cast
 
 import flask
@@ -22,10 +24,12 @@ from gptme.llm.models import (
     _apply_model_filters,
     _get_models_for_provider,
     get_default_model,
+    get_recommended_model,
 )
 from gptme.prompts import get_prompt
 
 from ..commands import handle_cmd
+from ..config import get_project_config
 from ..dirs import get_logs_dir
 from ..logmanager import Log, LogManager, get_user_conversations
 from ..message import Message
@@ -136,7 +140,7 @@ def api_config():
             "name": "search",
             "in": "query",
             "schema": {"type": "string"},
-            "description": "Filter conversations by name (case-insensitive substring match)",
+            "description": "Filter conversations by name, id, or last message preview (case-insensitive substring match)",
         },
     ],
 )
@@ -144,7 +148,7 @@ def api_conversations():
     """List conversations (V2).
 
     Get a list of user conversations with metadata using the V2 API.
-    Supports optional search filtering by conversation name.
+    Supports optional search filtering by conversation name, id, or last message preview.
     """
     limit = int(request.args.get("limit", 100))
     search = request.args.get("search", "").strip().lower()
@@ -152,7 +156,14 @@ def api_conversations():
     if search:
         conversations = []
         for conv in get_user_conversations():
-            if search in conv.name.lower() or search in conv.id.lower():
+            if (
+                search in conv.name.lower()
+                or search in conv.id.lower()
+                or (
+                    conv.last_message_preview
+                    and search in conv.last_message_preview.lower()
+                )
+            ):
                 conversations.append(conv)
                 if len(conversations) >= limit:
                     break
@@ -182,11 +193,12 @@ def api_conversation(conversation_id: str):
     manager = LogManager.load(conversation_id, lock=False)
     log_dict = manager.to_dict(branches=True)
 
-    # make all paths absolute or relative to workspace (no "../")
+    # make all paths relative to workspace or logdir (no "../" or absolute paths)
     for msg in log_dict["log"]:
         if files := msg.get("files"):
             msg["files"] = [
-                _abs_to_rel_workspace(f, chat_config.workspace) for f in files
+                _abs_to_rel_workspace(f, chat_config.workspace, manager.logdir)
+                for f in files
             ]
 
     # Include agent info if available
@@ -346,8 +358,12 @@ def api_conversation_post(conversation_id: str):
             404,
         )
 
+    # Convert file paths from JSON strings to Path objects
+    file_paths = [Path(f) for f in req_json.get("files", [])]
     msg = Message(
-        req_json["role"], req_json["content"], files=req_json.get("files", [])
+        req_json["role"],
+        req_json["content"],
+        files=file_paths,  # type: ignore[arg-type]  # list[Path] is valid for list[FilePath]
     )
 
     # Check if the message is a slash command (e.g. /help, /model, /tools)
@@ -365,7 +381,10 @@ def api_conversation_post(conversation_id: str):
         log.append(msg)
         SessionManager.add_event(
             conversation_id,
-            {"type": "message_added", "message": msg2dict(msg, log.workspace)},
+            {
+                "type": "message_added",
+                "message": msg2dict(msg, log.workspace, log.logdir),
+            },
         )
 
         # Execute the command and collect response messages
@@ -376,7 +395,10 @@ def api_conversation_post(conversation_id: str):
                 responses.append(resp)
                 SessionManager.add_event(
                     conversation_id,
-                    {"type": "message_added", "message": msg2dict(resp, log.workspace)},
+                    {
+                        "type": "message_added",
+                        "message": msg2dict(resp, log.workspace, log.logdir),
+                    },
                 )
         except (Exception, SystemExit) as e:
             logger.exception("Error executing command: %s", msg.content)
@@ -387,7 +409,7 @@ def api_conversation_post(conversation_id: str):
                 conversation_id,
                 {
                     "type": "message_added",
-                    "message": msg2dict(error_msg, log.workspace),
+                    "message": msg2dict(error_msg, log.workspace, log.logdir),
                 },
             )
 
@@ -402,11 +424,226 @@ def api_conversation_post(conversation_id: str):
         conversation_id,
         {
             "type": "message_added",
-            "message": msg2dict(msg, log.workspace),
+            "message": msg2dict(msg, log.workspace, log.logdir),
         },
     )
 
     return flask.jsonify({"status": "ok"})
+
+
+@v2_api.route(
+    "/api/v2/conversations/<string:conversation_id>/messages/<int:index>",
+    methods=["PATCH"],
+)
+@require_auth
+@api_doc(
+    summary="Edit message in conversation (V2)",
+    description="Edit a user message in a conversation. With ?truncate=1, removes all messages after the edited one.",
+    responses={
+        200: ConversationResponse,
+        400: ErrorResponse,
+        404: ErrorResponse,
+        409: ErrorResponse,
+    },
+    parameters=[
+        CONVERSATION_ID_PARAM,
+        {
+            "name": "index",
+            "in": "path",
+            "required": True,
+            "schema": {"type": "integer"},
+            "description": "Message index",
+        },
+        {
+            "name": "truncate",
+            "in": "query",
+            "required": False,
+            "schema": {"type": "string", "enum": ["0", "1"]},
+            "description": "If '1', remove all messages after the edited one",
+        },
+    ],
+    tags=["conversations-v2"],
+)
+def api_conversation_edit_message(conversation_id: str, index: int):
+    """Edit a message in a conversation.
+
+    Only user messages can be edited. Creates a backup branch before editing.
+    With ?truncate=1, removes all messages after the edited one.
+    """
+    # Validate conversation_id to prevent path traversal
+    if error := _validate_conversation_id(conversation_id):
+        return error
+
+    req_json = request.json or {}
+    content = req_json.get("content")
+    truncate = request.args.get("truncate") == "1"
+
+    # Content is required for edits, but optional for pure truncation
+    if not truncate and (not content or not content.strip()):
+        return flask.jsonify({"error": "content is required and cannot be empty"}), 400
+
+    # Check if generation is in progress
+    sessions = SessionManager.get_sessions_for_conversation(conversation_id)
+    for sess in sessions:
+        if sess.generating:
+            return (
+                flask.jsonify({"error": "Cannot edit while generation is in progress"}),
+                409,
+            )
+
+    try:
+        manager = LogManager.load(conversation_id, lock=False)
+    except FileNotFoundError:
+        return (
+            flask.jsonify({"error": f"Conversation not found: {conversation_id}"}),
+            404,
+        )
+
+    msgs = list(manager.log.messages)
+    if index < 0 or index >= len(msgs):
+        return (
+            flask.jsonify(
+                {"error": f"Message index {index} out of range (0-{len(msgs) - 1})"}
+            ),
+            404,
+        )
+
+    # Content changes are only allowed on user messages.
+    # Truncation (without content change) is allowed on any message.
+    content_changed = content is not None and content != msgs[index].content
+    if content_changed and msgs[index].role != "user":
+        return flask.jsonify({"error": "Can only edit user messages"}), 400
+
+    if content_changed:
+        assert content is not None  # guaranteed by content_changed check
+        edited_msg = replace(msgs[index], content=content)
+        new_msgs = msgs[:index] + [edited_msg] + ([] if truncate else msgs[index + 1 :])
+    elif truncate:
+        new_msgs = msgs[: index + 1]
+    else:
+        return flask.jsonify({"error": "No changes requested"}), 400
+
+    manager.edit(Log(new_msgs))
+
+    # Build response with updated conversation
+    log_dict = manager.to_dict(branches=True)
+
+    # Emit SSE event
+    SessionManager.add_event(
+        conversation_id,
+        {
+            "type": "conversation_edited",
+            "index": index,
+            "truncated": truncate,
+            "log": log_dict.get("log", []),
+            "branches": log_dict.get("branches", {}),
+        },
+    )
+
+    return flask.jsonify(log_dict)
+
+
+@v2_api.route(
+    "/api/v2/conversations/<string:conversation_id>/messages/<int:index>",
+    methods=["DELETE"],
+)
+@require_auth
+@api_doc(
+    summary="Delete message from conversation (V2)",
+    description="Delete a message from a conversation. Creates a backup branch before deleting.",
+    responses={
+        200: ConversationResponse,
+        400: ErrorResponse,
+        404: ErrorResponse,
+        409: ErrorResponse,
+    },
+    parameters=[
+        CONVERSATION_ID_PARAM,
+        {
+            "name": "index",
+            "in": "path",
+            "required": True,
+            "schema": {"type": "integer"},
+            "description": "Message index",
+        },
+    ],
+    tags=["conversations-v2"],
+)
+def api_conversation_delete_message(conversation_id: str, index: int):
+    """Delete a message from a conversation.
+
+    Removes the message at the given index and keeps all other messages intact.
+    Creates a backup branch before deleting.
+    """
+    # Validate conversation_id to prevent path traversal
+    if error := _validate_conversation_id(conversation_id):
+        return error
+
+    # Check if generation is in progress
+    sessions = SessionManager.get_sessions_for_conversation(conversation_id)
+    for sess in sessions:
+        if sess.generating:
+            return (
+                flask.jsonify(
+                    {"error": "Cannot delete while generation is in progress"}
+                ),
+                409,
+            )
+
+    try:
+        manager = LogManager.load(conversation_id, lock=False)
+    except FileNotFoundError:
+        return (
+            flask.jsonify({"error": f"Conversation not found: {conversation_id}"}),
+            404,
+        )
+
+    msgs = list(manager.log.messages)
+    if index < 0 or index >= len(msgs):
+        return (
+            flask.jsonify(
+                {"error": f"Message index {index} out of range (0-{len(msgs) - 1})"}
+            ),
+            404,
+        )
+
+    # Cannot delete system messages
+    if msgs[index].role == "system":
+        return flask.jsonify({"error": "Cannot delete system messages"}), 400
+
+    new_msgs = msgs[:index] + msgs[index + 1 :]
+
+    # Validate role sequence: consecutive same-role messages break LLM APIs
+    non_system = [m for m in new_msgs if m.role != "system"]
+    for i in range(1, len(non_system)):
+        if non_system[i].role == non_system[i - 1].role:
+            return (
+                flask.jsonify(
+                    {
+                        "error": f"Deleting this message would create consecutive {non_system[i].role!r} messages, which is not supported by LLM APIs"
+                    }
+                ),
+                400,
+            )
+
+    manager.edit(Log(new_msgs))
+
+    # Build response with updated conversation
+    log_dict = manager.to_dict(branches=True)
+
+    # Emit SSE event (reuse conversation_edited — client handles log replacement)
+    SessionManager.add_event(
+        conversation_id,
+        {
+            "type": "conversation_edited",
+            "index": index,
+            "truncated": False,
+            "log": log_dict.get("log", []),
+            "branches": log_dict.get("branches", {}),
+        },
+    )
+
+    return flask.jsonify(log_dict)
 
 
 @v2_api.route("/api/v2/conversations/<string:conversation_id>", methods=["DELETE"])
@@ -514,10 +751,22 @@ def api_models():
             for model in models
         )
 
+    # Build recommended models list from core definitions
+    recommended: list[str] = []
+    for provider in providers_to_check:
+        try:
+            rec = get_recommended_model(provider)
+            full_id = f"{provider}/{rec}"
+            if any(m["id"] == full_id for m in models_data):
+                recommended.append(full_id)
+        except ValueError:
+            pass
+
     return flask.jsonify(
         {
             "models": models_data,
             "default": default_model.full if default_model else None,
+            "recommended": recommended,
         }
     )
 
@@ -675,6 +924,96 @@ def api_conversation_agent_avatar(conversation_id: str):
         return flask.jsonify({"error": "Avatar file not found"}), 404
 
     return flask.send_file(full_path)
+
+
+def _serve_agent_avatar(agent_path_str: str):
+    """Shared helper to serve an agent's avatar by its workspace path."""
+    from pathlib import Path
+
+    agent_path = Path(agent_path_str)
+    project_config = get_project_config(agent_path, quiet=True)
+    if not project_config or not project_config.agent:
+        return flask.jsonify({"error": "Agent not found"}), 404
+
+    avatar = project_config.agent.avatar
+    if not avatar:
+        return flask.jsonify({"error": "No avatar configured"}), 404
+
+    # If it's a URL, redirect to it
+    if avatar.startswith(("http://", "https://")):
+        return flask.redirect(avatar)
+
+    # Otherwise, serve the file from agent workspace
+    full_path = agent_path / avatar
+    try:
+        full_path.resolve().relative_to(agent_path.resolve())
+    except ValueError:
+        return flask.jsonify({"error": "Invalid avatar path"}), 400
+
+    if not full_path.exists():
+        return flask.jsonify({"error": "Avatar file not found"}), 404
+
+    return flask.send_file(full_path)
+
+
+@v2_api.route("/api/v2/agents", methods=["GET"])
+@require_auth
+@api_doc(
+    summary="List agents",
+    description="List agents discovered from conversation history",
+    responses={200: None},
+    tags=["agents"],
+)
+def api_agents():
+    """List agents extracted from conversations."""
+    agent_map: dict[str, dict] = {}
+    for conv in get_user_conversations():
+        if not conv.agent_path:
+            continue
+        path = conv.agent_path
+        if path not in agent_map:
+            agent_map[path] = {
+                "name": conv.agent_name or path.split("/")[-1],
+                "path": path,
+                "has_avatar": conv.agent_avatar is not None,
+                "urls": conv.agent_urls,
+                "conversation_count": 0,
+                "last_used": conv.modified,
+            }
+        entry = agent_map[path]
+        entry["conversation_count"] += 1
+        if conv.modified > entry["last_used"]:
+            entry["last_used"] = conv.modified
+            if conv.agent_urls:
+                entry["urls"] = conv.agent_urls
+            if conv.agent_avatar is not None:
+                entry["has_avatar"] = True
+    return flask.jsonify(list(agent_map.values()))
+
+
+@v2_api.route("/api/v2/agents/avatar", methods=["GET"])
+@require_auth
+@api_doc(
+    summary="Get agent avatar by path",
+    description="Serve an agent's avatar image by its workspace path",
+    responses={200: None, 404: ErrorResponse},
+    parameters=[
+        {
+            "name": "path",
+            "in": "query",
+            "required": True,
+            "schema": {"type": "string"},
+            "description": "Agent workspace path",
+        }
+    ],
+    tags=["agents"],
+)
+def api_agent_avatar():
+    """Serve an agent's avatar by workspace path."""
+    agent_path = request.args.get("path")
+    if not agent_path:
+        return flask.jsonify({"error": "path parameter required"}), 400
+    return _serve_agent_avatar(agent_path)
 
 
 @v2_api.route("/api/v2/user", methods=["GET"])

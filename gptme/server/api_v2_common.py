@@ -24,10 +24,14 @@ def _is_debug_errors_enabled() -> bool:
     return os.environ.get("GPTME_DEBUG_ERRORS", "").lower() in ("1", "true", "yes")
 
 
-def _abs_to_rel_workspace(path: str | Path | URI, workspace: Path) -> str:
+def _abs_to_rel_workspace(
+    path: str | Path | URI, workspace: Path, logdir: Path | None = None
+) -> str:
     """Convert an absolute path to a relative path.
 
     URIs are returned as-is since they are not workspace-relative.
+    Files under workspace are returned relative to workspace.
+    Files under logdir (e.g. attachments/) are returned relative to logdir.
     """
     # URIs should be returned as-is (they're not workspace-relative)
     if isinstance(path, URI):
@@ -36,6 +40,9 @@ def _abs_to_rel_workspace(path: str | Path | URI, workspace: Path) -> str:
     path = Path(path).resolve()
     if path.is_relative_to(workspace):
         return str(path.relative_to(workspace))
+    # For files outside workspace (e.g. logdir/attachments/), normalize against logdir
+    if logdir is not None and path.is_relative_to(logdir):
+        return str(path.relative_to(logdir))
     return str(path)
 
 
@@ -77,6 +84,7 @@ class BaseEvent(TypedDict):
         "interrupted",
         "error",
         "config_changed",
+        "conversation_edited",
     ]
 
 
@@ -84,6 +92,8 @@ class ConnectedEvent(BaseEvent):
     """Sent when a client connects to the event stream."""
 
     session_id: str
+    generating: NotRequired[bool]
+    pending_tools: NotRequired[list]
 
 
 class PingEvent(BaseEvent):
@@ -179,6 +189,15 @@ class ConfigChangedEvent(BaseEvent):
     changed_fields: list[str]
 
 
+class ConversationEditedEvent(BaseEvent):
+    """Sent when a message is edited (and optionally truncated)."""
+
+    index: int
+    truncated: bool
+    log: list
+    branches: dict
+
+
 # Union type for all possible events
 EventType = (
     ConnectedEvent
@@ -193,10 +212,11 @@ EventType = (
     | InterruptedEvent
     | ErrorEvent
     | ConfigChangedEvent
+    | ConversationEditedEvent
 )
 
 
-def msg2dict(msg: Message, workspace: Path) -> MessageDict:
+def msg2dict(msg: Message, workspace: Path, logdir: Path | None = None) -> MessageDict:
     """Convert a Message object to a dictionary."""
     result: MessageDict = {
         "role": msg.role,
@@ -204,7 +224,9 @@ def msg2dict(msg: Message, workspace: Path) -> MessageDict:
         "timestamp": msg.timestamp.isoformat(),
     }
     if msg.files:
-        result["files"] = [_abs_to_rel_workspace(f, workspace) for f in msg.files]
+        result["files"] = [
+            _abs_to_rel_workspace(f, workspace, logdir) for f in msg.files
+        ]
     if msg.hide:
         result["hide"] = True
     return result

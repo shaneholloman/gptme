@@ -1,5 +1,16 @@
-import { Send, Loader2, Settings, X, Bot, Folder, Clock, Paperclip, File } from 'lucide-react';
-import { toast } from 'sonner';
+import {
+  Send,
+  Loader2,
+  Settings,
+  X,
+  Bot,
+  Folder,
+  Clock,
+  Paperclip,
+  File,
+  ChevronDown,
+  SlidersHorizontal,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
 import {
@@ -14,7 +25,8 @@ import {
 } from 'react';
 import { useApi } from '@/contexts/ApiContext';
 import { Badge } from '@/components/ui/badge';
-import { ModelSelector } from '@/components/ModelSelector';
+import { ModelPicker } from '@/components/ModelPicker';
+import { ProviderIcon } from '@/components/ProviderIcon';
 
 import { Popover, PopoverContent, PopoverTrigger } from '@/components/ui/popover';
 import { Switch } from '@/components/ui/switch';
@@ -22,19 +34,34 @@ import { Label } from '@/components/ui/label';
 import { type Observable } from '@legendapp/state';
 import { Computed, use$ } from '@legendapp/state/react';
 import { conversations$ } from '@/stores/conversations';
-import { selectedAgent$, selectedWorkspace$ } from '@/stores/sidebar';
+import {
+  selectedAgent$,
+  selectedWorkspace$,
+  rightSidebarVisible$,
+  rightSidebarActiveTab$,
+} from '@/stores/sidebar';
 import { useWorkspaces } from '@/hooks/useWorkspaces';
 import { WorkspaceSelector } from '@/components/WorkspaceSelector';
 import type { WorkspaceProject, Agent } from '@/utils/workspaceUtils';
 import { useModels } from '@/hooks/useModels';
+import { useAgents } from '@/hooks/useAgents';
 import { useFileAutocomplete } from '@/hooks/useFileAutocomplete';
 import { FileAutocomplete } from '@/components/FileAutocomplete';
+import {
+  Select,
+  SelectContent,
+  SelectItem,
+  SelectTrigger,
+  SelectValue,
+} from '@/components/ui/select';
 
 export interface ChatOptions {
   model?: string;
   stream?: boolean;
   workspace?: string;
   files?: string[];
+  /** Raw File objects to upload after conversation creation (for new chat view) */
+  pendingFiles?: File[];
 }
 
 interface Props {
@@ -49,41 +76,94 @@ interface Props {
 }
 
 interface ChatOptionsProps {
-  selectedModel: string;
-  setSelectedModel: (model: string) => void;
   selectedWorkspace: string;
   setSelectedWorkspace: (workspace: string) => void;
+  selectedAgent: Agent | null;
+  setSelectedAgent: (agent: Agent | null) => void;
+  availableAgents: Agent[];
+  baseUrl: string;
   streamingEnabled: boolean;
   setStreamingEnabled: (enabled: boolean) => void;
   availableWorkspaces: WorkspaceProject[];
   isDisabled: boolean;
   showWorkspaceSelector: boolean;
   onAddWorkspace?: (path: string) => void;
+  onOpenChatSettings?: () => void;
 }
 
 const ChatOptionsPanel: FC<ChatOptionsProps> = ({
-  selectedModel,
-  setSelectedModel,
   selectedWorkspace,
   setSelectedWorkspace,
+  selectedAgent,
+  setSelectedAgent,
+  availableAgents,
+  baseUrl,
   streamingEnabled,
   setStreamingEnabled,
   availableWorkspaces,
   isDisabled,
   showWorkspaceSelector,
   onAddWorkspace,
+  onOpenChatSettings,
 }) => (
   <div className="space-y-8">
-    <div className="space-y-1">
-      <Label>Model</Label>
-      <ModelSelector
-        value={selectedModel}
-        onValueChange={setSelectedModel}
-        disabled={isDisabled}
-        showFormField={false}
-        placeholder="Select model"
-      />
-    </div>
+    {showWorkspaceSelector && availableAgents.length > 0 && (
+      <div className="space-y-1">
+        <Label>Agent</Label>
+        <Select
+          value={selectedAgent?.path || '_none'}
+          onValueChange={(val) => {
+            if (val === '_none') {
+              setSelectedAgent(null);
+            } else {
+              const agent = availableAgents.find((a) => a.path === val);
+              if (agent) setSelectedAgent(agent);
+            }
+          }}
+          disabled={isDisabled}
+        >
+          <SelectTrigger>
+            <SelectValue placeholder="No agent">
+              {selectedAgent ? (
+                <div className="flex items-center gap-2">
+                  {selectedAgent.hasAvatar ? (
+                    <img
+                      src={`${baseUrl}/api/v2/agents/avatar?path=${encodeURIComponent(selectedAgent.path)}`}
+                      alt={selectedAgent.name}
+                      className="h-4 w-4 rounded-full object-cover"
+                    />
+                  ) : (
+                    <Bot className="h-3.5 w-3.5" />
+                  )}
+                  <span>{selectedAgent.name}</span>
+                </div>
+              ) : (
+                'No agent'
+              )}
+            </SelectValue>
+          </SelectTrigger>
+          <SelectContent>
+            <SelectItem value="_none">No agent</SelectItem>
+            {availableAgents.map((agent) => (
+              <SelectItem key={agent.path} value={agent.path}>
+                <div className="flex items-center gap-2">
+                  {agent.hasAvatar ? (
+                    <img
+                      src={`${baseUrl}/api/v2/agents/avatar?path=${encodeURIComponent(agent.path)}`}
+                      alt={agent.name}
+                      className="h-4 w-4 rounded-full object-cover"
+                    />
+                  ) : (
+                    <Bot className="h-3.5 w-3.5" />
+                  )}
+                  <span>{agent.name}</span>
+                </div>
+              </SelectItem>
+            ))}
+          </SelectContent>
+        </Select>
+      </div>
+    )}
 
     {showWorkspaceSelector && (
       <WorkspaceSelector
@@ -102,6 +182,17 @@ const ChatOptionsPanel: FC<ChatOptionsProps> = ({
       setStreamingEnabled={setStreamingEnabled}
       isDisabled={isDisabled}
     />
+
+    {onOpenChatSettings && (
+      <button
+        type="button"
+        onClick={onOpenChatSettings}
+        className="flex w-full items-center gap-2 border-t pt-4 text-sm text-muted-foreground transition-colors hover:text-foreground"
+      >
+        <SlidersHorizontal className="h-3.5 w-3.5" />
+        Chat settings
+      </button>
+    )}
   </div>
 );
 
@@ -120,6 +211,43 @@ const StreamingToggle: FC<{
     />
   </div>
 );
+
+const ModelBadge: FC<{
+  model: string;
+  models: { id: string; provider: string; model: string }[];
+  onModelChange: (model: string) => void;
+  isDisabled: boolean;
+}> = ({ model, models, onModelChange, isDisabled }) => {
+  const [open, setOpen] = useState(false);
+  const modelInfo = models.find((m) => m.id === model);
+  const displayName = modelInfo?.model || model.split('/').pop() || model;
+
+  return (
+    <Popover open={open} onOpenChange={setOpen}>
+      <PopoverTrigger asChild>
+        <Button
+          variant="ghost"
+          size="sm"
+          className="h-5 max-w-[200px] rounded-sm px-1.5 text-[10px] text-muted-foreground transition-all hover:bg-accent hover:text-muted-foreground hover:opacity-100"
+          disabled={isDisabled}
+        >
+          {modelInfo?.provider && <ProviderIcon provider={modelInfo.provider} size={10} />}
+          <span className="ml-1 truncate">{displayName}</span>
+          <ChevronDown className="ml-0.5 h-2 w-2 flex-shrink-0" />
+        </Button>
+      </PopoverTrigger>
+      <PopoverContent className="w-80 p-0" align="start">
+        <ModelPicker
+          value={model}
+          onSelect={(id) => {
+            onModelChange(id);
+            setOpen(false);
+          }}
+        />
+      </PopoverContent>
+    </Popover>
+  );
+};
 
 const OptionsButton: FC<{ isDisabled: boolean; children: React.ReactNode }> = ({
   isDisabled,
@@ -211,10 +339,22 @@ const WorkspaceBadge: FC<{ workspace: string; onRemove: () => void }> = ({
   );
 };
 
-const AgentBadge: FC<{ agent: Agent; onRemove: () => void }> = ({ agent, onRemove }) => (
+const AgentBadge: FC<{ agent: Agent; baseUrl: string; onRemove: () => void }> = ({
+  agent,
+  baseUrl,
+  onRemove,
+}) => (
   <Badge variant="secondary" className="flex items-center gap-1.5 pr-1">
     <div className="flex items-center gap-1.5">
-      <Bot className="h-3 w-3" />
+      {agent.hasAvatar ? (
+        <img
+          src={`${baseUrl}/api/v2/agents/avatar?path=${encodeURIComponent(agent.path)}`}
+          alt={agent.name}
+          className="h-4 w-4 rounded-full object-cover"
+        />
+      ) : (
+        <Bot className="h-3 w-3" />
+      )}
       <span className="text-xs">{agent.name}</span>
     </div>
     <Button
@@ -258,10 +398,18 @@ const QueuedMessageBadge: FC<{ message: string; onClear: () => void }> = ({ mess
   );
 };
 
-const AttachedFileBadge: FC<{ name: string; onRemove: () => void }> = ({ name, onRemove }) => (
+const AttachedFileBadge: FC<{ name: string; previewUrl?: string; onRemove: () => void }> = ({
+  name,
+  previewUrl,
+  onRemove,
+}) => (
   <Badge variant="secondary" className="flex items-center gap-1.5 pr-1">
     <div className="flex items-center gap-1.5">
-      <File className="h-3 w-3" />
+      {previewUrl ? (
+        <img src={previewUrl} alt={name} className="h-6 w-6 rounded object-cover" />
+      ) : (
+        <File className="h-3 w-3" />
+      )}
       <span className="max-w-[120px] truncate text-xs" title={name}>
         {name}
       </span>
@@ -288,12 +436,12 @@ export const ChatInput: FC<Props> = ({
   value,
   onChange,
 }) => {
-  const { api, isConnected$ } = useApi();
+  const { isConnected$, connectionConfig } = useApi();
   const sidebarSelectedWorkspace = use$(selectedWorkspace$);
   const sidebarSelectedAgent = use$(selectedAgent$);
 
   // Use dynamic models instead of static list
-  const { defaultModel: apiDefaultModel } = useModels();
+  const { models: modelInfos, defaultModel: apiDefaultModel } = useModels();
 
   // Get conversation config to read the actual model
   const conversation$ = conversationId ? conversations$.get(conversationId) : null;
@@ -366,44 +514,52 @@ export const ChatInput: FC<Props> = ({
   interface AttachedFile {
     name: string;
     path: string; // absolute path returned by the upload endpoint
+    file?: File; // raw File object (for local buffering / preview)
+    previewUrl?: string; // object URL for image preview
   }
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>([]);
-  const [isUploading, setIsUploading] = useState(false);
   const [isDragOver, setIsDragOver] = useState(false);
+
+  // Revoke preview URLs and clear files
+  const cleanupAndClearFiles = useCallback(() => {
+    setAttachedFiles((prev) => {
+      prev.forEach((f) => {
+        if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+      });
+      return [];
+    });
+  }, []);
 
   useEffect(() => {
     currentConversationIdRef.current = conversationId;
-    setAttachedFiles([]);
+    cleanupAndClearFiles();
     setIsDragOver(false);
-  }, [conversationId]);
+  }, [conversationId, cleanupAndClearFiles]);
 
-  const uploadAndAttach = useCallback(
-    async (files: FileList | File[]) => {
-      if (!conversationId || files.length === 0) return;
-      const uploadConversationId = conversationId;
-      setIsUploading(true);
-      try {
-        const result = await api.uploadFiles(uploadConversationId, Array.from(files));
-        if (currentConversationIdRef.current !== uploadConversationId) {
-          return;
-        }
-        setAttachedFiles((prev) => [
-          ...prev,
-          ...result.files.map((f) => ({ name: f.name, path: f.path })),
-        ]);
-      } catch (error) {
-        if (currentConversationIdRef.current !== uploadConversationId) {
-          return;
-        }
-        console.error('[ChatInput] File upload failed:', error);
-        const message = error instanceof Error ? error.message : 'Upload failed';
-        toast.error(`File upload failed: ${message}`);
-      } finally {
-        setIsUploading(false);
-      }
-    },
-    [conversationId, api]
-  );
+  // Always buffer files locally — upload happens on send, not on attach
+  const attachFiles = useCallback((files: FileList | File[]) => {
+    const fileArray = Array.from(files);
+    if (fileArray.length === 0) return;
+    setAttachedFiles((prev) => [
+      ...prev,
+      ...fileArray.map((f) => ({
+        name: f.name,
+        path: '', // set after upload on send
+        file: f,
+        previewUrl: f.type.startsWith('image/') ? URL.createObjectURL(f) : undefined,
+      })),
+    ]);
+  }, []);
+
+  // Clean up object URLs on unmount
+  useEffect(() => {
+    return () => {
+      attachedFiles.forEach((f) => {
+        if (f.previewUrl) URL.revokeObjectURL(f.previewUrl);
+      });
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []); // Only on unmount
 
   const handleDragOver = useCallback((e: DragEvent) => {
     e.preventDefault();
@@ -427,16 +583,17 @@ export const ChatInput: FC<Props> = ({
       e.stopPropagation();
       setIsDragOver(false);
       if (e.dataTransfer.files.length > 0) {
-        uploadAndAttach(e.dataTransfer.files);
+        attachFiles(e.dataTransfer.files);
       }
     },
-    [uploadAndAttach]
+    [attachFiles]
   );
 
   const isConnected = use$(isConnected$);
 
-  // Get available workspaces using the reusable hook
-  const { workspaces: availableWorkspaces, addCustomWorkspace } = useWorkspaces(false); // Don't fetch, just subscribe to cache changes
+  // Get available workspaces and agents using reusable hooks
+  const { workspaces: availableWorkspaces, addCustomWorkspace } = useWorkspaces(false);
+  const { agents: availableAgents } = useAgents(false);
 
   // File autocomplete for @ mentions
   const fileAutocomplete = useFileAutocomplete({
@@ -497,19 +654,24 @@ export const ChatInput: FC<Props> = ({
     wasGenerating.current = isGenerating;
   }, [isGenerating, messageQueue, onSend]);
 
-  // Update workspace when sidebar selection changes (only for new conversations)
+  // Update workspace when sidebar/agent selection changes (only for new conversations)
+  // Agent selection defaults workspace to agent's path, but explicit workspace choice takes priority
   useEffect(() => {
     if (!conversationId && sidebarSelectedWorkspace) {
       setSelectedWorkspace(sidebarSelectedWorkspace);
       setWorkspaceExplicitlySelected(true);
-    } else if (!conversationId && sidebarSelectedAgent && sidebarSelectedAgent.path) {
+    } else if (
+      !conversationId &&
+      sidebarSelectedAgent &&
+      sidebarSelectedAgent.path &&
+      !workspaceExplicitlySelected
+    ) {
       setSelectedWorkspace(sidebarSelectedAgent.path);
-      setWorkspaceExplicitlySelected(false); // Agent-derived workspace, not explicit
     } else if (!conversationId && !sidebarSelectedWorkspace && !sidebarSelectedAgent) {
       setSelectedWorkspace('.');
       setWorkspaceExplicitlySelected(false);
     }
-  }, [conversationId, sidebarSelectedWorkspace, sidebarSelectedAgent]);
+  }, [conversationId, sidebarSelectedWorkspace, sidebarSelectedAgent, workspaceExplicitlySelected]);
 
   // Wrapper function for explicit workspace selection
   const handleWorkspaceChange = (workspace: string) => {
@@ -519,7 +681,14 @@ export const ChatInput: FC<Props> = ({
 
   const handleSubmit = async (e: FormEvent) => {
     e.preventDefault();
-    const filePaths = attachedFiles.length > 0 ? attachedFiles.map((f) => f.path) : undefined;
+    // Files are always buffered locally — pass raw File objects for upload on send
+    const pendingFiles =
+      attachedFiles.length > 0
+        ? attachedFiles.filter((f) => f.file).map((f) => f.file!)
+        : undefined;
+    // Also include any already-uploaded file paths (shouldn't happen with new flow, but defensive)
+    const uploadedPaths =
+      attachedFiles.length > 0 ? attachedFiles.filter((f) => f.path).map((f) => f.path) : undefined;
 
     if (isGenerating) {
       // If there's a message, queue it instead of interrupting
@@ -536,12 +705,13 @@ export const ChatInput: FC<Props> = ({
               model: effectiveModel === 'default' ? undefined : effectiveModel,
               stream: streamingEnabled,
               workspace: selectedWorkspace || undefined,
-              files: filePaths,
+              files: uploadedPaths,
+              pendingFiles,
             },
           },
         ]);
         setMessage('');
-        setAttachedFiles([]);
+        cleanupAndClearFiles();
         // Clear localStorage draft since we're queueing it
         if (typeof window !== 'undefined') {
           localStorage.removeItem(storageKey);
@@ -565,10 +735,11 @@ export const ChatInput: FC<Props> = ({
         model: effectiveModel === 'default' ? undefined : effectiveModel,
         stream: streamingEnabled,
         workspace: selectedWorkspace || undefined,
-        files: filePaths,
+        files: uploadedPaths,
+        pendingFiles,
       });
       setMessage('');
-      setAttachedFiles([]);
+      cleanupAndClearFiles();
       // Reset textarea height to default by removing inline style
       if (textareaRef.current) {
         textareaRef.current.style.height = '';
@@ -619,6 +790,27 @@ export const ChatInput: FC<Props> = ({
     }
   };
 
+  const handlePaste = useCallback(
+    (e: React.ClipboardEvent) => {
+      const items = e.clipboardData?.items;
+      if (!items) return;
+
+      const imageFiles: File[] = [];
+      for (const item of items) {
+        if (item.type.startsWith('image/')) {
+          const file = item.getAsFile();
+          if (file) imageFiles.push(file);
+        }
+      }
+
+      if (imageFiles.length > 0) {
+        e.preventDefault(); // Don't paste the image as text
+        attachFiles(imageFiles);
+      }
+    },
+    [attachFiles]
+  );
+
   const handleTextareaChange = (e: React.ChangeEvent<HTMLTextAreaElement>) => {
     const newValue = e.target.value;
     const cursorPos = e.target.selectionStart || 0;
@@ -641,7 +833,7 @@ export const ChatInput: FC<Props> = ({
         aria-label="Attach files"
         onChange={(e) => {
           if (e.target.files && e.target.files.length > 0) {
-            uploadAndAttach(e.target.files);
+            attachFiles(e.target.files);
           }
           // Reset so the same file can be selected again
           e.target.value = '';
@@ -653,9 +845,16 @@ export const ChatInput: FC<Props> = ({
           <div className="flex flex-wrap items-center gap-1">
             {attachedFiles.map((file, index) => (
               <AttachedFileBadge
-                key={`${file.path}-${index}`}
+                key={`${file.name}-${index}`}
                 name={file.name}
-                onRemove={() => setAttachedFiles((prev) => prev.filter((_, i) => i !== index))}
+                previewUrl={file.previewUrl}
+                onRemove={() =>
+                  setAttachedFiles((prev) => {
+                    const removed = prev[index];
+                    if (removed?.previewUrl) URL.revokeObjectURL(removed.previewUrl);
+                    return prev.filter((_, i) => i !== index);
+                  })
+                }
               />
             ))}
           </div>
@@ -677,9 +876,9 @@ export const ChatInput: FC<Props> = ({
             {() => (
               <div
                 className={`relative flex flex-1 ${isDragOver ? 'rounded-md ring-2 ring-primary ring-offset-2' : ''}`}
-                onDragOver={conversationId ? handleDragOver : undefined}
-                onDragLeave={conversationId ? handleDragLeave : undefined}
-                onDrop={conversationId ? handleDrop : undefined}
+                onDragOver={handleDragOver}
+                onDragLeave={handleDragLeave}
+                onDrop={handleDrop}
               >
                 {/* Drag overlay */}
                 {isDragOver && (
@@ -705,21 +904,44 @@ export const ChatInput: FC<Props> = ({
                   data-testid="chat-input"
                   onChange={handleTextareaChange}
                   onKeyDown={handleKeyDown}
+                  onPaste={handlePaste}
                   placeholder={placeholder}
                   className="max-h-[400px] min-h-[60px] resize-none overflow-y-auto pb-8 pr-16"
                   disabled={isDisabled}
                 />
 
                 <div className="absolute bottom-1.5 left-1.5 flex items-center gap-2">
+                  <ModelBadge
+                    model={effectiveModel}
+                    models={modelInfos}
+                    onModelChange={(model: string) => {
+                      setSelectedModel(model);
+                      setHasExplicitModelSelection(true);
+                    }}
+                    isDisabled={isDisabled}
+                  />
+                  {/* File attach button */}
+                  <Button
+                    type="button"
+                    variant="ghost"
+                    size="sm"
+                    className="h-5 rounded-sm px-1.5 text-[10px] text-muted-foreground transition-all hover:bg-accent hover:text-muted-foreground hover:opacity-100"
+                    disabled={isDisabled}
+                    onClick={() => fileInputRef.current?.click()}
+                    title="Attach files"
+                  >
+                    <Paperclip className="mr-0.5 h-2.5 w-2.5" />
+                    Attach
+                  </Button>
+
                   <OptionsButton isDisabled={isDisabled}>
                     <ChatOptionsPanel
-                      selectedModel={effectiveModel}
-                      setSelectedModel={(model: string) => {
-                        setSelectedModel(model);
-                        setHasExplicitModelSelection(true);
-                      }}
                       selectedWorkspace={selectedWorkspace}
                       setSelectedWorkspace={handleWorkspaceChange}
+                      selectedAgent={sidebarSelectedAgent}
+                      setSelectedAgent={(agent) => selectedAgent$.set(agent)}
+                      availableAgents={availableAgents}
+                      baseUrl={connectionConfig.baseUrl.replace(/\/+$/, '')}
                       streamingEnabled={streamingEnabled}
                       setStreamingEnabled={setStreamingEnabled}
                       availableWorkspaces={availableWorkspaces}
@@ -729,33 +951,22 @@ export const ChatInput: FC<Props> = ({
                         console.log('[ChatInput] Adding new workspace:', path);
                         addCustomWorkspace(path);
                       }}
+                      onOpenChatSettings={
+                        conversationId
+                          ? () => {
+                              rightSidebarActiveTab$.set('settings');
+                              rightSidebarVisible$.set(true);
+                            }
+                          : undefined
+                      }
                     />
                   </OptionsButton>
-
-                  {/* File upload button (only for existing conversations) */}
-                  {conversationId && (
-                    <Button
-                      type="button"
-                      variant="ghost"
-                      size="sm"
-                      className="h-5 rounded-sm px-1.5 text-[10px] text-muted-foreground transition-all hover:bg-accent hover:text-muted-foreground hover:opacity-100"
-                      disabled={isDisabled || isUploading}
-                      onClick={() => fileInputRef.current?.click()}
-                      title="Attach files"
-                    >
-                      {isUploading ? (
-                        <Loader2 className="mr-0.5 h-2.5 w-2.5 animate-spin" />
-                      ) : (
-                        <Paperclip className="mr-0.5 h-2.5 w-2.5" />
-                      )}
-                      {isUploading ? 'Uploading...' : 'Attach'}
-                    </Button>
-                  )}
 
                   {/* Agent badge for new conversations */}
                   {!conversationId && sidebarSelectedAgent && (
                     <AgentBadge
                       agent={sidebarSelectedAgent}
+                      baseUrl={connectionConfig.baseUrl.replace(/\/+$/, '')}
                       onRemove={() => selectedAgent$.set(null)}
                     />
                   )}

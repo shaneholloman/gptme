@@ -3,10 +3,12 @@ import { useRef, useEffect } from 'react';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput, type ChatOptions } from './ChatInput';
 import { useConversation } from '@/hooks/useConversation';
+import { BranchIndicator } from './BranchIndicator';
+import { computeForkPoints } from '@/utils/branchUtils';
 
 import { InlineToolConfirmation } from './InlineToolConfirmation';
 import { InlineToolExecution } from './InlineToolExecution';
-import { For, use$, useObservable, useObserveEffect } from '@legendapp/state/react';
+import { For, Memo, use$, useObservable, useObserveEffect } from '@legendapp/state/react';
 import { getObservableIndex } from '@legendapp/state';
 import { useApi } from '@/contexts/ApiContext';
 import { useSettings } from '@/contexts/SettingsContext';
@@ -20,10 +22,18 @@ interface Props {
 }
 
 export const ConversationContent: FC<Props> = ({ conversationId, serverId, isReadOnly }) => {
-  const { conversation$, sendMessage, confirmTool, interruptGeneration } = useConversation(
-    conversationId,
-    serverId
-  );
+  const {
+    conversation$,
+    sendMessage,
+    retryMessage,
+    editMessage,
+    deleteMessage,
+    rerunFromMessage,
+    regenerateMessage,
+    switchBranch,
+    confirmTool,
+    interruptGeneration,
+  } = useConversation(conversationId, serverId);
   // State to track when to auto-focus the input
   const shouldFocus$ = useObservable(false);
   // Store the previous conversation ID to detect changes
@@ -119,6 +129,14 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
   // Observable for if the user is scrolled away from the bottom
   // (used to show the scroll-to-bottom button)
   const isScrolledUp$ = useObservable(false);
+
+  // Compute fork points once (reactive: recomputes when branches/currentBranch change)
+  const forkPoints$ = useObservable(() => {
+    const branches = conversation$.data.branches?.get();
+    const currentBranch = conversation$.currentBranch?.get() || 'main';
+    if (!branches || Object.keys(branches).length <= 1) return new Map();
+    return computeForkPoints(currentBranch, branches);
+  });
 
   // Reset the autoScrollAborted flag when generation is complete or starts again
   useObserveEffect(conversation$?.isGenerating, () => {
@@ -265,15 +283,36 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
             const agentName = conversation$.data.agent?.name?.get();
 
             return (
-              <ChatMessage
-                key={`${index}-${msg$.timestamp.get()}`}
-                message$={msg$}
-                previousMessage$={previousMessage$}
-                nextMessage$={nextMessage$}
-                conversationId={conversationId}
-                agentAvatarUrl={agentAvatarUrl}
-                agentName={agentName}
-              />
+              <div key={`${index}-${msg$.timestamp.get()}`}>
+                <ChatMessage
+                  message$={msg$}
+                  previousMessage$={previousMessage$}
+                  nextMessage$={nextMessage$}
+                  conversationId={conversationId}
+                  agentAvatarUrl={agentAvatarUrl}
+                  agentName={agentName}
+                  onRetry={isReadOnly ? undefined : retryMessage}
+                  onEdit={isReadOnly ? undefined : editMessage}
+                  onDelete={isReadOnly ? undefined : deleteMessage}
+                  onRerun={isReadOnly ? undefined : rerunFromMessage}
+                  onRegenerate={isReadOnly ? undefined : regenerateMessage}
+                  messageIndex={index}
+                />
+                {/* Branch indicator at fork points */}
+                <Memo>
+                  {() => {
+                    const forkInfo = forkPoints$.get().get(index);
+                    if (!forkInfo) return null;
+                    return (
+                      <div className="mx-auto max-w-3xl">
+                        <div className="md:px-12">
+                          <BranchIndicator forkInfo={forkInfo} onSwitchBranch={switchBranch} />
+                        </div>
+                      </div>
+                    );
+                  }}
+                </Memo>
+              </div>
             );
           }}
         </For>

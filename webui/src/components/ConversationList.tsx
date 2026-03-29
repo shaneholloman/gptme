@@ -9,6 +9,7 @@ import {
   FileText,
   FileJson,
   Trash2,
+  BookOpen,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip';
@@ -149,6 +150,8 @@ export const ConversationList: FC<Props> = ({
   const scrollContainerRef = useRef<HTMLDivElement>(null);
   const loadMoreSentinelRef = useRef<HTMLDivElement>(null);
   const observer = useRef<IntersectionObserver | null>(null);
+  const isFetchingRef = useRef(isFetching);
+  isFetchingRef.current = isFetching;
 
   // Set up intersection observer for infinite scrolling
   useEffect(() => {
@@ -165,7 +168,7 @@ export const ConversationList: FC<Props> = ({
     observer.current = new IntersectionObserver(
       (entries) => {
         const entry = entries[0];
-        if (entry.isIntersecting && hasNextPage && !isFetching) {
+        if (entry.isIntersecting && hasNextPage && !isFetchingRef.current) {
           // Additional check: ensure we actually have scrollable content or are near the bottom
           const containerHeight = container.clientHeight;
           const scrollHeight = container.scrollHeight;
@@ -193,12 +196,16 @@ export const ConversationList: FC<Props> = ({
     return () => {
       if (observer.current) observer.current.disconnect();
     };
-    // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [hasNextPage, fetchNextPage]); // isFetching intentionally excluded to prevent observer recreation
+  }, [hasNextPage, fetchNextPage]); // isFetching accessed via ref to avoid observer recreation
 
   if (!conversations) {
     return null;
   }
+
+  // Separate demo conversations from real ones
+  const demoIds = new Set(demoConversations.map((d) => d.id));
+  const realConversations = conversations.filter((c) => !demoIds.has(c.id));
+  const demos = conversations.filter((c) => demoIds.has(c.id));
 
   // strip leading YYYY-MM-DD from name if present
   function stripDate(name: string) {
@@ -468,16 +475,16 @@ export const ConversationList: FC<Props> = ({
     <div
       ref={scrollContainerRef}
       data-testid="conversation-list"
-      className="h-full space-y-2 overflow-y-auto overflow-x-hidden p-2"
+      className="h-full space-y-2 overflow-y-auto overflow-x-hidden"
     >
       {isLoading && (
-        <div className="flex items-center justify-center p-4 text-sm text-muted-foreground">
+        <div className="flex items-center justify-center px-2 py-4 text-sm text-muted-foreground">
           <Loader2 className="mr-2 h-4 w-4 animate-spin" />
           Loading conversations...
         </div>
       )}
       {!isLoading && isError && (
-        <div className="space-y-2 p-4 text-sm text-destructive">
+        <div className="space-y-2 px-2 py-4 text-sm text-destructive">
           <div className="font-medium">Failed to load conversations</div>
           <div className="text-muted-foreground">{error?.message}</div>
           {onRetry && (
@@ -489,20 +496,20 @@ export const ConversationList: FC<Props> = ({
         </div>
       )}
       {!isLoading && !isError && !isConnected && conversations.length === 0 && (
-        <div className="p-2 text-sm text-muted-foreground">
+        <div className="px-2 py-2 text-sm text-muted-foreground">
           Not connected to API. Use the connect button to load conversations.
         </div>
       )}
       {!isLoading && !isError && isConnected && conversations.length === 0 && (
-        <div className="p-2 text-sm text-muted-foreground">
+        <div className="px-2 py-2 text-sm text-muted-foreground">
           No conversations found. Start a new conversation to get started.
         </div>
       )}
 
-      {/* Render conversations grouped by date */}
+      {/* Render real conversations grouped by date */}
       {!isLoading &&
         !isError &&
-        groupByDate<ConversationSummary>(conversations, (c) => c.modified).map(
+        groupByDate<ConversationSummary>(realConversations, (c) => c.created ?? c.modified).map(
           ({ group, items }) => (
             <div key={group}>
               <div
@@ -511,7 +518,7 @@ export const ConversationList: FC<Props> = ({
               >
                 {group}
               </div>
-              <div className="space-y-2">
+              <div className="space-y-2 px-2">
                 {items.map((conv) => (
                   <ConversationItem
                     key={conv.serverId ? `${conv.serverId}:${conv.id}` : conv.id}
@@ -536,9 +543,24 @@ export const ConversationList: FC<Props> = ({
       <div ref={loadMoreSentinelRef} style={{ height: '1px' }} />
 
       {/* End message */}
-      {!hasNextPage && conversations.length > 0 && (
+      {!hasNextPage && realConversations.length > 0 && (
         <div className="py-4 text-center text-sm text-muted-foreground">
           You've reached the end of your conversations.
+        </div>
+      )}
+
+      {/* Demo conversations pinned at bottom */}
+      {!isLoading && !isError && demos.length > 0 && (
+        <div>
+          <div className="flex items-center gap-1 px-2 py-1.5 text-xs font-medium text-muted-foreground">
+            <BookOpen className="h-3 w-3" />
+            Getting Started
+          </div>
+          <div className="space-y-2 px-2">
+            {demos.map((conv) => (
+              <ConversationItem key={conv.id} conv={conv} />
+            ))}
+          </div>
         </div>
       )}
 

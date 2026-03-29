@@ -22,12 +22,14 @@ import {
 import { useApi } from '@/contexts/ApiContext';
 import type { ConversationSummary } from '@/types/conversation';
 import { conversations$, selectedConversation$ } from '@/stores/conversations';
+import { commandPaletteOpen$ } from '@/stores/commandPalette';
 import {
   exportConversationAsMarkdown,
   exportConversationAsJSON,
   getExportableMessages,
 } from '@/utils/exportConversation';
 import { toast } from 'sonner';
+import { settingsModal$ } from '@/stores/settingsModal';
 
 interface CommandAction {
   id: string;
@@ -40,7 +42,7 @@ interface CommandAction {
 }
 
 export function CommandPalette() {
-  const [open, setOpen] = useState(false);
+  const [open, setOpenState] = useState(false);
   const [search, setSearch] = useState('');
   const [conversationResults, setConversationResults] = useState<ConversationSummary[]>([]);
   const [isSearching, setIsSearching] = useState(false);
@@ -48,12 +50,28 @@ export function CommandPalette() {
   const { api } = useApi();
   const searchTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null);
 
+  // Sync open state bidirectionally with the observable (for external control, e.g. MenuBar search button)
+  const setOpen = useCallback((value: boolean) => {
+    setOpenState(value);
+    commandPaletteOpen$.set(value);
+  }, []);
+
+  useEffect(() => {
+    return commandPaletteOpen$.onChange(({ value }) => {
+      setOpenState(value);
+    });
+  }, []);
+
   // Toggle command palette with Cmd+K or Ctrl+K
   useEffect(() => {
     const down = (e: KeyboardEvent) => {
       if (e.key === 'k' && (e.metaKey || e.ctrlKey)) {
         e.preventDefault();
-        setOpen((open) => !open);
+        setOpenState((prev) => {
+          const next = !prev;
+          commandPaletteOpen$.set(next);
+          return next;
+        });
       }
     };
 
@@ -144,8 +162,8 @@ export function CommandPalette() {
         icon: <Settings className="mr-2 h-4 w-4" />,
         keywords: ['settings', 'preferences', 'config'],
         action: () => {
-          navigate('/settings');
           setOpen(false);
+          settingsModal$.open.set(true);
         },
         group: 'Navigation',
       },
@@ -185,51 +203,60 @@ export function CommandPalette() {
         },
         group: 'Navigation',
       },
-      {
-        id: 'export-markdown',
-        label: 'Export as Markdown',
-        description: 'Download current conversation as .md',
-        icon: <Download className="mr-2 h-4 w-4" />,
-        keywords: ['export', 'download', 'markdown', 'save', 'share'],
-        action: () => {
-          const convId = selectedConversation$.get();
-          const conv = convId ? conversations$.get(convId)?.get() : null;
-          if (!conv?.data?.log?.length) {
-            toast.error('No messages to export');
-            return;
-          }
-          const exportableMessages = getExportableMessages(conv.data.log);
-          if (!exportableMessages.length) {
-            toast.error('No visible messages to export');
-            return;
-          }
-          exportConversationAsMarkdown(convId!, conv.data.name || convId!, exportableMessages);
-          toast.success('Exported as Markdown');
-          setOpen(false);
-        },
-        group: 'Actions',
-      },
-      {
-        id: 'export-json',
-        label: 'Export as JSON',
-        description: 'Download current conversation as .json',
-        icon: <Download className="mr-2 h-4 w-4" />,
-        keywords: ['export', 'download', 'json', 'save', 'data'],
-        action: () => {
-          const convId = selectedConversation$.get();
-          const conv = convId ? conversations$.get(convId)?.get() : null;
-          if (!conv?.data?.log?.length) {
-            toast.error('No messages to export');
-            return;
-          }
-          exportConversationAsJSON(convId!, conv.data.name || convId!, conv.data.log);
-          toast.success('Exported as JSON');
-          setOpen(false);
-        },
-        group: 'Actions',
-      },
+      // Conversation-specific actions (only when a conversation is selected)
+      ...(selectedConversation$.get()
+        ? [
+            {
+              id: 'export-markdown',
+              label: 'Export as Markdown',
+              description: 'Download current conversation as .md',
+              icon: <Download className="mr-2 h-4 w-4" />,
+              keywords: ['export', 'download', 'markdown', 'save', 'share'],
+              action: () => {
+                const convId = selectedConversation$.get();
+                const conv = convId ? conversations$.get(convId)?.get() : null;
+                if (!conv?.data?.log?.length) {
+                  toast.error('No messages to export');
+                  return;
+                }
+                const exportableMessages = getExportableMessages(conv.data.log);
+                if (!exportableMessages.length) {
+                  toast.error('No visible messages to export');
+                  return;
+                }
+                exportConversationAsMarkdown(
+                  convId!,
+                  conv.data.name || convId!,
+                  exportableMessages
+                );
+                toast.success('Exported as Markdown');
+                setOpen(false);
+              },
+              group: 'Conversation',
+            },
+            {
+              id: 'export-json',
+              label: 'Export as JSON',
+              description: 'Download current conversation as .json',
+              icon: <Download className="mr-2 h-4 w-4" />,
+              keywords: ['export', 'download', 'json', 'save', 'data'],
+              action: () => {
+                const convId = selectedConversation$.get();
+                const conv = convId ? conversations$.get(convId)?.get() : null;
+                if (!conv?.data?.log?.length) {
+                  toast.error('No messages to export');
+                  return;
+                }
+                exportConversationAsJSON(convId!, conv.data.name || convId!, conv.data.log);
+                toast.success('Exported as JSON');
+                setOpen(false);
+              },
+              group: 'Conversation',
+            },
+          ]
+        : []),
     ],
-    [navigate]
+    [navigate, setOpen]
   );
 
   // Filter actions based on search query

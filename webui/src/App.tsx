@@ -9,6 +9,9 @@ import { SettingsProvider } from './contexts/SettingsContext';
 import Index from './pages/Index';
 import Tasks from './pages/Tasks';
 import Workspace from './pages/Workspace';
+import Agents from './pages/Agents';
+import Workspaces from './pages/Workspaces';
+import History from './pages/History';
 import { CommandPalette } from './components/CommandPalette';
 import { SetupWizard } from './components/SetupWizard';
 import type { FC } from 'react';
@@ -56,6 +59,9 @@ const App: FC = () => {
                   <Route path="/chat/:id" element={<Index />} />
                   <Route path="/tasks" element={<Tasks />} />
                   <Route path="/tasks/:id" element={<Tasks />} />
+                  <Route path="/agents" element={<Agents />} />
+                  <Route path="/workspaces" element={<Workspaces />} />
+                  <Route path="/history" element={<History />} />
                   <Route path="/workspace/:id" element={<Workspace />} />
                 </Routes>
                 <SetupWizard />

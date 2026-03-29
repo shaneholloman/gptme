@@ -17,7 +17,7 @@ import {
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
 
-export const WelcomeView = ({ onToggleHistory }: { onToggleHistory: () => void }) => {
+export const WelcomeView = () => {
   const [inputValue, setInputValue] = useState('');
   const [isSubmitting, setIsSubmitting] = useState(false);
   const navigate = useNavigate();
@@ -42,7 +42,7 @@ export const WelcomeView = ({ onToggleHistory }: { onToggleHistory: () => void }
   };
 
   const handleSend = async (message: string, options?: ChatOptions) => {
-    if (!message.trim() || !isConnected) return;
+    if ((!message.trim() && !options?.pendingFiles?.length) || !isConnected) return;
 
     setIsSubmitting(true);
 
@@ -52,6 +52,7 @@ export const WelcomeView = ({ onToggleHistory }: { onToggleHistory: () => void }
         model: options?.model,
         stream: options?.stream,
         workspace: options?.workspace || '.',
+        pendingFiles: options?.pendingFiles,
       });
 
       // Navigate immediately - server-side creation happens in background
@@ -115,7 +116,7 @@ export const WelcomeView = ({ onToggleHistory }: { onToggleHistory: () => void }
             type="button"
             variant="ghost"
             size="sm"
-            onClick={onToggleHistory}
+            onClick={() => navigate('/history')}
             className="text-muted-foreground"
           >
             <History className="mr-2 h-4 w-4" />

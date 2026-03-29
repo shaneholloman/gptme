@@ -1,4 +1,4 @@
-import { useEffect, useRef, type FC } from 'react';
+import { useCallback, useRef, type FC } from 'react';
 import type { Message, StreamingMessage } from '@/types/conversation';
 import { MessageAvatar } from './MessageAvatar';
 import { useMessageChainType } from '@/utils/messageUtils';
@@ -8,8 +8,19 @@ import { ObservableHint, type Observable } from '@legendapp/state';
 import { Memo, useObservable, useObserveEffect } from '@legendapp/state/react';
 import * as smd from '@/utils/smd';
 import { customRenderer, type CustomRenderer } from '@/utils/markdownRenderer';
-import { Clipboard, Check } from 'lucide-react';
+import {
+  Clipboard,
+  Check,
+  AlertCircle,
+  RotateCcw,
+  Pencil,
+  X,
+  Play,
+  RefreshCw,
+  Trash2,
+} from 'lucide-react';
 import { Button } from '@/components/ui/button';
+import { Textarea } from '@/components/ui/textarea';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 
 function formatTimestamp(timestamp: string): { short: string; full: string } {
@@ -47,6 +58,12 @@ interface Props {
   conversationId: string;
   agentAvatarUrl?: string;
   agentName?: string;
+  onRetry?: (message: Message) => void;
+  onEdit?: (index: number, content: string, truncate: boolean) => void;
+  onDelete?: (index: number) => void;
+  onRerun?: (index: number) => void;
+  onRegenerate?: (index: number) => void;
+  messageIndex?: number;
 }
 
 export const ChatMessage: FC<Props> = ({
@@ -56,31 +73,83 @@ export const ChatMessage: FC<Props> = ({
   conversationId,
   agentAvatarUrl,
   agentName,
+  onRetry,
+  onEdit,
+  onDelete,
+  onRerun,
+  onRegenerate,
+  messageIndex,
 }) => {
   const { api, connectionConfig } = useApi();
   const { settings } = useSettings();
+  // Use observables (not useState) because these are read inside <Memo>
+  const isEditing$ = useObservable(false);
+  const editContent$ = useObservable('');
 
-  const contentRef = useRef<HTMLDivElement>(null);
+  const contentRef = useRef<HTMLDivElement | null>(null);
   const renderer$ = useObservable<CustomRenderer | null>(null);
   const parser$ = useObservable<smd.Parser | null>(null);
 
-  // Initialize the renderer and parser once the contentRef is available
-  useEffect(() => {
-    if (!contentRef.current) return;
-    const renderer = customRenderer(contentRef.current, false, true, settings.blocksDefaultOpen);
-    renderer$.set(ObservableHint.opaque(renderer));
-    const parser = smd.parser(renderer);
-    parser$.set(ObservableHint.opaque(parser));
+  // Callback ref: initializes the parser whenever the content div mounts.
+  // This fires inside <Memo> when the div appears (e.g. after exiting edit mode),
+  // unlike useEffect which only fires on outer component re-render.
+  const contentCallbackRef = useCallback(
+    (node: HTMLDivElement | null) => {
+      contentRef.current = node;
+      if (!node) return;
+
+      const renderer = customRenderer(node, false, true, settings.blocksDefaultOpen);
+      renderer$.set(ObservableHint.opaque(renderer));
+      const newParser = smd.parser(renderer);
+      parser$.set(ObservableHint.opaque(newParser));
+
+      // Write existing content to the new parser (handles re-mount after edit mode)
+      const existingContent = message$.content.peek();
+      if (existingContent) {
+        previousContent$.set('');
+        smd.parser_write(newParser, existingContent);
+        smd.parser_end(newParser);
+        renderer$.set(null);
+        parser$.set(null);
+        previousContent$.set(existingContent);
+      }
+    },
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [contentRef.current, settings.blocksDefaultOpen]);
+    [settings.blocksDefaultOpen]
+  );
 
   // Send any new content to the parser
   const previousContent$ = useObservable('');
   useObserveEffect(message$.content, ({ value }) => {
     const previousContent = previousContent$.get();
-    const newChars = value?.slice(previousContent.length);
+    const content = value || '';
+
+    // If content was replaced (not appended), reinitialize the parser
+    if (content && !content.startsWith(previousContent) && previousContent.length > 0) {
+      previousContent$.set('');
+      if (contentRef.current) {
+        contentRef.current.innerHTML = '';
+        const renderer = customRenderer(
+          contentRef.current,
+          false,
+          true,
+          settings.blocksDefaultOpen
+        );
+        renderer$.set(ObservableHint.opaque(renderer));
+        const newParser = smd.parser(renderer);
+        parser$.set(ObservableHint.opaque(newParser));
+        smd.parser_write(newParser, content);
+        smd.parser_end(newParser);
+        renderer$.set(null);
+        parser$.set(null);
+        previousContent$.set(content);
+      }
+      return;
+    }
+
+    const newChars = content.slice(previousContent.length);
     if (!newChars) return;
-    previousContent$.set(value || '');
+    previousContent$.set(content);
     if (!contentRef.current) return;
     const parser = parser$.get();
     if (!parser) return;
@@ -131,7 +200,7 @@ export const ChatMessage: FC<Props> = ({
                 .split('/')
                 .filter((part) => part !== '..')
                 .join('/');
-              const fileUrl = `${connectionConfig.baseUrl}/api/conversations/${conversationId}/files/${sanitizedPath}`;
+              const fileUrl = `${connectionConfig.baseUrl}/api/v2/conversations/${conversationId}/files/${sanitizedPath}`;
               const isImage = /\.(jpg|jpeg|png|gif|webp)$/i.test(filename);
 
               // Get just the filename without path for display
@@ -280,55 +349,237 @@ export const ChatMessage: FC<Props> = ({
                 />
                 <div className="md:px-12">
                   <div className={`group/message relative ${messageClasses$.get()}`}>
-                    <Button
-                      variant="ghost"
-                      size="sm"
-                      onClick={handleCopy}
-                      className="absolute right-1 top-1 z-10 h-7 w-7 p-0 opacity-0 transition-opacity hover:!opacity-100 group-hover/message:opacity-50"
-                      aria-label="Copy message"
-                    >
-                      {copied$.get() ? <Check size={14} /> : <Clipboard size={14} />}
-                    </Button>
-                    <div className="px-3 py-1.5">
-                      <Memo>
-                        {() => {
-                          const isEmptyAssistantMessage =
-                            message$.role.get() === 'assistant' && !message$.content.get();
-
-                          return (
-                            <div
-                              ref={contentRef}
-                              className="chat-message prose prose-sm dark:prose-invert prose-pre:overflow-x-auto prose-pre:max-w-[calc(100vw-16rem)]"
+                    {/* Action buttons (top-right) */}
+                    <div className="absolute right-1 top-1 z-10 flex gap-0.5 opacity-0 transition-opacity hover:!opacity-100 group-hover/message:opacity-50">
+                      {onEdit &&
+                        messageIndex !== undefined &&
+                        message$.role.get() === 'user' &&
+                        !isEditing$.get() && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => {
+                              editContent$.set(message$.content.get());
+                              isEditing$.set(true);
+                            }}
+                            className="h-7 w-7 p-0"
+                            aria-label="Edit message"
+                          >
+                            <Pencil size={14} />
+                          </Button>
+                        )}
+                      {messageIndex !== undefined && message$.role.get() === 'assistant' && (
+                        <>
+                          {onRerun && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => onRerun(messageIndex)}
+                              className="h-7 w-7 p-0"
+                              aria-label="Re-run tools"
+                              title="Re-run tools"
                             >
-                              {isEmptyAssistantMessage && (
-                                <span className="text-muted-foreground">Thinking...</span>
-                              )}
-                            </div>
-                          );
-                        }}
-                      </Memo>
-                      {renderFiles()}
-                      <Memo>
-                        {() => {
-                          const timestamp = (message$.get() as Message)?.timestamp;
-                          if (!timestamp) return null;
-                          const { short, full } = formatTimestamp(timestamp);
-                          if (!short) return null;
-                          return (
-                            <TooltipProvider>
-                              <Tooltip>
-                                <TooltipTrigger asChild>
-                                  <div className="mt-0.5 select-none text-right text-[10px] text-muted-foreground/50 opacity-0 transition-opacity group-hover/message:opacity-100">
-                                    {short}
-                                  </div>
-                                </TooltipTrigger>
-                                <TooltipContent side="bottom">{full}</TooltipContent>
-                              </Tooltip>
-                            </TooltipProvider>
-                          );
-                        }}
-                      </Memo>
+                              <Play size={14} />
+                            </Button>
+                          )}
+                          {onRegenerate && (
+                            <Button
+                              variant="ghost"
+                              size="sm"
+                              onClick={() => onRegenerate(messageIndex)}
+                              className="h-7 w-7 p-0"
+                              aria-label="Regenerate"
+                              title="Regenerate response"
+                            >
+                              <RefreshCw size={14} />
+                            </Button>
+                          )}
+                        </>
+                      )}
+                      <Button
+                        variant="ghost"
+                        size="sm"
+                        onClick={handleCopy}
+                        className="h-7 w-7 p-0"
+                        aria-label="Copy message"
+                      >
+                        {copied$.get() ? <Check size={14} /> : <Clipboard size={14} />}
+                      </Button>
+                      {onDelete &&
+                        messageIndex !== undefined &&
+                        message$.role.get() !== 'system' && (
+                          <Button
+                            variant="ghost"
+                            size="sm"
+                            onClick={() => {
+                              if (
+                                window.confirm(
+                                  'Delete this message? A backup branch will be created.'
+                                )
+                              ) {
+                                onDelete(messageIndex);
+                              }
+                            }}
+                            className="h-7 w-7 p-0 text-destructive hover:text-destructive"
+                            aria-label="Delete message"
+                            title="Delete message"
+                          >
+                            <Trash2 size={14} />
+                          </Button>
+                        )}
                     </div>
+                    <div className="px-3 py-1.5">
+                      {isEditing$.get() ? (
+                        <div className="flex flex-col gap-2">
+                          <Textarea
+                            value={editContent$.get()}
+                            onChange={(e) => editContent$.set(e.target.value)}
+                            className="min-h-[60px] resize-none"
+                            autoFocus
+                            onKeyDown={(e) => {
+                              if (e.key === 'Escape') {
+                                isEditing$.set(false);
+                              }
+                            }}
+                          />
+                          <div className="flex items-center gap-2">
+                            <Button
+                              size="sm"
+                              onClick={() => {
+                                onEdit?.(messageIndex!, editContent$.get(), false);
+                                isEditing$.set(false);
+                              }}
+                              disabled={!editContent$.get().trim()}
+                            >
+                              Save
+                            </Button>
+                            <Button
+                              size="sm"
+                              variant="secondary"
+                              onClick={() => {
+                                onEdit?.(messageIndex!, editContent$.get(), true);
+                                isEditing$.set(false);
+                              }}
+                              disabled={!editContent$.get().trim()}
+                            >
+                              Save & Re-run
+                            </Button>
+                            <Button size="sm" variant="ghost" onClick={() => isEditing$.set(false)}>
+                              <X className="mr-1 h-3 w-3" />
+                              Cancel
+                            </Button>
+                          </div>
+                        </div>
+                      ) : (
+                        <>
+                          <Memo>
+                            {() => {
+                              const isEmptyAssistantMessage =
+                                message$.role.get() === 'assistant' && !message$.content.get();
+
+                              return (
+                                <div
+                                  ref={contentCallbackRef}
+                                  className="chat-message prose prose-sm dark:prose-invert prose-pre:overflow-x-auto prose-pre:max-w-[calc(100vw-16rem)]"
+                                >
+                                  {isEmptyAssistantMessage && (
+                                    <span className="text-muted-foreground">Thinking...</span>
+                                  )}
+                                </div>
+                              );
+                            }}
+                          </Memo>
+                          {renderFiles()}
+                        </>
+                      )}
+                    </div>
+                    {/* Failed message indicator */}
+                    <Memo>
+                      {() => {
+                        const msg = message$.get() as Message;
+                        if (msg._status !== 'failed') return null;
+                        return (
+                          <div className="flex items-center gap-2 px-3 py-1 text-xs text-destructive">
+                            <AlertCircle className="h-3 w-3" />
+                            <span>{msg._error || 'Failed to send'}</span>
+                            {onRetry && (
+                              <Button
+                                variant="ghost"
+                                size="sm"
+                                className="h-5 gap-1 px-1.5 text-xs text-destructive hover:text-destructive"
+                                onClick={() => onRetry(msg)}
+                              >
+                                <RotateCcw className="h-3 w-3" />
+                                Retry
+                              </Button>
+                            )}
+                          </div>
+                        );
+                      }}
+                    </Memo>
+                    <Memo>
+                      {() => {
+                        const msg = message$.get() as Message;
+                        const timestamp = msg?.timestamp;
+                        const metadata = msg?.metadata;
+                        if (!timestamp && !metadata) return null;
+
+                        const time = timestamp ? formatTimestamp(timestamp) : null;
+                        const model = metadata?.model;
+                        const cost = metadata?.cost;
+                        const usage = metadata?.usage;
+
+                        // Build the short inline label: "model · time"
+                        const parts: string[] = [];
+                        if (model) parts.push(model);
+                        if (time?.short) parts.push(time.short);
+                        const shortLabel = parts.join(' · ');
+                        if (!shortLabel) return null;
+
+                        // Build rich tooltip content
+                        const tooltipLines: string[] = [];
+                        if (time?.full) tooltipLines.push(time.full);
+                        if (model) tooltipLines.push(`Model: ${model}`);
+                        if (cost != null) tooltipLines.push(`Cost: $${cost.toFixed(4)}`);
+                        if (usage) {
+                          if (usage.input_tokens)
+                            tooltipLines.push(
+                              `Input: ${usage.input_tokens.toLocaleString()} tokens`
+                            );
+                          if (usage.output_tokens)
+                            tooltipLines.push(
+                              `Output: ${usage.output_tokens.toLocaleString()} tokens`
+                            );
+                          if (usage.cache_read_tokens)
+                            tooltipLines.push(
+                              `Cache read: ${usage.cache_read_tokens.toLocaleString()} tokens`
+                            );
+                          if (usage.cache_creation_tokens)
+                            tooltipLines.push(
+                              `Cache write: ${usage.cache_creation_tokens.toLocaleString()} tokens`
+                            );
+                        }
+
+                        return (
+                          <TooltipProvider>
+                            <Tooltip>
+                              <TooltipTrigger asChild>
+                                <div className="h-0 select-none overflow-visible px-3 text-right text-[10px] leading-4 text-muted-foreground/50 opacity-0 transition-opacity group-hover/message:opacity-100">
+                                  {shortLabel}
+                                </div>
+                              </TooltipTrigger>
+                              <TooltipContent side="bottom" className="max-w-xs">
+                                <div className="space-y-0.5 text-xs">
+                                  {tooltipLines.map((line, i) => (
+                                    <div key={i}>{line}</div>
+                                  ))}
+                                </div>
+                              </TooltipContent>
+                            </Tooltip>
+                          </TooltipProvider>
+                        );
+                      }}
+                    </Memo>
                   </div>
                 </div>
               </div>
