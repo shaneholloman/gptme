@@ -35,6 +35,7 @@ from ..logmanager import Log, LogManager, get_user_conversations
 from ..message import Message
 from ..tools import get_toolchain, get_tools, init_tools
 from ..util.content import is_message_command
+from ..util.uri import parse_file_reference
 
 
 def _validate_conversation_id(
@@ -153,22 +154,22 @@ def api_conversations():
     limit = int(request.args.get("limit", 100))
     search = request.args.get("search", "").strip().lower()
 
+    # Use fast tail-only scan for list/search — reads last 8KB for
+    # preview/model, skips json.loads() on every metadata line.
+    # Full file is still read for line count, but without JSON parsing.
     if search:
         conversations = []
-        for conv in get_user_conversations():
+        for conv in get_user_conversations(detail=False):
             if (
                 search in conv.name.lower()
                 or search in conv.id.lower()
-                or (
-                    conv.last_message_preview
-                    and search in conv.last_message_preview.lower()
-                )
+                or search in (conv.last_message_preview or "").lower()
             ):
                 conversations.append(conv)
                 if len(conversations) >= limit:
                     break
     else:
-        conversations = list(islice(get_user_conversations(), limit))
+        conversations = list(islice(get_user_conversations(detail=False), limit))
     return flask.jsonify(conversations)
 
 
@@ -474,13 +475,27 @@ def api_conversation_edit_message(conversation_id: str, index: int):
     if error := _validate_conversation_id(conversation_id):
         return error
 
-    req_json = request.json or {}
+    req_json = request.get_json(silent=True)
+    if req_json is None:
+        req_json = {}
+    elif not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
+
     content = req_json.get("content")
+    files = req_json.get("files")  # Optional list of file paths
     truncate = request.args.get("truncate") == "1"
 
-    # Content is required for edits, but optional for pure truncation
-    if not truncate and (not content or not content.strip()):
-        return flask.jsonify({"error": "content is required and cannot be empty"}), 400
+    if content is not None and not isinstance(content, str):
+        return flask.jsonify({"error": "content must be a string"}), 400
+    if files is not None and (
+        not isinstance(files, list) or not all(isinstance(f, str) for f in files)
+    ):
+        return flask.jsonify({"error": "files must be a list of strings"}), 400
+
+    # Content or files required for edits, but optional for pure truncation
+    has_changes = (content and content.strip()) or files is not None
+    if not truncate and not has_changes:
+        return flask.jsonify({"error": "content or files is required"}), 400
 
     # Check if generation is in progress
     sessions = SessionManager.get_sessions_for_conversation(conversation_id)
@@ -508,15 +523,20 @@ def api_conversation_edit_message(conversation_id: str, index: int):
             404,
         )
 
-    # Content changes are only allowed on user messages.
+    # Content/file changes are only allowed on user messages.
     # Truncation (without content change) is allowed on any message.
     content_changed = content is not None and content != msgs[index].content
-    if content_changed and msgs[index].role != "user":
+    files_changed = files is not None and [str(f) for f in msgs[index].files] != files
+    if (content_changed or files_changed) and msgs[index].role != "user":
         return flask.jsonify({"error": "Can only edit user messages"}), 400
 
-    if content_changed:
-        assert content is not None  # guaranteed by content_changed check
-        edited_msg = replace(msgs[index], content=content)
+    if content_changed or files_changed:
+        replacements: dict = {}
+        if content_changed:
+            replacements["content"] = content
+        if files_changed and files is not None:
+            replacements["files"] = [parse_file_reference(f) for f in files]
+        edited_msg = replace(msgs[index], **replacements)
         new_msgs = msgs[:index] + [edited_msg] + ([] if truncate else msgs[index + 1 :])
     elif truncate:
         new_msgs = msgs[: index + 1]
