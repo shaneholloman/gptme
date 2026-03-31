@@ -410,7 +410,13 @@ def _handle_openai_transient_error(e, attempt, max_retries, base_delay):
     # This breaks out of the retry loop early to prevent test timeouts
     test_max_retries_str = os.environ.get("GPTME_TEST_MAX_RETRIES")
     if test_max_retries_str:
-        test_max_retries = int(test_max_retries_str)
+        try:
+            test_max_retries = int(test_max_retries_str)
+        except ValueError as parse_err:
+            raise ValueError(
+                f"Invalid GPTME_TEST_MAX_RETRIES value: {test_max_retries_str!r}. "
+                "Must be a valid integer."
+            ) from parse_err
         if attempt >= test_max_retries - 1:
             logger.warning(
                 f"Test max_retries={test_max_retries} reached (attempt {attempt + 1}), not retrying"
@@ -575,6 +581,8 @@ def chat(
         **optional_kwargs,
     )
     metadata = _record_usage(response.usage, model)
+    if not response.choices:
+        raise ValueError("OpenAI API returned empty choices list")
     choice = response.choices[0]
     result = []
     if choice.finish_reason == "tool_calls":
@@ -659,13 +667,23 @@ def extra_body(
         # Ensure routed provider supports all request parameters (tools,
         # response_format, etc.) — prevents silent failures when OpenRouter
         # falls back to a provider that doesn't support function calling.
-        provider_prefs["require_parameters"] = True
+        # NOTE: only set when reasoning is NOT enabled, because the
+        # combination of require_parameters=True + reasoning extension can
+        # eliminate all available providers (the reasoning body parameter
+        # is not universally supported).
+        if "reasoning" not in body:
+            provider_prefs["require_parameters"] = True
 
-        # Privacy: deny provider data collection by default.
-        # Aligns with gptme's local-first, privacy-preserving philosophy.
-        # Users can override with OPENROUTER_DATA_COLLECTION env var or config.
-        data_collection = get_config().get_env("OPENROUTER_DATA_COLLECTION", "deny")
-        provider_prefs["data_collection"] = data_collection
+        # Privacy: default to "deny" for non-reasoning models to preserve
+        # user privacy. For reasoning models, skip the default — the triple
+        # constraint (require_parameters + reasoning + data_collection="deny")
+        # eliminates all available providers and causes 400 errors.
+        if "reasoning" not in body:
+            data_collection = get_config().get_env("OPENROUTER_DATA_COLLECTION", "deny")
+        else:
+            data_collection = get_config().get_env("OPENROUTER_DATA_COLLECTION")
+        if data_collection:
+            provider_prefs["data_collection"] = data_collection
 
         # Quantization preferences: restrict to specific precision levels.
         # Useful for controlling quality (fp16) or cost (int4/int8).

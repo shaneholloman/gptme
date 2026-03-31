@@ -534,7 +534,9 @@ export const ChatInput: FC<Props> = ({
   );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
-  const editFileKey = editFiles?.join('\0') || '';
+  // Stable string key derived from editFiles — prevents the useEffect below from
+  // firing on every render due to new array references from the parent.
+  const editFileKey = editFiles?.join('\0') ?? '';
   const [attachedFiles, setAttachedFiles] = useState<AttachedFile[]>(() =>
     editMode ? createAttachedFiles(editFiles) : []
   );
@@ -564,6 +566,7 @@ export const ChatInput: FC<Props> = ({
   useEffect(() => {
     if (!editMode) return;
     replaceAttachedFiles(createAttachedFiles(editFiles));
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [editMode, editFileKey, replaceAttachedFiles]);
 
   // Always buffer files locally — upload happens on send, not on attach

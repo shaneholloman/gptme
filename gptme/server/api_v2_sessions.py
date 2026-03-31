@@ -415,7 +415,18 @@ def api_conversation_tool_confirm(conversation_id: str):
                 404,
             )
 
-    tool_exec = session.pending_tools[tool_id]
+    # Use .get() to avoid KeyError if tool was concurrently removed (e.g., by another
+    # request or the session step thread) between the check above and this access.
+    tool_exec = session.pending_tools.get(tool_id)
+    if tool_exec is None:
+        return (
+            flask.jsonify(
+                {
+                    "error": f"Tool {tool_id} no longer pending (may have been executed or cancelled)"
+                }
+            ),
+            404,
+        )
 
     logdir = get_logs_dir() / conversation_id
     chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
@@ -457,7 +468,9 @@ def api_conversation_tool_confirm(conversation_id: str):
     elif action == "skip":
         # Skip the tool execution
         tool_exec.status = ToolStatus.SKIPPED
-        del session.pending_tools[tool_id]
+        session.pending_tools.pop(
+            tool_id, None
+        )  # use pop to avoid KeyError if concurrently removed
 
         # Provide meaningful message to prevent LLM from re-suggesting the same tool
         tool_name = tool_exec.tooluse.tool
