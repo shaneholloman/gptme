@@ -495,8 +495,20 @@ def computer(
         default_resolution = MAX_SCALING_TARGETS["XGA"]
         logger.info("Fallback to XGA resolution")
 
-    width = int(os.getenv("WIDTH", str(default_resolution["width"])))
-    height = int(os.getenv("HEIGHT", str(default_resolution["height"])))
+    _width_str = os.getenv("WIDTH", str(default_resolution["width"]))
+    _height_str = os.getenv("HEIGHT", str(default_resolution["height"]))
+    try:
+        width = int(_width_str)
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid WIDTH env var: must be an integer, got {_width_str!r}"
+        ) from e
+    try:
+        height = int(_height_str)
+    except ValueError as e:
+        raise ValueError(
+            f"Invalid HEIGHT env var: must be an integer, got {_height_str!r}"
+        ) from e
     logger.info(f"Using API space resolution: {width}x{height}")
 
     if action in ("mouse_move", "left_click_drag"):
@@ -584,14 +596,10 @@ def computer(
     if action == "screenshot":
         path = screenshot()  # Use existing screenshot function
 
-        # Scale if needed
-        # TODO: also scale in screenshot tool for these situations
+        # Resize screenshot from physical resolution to API dimensions
         if path.exists():
-            x, y = _scale_coordinates(
-                _ScalingSource.COMPUTER, width, height, width, height
-            )
             subprocess.run(
-                ["convert", str(path), "-resize", f"{x}x{y}!", str(path)],
+                ["convert", str(path), "-resize", f"{width}x{height}!", str(path)],
                 check=True,
             )
             return view_image(path)

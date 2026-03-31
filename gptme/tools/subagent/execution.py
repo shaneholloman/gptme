@@ -335,8 +335,8 @@ def _run_subagent_subprocess(
             process = subprocess.Popen(
                 cmd,
                 stdin=stdin_file,
-                stdout=subprocess.PIPE,
-                stderr=subprocess.PIPE,
+                stdout=subprocess.DEVNULL,
+                stderr=subprocess.DEVNULL,
                 cwd=workspace,
                 text=True,
             )
@@ -388,8 +388,8 @@ def _monitor_subprocess(
     """Monitor a subprocess and invoke callbacks when it completes.
 
     Runs in a background thread to enable non-blocking operation.
-    Uses .wait() instead of .communicate() to avoid memory issues with
-    long-running subagents that produce large outputs.
+    Subprocess stdout/stderr are sent to DEVNULL since results are read
+    from the conversation log, not the process pipes.
     """
     from .hooks import notify_completion
     from .types import (
@@ -494,8 +494,10 @@ def _run_planner(
             )
 
         t = threading.Thread(target=run_executor, daemon=True)
-        t.start()
+        # Register subagent BEFORE starting thread to avoid race condition
+        # (matches pattern in api.py — thread closure may look up _subagents)
         _subagents.append(Subagent(executor_id, executor_prompt, t, logdir, model))
+        t.start()
 
         # Sequential mode: wait for each task to complete before starting next
         if execution_mode == "sequential":

@@ -241,16 +241,17 @@ def api_conversation_put(conversation_id: str):
         return error
 
     logdir = get_logs_dir() / conversation_id
-    if logdir.exists():
+
+    req_json = flask.request.json or {}
+
+    # Create the log directory atomically to avoid TOCTOU race
+    try:
+        logdir.mkdir(parents=True)
+    except FileExistsError:
         return (
             flask.jsonify({"error": f"Conversation already exists: {conversation_id}"}),
             409,
         )
-
-    req_json = flask.request.json or {}
-
-    # Create the log directory
-    logdir.mkdir(parents=True)
 
     # Load or create the chat config, overriding values from request config if provided
     config_dict = req_json.get("config", {})
@@ -287,7 +288,6 @@ def api_conversation_put(conversation_id: str):
         )
         msgs.append(Message(msg["role"], msg["content"], timestamp=timestamp))
 
-    logdir.mkdir(parents=True, exist_ok=True)
     log = LogManager.load(logdir=logdir, initial_msgs=msgs, create=True)
     log.write()
 

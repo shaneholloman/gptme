@@ -470,6 +470,7 @@ class LogManager:
 
         peek = self.log[-1] if self.log else None
         if not peek:
+            self.write()
             print("[yellow]Nothing to undo.[/]")
             return
 
@@ -485,6 +486,7 @@ class LogManager:
                     f"[red]  {undid.role}: {textwrap.shorten(undid.content.strip(), width=50, placeholder='...')}[/]",
                 )
             peek = self.log[-1] if self.log else None
+        self.write()
 
     @classmethod
     def load(
@@ -501,11 +503,12 @@ class LogManager:
             logdir = Path(logdir).parent
 
         logsdir = get_logs_dir()
-        if str(logsdir) not in str(logdir):
-            # if the path was not fully specified, assume its a dir in logsdir
+        logdir = Path(logdir)
+        if not logdir.is_absolute():
+            # Relative path: always resolve relative to logsdir, not CWD.
+            # Using resolve() here would be CWD-dependent and breaks when
+            # session_step.py calls os.chdir(workspace) mid-execution.
             logdir = logsdir / logdir
-        else:
-            logdir = Path(logdir)
 
         if branch == "main":
             logfile = logdir / "conversation.jsonl"
