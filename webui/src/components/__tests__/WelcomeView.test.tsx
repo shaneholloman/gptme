@@ -1,5 +1,6 @@
 import '@testing-library/jest-dom';
 import { render, screen } from '@testing-library/react';
+import { SettingsProvider } from '@/contexts/SettingsContext';
 import { WelcomeView } from '../WelcomeView';
 
 const mockNavigate = jest.fn();
@@ -59,9 +60,12 @@ describe('WelcomeView', () => {
   });
 
   it('renders the refreshed new chat copy and quick suggestions', () => {
-    render(<WelcomeView />);
+    render(
+      <SettingsProvider>
+        <WelcomeView />
+      </SettingsProvider>
+    );
 
-    expect(screen.getByText('New chat')).toBeInTheDocument();
     expect(screen.getByRole('heading', { name: 'What are you working on?' })).toBeInTheDocument();
     expect(
       screen.getByText(/Start with a real task, question, or rough idea\./)

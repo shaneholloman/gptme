@@ -21,6 +21,7 @@ from gptme.eval.leaderboard import (
     main,
     normalize_model,
     parse_model_format,
+    wilson_lower_bound,
 )
 
 
@@ -382,6 +383,47 @@ def test_aggregate_tiebreak_by_total_tests(tmp_path):
     assert ranked[0]["format"] == "tool"
     assert ranked[0]["total_tests"] == 4
     # model-b is second
+    assert ranked[1]["model"] == "model-b"
+
+
+def test_wilson_ranking_prefers_high_coverage(tmp_path):
+    """Model with many tests and 95% rate should rank above one with few tests at 100%.
+
+    This tests the Wilson score ranking: a model tested on 20 tests at 95%
+    is more credibly strong than one tested on 4 tests at 100%.
+    """
+    rows = [("model-a", "tool", f"test-a-{i}", "true") for i in range(4)] + [
+        ("model-b", "tool", f"test-b-{i}", "true" if i > 0 else "false")
+        for i in range(20)
+    ]
+
+    _create_eval_results(tmp_path, [{"dir": "run1", "rows": rows}])
+    results = load_results(tmp_path)
+    ranked = aggregate_results(results, min_tests=4)
+
+    assert len(ranked) == 2
+    # model-b (95%, 20 tests) should rank above model-a (100%, 4 tests)
+    assert ranked[0]["model"] == "model-b"
+    assert ranked[1]["model"] == "model-a"
+    # Both should have ranking_score
+    assert "ranking_score" in ranked[0]
+    assert ranked[0]["ranking_score"] > ranked[1]["ranking_score"]
+
+
+def test_wilson_ranking_same_coverage(tmp_path):
+    """With similar test counts, raw pass rate still dominates ranking."""
+    rows = [("model-a", "tool", f"test-a-{i}", "true") for i in range(10)] + [
+        ("model-b", "tool", f"test-b-{i}", "true" if i < 8 else "false")
+        for i in range(10)
+    ]
+
+    _create_eval_results(tmp_path, [{"dir": "run1", "rows": rows}])
+    results = load_results(tmp_path)
+    ranked = aggregate_results(results, min_tests=4)
+
+    assert len(ranked) == 2
+    # model-a (100%, 10 tests) should still rank above model-b (80%, 10 tests)
+    assert ranked[0]["model"] == "model-a"
     assert ranked[1]["model"] == "model-b"
 
 
@@ -836,3 +878,103 @@ def test_practical_tests_sync():
         )
 
     assert not errors, "\n".join(errors)
+
+
+def test_wilson_lower_bound_basic():
+    """Wilson score helper produces expected ordering."""
+    # Perfect but low-N should rank below high-N with slightly lower rate
+    perfect_4 = wilson_lower_bound(4, 4)  # 100% on 4 tests
+    strong_59 = wilson_lower_bound(56, 59)  # ~95% on 59 tests
+    assert strong_59 > perfect_4, (
+        f"56/59 ({strong_59:.4f}) should rank above 4/4 ({perfect_4:.4f})"
+    )
+
+    # Zero tests should return 0
+    assert wilson_lower_bound(0, 0) == 0.0
+
+    # All-pass should be higher than all-fail
+    assert wilson_lower_bound(10, 10) > wilson_lower_bound(0, 10)
+
+
+def test_per_test_and_summary_pick_same_format(tmp_path):
+    """aggregate_per_test and aggregate_results should pick the same format for each model.
+
+    Both functions select the "best" format per model. After the Wilson score
+    fix, they should agree (previously aggregate_per_test used raw pass rate).
+    """
+    results_dir = tmp_path / "eval_results"
+    run_dir = results_dir / "2025-01-01_00-00-00"
+    run_dir.mkdir(parents=True)
+    csv_path = run_dir / "eval_results.csv"
+
+    # Model A: two formats
+    #   - markdown: 4/4 (100%) but only 4 tests → lower Wilson score
+    #   - xml: 18/20 (90%) but 20 tests → higher Wilson score
+    rows = [
+        {
+            "Model": "test/model-a",
+            "Test": f"test-{i}",
+            "Passed": "True",
+            "Tool Format": "markdown",
+        }
+        for i in range(4)
+    ] + [
+        {
+            "Model": "test/model-a",
+            "Test": f"test-{i}",
+            "Passed": "True" if i < 18 else "False",
+            "Tool Format": "xml",
+        }
+        for i in range(20)
+    ]
+
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["Model", "Test", "Passed", "Tool Format"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    results = load_results(results_dir)
+    ranked = aggregate_results(results, min_tests=4)
+    model_names, _test_names, _matrix = aggregate_per_test(results, min_tests=4)
+
+    # Both should pick xml (higher Wilson score despite lower raw rate)
+    assert len(ranked) == 1
+    assert ranked[0]["format"] == "xml"
+
+    # per-test should also include the model AND pick xml (20 tests, not 4)
+    assert len(model_names) == 1
+    assert len(_test_names) == 20, (
+        f"Expected 20 test columns (xml format); got {len(_test_names)} "
+        "(likely markdown was incorrectly selected)"
+    )
+
+
+def test_json_output_includes_ranking_score(tmp_path):
+    """JSON output should include the Wilson ranking_score field."""
+    results_dir = tmp_path / "eval_results"
+    run_dir = results_dir / "2025-01-01_00-00-00"
+    run_dir.mkdir(parents=True)
+    csv_path = run_dir / "eval_results.csv"
+
+    rows = [
+        {
+            "Model": "test/model",
+            "Test": f"test-{i}",
+            "Passed": "True",
+            "Tool Format": "xml",
+        }
+        for i in range(5)
+    ]
+    with open(csv_path, "w", newline="") as f:
+        writer = csv.DictWriter(
+            f, fieldnames=["Model", "Test", "Passed", "Tool Format"]
+        )
+        writer.writeheader()
+        writer.writerows(rows)
+
+    output = generate_leaderboard(results_dir, output_format="json", min_tests=4)
+    data = json.loads(output)
+    assert "ranking_score" in data["models"][0]
+    assert data["models"][0]["ranking_score"] > 0

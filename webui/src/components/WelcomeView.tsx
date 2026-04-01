@@ -1,5 +1,5 @@
 import { Button } from '@/components/ui/button';
-import { useState } from 'react';
+import { useState, useEffect, type CSSProperties } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { useApi } from '@/contexts/ApiContext';
 import { useQueryClient } from '@tanstack/react-query';
@@ -7,7 +7,8 @@ import { toast } from 'sonner';
 import { use$ } from '@legendapp/state/react';
 import { observable } from '@legendapp/state';
 import { ChatInput, type ChatOptions } from '@/components/ChatInput';
-import { History, Server, Sparkles } from 'lucide-react';
+import { History, Server } from 'lucide-react';
+import { useSettings } from '@/contexts/SettingsContext';
 import { ExamplesSection } from '@/components/ExamplesSection';
 import { serverRegistry$, getConnectedServers } from '@/stores/servers';
 import { getExamples } from '@/utils/examples';
@@ -19,7 +20,19 @@ import {
 } from '@/components/ui/dropdown-menu';
 
 export const WelcomeView = () => {
-  const [inputValue, setInputValue] = useState('');
+  const [inputValue, setInputValue] = useState(
+    () => (typeof window !== 'undefined' ? localStorage.getItem('gptme-draft-new') : null) || ''
+  );
+  // Persist new-chat draft to localStorage
+  useEffect(() => {
+    if (typeof window === 'undefined') return;
+    if (inputValue) {
+      localStorage.setItem('gptme-draft-new', inputValue);
+    } else {
+      localStorage.removeItem('gptme-draft-new');
+    }
+  }, [inputValue]);
+
   const [isSubmitting, setIsSubmitting] = useState(false);
   const navigate = useNavigate();
   const { api, isConnected$, connectionConfig, switchServer } = useApi();
@@ -75,19 +88,29 @@ export const WelcomeView = () => {
     }
   };
 
-  return (
-    <div className="relative mx-auto flex h-full w-full flex-col overflow-hidden">
-      <div className="pointer-events-none absolute inset-x-0 top-0 h-40 bg-gradient-to-b from-primary/10 via-primary/5 to-transparent" />
-      <div className="pointer-events-none absolute left-1/2 top-1/3 h-72 w-72 -translate-x-1/2 rounded-full bg-primary/10 blur-3xl" />
+  const { settings } = useSettings();
+  const bg = settings.welcomeBackground;
+  // Determine if the background is an image URL or a CSS gradient/color
+  const isImageBg = bg && (bg.startsWith('http') || bg.startsWith('/') || bg.startsWith('data:'));
+  const bgStyle: CSSProperties = bg
+    ? isImageBg
+      ? { backgroundImage: `url("${bg}")`, backgroundSize: 'cover', backgroundPosition: 'center' }
+      : { background: bg }
+    : {};
+  const hasCustomBg = !!bg;
 
-      <div className="relative mx-auto flex h-full w-full max-w-5xl flex-col items-center justify-center px-4 py-10 sm:px-6">
-        <div className="w-full max-w-4xl rounded-[28px] border border-border/70 bg-background/90 p-6 shadow-[0_30px_120px_-48px_rgba(15,23,42,0.45)] backdrop-blur sm:p-8">
+  return (
+    <div className="mx-auto flex h-full w-full flex-col" style={bgStyle}>
+      <div className="mx-auto flex h-full w-full max-w-5xl flex-col items-center justify-center px-4 pt-12 sm:px-6">
+        <div
+          className={`w-full max-w-4xl rounded-[28px] border p-6 shadow-[0_30px_120px_-48px_rgba(15,23,42,0.45)] sm:p-8 ${
+            hasCustomBg
+              ? 'border-white/20 bg-background/60 backdrop-blur-xl'
+              : 'border-border/70 bg-background/90 backdrop-blur'
+          }`}
+        >
           <div className="flex flex-col gap-8">
             <div className="space-y-4 text-center">
-              <div className="inline-flex items-center gap-2 rounded-full border border-border/70 bg-background/80 px-3 py-1 text-xs font-medium uppercase tracking-[0.24em] text-muted-foreground">
-                <Sparkles className="h-3.5 w-3.5" />
-                New chat
-              </div>
               <div className="space-y-3">
                 <h1 className="text-3xl font-semibold tracking-tight text-foreground/90 sm:text-5xl">
                   What are you working on?
@@ -99,7 +122,7 @@ export const WelcomeView = () => {
               </div>
             </div>
 
-            <div className="mx-auto w-full max-w-2xl rounded-[24px] border border-border/70 bg-card/80 shadow-[0_20px_50px_-36px_rgba(15,23,42,0.45)]">
+            <div className="mx-auto w-full max-w-2xl [&_textarea]:min-h-[80px] [&_textarea]:text-base">
               <ChatInput
                 onSend={handleSend}
                 autoFocus$={autoFocus$}

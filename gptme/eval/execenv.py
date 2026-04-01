@@ -270,18 +270,26 @@ class DockerExecutionEnv(ExecutionEnv):
     def cleanup(self) -> None:
         """Stop and remove Docker container."""
         if self.container_id:
-            subprocess.run(
-                ["docker", "stop", self.container_id],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
-            subprocess.run(
-                ["docker", "rm", self.container_id],
-                check=False,
-                stdout=subprocess.DEVNULL,
-                stderr=subprocess.DEVNULL,
-            )
+            try:
+                subprocess.run(
+                    ["docker", "stop", self.container_id],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                pass  # best-effort; proceed to docker rm
+            try:
+                subprocess.run(
+                    ["docker", "rm", "-f", self.container_id],
+                    check=False,
+                    stdout=subprocess.DEVNULL,
+                    stderr=subprocess.DEVNULL,
+                    timeout=10,
+                )
+            except subprocess.TimeoutExpired:
+                pass  # best-effort cleanup
 
     def __del__(self) -> None:
         """Cleanup container on object destruction."""
@@ -397,8 +405,14 @@ class DockerGPTMeEnv(DockerExecutionEnv):
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=120,  # 2 min cap for docker startup / image pull
             )
             self.container_id = result.stdout.strip()
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(
+                f"Docker container startup timed out after 120s for image '{self.image}'. "
+                "The image may need to be pre-pulled: docker pull gptme-eval:latest"
+            ) from e
         except subprocess.CalledProcessError as e:
             error_msg = f"Failed to start Docker container with image '{self.image}'.\n"
             if "Unable to find image" in e.stderr or "No such image" in e.stderr:

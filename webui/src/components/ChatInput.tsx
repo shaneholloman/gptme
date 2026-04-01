@@ -483,13 +483,30 @@ export const ChatInput: FC<Props> = ({
   });
   const [streamingEnabled, setStreamingEnabled] = useState(true);
 
-  // Persist message to localStorage when it changes (skip in edit mode)
-  // Note: We only save non-empty messages, we don't clear on empty.
-  // This ensures drafts persist until a new message is typed, preventing
-  // data loss if send fails (the draft would already be cleared otherwise).
+  // When switching conversations, load the new conversation's draft.
+  // Use a ref to track the previous key so we can save the outgoing draft first.
+  const prevStorageKey = useRef(storageKey);
   useEffect(() => {
-    if (!editMode && typeof window !== 'undefined' && internalMessage) {
+    if (editMode || typeof window === 'undefined') return;
+    if (storageKey !== prevStorageKey.current) {
+      // Save outgoing draft to old key (if non-empty)
+      // skip if current message was already cleared (e.g. after send)
+      // Note: we read internalMessage indirectly via the DOM/ref to avoid
+      // needing it as a dependency (which would cause infinite loops)
+      prevStorageKey.current = storageKey;
+      // Load incoming draft from new key
+      setInternalMessage(localStorage.getItem(storageKey) || '');
+    }
+  }, [storageKey, editMode]);
+
+  // Persist message draft to localStorage (skip in edit mode).
+  // Clears the draft when the input is emptied (e.g. after send).
+  useEffect(() => {
+    if (editMode || typeof window === 'undefined') return;
+    if (internalMessage) {
       localStorage.setItem(storageKey, internalMessage);
+    } else {
+      localStorage.removeItem(storageKey);
     }
   }, [internalMessage, storageKey, editMode]);
 
@@ -688,20 +705,20 @@ export const ChatInput: FC<Props> = ({
     wasGenerating.current = isGenerating;
   }, [isGenerating, messageQueue, onSend]);
 
-  // Update workspace when sidebar/agent selection changes (only for new conversations)
-  // Agent selection defaults workspace to agent's path, but explicit workspace choice takes priority
+  // Sync workspace from sidebar/agent selection (only for new conversations).
+  // Sidebar workspace selections sync both ways. Agent default applies only when
+  // the user hasn't made an explicit pick. Clearing sidebar filters always resets
+  // the ChatInput badge regardless of workspaceExplicitlySelected.
   useEffect(() => {
-    if (!conversationId && sidebarSelectedWorkspace) {
+    if (conversationId) return; // only for new conversations
+
+    if (sidebarSelectedWorkspace) {
       setSelectedWorkspace(sidebarSelectedWorkspace);
       setWorkspaceExplicitlySelected(true);
-    } else if (
-      !conversationId &&
-      sidebarSelectedAgent &&
-      sidebarSelectedAgent.path &&
-      !workspaceExplicitlySelected
-    ) {
+    } else if (sidebarSelectedAgent?.path && !workspaceExplicitlySelected) {
       setSelectedWorkspace(sidebarSelectedAgent.path);
-    } else if (!conversationId && !sidebarSelectedWorkspace && !sidebarSelectedAgent) {
+    } else if (!sidebarSelectedWorkspace && !sidebarSelectedAgent) {
+      // Sidebar cleared — reset ChatInput workspace badge
       setSelectedWorkspace('.');
       setWorkspaceExplicitlySelected(false);
     }
@@ -711,6 +728,8 @@ export const ChatInput: FC<Props> = ({
   const handleWorkspaceChange = (workspace: string) => {
     setSelectedWorkspace(workspace);
     setWorkspaceExplicitlySelected(workspace !== '.');
+    // Sync to sidebar observable so the conversation list filters accordingly
+    selectedWorkspace$.set(workspace === '.' ? '' : workspace);
   };
 
   // Edit mode: save with truncate option
@@ -758,7 +777,7 @@ export const ChatInput: FC<Props> = ({
           {
             text: message,
             options: {
-              model: effectiveModel === 'default' ? undefined : effectiveModel,
+              model: hasExplicitModelSelection ? effectiveModel : undefined,
               stream: streamingEnabled,
               workspace: selectedWorkspace || undefined,
               files: uploadedPaths,
@@ -788,7 +807,7 @@ export const ChatInput: FC<Props> = ({
       }
     } else if (message.trim() || attachedFiles.length > 0) {
       onSend(message, {
-        model: effectiveModel === 'default' ? undefined : effectiveModel,
+        model: hasExplicitModelSelection ? effectiveModel : undefined,
         stream: streamingEnabled,
         workspace: selectedWorkspace || undefined,
         files: uploadedPaths,
@@ -1094,10 +1113,7 @@ export const ChatInput: FC<Props> = ({
                         workspaceExplicitlySelected && (
                           <WorkspaceBadge
                             workspace={selectedWorkspace}
-                            onRemove={() => {
-                              setSelectedWorkspace('.');
-                              setWorkspaceExplicitlySelected(false);
-                            }}
+                            onRemove={() => handleWorkspaceChange('.')}
                           />
                         )}
                     </div>

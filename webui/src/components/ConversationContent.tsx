@@ -1,5 +1,5 @@
 import type { FC } from 'react';
-import { useRef, useEffect, useState, useCallback } from 'react';
+import { useRef, useEffect } from 'react';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput, type ChatOptions } from './ChatInput';
 import { CollapsedStepGroup } from './CollapsedStepGroup';
@@ -121,24 +121,24 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
 
   // Step grouping: compute roles and track expanded groups
   const stepRoles$ = useObservable<Map<number, StepRole>>(() => new Map());
-  const [expandedGroups, setExpandedGroups] = useState<Set<number>>(new Set());
+  // Must be an observable (not React state) so changes trigger re-renders inside <For>
+  const expandedGroups$ = useObservable<Set<number>>(new Set<number>());
 
-  // Reset expanded state when switching conversations (groupIds reset to 0 per conversation)
+  // Reset expanded state when switching conversations
   useEffect(() => {
-    setExpandedGroups(new Set());
-  }, [conversationId]);
+    expandedGroups$.set(new Set<number>());
+  }, [conversationId, expandedGroups$]);
 
-  const toggleGroup = useCallback((groupId: number) => {
-    setExpandedGroups((prev) => {
-      const next = new Set(prev);
-      if (next.has(groupId)) {
-        next.delete(groupId);
-      } else {
-        next.add(groupId);
-      }
-      return next;
-    });
-  }, []);
+  const toggleGroup = (groupId: number) => {
+    const prev = expandedGroups$.get();
+    const next = new Set(prev);
+    if (next.has(groupId)) {
+      next.delete(groupId);
+    } else {
+      next.add(groupId);
+    }
+    expandedGroups$.set(next);
+  };
 
   // Recompute step roles when messages or visibility settings change.
   // All .get() calls inside are auto-tracked, so this re-runs when any of
@@ -192,28 +192,26 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
     autoScrollAborted$.set(false);
   });
 
-  // Scroll to the bottom when the conversation is updated
-  useObserveEffect(conversation$.data.log, () => {
-    const scrollToBottom = () => {
-      if (scrollContainerRef.current) {
-        isAutoScrolling$.set(true);
-        scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
-        requestAnimationFrame(() => {
-          isAutoScrolling$.set(false);
-        });
-      }
-    };
+  const scrollToBottom = () => {
+    const container = scrollContainerRef.current;
+    if (!container) return;
+    isAutoScrolling$.set(true);
+    container.scrollTop = container.scrollHeight;
+    requestAnimationFrame(() => {
+      isAutoScrolling$.set(false);
+    });
+  };
 
+  // Auto-scroll when the conversation is updated (e.g., streaming response)
+  useObserveEffect(conversation$.data.log, () => {
     if (!autoScrollAborted$.get()) {
       requestAnimationFrame(scrollToBottom);
     }
   });
 
-  // Scroll to the bottom when switching conversations
+  // Scroll to bottom when switching conversations so the latest response is visible
   useEffect(() => {
-    if (scrollContainerRef.current) {
-      scrollContainerRef.current.scrollTop = scrollContainerRef.current.scrollHeight;
-    }
+    requestAnimationFrame(scrollToBottom);
   }, [conversationId]);
 
   const handleSendMessage = (message: string, options?: ChatOptions) => {
@@ -238,13 +236,14 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
   };
 
   const handleScrollToBottom = () => {
-    if (scrollContainerRef.current) {
+    const container = scrollContainerRef.current;
+    if (container) {
       isAutoScrolling$.set(true);
-      scrollContainerRef.current.scrollTo({
-        top: scrollContainerRef.current.scrollHeight,
+      container.scrollTo({
+        top: container.scrollHeight,
         behavior: 'smooth',
       });
-      scrollContainerRef.current.addEventListener('scrollend', () => isAutoScrolling$.set(false), {
+      container.addEventListener('scrollend', () => isAutoScrolling$.set(false), {
         once: true,
       });
     }
@@ -308,6 +307,11 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
                 r === 'system' && (firstNonSystemIndex === -1 || idx < firstNonSystemIndex);
               if (isInitial && !showInitialSystem$.get()) return true;
               if (h && !showHiddenMessages$.get()) return true;
+              // Messages in collapsed step groups are visually hidden
+              const role = stepRoles$.get().get(idx);
+              if (role?.type === 'group-start' || role?.type === 'grouped') {
+                if (!expandedGroups$.get().has(role.groupId)) return true;
+              }
               return false;
             };
 
@@ -327,7 +331,7 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
             const stepRole = stepRoles$.get().get(index);
 
             // If this is a grouped message and the group is collapsed, hide it
-            if (stepRole?.type === 'grouped' && !expandedGroups.has(stepRole.groupId)) {
+            if (stepRole?.type === 'grouped' && !expandedGroups$.get().has(stepRole.groupId)) {
               return <div key={`${index}-${msg$.timestamp.get()}`} />;
             }
 
@@ -338,13 +342,13 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
                 <CollapsedStepGroup
                   count={stepRole.count}
                   tools={stepRole.tools}
-                  isExpanded={expandedGroups.has(stepRole.groupId)}
+                  isExpanded={expandedGroups$.get().has(stepRole.groupId)}
                   onToggle={() => toggleGroup(stepRole.groupId)}
                 />
               ) : null;
 
             // When group is collapsed and this is group-start, show only the summary bar
-            if (stepRole?.type === 'group-start' && !expandedGroups.has(stepRole.groupId)) {
+            if (stepRole?.type === 'group-start' && !expandedGroups$.get().has(stepRole.groupId)) {
               return <div key={`${index}-${msg$.timestamp.get()}`}>{groupSummary}</div>;
             }
 

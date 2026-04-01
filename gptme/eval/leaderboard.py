@@ -16,10 +16,39 @@ import csv
 import html
 import io
 import json
+import math
 import sys
 from collections import defaultdict
 from datetime import datetime, timezone
 from pathlib import Path
+
+# ---------------------------------------------------------------------------
+# Wilson score lower bound — used for ranking and format selection
+# ---------------------------------------------------------------------------
+
+# z=1.0 (~68% confidence) gives a moderate penalty for low sample sizes.
+# This means 4/4 (100%) ranks below 56/59 (95%) because the confidence
+# interval is much wider with n=4.
+_WILSON_Z = 1.0
+_WILSON_Z2 = _WILSON_Z * _WILSON_Z
+
+
+def wilson_lower_bound(passed: int, total: int) -> float:
+    """Wilson score lower bound for a binomial proportion.
+
+    Penalizes models tested on few tests: a perfect 4/4 result ranks below
+    a strong 56/59 result because the confidence interval is wider.
+    """
+    if total <= 0:
+        return 0.0
+    p = passed / total
+    n = total
+    return (
+        p
+        + _WILSON_Z2 / (2 * n)
+        - _WILSON_Z * math.sqrt((p * (1 - p) / n) + _WILSON_Z2 / (4 * n * n))
+    ) / (1 + _WILSON_Z2 / n)
+
 
 # Test suite membership — tests not in either set count toward Overall only
 BASIC_TESTS = {
@@ -107,6 +136,10 @@ PRACTICAL_TESTS = {
     "async-queue-workers",
     "json-schema-validate",
     "implement-trie",
+    # practical17
+    "lru-cache",
+    "interval-merge",
+    "base-converter",
 }
 
 
@@ -268,25 +301,31 @@ def aggregate_results(results: list[dict], min_tests: int = 4) -> list[dict]:
                 "pass_rate": total_passed / total_tests if total_tests > 0 else 0,
             }
 
-    # For each base model, pick the best format (highest pass rate).
-    # Tie-break: prefer format with more tests.
+    # Compute Wilson score lower bound for all format entries.
+    for stats in fmt_stats.values():
+        n: int = stats["total_tests"]  # type: ignore[assignment]
+        passed: int = stats["total_passed"]  # type: ignore[assignment]
+        stats["ranking_score"] = wilson_lower_bound(passed, n)
+
+    # For each base model, pick the best format by Wilson score (consistent
+    # with the final ranking criterion). Tie-break: prefer format with more tests.
     best_by_model: dict[str, dict] = {}
     for (model, _fmt), stats in fmt_stats.items():
         current = best_by_model.get(model)
         if (
             current is None
-            or stats["pass_rate"] > current["pass_rate"]
+            or stats["ranking_score"] > current["ranking_score"]
             or (
-                stats["pass_rate"] == current["pass_rate"]
+                stats["ranking_score"] == current["ranking_score"]
                 and stats["total_tests"] > current["total_tests"]
             )
         ):
             best_by_model[model] = stats
 
-    # Sort by pass rate descending, then total tests descending
+    # Sort by Wilson score descending, then total tests descending
     ranked = sorted(
         best_by_model.values(),
-        key=lambda x: (-x["pass_rate"], -x["total_tests"]),
+        key=lambda x: (-x.get("ranking_score", 0), -x["total_tests"]),
     )
     return ranked
 
@@ -530,6 +569,7 @@ def format_json(ranked: list[dict]) -> str:
             "display_name": normalize_model(stats["model"]),
             "format": stats["format"] or "default",
             "pass_rate": round(stats["pass_rate"], 4),
+            "ranking_score": round(stats.get("ranking_score", 0), 4),
             "total_passed": stats["total_passed"],
             "total_tests": stats["total_tests"],
             "basic": {
@@ -562,8 +602,8 @@ def aggregate_per_test(
     for r in results:
         model_fmt[(r["model"], r["format"])][r["test"]].append(r)
 
-    # Pick best format per model (same logic as aggregate_results)
-    best_fmt: dict[str, tuple[str, dict[str, list[dict]]]] = {}
+    # Pick best format per model by Wilson score (consistent with aggregate_results)
+    best_fmt: dict[str, tuple[str, dict[str, list[dict]], float]] = {}
     for (model, fmt), tests_dict in model_fmt.items():
         total = len(tests_dict)
         if total < min_tests:
@@ -573,24 +613,19 @@ def aggregate_per_test(
             for runs in tests_dict.values()
             if sorted(runs, key=lambda r: r["run_dir"])[-1]["passed"]
         )
-        rate = passed / total if total > 0 else 0
+        score = wilson_lower_bound(passed, total)
         current = best_fmt.get(model)
         if current is None:
-            best_fmt[model] = (fmt, tests_dict)
+            best_fmt[model] = (fmt, tests_dict, score)
         else:
-            cur_tests = current[1]
-            cur_passed = sum(
-                1
-                for runs in cur_tests.values()
-                if sorted(runs, key=lambda r: r["run_dir"])[-1]["passed"]
-            )
-            cur_rate = cur_passed / len(cur_tests) if cur_tests else 0
-            if rate > cur_rate or (rate == cur_rate and total > len(cur_tests)):
-                best_fmt[model] = (fmt, tests_dict)
+            cur_score = current[2]
+            cur_total = len(current[1])
+            if score > cur_score or (score == cur_score and total > cur_total):
+                best_fmt[model] = (fmt, tests_dict, score)
 
     # Collect all test names across all models
     all_tests: set[str] = set()
-    for _fmt, tests_dict in best_fmt.values():
+    for _fmt, tests_dict, _score in best_fmt.values():
         all_tests.update(tests_dict.keys())
 
     # Order tests: basic first, then practical, then others — alphabetical within each
@@ -603,25 +638,20 @@ def aggregate_per_test(
 
     # Build matrix
     matrix: dict[str, dict[str, bool | None]] = {}
-    model_pass_rates: dict[str, float] = {}
-    for model, (_fmt, tests_dict) in best_fmt.items():
+    model_wilson_scores: dict[str, float] = {}
+    for model, (_fmt, tests_dict, fmt_score) in best_fmt.items():
         row: dict[str, bool | None] = {}
-        passed = 0
-        total = 0
         for test in test_names:
             if test in tests_dict:
                 latest = sorted(tests_dict[test], key=lambda r: r["run_dir"])[-1]
                 row[test] = latest["passed"]
-                total += 1
-                if latest["passed"]:
-                    passed += 1
             else:
                 row[test] = None
         matrix[model] = row
-        model_pass_rates[model] = passed / total if total > 0 else 0
+        model_wilson_scores[model] = fmt_score
 
-    # Sort models by pass rate descending
-    model_names = sorted(matrix.keys(), key=lambda m: -model_pass_rates[m])
+    # Sort models by Wilson score descending (consistent with summary leaderboard)
+    model_names = sorted(matrix.keys(), key=lambda m: -model_wilson_scores[m])
 
     return model_names, test_names, matrix
 
