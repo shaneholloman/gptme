@@ -148,6 +148,14 @@ PRACTICAL_TESTS = {
     "edit-distance",
     "bst-operations",
     "coin-change",
+    # practical20
+    "dijkstra",
+    "spiral-matrix",
+    "num-islands",
+    # practical21
+    "kadane",
+    "knapsack",
+    "flood-fill",
 }
 
 

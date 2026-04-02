@@ -22,7 +22,7 @@ from typing import TYPE_CHECKING
 from ..commands import CommandContext
 from ..config import get_config
 from ..hooks import HookType, StopPropagation
-from ..lessons import LessonIndex, LessonMatcher, MatchContext
+from ..lessons import Lesson, LessonIndex, LessonMatcher, MatchContext
 from ..lessons.commands import lesson
 from ..message import Message
 from .base import ToolSpec
@@ -31,6 +31,45 @@ if TYPE_CHECKING:
     from ..logmanager import LogManager
 
 logger = logging.getLogger(__name__)
+
+
+def _parse_holdout_lessons(raw: str | None) -> set[str]:
+    """Parse comma-separated lesson identifiers from HOLDOUT_LESSONS."""
+    if not raw:
+        return set()
+    return {
+        token.strip().lower().replace("\\", "/")
+        for token in raw.split(",")
+        if token.strip()
+    }
+
+
+def _is_holdout_lesson(lesson: "Lesson", holdout_lessons: set[str]) -> bool:
+    """Return True if the lesson matches a configured holdout identifier."""
+    if not holdout_lessons:
+        return False
+
+    path = lesson.path
+    path_str = str(path).lower().replace("\\", "/")
+    identifiers = {
+        path_str,
+        path.name.lower(),
+        (path.parent.name if path.name.upper() == "SKILL.MD" else path.stem).lower(),
+    }
+
+    lesson_id = getattr(lesson.metadata, "id", None)
+    if lesson_id:
+        identifiers.add(str(lesson_id).strip().lower())
+
+    for token in holdout_lessons:
+        if token in identifiers:
+            return True
+        if "/" in token or token.endswith(".md"):
+            normalized = token.lstrip("./")
+            if path_str == normalized or path_str.endswith(f"/{normalized}"):
+                return True
+
+    return False
 
 
 def _get_ace_components() -> tuple[type | None, type | None]:
@@ -203,6 +242,7 @@ def auto_include_lessons_hook(
     # Get configuration
     config = get_config()
     auto_include = config.get_env_bool("GPTME_LESSONS_AUTO_INCLUDE", True)
+    holdout_lessons = _parse_holdout_lessons(config.get_env("GPTME_LESSONS_HOLDOUT"))
 
     if not auto_include:
         logger.debug("Auto-inclusion disabled")
@@ -321,7 +361,8 @@ def auto_include_lessons_hook(
         new_matches = [
             match
             for match in match_results
-            if str(match.lesson.path) not in included_lessons
+            if not _is_holdout_lesson(match.lesson, holdout_lessons)
+            and str(match.lesson.path) not in included_lessons
             and str(match.lesson.path) not in stats.unique_lessons
         ]
 
