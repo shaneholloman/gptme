@@ -66,6 +66,7 @@ def _get_pr_check_runs(
             capture_output=True,
             text=True,
             check=True,
+            timeout=30,
         )
         pr_details = json.loads(pr_details_result.stdout)
         head_sha = pr_details.get("head", {}).get("sha")
@@ -79,6 +80,7 @@ def _get_pr_check_runs(
             capture_output=True,
             text=True,
             check=True,
+            timeout=30,
         )
 
         check_runs_data = json.loads(check_runs_result.stdout)
@@ -86,6 +88,8 @@ def _get_pr_check_runs(
 
         return head_sha, check_runs, None
 
+    except subprocess.TimeoutExpired:
+        return None, None, "GitHub API call timed out after 30s"
     except subprocess.CalledProcessError as e:
         return None, None, f"Failed to fetch check status: {e}"
     except (json.JSONDecodeError, KeyError) as e:
@@ -151,10 +155,16 @@ def _wait_for_checks(
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=30,
             )
             check_runs_data = json.loads(check_runs_result.stdout)
             check_runs = check_runs_data.get("check_runs", [])
-        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            json.JSONDecodeError,
+            KeyError,
+        ) as e:
             yield Message("system", f"Error fetching checks: {e}")
             return
 
@@ -394,12 +404,18 @@ def _handle_pr_status(
                 capture_output=True,
                 text=True,
                 check=True,
+                timeout=30,
             )
             data = json.loads(result.stdout)
             head_sha = commit_sha
             check_runs = data.get("check_runs", [])
             error = None
-        except (subprocess.CalledProcessError, json.JSONDecodeError, KeyError) as e:
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            json.JSONDecodeError,
+            KeyError,
+        ) as e:
             error = f"Failed to fetch checks: {e}"
             head_sha, check_runs = None, None
     else:

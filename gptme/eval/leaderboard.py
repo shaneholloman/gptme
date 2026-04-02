@@ -140,6 +140,14 @@ PRACTICAL_TESTS = {
     "lru-cache",
     "interval-merge",
     "base-converter",
+    # practical18
+    "min-stack",
+    "knight-moves",
+    "histogram-area",
+    # practical19
+    "edit-distance",
+    "bst-operations",
+    "coin-change",
 }
 
 
