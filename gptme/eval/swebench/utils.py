@@ -96,6 +96,7 @@ def setup_github_repo(repo: str, base_commit: str, base_dir: str | None = None) 
                 check=True,
                 capture_output=True,
                 text=True,
+                timeout=300,
             )
 
         logger.info(f"Checking out commit {base_commit} in {repo_dir}")
@@ -105,6 +106,7 @@ def setup_github_repo(repo: str, base_commit: str, base_dir: str | None = None) 
             capture_output=True,
             text=True,
             cwd=repo_dir,
+            timeout=120,
         )
         subprocess.run(
             ["git", "checkout", base_commit],
@@ -112,12 +114,18 @@ def setup_github_repo(repo: str, base_commit: str, base_dir: str | None = None) 
             capture_output=True,
             text=True,
             cwd=repo_dir,
+            timeout=60,
         )
 
         return repo_dir
     except subprocess.CalledProcessError as e:
         logger.error(f"Error setting up GitHub repo: {e}")
         logger.error(f"Command output: {e.output}")
+        raise
+    except subprocess.TimeoutExpired as e:
+        logger.error(
+            f"Timed out setting up GitHub repo (command took >{e.timeout}s): {e.cmd}"
+        )
         raise
     except Exception as e:
         logger.error(f"Unexpected error setting up GitHub repo: {e}")
