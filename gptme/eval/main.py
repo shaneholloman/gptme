@@ -212,6 +212,44 @@ def sort_tests(test_names):
     )
 
 
+def resolve_eval_names(eval_names: list[str]) -> list[EvalSpec]:
+    """Resolve eval names/aliases to a deduplicated list of EvalSpecs.
+
+    Handles the 'all' and 'all-practical' aliases, individual test names,
+    and suite names. Deduplicates while preserving order.
+
+    Raises ValueError if an eval name is not found.
+    """
+    evals: list[EvalSpec] = []
+    for eval_name in eval_names:
+        if eval_name == "all":
+            evals.extend(
+                test for suite_tests in suites.values() for test in suite_tests
+            )
+        elif eval_name == "all-practical":
+            evals.extend(
+                test
+                for name, suite_tests in suites.items()
+                if name.startswith("practical")
+                for test in suite_tests
+            )
+        elif test := tests_map.get(eval_name):
+            evals.append(test)
+        elif suite := suites.get(eval_name) or suites.get(eval_name.replace("-", "_")):
+            evals.extend(suite)
+        else:
+            raise ValueError(f"Test or results '{eval_name}' not found")
+
+    # Deduplicate while preserving order
+    seen_names: set[str] = set()
+    deduped: list[EvalSpec] = []
+    for t in evals:
+        if t["name"] not in seen_names:
+            seen_names.add(t["name"])
+            deduped.append(t)
+    return deduped
+
+
 def print_available_tests():
     """Print available eval suites and their tests."""
     default_names = set(tests_default_ids)
@@ -236,6 +274,10 @@ def print_available_tests():
     print(f"Total: {total_tests} tests across {len(suites)} suites")
     print(f"Default suite: {', '.join(tests_default_ids)}")
     print("(* = included in default suite)")
+    print()
+    print("Aliases:")
+    print("  all             Run all suites")
+    print("  all-practical   Run all practical suites")
 
 
 def list_available_tests_json() -> dict:
@@ -671,14 +713,7 @@ def main(
                     )
         external_evals.extend(loaded)
 
-    evals_to_run: list[EvalSpec] = []
-    for eval_name in eval_names:
-        if test := tests_map.get(eval_name):
-            evals_to_run.append(test)
-        elif suite := suites.get(eval_name) or suites.get(eval_name.replace("-", "_")):
-            evals_to_run.extend(suite)
-        else:
-            raise ValueError(f"Test or results '{eval_name}' not found")
+    evals_to_run = resolve_eval_names(eval_names)
 
     # Detect name collisions between external module tests and named/suite evals
     if evals_to_run and external_evals:
