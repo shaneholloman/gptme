@@ -624,9 +624,64 @@ def test_format_html_escapes_model_names(tmp_path):
     )
     results = load_results(tmp_path)
     ranked = aggregate_results(results, min_tests=3)
-    html = format_html_page(ranked)
-    assert "<script>" not in html
-    assert "&lt;script&gt;" in html
+    output = format_html_page(ranked)
+    # The model name must be escaped — no raw <script>evil</script> in data cells
+    assert "<script>evil</script>" not in output
+    assert "&lt;script&gt;" in output
+    # data-model attribute must also be escaped (single-quote injection risk)
+    assert "data-model='some/&lt;script&gt;evil&lt;/script&gt;'" in output
+
+
+def test_format_html_escapes_single_quote_in_data_model(tmp_path):
+    """data-model attribute value escapes single quotes to prevent attribute injection."""
+    _create_eval_results(
+        tmp_path,
+        [
+            {
+                "dir": "run1",
+                "rows": [
+                    ("vendor/model's-name", "tool", f"test-{i}", "true")
+                    for i in range(5)
+                ],
+            }
+        ],
+    )
+    results = load_results(tmp_path)
+    ranked = aggregate_results(results, min_tests=3)
+    output = format_html_page(ranked)
+    # Raw single quote must not appear in the data-model attribute value
+    assert "data-model='vendor/model's-name'" not in output
+    # Must be escaped as &#x27;
+    assert "&#x27;" in output
+
+
+def test_format_html_interactive_features(tmp_path):
+    """HTML output includes interactive sort/filter features."""
+    _create_eval_results(
+        tmp_path,
+        [
+            {
+                "dir": "run1",
+                "rows": [("model-a", "tool", f"test-{i}", "true") for i in range(5)]
+                + [("model-b", "tool", f"test-{i}", "false") for i in range(5)],
+            }
+        ],
+    )
+    results = load_results(tmp_path)
+    ranked = aggregate_results(results, min_tests=3)
+    output = format_html_page(ranked)
+    # Search input
+    assert 'id="search"' in output
+    assert 'placeholder="Filter models..."' in output
+    # Sortable headers with data-sort attributes
+    assert 'data-sort="rate"' in output
+    assert 'data-sort="model"' in output
+    # Data attributes on rows for JS sorting
+    assert "data-rate=" in output
+    assert "data-model=" in output
+    # JavaScript included
+    assert "sortTable" in output
+    assert "filterRows" in output
 
 
 def test_main_graceful_on_missing_results(tmp_path, capsys, monkeypatch):
@@ -978,3 +1033,49 @@ def test_json_output_includes_ranking_score(tmp_path):
     data = json.loads(output)
     assert "ranking_score" in data["models"][0]
     assert data["models"][0]["ranking_score"] > 0
+
+
+def test_test_sets_auto_derived():
+    """BASIC_TESTS and PRACTICAL_TESTS should be auto-derived from suites."""
+    from gptme.eval.leaderboard import BASIC_TESTS, PRACTICAL_TESTS
+    from gptme.eval.suites import suites
+
+    assert len(BASIC_TESTS) > 0, "BASIC_TESTS should not be empty"
+    assert len(PRACTICAL_TESTS) > 0, "PRACTICAL_TESTS should not be empty"
+
+    # Every test in the basic suite should be in BASIC_TESTS
+    for test in suites.get("basic", []):
+        assert test["name"] in BASIC_TESTS, f"basic test {test['name']} missing"
+
+    # Every test in practical* suites should be in PRACTICAL_TESTS
+    for suite_name, suite_tests in suites.items():
+        if suite_name.startswith("practical"):
+            for test in suite_tests:
+                assert test["name"] in PRACTICAL_TESTS, (
+                    f"practical test {test['name']} from {suite_name} missing"
+                )
+
+    # Sets should be disjoint
+    overlap = BASIC_TESTS & PRACTICAL_TESTS
+    assert not overlap, f"Overlap between basic and practical: {overlap}"
+
+
+def test_derive_test_sets_import_failure(monkeypatch):
+    """When suites import fails, _derive_test_sets returns empty sets and logs a warning."""
+    import sys
+    from unittest.mock import patch
+
+    from gptme.eval import leaderboard as lb
+
+    # Remove cached module so the import inside _derive_test_sets is retried
+    sys.modules.pop("gptme.eval.suites", None)
+
+    with (
+        patch.dict(sys.modules, {"gptme.eval.suites": None}),  # type: ignore[dict-item]
+        patch.object(lb.logger, "warning") as mock_warn,
+    ):
+        basic, practical = lb._derive_test_sets()
+
+    assert basic == frozenset()
+    assert practical == frozenset()
+    assert mock_warn.called

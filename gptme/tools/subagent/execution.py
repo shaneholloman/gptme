@@ -401,8 +401,19 @@ def _monitor_subprocess(
     if not subagent.process:
         return
 
-    # Wait for process to complete (without reading stdout into memory)
-    subagent.process.wait()
+    # Track whether the process was killed due to our timeout (vs external SIGKILL)
+    _timed_out = False
+
+    # Wait for process to complete with timeout to prevent indefinite blocking
+    try:
+        subagent.process.wait(timeout=subagent.timeout)
+    except subprocess.TimeoutExpired:
+        logger.warning(
+            f"Subagent {subagent.agent_id} timed out after {subagent.timeout}s, killing"
+        )
+        _timed_out = True
+        subagent.process.kill()
+        subagent.process.wait()  # reap the killed process
 
     # Determine status based on return code
     if subagent.process.returncode == 0:
@@ -413,6 +424,10 @@ def _monitor_subprocess(
             result = log_status.result
         except Exception:
             result = "Task completed (check log for details)"
+    elif _timed_out:
+        # Process was killed because our timeout expired (not an external SIGKILL)
+        status = "failure"
+        result = f"Process killed after {subagent.timeout}s timeout"
     else:
         status = "failure"
         result = f"Process exited with code {subagent.process.returncode}"
