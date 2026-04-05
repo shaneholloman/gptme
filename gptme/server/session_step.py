@@ -472,6 +472,7 @@ async def _acp_step(
             )
     except Exception as e:
         logger.exception("Error during ACP step: %s", e)
+        session.last_error = str(e)
         SessionManager.add_event(conversation_id, {"type": "error", "error": str(e)})
     finally:
         acp_runtime.set_on_update(None)
@@ -484,6 +485,7 @@ def _start_acp_step_thread(
     workspace: Path,
 ) -> None:
     """Start an ACP-backed step in a background thread."""
+    session.last_error = None
     session.generating = True
 
     def _run() -> None:
@@ -735,6 +737,7 @@ def step(
     except Exception as e:
         logger.exception(f"Error during step execution: {e}")
         error_message = str(e) or "Generation failed"
+        session.last_error = error_message
         try:
             _persist_generation_error(manager, session, error_message)
         except Exception:
@@ -839,31 +842,34 @@ def _start_step_thread(
     branch: str = "main",
     auto_confirm: bool = False,
     stream: bool = True,
-):
-    """Start a step execution in a background thread."""
+) -> None:
+    """Start a step execution in a background thread.
 
-    # Mark as generating before starting thread to avoid race condition
-    # where interrupt is called before the thread sets generating=True
+    Clears any previous error state before starting.
+    """
+
+    # Clear previous error and mark as generating before starting thread
+    # to avoid race condition where interrupt is called before the thread
+    # sets generating=True.
+    #
+    # NOTE: the /step route handler also sets session.generating = True early
+    # (under step_lock, with try/finally guard).  This assignment is still
+    # needed because _start_step_thread is called directly from the
+    # tool-confirm endpoint (api_conversation_tool_response), which bypasses
+    # the /step route's guard.
+    session.last_error = None
     session.generating = True
 
     def step_thread() -> None:
-        try:
-            step(
-                conversation_id=conversation_id,
-                session=session,
-                model=model,
-                workspace=workspace,
-                branch=branch,
-                auto_confirm=auto_confirm,
-                stream=stream,
-            )
-
-        except Exception as e:
-            logger.exception(f"Error during step execution: {e}")
-            SessionManager.add_event(
-                conversation_id, {"type": "error", "error": str(e)}
-            )
-            session.generating = False
+        step(
+            conversation_id=conversation_id,
+            session=session,
+            model=model,
+            workspace=workspace,
+            branch=branch,
+            auto_confirm=auto_confirm,
+            stream=stream,
+        )
 
     # Start step execution in a thread
     thread = threading.Thread(target=step_thread)
