@@ -7,11 +7,18 @@ lessons about *how to work* should have a measurable effect on outcomes:
 - git-selective-commit: stage and commit only the relevant files
 - multi-file-rename: rename a function consistently across a project
 - iterative-debug: find and fix a bug through test feedback
+- stage-new-files: stage an untracked file before committing it
+- write-test-suite: read existing code and write a comprehensive test suite
+- add-error-handling: add input validation to functions based on test expectations
+- merge-conflict-resolution: resolve a git merge conflict preserving both features
+- extract-function-refactor: extract duplicated code into a shared module
 
 Each scenario comes with a deterministic checker so results can be used in
 lesson holdout A/B experiments (idea #19, eval-to-lesson feedback loop).
 """
 
+import ast
+from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:
@@ -118,6 +125,257 @@ def check_debug_fix_in_file(ctx):
     # All of these are accepted because they eliminate the buggy pattern.
     still_buggy = "except ZeroDivisionError" in content and "return None" in content
     return not still_buggy
+
+
+# ── stage-new-files ──────────────────────────────────────────────────────────
+
+
+def check_stage_new_file_committed(ctx):
+    """new_feature.py should appear in the HEAD commit's file list."""
+    # stdout: <git log --oneline>\n__GPTME_SEP__\n<git show HEAD --name-only --format="">
+    parts = ctx.stdout.split("__GPTME_SEP__")
+    if len(parts) < 2:
+        return False
+    files_in_commit = parts[1]
+    return "new_feature.py" in files_in_commit
+
+
+def check_stage_two_commits(ctx):
+    """There should be at least 2 commits (initial + new file)."""
+    parts = ctx.stdout.split("__GPTME_SEP__")
+    if not parts[0].strip():
+        return False
+    log_lines = [line for line in parts[0].strip().split("\n") if line.strip()]
+    return len(log_lines) >= 2
+
+
+def check_stage_file_has_double(ctx):
+    """new_feature.py contains the double function as requested."""
+    content = ctx.files.get("new_feature.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return "def double" in content
+
+
+# ── write-tests ─────────────────────────────────────────────────────────────
+
+
+def check_write_tests_file_exists(ctx):
+    """test_text_processor.py should exist."""
+    content = ctx.files.get("test_text_processor.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return len(content.strip()) > 0
+
+
+def check_write_tests_pass(ctx):
+    """All written tests should pass."""
+    return ctx.exit_code == 0 and "failed" not in ctx.stdout.lower()
+
+
+def check_write_tests_covers_word_count(ctx):
+    """Tests should cover the word_count function."""
+    content = ctx.files.get("test_text_processor.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return "word_count" in content
+
+
+def check_write_tests_covers_truncate(ctx):
+    """Tests should cover the truncate function."""
+    content = ctx.files.get("test_text_processor.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return "truncate" in content
+
+
+def check_write_tests_covers_extract_emails(ctx):
+    """Tests should cover the extract_emails function."""
+    content = ctx.files.get("test_text_processor.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return "extract_emails" in content
+
+
+def check_write_tests_sufficient_count(ctx):
+    """Should have at least 6 test functions for reasonable coverage."""
+    content = ctx.files.get("test_text_processor.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return content.count("def test_") >= 6
+
+
+# ── add-error-handling ──────────────────────────────────────────────────────
+
+
+def _parse_python_source(text: str) -> ast.Module | None:
+    try:
+        return ast.parse(text)
+    except SyntaxError:
+        return None
+
+
+def _get_function_def(module: ast.Module | None, name: str) -> ast.FunctionDef | None:
+    if module is None:
+        return None
+    for node in module.body:
+        if isinstance(node, ast.FunctionDef) and node.name == name:
+            return node
+    return None
+
+
+def _iter_nodes_excluding_nested_scopes(node: ast.AST) -> Iterator[ast.AST]:
+    """Yield descendants while skipping nested function/lambda/class scopes."""
+    for child in ast.iter_child_nodes(node):
+        if isinstance(
+            child, ast.FunctionDef | ast.AsyncFunctionDef | ast.Lambda | ast.ClassDef
+        ):
+            continue
+        yield child
+        yield from _iter_nodes_excluding_nested_scopes(child)
+
+
+def _function_raises_value_error(func: ast.FunctionDef | None) -> bool:
+    if func is None:
+        return False
+    for node in _iter_nodes_excluding_nested_scopes(func):
+        if isinstance(node, ast.Raise) and isinstance(node.exc, ast.Call):
+            target = node.exc.func
+            if isinstance(target, ast.Name) and target.id == "ValueError":
+                return True
+    return False
+
+
+def check_error_handling_tests_pass(ctx):
+    """All tests should pass after adding error handling."""
+    output = ctx.stdout.lower()
+    return ctx.exit_code == 0 and "failed" not in output and "passed" in output
+
+
+def check_error_handling_parse_csv(ctx):
+    """parse_csv_line should validate input (raise ValueError on empty)."""
+    content = ctx.files.get("converter.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    module = _parse_python_source(content)
+    return _function_raises_value_error(_get_function_def(module, "parse_csv_line"))
+
+
+def check_error_handling_to_int(ctx):
+    """to_int should handle non-numeric input."""
+    content = ctx.files.get("converter.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    module = _parse_python_source(content)
+    return _function_raises_value_error(_get_function_def(module, "to_int"))
+
+
+def check_error_handling_safe_divide(ctx):
+    """safe_divide should handle division by zero and bad types."""
+    content = ctx.files.get("converter.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    module = _parse_python_source(content)
+    return _function_raises_value_error(_get_function_def(module, "safe_divide"))
+
+
+def check_error_handling_source_unchanged(ctx):
+    """test_converter.py should not be modified."""
+    content = ctx.files.get("test_converter.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    # Check that the test file still contains the original test functions
+    return (
+        "test_parse_csv_valid" in content
+        and "test_to_int_valid" in content
+        and "test_safe_divide_valid" in content
+        and "test_parse_csv_empty" in content
+    )
+
+
+# ── merge-conflict-resolution ────────────────────────────────────────────────
+
+
+def check_merge_no_conflict_markers(ctx):
+    """No conflict markers should remain in tracked source/test files."""
+    for name, content in ctx.files.items():
+        if name.startswith(".git/"):
+            continue
+        text = content if isinstance(content, str) else content.decode()
+        if "<<<<<<<" in text or "=======" in text or ">>>>>>>" in text:
+            return False
+    return True
+
+
+def check_merge_tests_pass(ctx):
+    """All tests should pass after conflict resolution."""
+    return ctx.exit_code == 0 and "failed" not in ctx.stdout.lower()
+
+
+def check_merge_null_safety(ctx):
+    """format_name should guard both None inputs and return Unknown."""
+    content = ctx.files.get("utils.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return (
+        "if first is None or last is None" in content and 'return "Unknown"' in content
+    )
+
+
+def check_merge_upper_function(ctx):
+    """format_name_upper should exist (main branch change)."""
+    content = ctx.files.get("utils.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return "def format_name_upper" in content
+
+
+def check_merge_commit_completed(ctx):
+    """The merge should be finalized with a commit, not left in-progress."""
+    git_head = ctx.files.get(".git/HEAD", "")
+    if isinstance(git_head, bytes):
+        git_head = git_head.decode()
+    merge_head = ctx.files.get(".git/MERGE_HEAD")
+    return bool(git_head.strip()) and merge_head is None
+
+
+# ── extract-function-refactor ────────────────────────────────────────────────
+
+
+def check_extract_tests_pass(ctx):
+    """All tests should pass after the refactor."""
+    return ctx.exit_code == 0 and "failed" not in ctx.stdout.lower()
+
+
+def check_extract_shared_module_exists(ctx):
+    """A shared validation module should exist with the extracted function."""
+    content = ctx.files.get("validation.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return "def validate_email" in content or "def normalize_email" in content
+
+
+def check_extract_no_duplication(ctx):
+    """The inline validation logic should be removed from all 3 service modules."""
+    for name in ("user_service.py", "newsletter.py", "contact.py"):
+        content = ctx.files.get(name, "")
+        if isinstance(content, bytes):
+            content = content.decode()
+        if '"@"' in content or "'@'" in content:
+            return False
+    return True
+
+
+def check_extract_callers_import(ctx):
+    """All three service modules should import from the shared module."""
+    import_count = 0
+    for name in ("user_service.py", "newsletter.py", "contact.py"):
+        content = ctx.files.get(name, "")
+        if isinstance(content, bytes):
+            content = content.decode()
+        if "from validation import" in content or "import validation" in content:
+            import_count += 1
+    return import_count == 3
 
 
 # ── test list ────────────────────────────────────────────────────────────────
@@ -361,6 +619,419 @@ def test_divide_by_zero():
             "tests pass": check_debug_tests_pass,
             "no syntax/import errors": check_debug_no_syntax_error,
             "fix present in calculator.py": check_debug_fix_in_file,
+        },
+    },
+    # -------------------------------------------------------------------
+    # Scenario 4: Stage new file before committing
+    # Agent must create a new file and commit it. Common failure mode:
+    # `git commit new_feature.py -m "msg"` errors with "pathspec did not
+    # match any file(s) known to git" because new files must be staged
+    # with `git add` first.  Tests: git staging discipline for new files.
+    # -------------------------------------------------------------------
+    {
+        "name": "stage-new-files",
+        "files": {
+            "setup.sh": """\
+#!/usr/bin/env bash
+set -e
+git init -q
+git config user.email "test@example.com"
+git config user.name "Test"
+git config core.hooksPath /dev/null
+
+cat > main.py << 'PYEOF'
+def greet(name):
+    return f"Hello, {name}!"
+PYEOF
+
+git add main.py
+git commit -q -m "initial: add greet function"
+""",
+        },
+        "run": "git log --oneline && echo __GPTME_SEP__ && git show HEAD --name-only --format=''",
+        "prompt": (
+            "Run `bash setup.sh` to initialise the git repository. "
+            "Then create a new file `new_feature.py` with a simple Python function "
+            "`def double(x): return x * 2`, and commit it with a conventional "
+            "commit message (e.g. `feat: add double function`). "
+            "The file does not exist yet — you need to create it and stage it "
+            "before committing."
+        ),
+        "tools": ["shell", "save", "read"],
+        "expect": {
+            "new_feature.py in HEAD commit": check_stage_new_file_committed,
+            "at least 2 commits": check_stage_two_commits,
+            "new_feature.py contains double function": check_stage_file_has_double,
+        },
+    },
+    # -------------------------------------------------------------------
+    # Scenario 5: Write tests for existing code
+    # A text processing module exists with no tests.  Agent must read the
+    # implementation, understand the behaviour (including edge cases), and
+    # produce a comprehensive test suite that passes.
+    # Tests: code comprehension, test design, edge-case coverage.
+    # -------------------------------------------------------------------
+    {
+        "name": "write-test-suite",
+        "files": {
+            "text_processor.py": """\
+\"\"\"Text processing utilities.\"\"\"
+import re
+
+
+def word_count(text):
+    \"\"\"Count words in text. Returns 0 for empty/None input.\"\"\"
+    if not text:
+        return 0
+    return len(text.split())
+
+
+def truncate(text, max_length, suffix="..."):
+    \"\"\"Truncate text to max_length, adding suffix if truncated.
+
+    Returns empty string for empty/None input.
+    If text fits within max_length, returns it unchanged.
+    Otherwise returns text[:max_length - len(suffix)] + suffix.
+    \"\"\"
+    if not text:
+        return ""
+    if len(text) <= max_length:
+        return text
+    return text[:max_length - len(suffix)] + suffix
+
+
+def extract_emails(text):
+    \"\"\"Extract all email addresses from text. Returns list.
+
+    Returns empty list for empty/None input.
+    \"\"\"
+    if not text:
+        return []
+    return re.findall(r'[\\w.+-]+@[\\w-]+\\.[\\w.]+', text)
+""",
+        },
+        "run": "uv run --with pytest python3 -m pytest test_text_processor.py -q 2>&1",
+        "prompt": (
+            "The module `text_processor.py` has three utility functions but no "
+            "tests. Write a comprehensive test suite in `test_text_processor.py` "
+            "that covers all three functions (`word_count`, `truncate`, "
+            "`extract_emails`) including edge cases such as empty strings, None "
+            "input, and boundary conditions. Make sure all tests pass."
+        ),
+        "tools": ["shell", "save", "read"],
+        "expect": {
+            "test file exists": check_write_tests_file_exists,
+            "tests pass": check_write_tests_pass,
+            "covers word_count": check_write_tests_covers_word_count,
+            "covers truncate": check_write_tests_covers_truncate,
+            "covers extract_emails": check_write_tests_covers_extract_emails,
+            "sufficient test count": check_write_tests_sufficient_count,
+        },
+    },
+    # -------------------------------------------------------------------
+    # Scenario 6: Add error handling based on test expectations
+    # converter.py has functions with no input validation.  Tests expect
+    # ValueError on bad inputs.  Agent must run the tests, read the
+    # failures, add appropriate error handling WITHOUT modifying tests.
+    # Tests: test-driven development, reading test expectations, defensive
+    # programming, not modifying the test file.
+    # -------------------------------------------------------------------
+    {
+        "name": "test-driven-error-handling",
+        "files": {
+            "converter.py": """\
+\"\"\"Data conversion utilities.\"\"\"
+
+
+def parse_csv_line(line):
+    \"\"\"Parse a CSV line into a list of stripped fields.\"\"\"
+    return [field.strip() for field in line.split(",")]
+
+
+def to_int(value):
+    \"\"\"Convert a string value to integer.\"\"\"
+    return int(value)
+
+
+def safe_divide(a, b):
+    \"\"\"Divide a by b, returning a float result.\"\"\"
+    return a / b
+""",
+            "test_converter.py": """\
+import pytest
+from converter import parse_csv_line, to_int, safe_divide
+
+
+def test_parse_csv_valid():
+    assert parse_csv_line("a, b, c") == ["a", "b", "c"]
+    assert parse_csv_line("hello") == ["hello"]
+
+
+def test_parse_csv_empty():
+    \"\"\"Empty or None input should raise ValueError.\"\"\"
+    with pytest.raises(ValueError):
+        parse_csv_line("")
+    with pytest.raises(ValueError):
+        parse_csv_line(None)
+
+
+def test_to_int_valid():
+    assert to_int("42") == 42
+    assert to_int("-7") == -7
+    assert to_int("0") == 0
+
+
+def test_to_int_invalid():
+    \"\"\"Non-numeric strings should raise ValueError with a helpful message.\"\"\"
+    with pytest.raises(ValueError, match="cannot convert"):
+        to_int("abc")
+    with pytest.raises(ValueError, match="cannot convert"):
+        to_int("")
+    with pytest.raises(ValueError, match="cannot convert"):
+        to_int(None)
+
+
+def test_safe_divide_valid():
+    assert safe_divide(10, 2) == 5.0
+    assert safe_divide(7, 2) == 3.5
+    assert safe_divide(-6, 3) == -2.0
+
+
+def test_safe_divide_by_zero():
+    \"\"\"Division by zero should raise ValueError, not ZeroDivisionError.\"\"\"
+    with pytest.raises(ValueError, match="cannot divide by zero"):
+        safe_divide(5, 0)
+
+
+def test_safe_divide_type_error():
+    \"\"\"Non-numeric inputs should raise ValueError.\"\"\"
+    with pytest.raises(ValueError, match="cannot divide"):
+        safe_divide("a", 2)
+    with pytest.raises(ValueError, match="cannot divide"):
+        safe_divide(10, "b")
+""",
+        },
+        "run": "uv run --with pytest python3 -m pytest test_converter.py -v --tb=short 2>&1",
+        "prompt": (
+            "The test suite in test_converter.py is failing because the functions "
+            "in converter.py lack input validation. Run the tests to see which "
+            "fail, then add appropriate error handling to each function in "
+            "converter.py so that all tests pass. Do not modify test_converter.py."
+        ),
+        "tools": ["shell", "save", "read"],
+        "expect": {
+            "tests pass": check_error_handling_tests_pass,
+            "parse_csv_line validates input": check_error_handling_parse_csv,
+            "to_int handles non-numeric": check_error_handling_to_int,
+            "safe_divide handles zero/types": check_error_handling_safe_divide,
+            "test file unchanged": check_error_handling_source_unchanged,
+        },
+    },
+    # -------------------------------------------------------------------
+    # Scenario 7: Merge conflict resolution
+    # Two branches modify the same file differently: main adds a new function
+    # (format_name_upper), feature branch adds null-safety to format_name.
+    # Agent starts with an in-progress merge that has conflicts and must
+    # resolve them so both features are preserved and all tests pass.
+    # Tests: conflict comprehension, preserving intent from both sides,
+    # completing the merge, and verifying with tests.
+    # -------------------------------------------------------------------
+    {
+        "name": "merge-conflict-resolution",
+        "files": {
+            "setup.sh": """\
+#!/usr/bin/env bash
+set -e
+git init -q
+git config user.email "test@example.com"
+git config user.name "Test"
+git config core.hooksPath /dev/null
+
+# Base version — compact so both branch diffs overlap in the same region
+cat > utils.py << 'PYEOF'
+def format_name(first, last):
+    return f"{first} {last}"
+PYEOF
+
+cat > test_utils.py << 'PYEOF'
+from utils import format_name
+
+def test_format_name():
+    assert format_name("Alice", "Smith") == "Alice Smith"
+PYEOF
+
+git add utils.py test_utils.py
+git commit -q -m "initial: add utils module"
+
+# Feature branch: add null-safety (inserts lines inside format_name body)
+git checkout -q -b feature-null-safety
+cat > utils.py << 'PYEOF'
+def format_name(first, last):
+    if first is None or last is None:
+        return "Unknown"
+    return f"{first} {last}"
+PYEOF
+
+cat > test_null_safety.py << 'PYEOF'
+from utils import format_name
+
+def test_format_name_none_first():
+    assert format_name(None, "Smith") == "Unknown"
+
+def test_format_name_none_last():
+    assert format_name("Alice", None) == "Unknown"
+PYEOF
+
+git add utils.py test_null_safety.py
+git commit -q -m "feat: add null safety to format_name"
+
+# Back to master: refactor body + add format_name_upper (overlapping region)
+git checkout -q master
+cat > utils.py << 'PYEOF'
+def format_name(first, last):
+    \"\"\"Format a person's full name.\"\"\"
+    full = f"{first} {last}"
+    return full
+
+
+def format_name_upper(first, last):
+    \"\"\"Format a person's full name in uppercase.\"\"\"
+    return format_name(first, last).upper()
+PYEOF
+
+cat > test_upper.py << 'PYEOF'
+from utils import format_name_upper
+
+def test_format_name_upper():
+    assert format_name_upper("Alice", "Smith") == "ALICE SMITH"
+PYEOF
+
+git add utils.py test_upper.py
+git commit -q -m "feat: add format_name_upper"
+
+# Start the merge — will conflict in utils.py (both branches modify body)
+git merge feature-null-safety --no-edit || true
+
+grep -q '^<<<<<<< ' utils.py
+""",
+        },
+        "run": "uv run --with pytest python3 -m pytest test_utils.py test_null_safety.py test_upper.py -q 2>&1",
+        "prompt": (
+            "Run `bash setup.sh` to initialise the repository. It creates two "
+            "branches that both modify `utils.py` and starts a merge that "
+            "conflicts. Resolve the merge conflict in `utils.py` so that BOTH "
+            "features are preserved:\n"
+            "1. `format_name` should handle `None` arguments (return 'Unknown')\n"
+            "2. `format_name_upper` should exist and work correctly\n"
+            "After resolving, complete the merge commit and verify all tests pass."
+        ),
+        "tools": ["shell", "save", "read"],
+        "expect": {
+            "no conflict markers": check_merge_no_conflict_markers,
+            "tests pass": check_merge_tests_pass,
+            "null safety preserved": check_merge_null_safety,
+            "upper function preserved": check_merge_upper_function,
+            "merge commit completed": check_merge_commit_completed,
+        },
+    },
+    # -------------------------------------------------------------------
+    # Scenario 8: Extract duplicated function
+    # Three service modules each contain identical email validation logic.
+    # Agent must extract it into a shared validation.py module and update
+    # all callers.  Tests: DRY refactoring, creating new modules, updating
+    # imports, maintaining test coverage across the change.
+    # -------------------------------------------------------------------
+    {
+        "name": "extract-function-refactor",
+        "files": {
+            "user_service.py": """\
+\"\"\"User account service.\"\"\"
+
+
+def create_user(email, name):
+    \"\"\"Create a new user account.\"\"\"
+    if not email or "@" not in email or "." not in email.split("@")[1]:
+        raise ValueError("Invalid email address")
+    clean_email = email.lower().strip()
+    return {"email": clean_email, "name": name}
+""",
+            "newsletter.py": """\
+\"\"\"Newsletter subscription service.\"\"\"
+
+
+def subscribe(email):
+    \"\"\"Subscribe an email to the newsletter.\"\"\"
+    if not email or "@" not in email or "." not in email.split("@")[1]:
+        raise ValueError("Invalid email address")
+    clean_email = email.lower().strip()
+    return {"email": clean_email, "subscribed": True}
+""",
+            "contact.py": """\
+\"\"\"Contact form service.\"\"\"
+
+
+def send_message(email, message):
+    \"\"\"Send a contact form message.\"\"\"
+    if not email or "@" not in email or "." not in email.split("@")[1]:
+        raise ValueError("Invalid email address")
+    clean_email = email.lower().strip()
+    return {"email": clean_email, "message": message, "sent": True}
+""",
+            "test_services.py": """\
+import pytest
+from user_service import create_user
+from newsletter import subscribe
+from contact import send_message
+
+
+def test_create_user():
+    result = create_user("Alice@Example.com", "Alice")
+    assert result == {"email": "alice@example.com", "name": "Alice"}
+
+
+def test_subscribe():
+    result = subscribe("Bob@Example.com")
+    assert result == {"email": "bob@example.com", "subscribed": True}
+
+
+def test_send_message():
+    result = send_message("Carol@Example.com", "Hi")
+    assert result == {"email": "carol@example.com", "message": "Hi", "sent": True}
+
+
+def test_create_user_invalid():
+    with pytest.raises(ValueError):
+        create_user("not-an-email", "Bad")
+
+
+def test_subscribe_empty():
+    with pytest.raises(ValueError):
+        subscribe("")
+
+
+def test_send_message_no_dot():
+    with pytest.raises(ValueError):
+        send_message("user@nodot", "Hi")
+""",
+        },
+        "run": "uv run --with pytest python3 -m pytest test_services.py -q 2>&1",
+        "prompt": (
+            "The three service modules (`user_service.py`, `newsletter.py`, "
+            "`contact.py`) each contain identical email validation and "
+            "normalisation logic. Extract the shared logic into a new "
+            "`validation.py` module with a `validate_email(email)` function "
+            "that raises `ValueError` for invalid emails and returns the "
+            "cleaned (lowercased, stripped) email string. Update all three "
+            "service modules to import and use `validate_email` from "
+            "`validation.py` instead of duplicating the logic. "
+            "Make sure all tests in `test_services.py` still pass."
+        ),
+        "tools": ["shell", "save", "read"],
+        "expect": {
+            "tests pass": check_extract_tests_pass,
+            "shared module exists": check_extract_shared_module_exists,
+            "no duplication across services": check_extract_no_duplication,
+            "all callers import from validation": check_extract_callers_import,
         },
     },
 ]
