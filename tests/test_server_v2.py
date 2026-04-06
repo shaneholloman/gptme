@@ -60,14 +60,229 @@ def v2_conv_with_config(client: FlaskClient, config: ChatConfig):
     return create_conversation(client, config)
 
 
-def test_v2_api_root(client: FlaskClient):
+def test_v2_api_root(client: FlaskClient, monkeypatch):
     """Test the V2 API root endpoint."""
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_external_session_provider", lambda: None
+    )
+
     response = client.get("/api/v2")
     assert response.status_code == 200
     data = response.get_json()
     assert data is not None
     assert "message" in data
     assert "gptme v2 API" in data["message"]
+    assert data["capabilities"] == {
+        "external_session_catalog": False,
+        "external_session_transcript": False,
+    }
+
+
+class _FakeExternalSessionItem:
+    def __init__(self):
+        self.id = "abc123"
+
+    def to_dict(self) -> dict[str, Any]:
+        return {
+            "id": "abc123",
+            "session_id": "session-1",
+            "harness": "claude-code",
+            "session_name": "Test Session",
+            "project": "/tmp/project",
+            "model": "claude-sonnet-4-5",
+            "started_at": "2026-04-06T12:00:00+00:00",
+            "last_activity": "2026-04-06T12:05:00+00:00",
+            "capabilities": ["view_transcript"],
+            "trajectory_path": "/tmp/session.jsonl",
+        }
+
+
+class _FakeExternalSessionProvider:
+    capabilities = {
+        "external_session_catalog": True,
+        "external_session_transcript": True,
+    }
+
+    def list_sessions(
+        self, limit: int = 100, days: int = 30
+    ) -> list[_FakeExternalSessionItem]:
+        assert limit >= 1
+        assert days >= 1
+        return [_FakeExternalSessionItem()]
+
+    def get_session(self, external_id: str, days: int = 30) -> dict[str, Any] | None:
+        assert days >= 1
+        if external_id != "abc123":
+            return None
+        return {
+            "id": "abc123",
+            "transcript": {
+                "session_id": "session-1",
+                "harness": "claude-code",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        }
+
+
+@pytest.fixture
+def fake_external_session_provider(monkeypatch):
+    provider = _FakeExternalSessionProvider()
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_external_session_provider", lambda: provider
+    )
+    return provider
+
+
+def test_v2_api_root_with_external_sessions(
+    client: FlaskClient, fake_external_session_provider
+):
+    """Test the V2 API root endpoint when optional external sessions are available."""
+    response = client.get("/api/v2")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["capabilities"] == {
+        "external_session_catalog": True,
+        "external_session_transcript": True,
+    }
+
+
+def test_v2_external_sessions_list(client: FlaskClient, fake_external_session_provider):
+    """Test listing read-only external sessions."""
+    response = client.get("/api/v2/external-sessions")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["sessions"] == [_FakeExternalSessionItem().to_dict()]
+
+
+def test_v2_external_session_get(client: FlaskClient, fake_external_session_provider):
+    """Test retrieving a read-only external session transcript."""
+    response = client.get("/api/v2/external-sessions/abc123")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["id"] == "abc123"
+    assert data["transcript"]["session_id"] == "session-1"
+
+
+def test_v2_external_sessions_unavailable(client: FlaskClient, monkeypatch):
+    """Test external session endpoints when provider is unavailable."""
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_external_session_provider", lambda: None
+    )
+
+    response = client.get("/api/v2/external-sessions")
+    assert response.status_code == 503
+    data = response.get_json()
+    assert data is not None
+    assert "unavailable" in data["error"]
+
+
+def test_v2_external_session_not_found(
+    client: FlaskClient, fake_external_session_provider
+):
+    """Test requesting a missing external session transcript."""
+    response = client.get("/api/v2/external-sessions/does-not-exist")
+    assert response.status_code == 404
+    data = response.get_json()
+    assert data is not None
+    assert "not found" in data["error"].lower()
+
+
+def test_external_session_provider_get_session_searches_beyond_list_limit():
+    """Test session lookup scans all discovered sessions instead of a capped list."""
+    from gptme.server.external_sessions import (
+        ExternalSessionProvider,
+        _make_external_session_id,
+    )
+
+    provider = ExternalSessionProvider.__new__(ExternalSessionProvider)
+    late_path = Path("/tmp/sessions/late-session.jsonl")
+    provider._discover_paths = lambda days: [late_path]  # type: ignore[method-assign]
+
+    class _Transcript:
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "trajectory_path": str(late_path),
+                "session_id": "late-session",
+                "harness": "claude-code",
+                "session_name": "Late Session",
+                "project": "/tmp/project",
+                "model": "claude-sonnet-4-5",
+                "started_at": "2026-04-01T00:00:00+00:00",
+                "last_activity": "2026-04-01T00:05:00+00:00",
+                "capabilities": ["view_transcript"],
+                "messages": [{"role": "user", "content": "hello"}],
+            }
+
+    provider._read_transcript = lambda path: _Transcript()  # type: ignore[assignment]
+
+    result = provider.get_session(_make_external_session_id(str(late_path)), days=30)
+
+    assert result is not None
+    assert result["id"] == _make_external_session_id(str(late_path))
+    assert result["transcript"]["session_id"] == "late-session"
+
+
+def test_external_session_provider_list_sessions_skips_unreadable_transcripts():
+    """Test unreadable transcripts do not break catalog listing."""
+    from gptme.server.external_sessions import ExternalSessionProvider
+
+    provider = ExternalSessionProvider.__new__(ExternalSessionProvider)
+    bad_path = Path("/tmp/sessions/bad-session.jsonl")
+    good_path = Path("/tmp/sessions/good-session.jsonl")
+    provider._discover_paths = lambda days: [bad_path, good_path]  # type: ignore[method-assign]
+
+    class _Transcript:
+        def __init__(self, path: Path) -> None:
+            self.path = path
+
+        def to_dict(self) -> dict[str, Any]:
+            return {
+                "trajectory_path": str(self.path),
+                "session_id": self.path.stem,
+                "harness": "claude-code",
+                "session_name": self.path.stem,
+                "project": "/tmp/project",
+                "model": "claude-sonnet-4-5",
+                "started_at": "2026-04-01T00:00:00+00:00",
+                "last_activity": "2026-04-01T00:05:00+00:00",
+                "capabilities": ["view_transcript"],
+            }
+
+    def _read_transcript(path: Path) -> _Transcript:
+        if path == bad_path:
+            raise ValueError("broken transcript")
+        return _Transcript(path)
+
+    provider._read_transcript = _read_transcript  # type: ignore[assignment]
+
+    result = provider.list_sessions(limit=10, days=30)
+
+    assert len(result) == 1
+    assert result[0].session_id == "good-session"
+
+
+def test_external_session_provider_get_session_skips_unreadable_matching_transcript():
+    """Test unreadable matching transcripts do not raise during detail lookup."""
+    from gptme.server.external_sessions import (
+        ExternalSessionProvider,
+        _make_external_session_id,
+    )
+
+    provider = ExternalSessionProvider.__new__(ExternalSessionProvider)
+    bad_path = Path("/tmp/sessions/bad-session.jsonl")
+    provider._discover_paths = lambda days: [bad_path]  # type: ignore[method-assign]
+
+    def _read_transcript(path: Path) -> Any:
+        raise ValueError(f"cannot read {path}")
+
+    provider._read_transcript = _read_transcript  # type: ignore[assignment]
+
+    result = provider.get_session(_make_external_session_id(str(bad_path)), days=30)
+
+    assert result is None
 
 
 def test_v2_conversations_list(client: FlaskClient):
