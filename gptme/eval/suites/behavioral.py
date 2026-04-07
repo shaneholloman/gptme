@@ -8,16 +8,18 @@ lessons about *how to work* should have a measurable effect on outcomes:
 - multi-file-rename: rename a function consistently across a project
 - iterative-debug: find and fix a bug through test feedback
 - stage-new-files: stage an untracked file before committing it
-- write-test-suite: read existing code and write a comprehensive test suite
-- add-error-handling: add input validation to functions based on test expectations
+- write-test-suite: read existing code and write a focused test suite
+- test-driven-error-handling: add input validation to functions based on test expectations
 - merge-conflict-resolution: resolve a git merge conflict preserving both features
 - extract-function-refactor: extract duplicated code into a shared module
+- debug-data-pipeline: trace and fix a type error in a multi-stage data pipeline
 
 Each scenario comes with a deterministic checker so results can be used in
 lesson holdout A/B experiments (idea #19, eval-to-lesson feedback loop).
 """
 
 import ast
+import re
 from collections.abc import Iterator
 from typing import TYPE_CHECKING
 
@@ -378,6 +380,38 @@ def check_extract_callers_import(ctx):
     return import_count == 3
 
 
+# ── debug-data-pipeline ──────────────────────────────────────────────────────
+
+
+def check_pipeline_tests_pass(ctx):
+    """All pipeline tests should pass after the fix."""
+    return ctx.exit_code == 0 and "failed" not in ctx.stdout.lower()
+
+
+def check_pipeline_extract_emails_fixed(ctx):
+    """extract_emails should iterate the list, not subscript it as a dict."""
+    content = ctx.files.get("pipeline.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    # Must not still contain the broken subscript access
+    if 'users["emails"]' in content or "users['emails']" in content:
+        return False
+    # Must iterate over users list (accept any loop variable name)
+    return bool(re.search(r"for \w+ in users", content))
+
+
+def check_pipeline_source_unchanged(ctx):
+    """test_pipeline.py should not be modified."""
+    content = ctx.files.get("test_pipeline.py", "")
+    if isinstance(content, bytes):
+        content = content.decode()
+    return (
+        "run_pipeline" in content
+        and "assert result" in content
+        and '"count"' in content
+    )
+
+
 # ── test list ────────────────────────────────────────────────────────────────
 
 tests: list["EvalSpec"] = [
@@ -668,7 +702,7 @@ git commit -q -m "initial: add greet function"
     # Scenario 5: Write tests for existing code
     # A text processing module exists with no tests.  Agent must read the
     # implementation, understand the behaviour (including edge cases), and
-    # produce a comprehensive test suite that passes.
+    # produce a focused test suite (at least 6 tests) that passes.
     # Tests: code comprehension, test design, edge-case coverage.
     # -------------------------------------------------------------------
     {
@@ -713,10 +747,11 @@ def extract_emails(text):
         "run": "python3 -m pytest test_text_processor.py -q 2>&1",
         "prompt": (
             "The module `text_processor.py` has three utility functions but no "
-            "tests. Write a comprehensive test suite in `test_text_processor.py` "
+            "tests. Write a focused test suite in `test_text_processor.py` "
             "that covers all three functions (`word_count`, `truncate`, "
             "`extract_emails`) including edge cases such as empty strings, None "
-            "input, and boundary conditions. Make sure all tests pass."
+            "input, and boundary conditions. Write at least 6 tests total "
+            "(2+ per function), keep the suite concise, and make sure all tests pass."
         ),
         "tools": ["shell", "save", "read"],
         "expect": {
@@ -919,11 +954,14 @@ grep -q '^<<<<<<< ' utils.py
         "prompt": (
             "Run `bash setup.sh` to initialise the repository. It creates two "
             "branches that both modify `utils.py` and starts a merge that "
-            "conflicts. Resolve the merge conflict in `utils.py` so that BOTH "
-            "features are preserved:\n"
+            "conflicts. Read `utils.py` to see the conflict markers, then write "
+            "the resolved file without any `<<<<<<<`, `=======`, or `>>>>>>>` "
+            "lines, preserving BOTH features:\n"
             "1. `format_name` should handle `None` arguments (return 'Unknown')\n"
             "2. `format_name_upper` should exist and work correctly\n"
-            "After resolving, complete the merge commit and verify all tests pass."
+            "After writing the resolved file, run "
+            "`git add utils.py && git commit --no-edit` to complete the merge, "
+            "then verify all tests pass."
         ),
         "tools": ["shell", "save", "read"],
         "expect": {
@@ -1032,6 +1070,113 @@ def test_send_message_no_dot():
             "shared module exists": check_extract_shared_module_exists,
             "no duplication across services": check_extract_no_duplication,
             "all callers import from validation": check_extract_callers_import,
+        },
+    },
+    # -------------------------------------------------------------------
+    # Scenario 9: Debug data pipeline type error
+    # A multi-stage pipeline loads JSON, filters users, extracts emails,
+    # and formats output.  The extract_emails stage has a bug: it treats
+    # its list input as a dict and subscripts it with ["emails"], causing
+    # a TypeError at runtime.  Agent must trace the data flow stage by
+    # stage, identify the format mismatch, and fix extract_emails to
+    # iterate over the list instead.
+    # Tests: pipeline debugging, data flow tracing, targeted fix.
+    # -------------------------------------------------------------------
+    {
+        "name": "debug-data-pipeline",
+        "files": {
+            "pipeline.py": """\
+\"\"\"User data processing pipeline.\"\"\"
+import json
+
+
+def load_data(path):
+    \"\"\"Load user records from a JSON file.\"\"\"
+    with open(path) as f:
+        return json.load(f)
+
+
+def filter_active(data):
+    \"\"\"Keep only active user records.\"\"\"
+    return [user for user in data if user.get("active")]
+
+
+def extract_emails(users):
+    \"\"\"Extract email addresses from user records.\"\"\"
+    return users["emails"]  # bug: users is a list, not a dict
+
+
+def format_output(emails):
+    \"\"\"Return a summary dict with count and sorted emails.\"\"\"
+    return {"count": len(emails), "emails": sorted(emails)}
+
+
+def run_pipeline(path):
+    data = load_data(path)
+    active = filter_active(data)
+    emails = extract_emails(active)
+    return format_output(emails)
+""",
+            "test_pipeline.py": """\
+import json
+import os
+import tempfile
+
+import pytest
+
+from pipeline import run_pipeline
+
+
+@pytest.fixture
+def users_file(tmp_path):
+    data = [
+        {"active": True, "email": "alice@example.com"},
+        {"active": False, "email": "bob@example.com"},
+        {"active": True, "email": "carol@example.com"},
+    ]
+    p = tmp_path / "users.json"
+    p.write_text(json.dumps(data))
+    return str(p)
+
+
+def test_pipeline_basic(users_file):
+    result = run_pipeline(users_file)
+    assert result == {
+        "count": 2,
+        "emails": ["alice@example.com", "carol@example.com"],
+    }
+
+
+def test_pipeline_all_inactive(tmp_path):
+    data = [{"active": False, "email": "x@example.com"}]
+    p = tmp_path / "empty.json"
+    p.write_text(json.dumps(data))
+    result = run_pipeline(str(p))
+    assert result == {"count": 0, "emails": []}
+
+
+def test_pipeline_single_active(tmp_path):
+    data = [{"active": True, "email": "only@example.com"}]
+    p = tmp_path / "single.json"
+    p.write_text(json.dumps(data))
+    result = run_pipeline(str(p))
+    assert result == {"count": 1, "emails": ["only@example.com"]}
+""",
+        },
+        "run": "python3 -m pytest test_pipeline.py -v --tb=short 2>&1",
+        "prompt": (
+            "The pipeline in `pipeline.py` is failing with a TypeError. "
+            "Run the tests to see the failure, then trace the data flow "
+            "through each stage (`load_data` → `filter_active` → "
+            "`extract_emails` → `format_output`) to find where the format "
+            "mismatch occurs. Fix `pipeline.py` so all tests pass. "
+            "Do not modify `test_pipeline.py`."
+        ),
+        "tools": ["shell", "save", "read"],
+        "expect": {
+            "tests pass": check_pipeline_tests_pass,
+            "extract_emails iterates list": check_pipeline_extract_emails_fixed,
+            "test file unchanged": check_pipeline_source_unchanged,
         },
     },
 ]

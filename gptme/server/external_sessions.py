@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
 import logging
 from dataclasses import dataclass
@@ -146,9 +147,35 @@ class ExternalSessionProvider:
         return None
 
 
+@functools.lru_cache(maxsize=1)
 def get_external_session_provider() -> ExternalSessionProvider | None:
-    """Return the optional external session provider if dependencies are available."""
+    """Return the optional external session provider if dependencies are available.
+
+    Cached so the import attempt and CLI-only warning happen at most once per process.
+    """
     try:
         return ExternalSessionProvider()
     except ImportError:
+        _warn_if_cli_only()
         return None
+
+
+def _warn_if_cli_only() -> None:
+    """Log a helpful warning when gptme-sessions CLI is in PATH but not importable.
+
+    This happens when gptme-sessions is installed via ``uv tool install`` (isolated
+    venv) rather than into gptme's own Python environment.
+    """
+    import shutil
+
+    if shutil.which("gptme-sessions"):
+        logger.warning(
+            "gptme-sessions CLI found in PATH but the gptme_sessions Python package is "
+            "not importable from gptme's environment. "
+            "The external session catalog feature requires gptme_sessions to be installed "
+            "in the same Python environment as gptme-server. "
+            "If you installed via 'uv tool install gptme-sessions', that creates an isolated "
+            "venv — the module is not visible to gptme. "
+            "Instead, install it into gptme's venv: "
+            "pip install gptme-sessions  (or add it to gptme's dependencies)."
+        )

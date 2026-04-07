@@ -9,10 +9,10 @@ This is critical infrastructure for idea #19 (eval-to-lesson feedback loop):
 before running expensive baseline experiments with real models, we need
 confidence that the checkers correctly identify good work.
 
-Covers all 8 behavioral scenarios:
+Covers all 9 behavioral scenarios:
   git-selective-commit, multi-file-rename, iterative-debug,
   stage-new-files, write-test-suite, test-driven-error-handling,
-  merge-conflict-resolution, extract-function-refactor
+  merge-conflict-resolution, extract-function-refactor, debug-data-pipeline
 """
 
 import subprocess
@@ -239,6 +239,16 @@ def _apply_solution(workspace: Path, scenario_name: str) -> None:
                 clean_email = validate_email(email)
                 return {"email": clean_email, "message": message, "sent": True}
             """)
+        )
+
+    elif scenario_name == "debug-data-pipeline":
+        # Fix extract_emails to iterate over the list instead of subscripting as dict
+        p = workspace / "pipeline.py"
+        p.write_text(
+            p.read_text().replace(
+                'return users["emails"]  # bug: users is a list, not a dict',
+                'return [u["email"] for u in users]',
+            )
         )
 
     else:

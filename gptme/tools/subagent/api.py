@@ -72,10 +72,9 @@ def subagent(
             - "full" (default): Share complete context (agent identity, tools, workspace)
             - "selective": Share only specified context components (requires context_include)
         context_include: For selective mode, list of context components to include:
-            - "files": Project config files (gptme.toml files list)
-            - "cmd": Dynamic context_cmd output
-            - "all": Include both files and cmd
-            Note: Tools and agent identity are always included by the CLI.
+            - Thread mode supports "agent" and "tools"
+            - Subprocess mode also supports "workspace", which maps to the CLI's "files" context
+            Legacy subprocess values like "files", "cmd", and "all" are still accepted.
         use_subprocess: If True, run subagent in subprocess for output isolation.
             Subprocess mode captures stdout/stderr separately from the parent.
         use_acp: If True, run subagent via ACP (Agent Client Protocol).
