@@ -101,10 +101,19 @@ class ExternalSessionProvider:
         start = end - timedelta(days=max(days - 1, 0))
 
         paths: list[Path] = []
-        paths.extend(self._discover_gptme_sessions(start, end))
-        paths.extend(self._discover_cc_sessions(start, end))
-        paths.extend(self._discover_codex_sessions(start, end))
-        paths.extend(self._discover_copilot_sessions(start, end))
+        # gptme discovery returns session *directories*; resolve to the
+        # conversation.jsonl file inside so IDs are consistent everywhere.
+        for p in self._discover_gptme_sessions(start, end):
+            jsonl = p / "conversation.jsonl"
+            if jsonl.exists():
+                paths.append(jsonl.resolve())
+            else:
+                logger.debug(
+                    "gptme session dir has no conversation.jsonl, skipping: %s", p
+                )
+        paths.extend(p.resolve() for p in self._discover_cc_sessions(start, end))
+        paths.extend(p.resolve() for p in self._discover_codex_sessions(start, end))
+        paths.extend(p.resolve() for p in self._discover_copilot_sessions(start, end))
         return paths
 
     def list_sessions(
