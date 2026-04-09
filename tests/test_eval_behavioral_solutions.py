@@ -9,11 +9,12 @@ This is critical infrastructure for idea #19 (eval-to-lesson feedback loop):
 before running expensive baseline experiments with real models, we need
 confidence that the checkers correctly identify good work.
 
-Covers all 10 behavioral scenarios:
+Covers all 16 behavioral scenarios:
   git-selective-commit, multi-file-rename, iterative-debug,
   stage-new-files, write-test-suite, test-driven-error-handling,
   merge-conflict-resolution, extract-function-refactor, debug-data-pipeline,
-  scope-discipline-bugfix
+  scope-discipline-bugfix, add-logging, use-existing-helper,
+  add-feature-preserve-default, handle-specific-exception
 """
 
 import subprocess
@@ -262,6 +263,340 @@ def _apply_solution(workspace: Path, scenario_name: str) -> None:
             )
         )
 
+    elif scenario_name == "add-logging":
+        # Add Python logging to process_record — error level for failures,
+        # debug level for success, no print statements.
+        p = workspace / "processor.py"
+        p.write_text(
+            '"""Data record processor."""\n'
+            "import logging\n"
+            "\n"
+            "\n"
+            "def process_record(record):\n"
+            '    """Process a single data record.\n'
+            "\n"
+            "    Returns True on success, None if the record is invalid or negative.\n"
+            '    """\n'
+            "    try:\n"
+            '        value = int(record["value"])\n'
+            "        if value < 0:\n"
+            '            logging.error("Negative value: %s", value)\n'
+            "            return None\n"
+            '        record["processed"] = value * 2\n'
+            '        logging.debug("Processed record: value=%s", value)\n'
+            "        return True\n"
+            "    except (KeyError, ValueError) as e:\n"
+            '        logging.error("Invalid record: %s", e)\n'
+            "        return None\n"
+        )
+
+    elif scenario_name == "use-existing-helper":
+        # Refactor users.py to import normalize_email from utils and call it
+        # instead of duplicating the .strip().lower() logic inline.
+        p = workspace / "users.py"
+        p.write_text(
+            '"""User management module."""\n'
+            "\n"
+            "from utils import normalize_email\n"
+            "\n"
+            "\n"
+            "def create_user(email: str) -> dict:\n"
+            '    """Create a new user record with a normalized email address.\n'
+            "\n"
+            "    Raises ValueError for obviously invalid addresses.\n"
+            "    Returns a dict with keys 'email' (normalized) and 'active'.\n"
+            '    """\n'
+            "    normalized = normalize_email(email)\n"
+            '    if "@" not in normalized or "." not in normalized.split("@")[-1]:\n'
+            '        raise ValueError(f"Invalid email: {email!r}")\n'
+            '    return {"email": normalized, "active": True}\n'
+        )
+
+    elif scenario_name == "add-feature-preserve-default":
+        # Add include_chars parameter with default False; append new tests
+        (workspace / "text_stats.py").write_text(
+            textwrap.dedent("""\
+            def summarize(text, include_chars=False):
+                \"\"\"Return a dict with word and line counts for the given text.\"\"\"
+                if not text:
+                    result = {"words": 0, "lines": 0}
+                else:
+                    words = len(text.split())
+                    lines = len(text.splitlines())
+                    result = {"words": words, "lines": lines}
+                if include_chars:
+                    result["chars"] = len(text) if text else 0
+                return result
+            """)
+        )
+        # Append new tests after the marker — do not modify original tests
+        original = (workspace / "test_text_stats.py").read_text()
+        (workspace / "test_text_stats.py").write_text(
+            original
+            + textwrap.dedent("""\
+
+            def test_include_chars_true():
+                result = summarize("hello world", include_chars=True)
+                assert result == {"words": 2, "lines": 1, "chars": 11}
+
+
+            def test_include_chars_empty():
+                result = summarize("", include_chars=True)
+                assert result == {"words": 0, "lines": 0, "chars": 0}
+
+
+            def test_include_chars_false_explicit():
+                result = summarize("hello", include_chars=False)
+                assert set(result.keys()) == {"words", "lines"}
+            """)
+        )
+
+    elif scenario_name == "handle-specific-exception":
+        # Narrow the broad except Exception: to json.JSONDecodeError,
+        # and add a test verifying FileNotFoundError propagates.
+        (workspace / "config.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Application configuration loader.\"\"\"
+
+            import json
+
+
+            def parse_config(path):
+                \"\"\"Load configuration from a JSON file.
+
+                Raises FileNotFoundError if the file does not exist.
+                Returns an empty dict if the file contains invalid JSON.
+                \"\"\"
+                try:
+                    with open(path) as f:
+                        return json.load(f)
+                except json.JSONDecodeError:
+                    return {}
+            """)
+        )
+        original = (workspace / "test_config.py").read_text()
+        (workspace / "test_config.py").write_text(
+            original
+            + textwrap.dedent("""\
+
+
+            def test_missing_file_raises():
+                import pytest
+                with pytest.raises(FileNotFoundError):
+                    parse_config("/nonexistent/path/config.json")
+            """)
+        )
+
+    elif scenario_name == "fix-security-path-traversal":
+        # Fix path traversal: resolve both paths and validate containment.
+        (workspace / "server.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Minimal static file server.\"\"\"
+
+            import os
+
+
+            def serve_file(base_dir: str, filename: str) -> bytes:
+                \"\"\"Return the contents of *filename* from *base_dir*.
+
+                Raises FileNotFoundError if the file does not exist.
+                Raises ValueError if *filename* is absolute or escapes base_dir.
+                \"\"\"
+                if os.path.isabs(filename):
+                    raise ValueError(f"Absolute paths not allowed: {filename!r}")
+
+                base = os.path.realpath(base_dir)
+                filepath = os.path.realpath(os.path.join(base_dir, filename))
+
+                if not filepath.startswith(base + os.sep) and filepath != base:
+                    raise ValueError(
+                        f"Path escapes base directory: {filename!r}"
+                    )
+
+                with open(filepath, "rb") as f:
+                    return f.read()
+            """)
+        )
+        original = (workspace / "test_server.py").read_text()
+        (workspace / "test_server.py").write_text(
+            original
+            + textwrap.dedent("""\
+
+
+            def test_blocks_path_traversal(tmp_path):
+                \"\"\"Requesting ../../etc/passwd must raise ValueError.\"\"\"
+                safe_dir = tmp_path / "safe"
+                safe_dir.mkdir()
+                with pytest.raises(ValueError, match="escapes"):
+                    serve_file(str(safe_dir), "../../etc/passwd")
+            """)
+        )
+
+    elif scenario_name == "refactor-for-testability":
+        # Extract pure computation into compute_stats(rows), keep generate_report
+        # as the I/O wrapper that delegates to compute_stats.
+        (workspace / "report.py").write_text(
+            textwrap.dedent('''\
+            import csv
+
+
+            def compute_stats(rows):
+                """Compute summary statistics from a list of row dicts."""
+                if not rows:
+                    return {"total_rows": 0}
+
+                scores = [int(r["score"]) for r in rows]
+                hours = [float(r["hours"]) for r in rows]
+
+                return {
+                    "total_rows": len(rows),
+                    "score_total": sum(scores),
+                    "score_average": round(sum(scores) / len(scores), 2),
+                    "score_min": min(scores),
+                    "score_max": max(scores),
+                    "hours_total": round(sum(hours), 2),
+                    "hours_average": round(sum(hours) / len(hours), 2),
+                    "hours_min": min(hours),
+                    "hours_max": max(hours),
+                }
+
+
+            def generate_report(filepath):
+                """Generate summary statistics from a CSV file."""
+                rows = []
+                with open(filepath, newline="") as f:
+                    reader = csv.DictReader(f)
+                    for row in reader:
+                        rows.append(row)
+                return compute_stats(rows)
+            ''')
+        )
+        (workspace / "test_report.py").write_text(
+            textwrap.dedent("""\
+            from report import compute_stats
+
+
+            def test_compute_stats_normal():
+                rows = [
+                    {"name": "Alice", "score": "90", "hours": "5.5"},
+                    {"name": "Bob", "score": "70", "hours": "3.0"},
+                ]
+                result = compute_stats(rows)
+                assert result["total_rows"] == 2
+                assert result["score_total"] == 160
+                assert result["score_average"] == 80.0
+                assert result["score_min"] == 70
+                assert result["score_max"] == 90
+
+
+            def test_compute_stats_empty():
+                assert compute_stats([]) == {"total_rows": 0}
+
+
+            def test_compute_stats_single_row():
+                rows = [{"name": "Carol", "score": "85", "hours": "4.0"}]
+                result = compute_stats(rows)
+                assert result["total_rows"] == 1
+                assert result["score_average"] == 85.0
+                assert result["score_min"] == 85
+                assert result["score_max"] == 85
+            """)
+        )
+
+    elif scenario_name == "add-type-hints":
+        (workspace / "datastore.py").write_text(
+            textwrap.dedent("""\
+            from typing import Any, Optional
+
+
+            class DataStore:
+                def __init__(self) -> None:
+                    self.data: dict[str, Any] = {}
+                    self.metadata: dict[str, dict[str, Any]] = {}
+
+                def set(self, key: str, value: Any) -> None:
+                    self.data[key] = value
+
+                def get(self, key: str, default: Optional[Any] = None) -> Any:
+                    return self.data.get(key, default)
+
+                def delete(self, key: str) -> bool:
+                    if key in self.data:
+                        del self.data[key]
+                        return True
+                    return False
+
+                def keys(self) -> list[str]:
+                    return list(self.data.keys())
+
+                def items(self) -> list[tuple[str, Any]]:
+                    return list(self.data.items())
+
+                def update_metadata(self, key: str, info: dict[str, Any]) -> None:
+                    self.metadata[key] = info
+
+                def get_metadata(self, key: str) -> Optional[dict[str, Any]]:
+                    return self.metadata.get(key)
+
+                def count(self) -> int:
+                    return len(self.data)
+
+                def search(self, prefix: str) -> list[str]:
+                    return [k for k in self.data if k.startswith(prefix)]
+
+
+            def merge_stores(
+                primary: DataStore, secondary: DataStore
+            ) -> DataStore:
+                result = DataStore()
+                for key, value in primary.items():
+                    result.set(key, value)
+                for key, value in secondary.items():
+                    if key not in primary.data:
+                        result.set(key, value)
+                return result
+
+
+            def filter_by_value(
+                store: DataStore, predicate: Any
+            ) -> DataStore:
+                result = DataStore()
+                for key, value in store.items():
+                    if predicate(value):
+                        result.set(key, value)
+                return result
+            """)
+        )
+
+    elif scenario_name == "noisy-worktree-fix":
+        # setup.sh introduced the bug in the working tree without committing it.
+        # First commit the buggy state so auth.py differs from HEAD, then fix and
+        # commit only auth.py — leaving api.py, config.py, utils.py uncommitted.
+        _run("git add auth.py", cwd=workspace)
+        _run(
+            'git commit -q -m "chore: introduce auth bug (test artifact)"',
+            cwd=workspace,
+        )
+        (workspace / "auth.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Authentication utilities.\"\"\"
+
+
+            def validate_email(email: str) -> bool:
+                \"\"\"Return True if email looks valid (must have @ and a dot in the domain).\"\"\"
+                parts = email.split("@")
+                if len(parts) != 2:
+                    return False
+                local, domain = parts
+                return bool(local) and "." in domain
+            """)
+        )
+        _run("git add auth.py", cwd=workspace)
+        _run(
+            'git commit -m "fix(auth): fix email validation to require dot in domain"',
+            cwd=workspace,
+        )
+
     else:
         raise ValueError(f"Unknown scenario: {scenario_name}")
 
@@ -296,6 +631,7 @@ def _get_workspace_files(
 
 
 @pytest.mark.parametrize("scenario", behavioral_tests, ids=lambda t: t["name"])
+@pytest.mark.timeout(30)
 def test_reference_solution_passes_all_checkers(
     tmp_path: Path, scenario: EvalSpec
 ) -> None:
