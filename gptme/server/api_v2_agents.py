@@ -29,7 +29,7 @@ from .openapi_docs import (
 logger = logging.getLogger(__name__)
 
 # Store the initial working directory when the module is imported
-INITIAL_WORKING_DIRECTORY = Path.cwd()
+INITIAL_WORKING_DIRECTORY = Path.cwd().resolve()
 
 
 def slugify_name(name: str) -> str:
@@ -55,8 +55,8 @@ agents_api = flask.Blueprint("agents_api", __name__)
 def api_agents_put():
     """Create a new agent."""
     req_json = flask.request.json
-    if not req_json:
-        return flask.jsonify({"error": "No JSON data provided"}), 400
+    if req_json is None or not isinstance(req_json, dict):
+        return flask.jsonify({"error": "Request body must be a JSON object"}), 400
 
     agent_name = req_json.get("name")
     if not agent_name:
@@ -78,12 +78,40 @@ def api_agents_put():
     if not path:
         # Auto-generate path from initial directory + slugified agent name
         agent_slug = slugify_name(agent_name)
+        if not agent_slug:
+            return (
+                flask.jsonify(
+                    {
+                        "error": "agent name must contain at least one alphanumeric character"
+                    }
+                ),
+                400,
+            )
         path = INITIAL_WORKING_DIRECTORY / agent_slug
     else:
-        path = Path(path).expanduser().resolve()
+        path = Path(path).expanduser()
 
     # Ensure path is a Path object and resolved
-    path = Path(path).expanduser().resolve()
+    path = Path(path).resolve()
+
+    # Validate that the resolved path is within the server's working directory
+    # to prevent creating workspaces at arbitrary filesystem locations
+    try:
+        path.relative_to(INITIAL_WORKING_DIRECTORY)
+    except ValueError:
+        logger.warning(
+            "Rejected agent creation path outside working directory",
+            extra={
+                "requested_path": str(path),
+                "working_directory": str(INITIAL_WORKING_DIRECTORY),
+            },
+        )
+        return (
+            flask.jsonify(
+                {"error": "Path must be within the server working directory"}
+            ),
+            400,
+        )
 
     # Parse project config if provided
     project_config = req_json.get("project_config")

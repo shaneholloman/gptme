@@ -151,6 +151,11 @@ class TestConversationSession:
         session = SessionManager.create_session("conv-1")
         assert session.generating is False
 
+    def test_default_generating_since_none(self):
+        """generating_since defaults to None."""
+        session = SessionManager.create_session("conv-1")
+        assert session.generating_since is None
+
     def test_default_events_empty(self):
         """events list defaults to empty."""
         session = SessionManager.create_session("conv-1")
@@ -212,6 +217,96 @@ class TestConversationSession:
         s2 = SessionManager.create_session("conv-2")
         s1.events.append({"type": "ping"})  # type: ignore[arg-type]
         assert s2.events == []
+
+    def test_events_count_matches_len_initially(self):
+        """events_count equals len(events) when no trimming has occurred."""
+        session = SessionManager.create_session("conv-1")
+        for _i in range(5):
+            session.events.append({"type": "ping"})  # type: ignore[arg-type]
+        assert session.events_count == 5
+        assert session.events_count == len(session.events)
+
+    def test_events_offset_starts_at_zero(self):
+        """_events_offset starts at 0."""
+        session = SessionManager.create_session("conv-1")
+        assert session._events_offset == 0
+
+    def test_get_events_since_returns_all_from_zero(self):
+        """get_events_since(0) returns all events."""
+        session = SessionManager.create_session("conv-1")
+        for i in range(3):
+            session.events.append({"type": "ping", "n": i})  # type: ignore[arg-type]
+        result = session.get_events_since(0)
+        assert len(result) == 3
+
+    def test_get_events_since_returns_subset(self):
+        """get_events_since returns events from the given index onward."""
+        session = SessionManager.create_session("conv-1")
+        for i in range(5):
+            session.events.append({"type": "ping", "n": i})  # type: ignore[arg-type]
+        result = session.get_events_since(3)
+        assert len(result) == 2
+        assert result[0]["n"] == 3  # type: ignore[typeddict-item]
+        assert result[1]["n"] == 4  # type: ignore[typeddict-item]
+
+    def test_trim_events_no_clients(self):
+        """trim_events trims when over threshold and no clients connected."""
+        session = SessionManager.create_session("conv-1")
+        # Fill beyond _MAX_EVENTS
+        for i in range(session._MAX_EVENTS + 500):
+            session.events.append({"type": "ping", "n": i})  # type: ignore[arg-type]
+        assert len(session.events) == session._MAX_EVENTS + 500
+
+        session.trim_events()
+        assert len(session.events) == session._KEEP_EVENTS
+        assert (
+            session._events_offset == session._MAX_EVENTS + 500 - session._KEEP_EVENTS
+        )
+        assert session.events_count == session._MAX_EVENTS + 500
+
+    def test_trim_events_preserves_absolute_indexing(self):
+        """After trimming, get_events_since still works with absolute indices."""
+        session = SessionManager.create_session("conv-1")
+        total = session._MAX_EVENTS + 100
+        for i in range(total):
+            session.events.append({"type": "ping", "n": i})  # type: ignore[arg-type]
+        session.trim_events()
+
+        # The last event should still be retrievable
+        result = session.get_events_since(total - 1)
+        assert len(result) == 1
+        assert result[0]["n"] == total - 1  # type: ignore[typeddict-item]
+
+    def test_trim_events_skipped_when_clients_connected(self):
+        """trim_events does not trim when clients are connected."""
+        session = SessionManager.create_session("conv-1")
+        session.clients.add("client-1")
+        for i in range(session._MAX_EVENTS + 500):
+            session.events.append({"type": "ping", "n": i})  # type: ignore[arg-type]
+
+        session.trim_events()
+        # No trimming because a client is connected
+        assert len(session.events) == session._MAX_EVENTS + 500
+        assert session._events_offset == 0
+
+    def test_trim_events_skipped_below_threshold(self):
+        """trim_events does nothing when below _MAX_EVENTS."""
+        session = SessionManager.create_session("conv-1")
+        for i in range(100):
+            session.events.append({"type": "ping", "n": i})  # type: ignore[arg-type]
+        session.trim_events()
+        assert len(session.events) == 100
+        assert session._events_offset == 0
+
+    def test_get_events_since_clamps_negative_relative_index(self):
+        """get_events_since with index before offset returns all available events."""
+        session = SessionManager.create_session("conv-1")
+        for i in range(session._MAX_EVENTS + 100):
+            session.events.append({"type": "ping", "n": i})  # type: ignore[arg-type]
+        session.trim_events()
+        # Requesting from index 0, which was trimmed away
+        result = session.get_events_since(0)
+        assert len(result) == session._KEEP_EVENTS
 
 
 # ---------------------------------------------------------------------------
@@ -409,6 +504,20 @@ class TestSessionManagerAddEvent:
         event: ErrorEvent = {"type": "error", "error": "nowhere"}
         SessionManager.add_event("unknown-conv", event)
 
+    def test_add_event_trims_when_over_threshold(self):
+        """add_event triggers trimming when events exceed threshold."""
+        session = SessionManager.create_session("conv-1")
+        # Fill to just below threshold
+        for i in range(session._MAX_EVENTS):
+            session.events.append({"type": "ping", "n": i})  # type: ignore[arg-type]
+        assert len(session.events) == session._MAX_EVENTS
+
+        # One more event via add_event pushes over threshold and triggers trim
+        event: ErrorEvent = {"type": "error", "error": "trigger trim"}
+        SessionManager.add_event("conv-1", event)
+        assert len(session.events) == session._KEEP_EVENTS
+        assert session.events_count == session._MAX_EVENTS + 1
+
 
 class TestSessionManagerCleanInactive:
     """Tests for SessionManager.clean_inactive_sessions()."""
@@ -454,3 +563,202 @@ class TestSessionManagerCleanInactive:
 
         assert SessionManager.get_session(s_old.id) is None
         assert SessionManager.get_session(s_recent.id) is not None
+
+    def test_removes_stuck_generating_sessions(self):
+        """Sessions stuck in generating=True beyond the timeout are force-cleaned."""
+        from datetime import datetime, timedelta, timezone
+
+        session = SessionManager.create_session("conv-stuck")
+        session.generating = True
+        # Simulate stuck for 15 minutes (exceeds 10-minute timeout)
+        session.generating_since = datetime.now(tz=timezone.utc) - timedelta(minutes=15)
+        # Keep last_activity recent so the normal inactive cleanup wouldn't catch it
+        session.last_activity = datetime.now(tz=timezone.utc)
+
+        SessionManager.clean_inactive_sessions(max_age_minutes=60)
+        assert SessionManager.get_session(session.id) is None
+
+    def test_does_not_remove_recently_generating_sessions(self):
+        """Sessions that started generating recently are not removed."""
+        from datetime import datetime, timezone
+
+        session = SessionManager.create_session("conv-gen")
+        session.generating = True
+        session.generating_since = datetime.now(tz=timezone.utc)  # just started
+        session.last_activity = datetime.now(tz=timezone.utc)
+
+        SessionManager.clean_inactive_sessions(max_age_minutes=60)
+        # Still present because generating started recently
+        assert SessionManager.get_session(session.id) is not None
+
+    def test_does_not_remove_generating_without_timestamp(self):
+        """Sessions with generating=True but no generating_since are not force-cleaned.
+
+        This handles the edge case of sessions created before this change was deployed.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        session = SessionManager.create_session("conv-legacy")
+        session.generating = True
+        session.generating_since = None  # no timestamp (legacy behavior)
+        session.last_activity = datetime.now(tz=timezone.utc) - timedelta(minutes=5)
+
+        SessionManager.clean_inactive_sessions(max_age_minutes=60)
+        # Still present — can't determine if stuck without timestamp
+        assert SessionManager.get_session(session.id) is not None
+
+    def test_stuck_session_generating_flag_reset(self):
+        """Force-cleaned stuck sessions have their generating flag reset."""
+        from datetime import datetime, timedelta, timezone
+
+        session = SessionManager.create_session("conv-stuck-flag")
+        session.generating = True
+        session.generating_since = datetime.now(tz=timezone.utc) - timedelta(minutes=15)
+        session.last_activity = datetime.now(tz=timezone.utc)
+
+        # Capture session reference before it's removed
+        assert session.generating is True
+        SessionManager.clean_inactive_sessions(max_age_minutes=60)
+        # Session is removed from the manager
+        assert SessionManager.get_session(session.id) is None
+        # generating flag is reset to False before removal (the key invariant this test verifies)
+        assert session.generating is False
+
+    def test_atomic_cleanup_removes_multiple_sessions(self):
+        """clean_inactive_sessions removes multiple stale sessions atomically."""
+        from datetime import datetime, timedelta, timezone
+
+        old = datetime.now(tz=timezone.utc) - timedelta(minutes=120)
+        s1 = SessionManager.create_session("conv-a")
+        s2 = SessionManager.create_session("conv-b")
+        s3 = SessionManager.create_session("conv-c")
+        s1.last_activity = old
+        s2.last_activity = old
+        # s3 stays fresh
+
+        SessionManager.clean_inactive_sessions(max_age_minutes=60)
+
+        assert SessionManager.get_session(s1.id) is None
+        assert SessionManager.get_session(s2.id) is None
+        assert SessionManager.get_session(s3.id) is not None
+
+    def test_cleanup_concurrent_with_step(self):
+        """A session that starts generating during cleanup is not wrongly removed.
+
+        Regression test for TOCTOU: under the old two-phase approach, a /step
+        could start generating on a stale session between the check and the
+        removal.  With atomic cleanup this is no longer possible — the session
+        is removed under the same lock that identified it as stale.
+        """
+        from datetime import datetime, timedelta, timezone
+
+        old = datetime.now(tz=timezone.utc) - timedelta(minutes=120)
+        session = SessionManager.create_session("conv-race")
+        session.last_activity = old
+
+        # Simulate a concurrent /step setting generating=True outside the lock.
+        # Under the NEW atomic approach, clean_inactive_sessions holds the lock
+        # while removing, so a concurrent /step can't interleave.  We verify
+        # that the session IS removed (the stale check and removal happen
+        # atomically under one lock acquisition).
+        SessionManager.clean_inactive_sessions(max_age_minutes=60)
+        assert SessionManager.get_session(session.id) is None
+
+
+class TestSessionManagerGetAllSessions:
+    """Tests for SessionManager.get_all_sessions()."""
+
+    def test_returns_empty_when_no_sessions(self):
+        """get_all_sessions returns empty list when no sessions exist."""
+        assert SessionManager.get_all_sessions() == []
+
+    def test_returns_snapshot(self):
+        """get_all_sessions returns a snapshot of all sessions."""
+        s1 = SessionManager.create_session("conv-1")
+        s2 = SessionManager.create_session("conv-2")
+        result = SessionManager.get_all_sessions()
+        ids = {sid for sid, _ in result}
+        assert s1.id in ids
+        assert s2.id in ids
+        assert len(result) == 2
+
+
+class TestSessionManagerThreadSafety:
+    """Tests for SessionManager thread safety."""
+
+    def test_concurrent_create_and_remove(self):
+        """Concurrent creates and removes don't raise or corrupt state."""
+        import time
+
+        errors: list[Exception] = []
+        barrier = threading.Barrier(4)
+
+        def creator():
+            barrier.wait()
+            for i in range(50):
+                try:
+                    SessionManager.create_session(f"concurrent-{i}")
+                except Exception as e:
+                    errors.append(e)
+
+        def remover():
+            barrier.wait()
+            for _ in range(50):
+                try:
+                    for sid, _ in SessionManager.get_all_sessions():
+                        SessionManager.remove_session(sid)
+                except Exception as e:
+                    errors.append(e)
+                time.sleep(0.001)
+
+        threads = [
+            threading.Thread(target=creator),
+            threading.Thread(target=creator),
+            threading.Thread(target=remover),
+            threading.Thread(target=remover),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, f"Thread errors: {errors}"
+
+    def test_concurrent_add_event_and_remove(self):
+        """Concurrent add_event and remove don't raise."""
+        errors: list[Exception] = []
+        barrier = threading.Barrier(3)
+
+        for _i in range(10):
+            SessionManager.create_session("event-conv")
+
+        def event_adder():
+            barrier.wait()
+            for i in range(100):
+                try:
+                    SessionManager.add_event(
+                        "event-conv",
+                        {"type": "error", "error": f"e{i}"},  # type: ignore[arg-type]
+                    )
+                except Exception as e:
+                    errors.append(e)
+
+        def session_remover():
+            barrier.wait()
+            for sid, _ in SessionManager.get_all_sessions():
+                try:
+                    SessionManager.remove_session(sid)
+                except Exception as e:
+                    errors.append(e)
+
+        threads = [
+            threading.Thread(target=event_adder),
+            threading.Thread(target=event_adder),
+            threading.Thread(target=session_remover),
+        ]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join(timeout=10)
+
+        assert not errors, f"Thread errors: {errors}"

@@ -1,17 +1,22 @@
 from types import SimpleNamespace
 
 from gptme.eval.suites.behavioral import (
+    check_all_functions_have_docstrings,
+    check_apply_updates_returns_new_dict,
     check_compat_has_default_param,
     check_compat_new_tests_exist,
     check_compat_original_tests_intact,
     check_compat_tests_pass,
+    check_compute_stats_all_documented,
     check_config_catches_json_error,
     check_config_no_bare_except,
     check_config_propagates_file_error,
     check_config_tests_pass,
+    check_dead_code_removed,
     check_debug_fix_in_file,
     check_debug_no_syntax_error,
     check_debug_tests_pass,
+    check_docstring_tests_pass,
     check_error_handling_parse_csv,
     check_error_handling_safe_divide,
     check_error_handling_source_unchanged,
@@ -24,6 +29,8 @@ from gptme.eval.suites.behavioral import (
     check_git_selective_commit_msg,
     check_git_selective_config_not_committed,
     check_git_selective_tests_pass,
+    check_independent_calls_verified,
+    check_live_functions_intact,
     check_logging_debug_or_info_used,
     check_logging_error_level_used,
     check_logging_module_imported,
@@ -34,14 +41,21 @@ from gptme.eval.suites.behavioral import (
     check_merge_null_safety,
     check_merge_tests_pass,
     check_merge_upper_function,
+    check_mutable_default_tests_pass,
+    check_mutation_tests_pass,
+    check_no_mutable_default_arg,
+    check_no_nested_loop,
     check_noisy_worktree_api_not_committed,
     check_noisy_worktree_auth_committed,
     check_noisy_worktree_config_not_committed,
     check_noisy_worktree_fix_correct,
     check_noisy_worktree_tests_pass,
+    check_parse_args_documented,
+    check_parse_returns_documented,
     check_pipeline_extract_emails_fixed,
     check_pipeline_source_unchanged,
     check_pipeline_tests_pass,
+    check_processor_unchanged,
     check_rename_new_name_in_geometry,
     check_rename_no_old_name,
     check_rename_test_uses_new_name,
@@ -60,9 +74,12 @@ from gptme.eval.suites.behavioral import (
     check_security_no_direct_join,
     check_security_tests_pass,
     check_security_uses_realpath,
+    check_signature_preserved,
     check_stage_file_has_double,
     check_stage_new_file_committed,
     check_stage_two_commits,
+    check_tag_records_no_in_place_append,
+    check_test_file_unchanged,
     check_testability_generate_report_preserved,
     check_testability_has_pure_function,
     check_testability_no_file_io_in_unit_tests,
@@ -73,6 +90,9 @@ from gptme.eval.suites.behavioral import (
     check_typehints_function_returns_annotated,
     check_typehints_mypy_passes,
     check_typehints_uses_generic_collection,
+    check_uses_efficient_structure,
+    check_uses_none_sentinel,
+    check_validate_email_raises_documented,
     check_write_tests_covers_extract_emails,
     check_write_tests_covers_truncate,
     check_write_tests_covers_word_count,
@@ -1883,3 +1903,564 @@ def test_check_noisy_worktree_fix_correct_still_buggy():
 def test_check_noisy_worktree_fix_correct_missing_file():
     # No auth.py in files → buggy pattern absent → passes
     assert check_noisy_worktree_fix_correct(_ctx(files={}))
+
+
+# --- fix-data-mutation scenario ---
+
+_RECORDS_BUGGY = """\
+def tag_records(records: list, tag: str) -> list:
+    for record in records:
+        record["tags"].append(tag)
+    return records
+
+def apply_updates(state: dict, updates: dict) -> dict:
+    state.update(updates)
+    return state
+"""
+
+_RECORDS_BUGGY_AUGMENTED = """\
+def tag_records(records: list, tag: str) -> list:
+    for record in records:
+        record["tags"] += [tag]
+    return records
+
+def apply_updates(state: dict, updates: dict) -> dict:
+    state.update(updates)
+    return state
+"""
+
+_RECORDS_FIXED = """\
+def tag_records(records: list, tag: str) -> list:
+    return [{**record, "tags": [*record["tags"], tag]} for record in records]
+
+def apply_updates(state: dict, updates: dict) -> dict:
+    return {**state, **updates}
+"""
+
+_RECORDS_FIXED_COPY_UPDATE = """\
+def tag_records(records: list, tag: str) -> list:
+    return [{**record, "tags": [*record["tags"], tag]} for record in records]
+
+def apply_updates(state: dict, updates: dict) -> dict:
+    state = state.copy()
+    state.update(updates)
+    return state
+"""
+
+_TEST_RECORDS_ORIGINAL = """\
+from records import tag_records, apply_updates
+
+def test_tag_records_does_not_mutate_input():
+    originals = [{"name": "a", "tags": ["x"]}]
+    tag_records(originals, "extra")
+    assert originals[0]["tags"] == ["x"]
+
+def test_apply_updates_does_not_mutate_input():
+    state = {"x": 1, "y": 2}
+    apply_updates(state, {"y": 99})
+    assert state["y"] == 2
+"""
+
+_TEST_RECORDS_STRIPPED = """\
+from records import tag_records, apply_updates
+
+def test_basic():
+    pass
+"""
+
+
+def test_check_mutation_tests_pass_when_ok():
+    assert check_mutation_tests_pass(_ctx(exit_code=0, stdout="4 passed"))
+
+
+def test_check_mutation_tests_pass_when_failed():
+    assert not check_mutation_tests_pass(_ctx(exit_code=1, stdout="2 failed, 2 passed"))
+
+
+def test_check_tag_records_no_in_place_append_fixed():
+    assert check_tag_records_no_in_place_append(
+        _ctx(files={"records.py": _RECORDS_FIXED})
+    )
+
+
+def test_check_tag_records_no_in_place_append_buggy():
+    assert not check_tag_records_no_in_place_append(
+        _ctx(files={"records.py": _RECORDS_BUGGY})
+    )
+
+
+def test_check_tag_records_no_in_place_append_augmented_assign():
+    """+=  is also in-place mutation — should be caught."""
+    assert not check_tag_records_no_in_place_append(
+        _ctx(files={"records.py": _RECORDS_BUGGY_AUGMENTED})
+    )
+
+
+def test_check_apply_updates_returns_new_dict_fixed():
+    assert check_apply_updates_returns_new_dict(
+        _ctx(files={"records.py": _RECORDS_FIXED})
+    )
+
+
+def test_check_apply_updates_returns_new_dict_copy_then_update():
+    """copy-then-update is a valid fix even though state.update() is still present."""
+    assert check_apply_updates_returns_new_dict(
+        _ctx(files={"records.py": _RECORDS_FIXED_COPY_UPDATE})
+    )
+
+
+def test_check_apply_updates_returns_new_dict_buggy():
+    assert not check_apply_updates_returns_new_dict(
+        _ctx(files={"records.py": _RECORDS_BUGGY})
+    )
+
+
+def test_check_test_file_unchanged_original():
+    assert check_test_file_unchanged(
+        _ctx(files={"test_records.py": _TEST_RECORDS_ORIGINAL})
+    )
+
+
+def test_check_test_file_unchanged_stripped():
+    assert not check_test_file_unchanged(
+        _ctx(files={"test_records.py": _TEST_RECORDS_STRIPPED})
+    )
+
+
+def test_check_test_file_unchanged_empty():
+    assert not check_test_file_unchanged(_ctx(files={}))
+
+
+# ── optimize-n-squared checkers ───────────────────────────────────────────
+
+_ANALYTICS_ORIGINAL = """\
+def find_duplicates(items: list) -> list:
+    duplicates = []
+    for i, item in enumerate(items):
+        if item not in duplicates:
+            for j, other in enumerate(items):
+                if i != j and item == other:
+                    duplicates.append(item)
+                    break
+    return sorted(duplicates)
+"""
+
+_ANALYTICS_COUNTER = """\
+from collections import Counter
+
+def find_duplicates(items: list) -> list:
+    return sorted(k for k, v in Counter(items).items() if v > 1)
+"""
+
+_ANALYTICS_SET = """\
+def find_duplicates(items: list) -> list:
+    seen = set()
+    dupes = set()
+    for item in items:
+        if item in seen:
+            dupes.add(item)
+        seen.add(item)
+    return sorted(dupes)
+"""
+
+
+def test_check_no_nested_loop_detects_original():
+    assert not check_no_nested_loop(_ctx(files={"analytics.py": _ANALYTICS_ORIGINAL}))
+
+
+def test_check_no_nested_loop_accepts_counter():
+    assert check_no_nested_loop(_ctx(files={"analytics.py": _ANALYTICS_COUNTER}))
+
+
+def test_check_no_nested_loop_accepts_set_approach():
+    assert check_no_nested_loop(_ctx(files={"analytics.py": _ANALYTICS_SET}))
+
+
+def test_check_uses_efficient_structure_original():
+    assert not check_uses_efficient_structure(
+        _ctx(files={"analytics.py": _ANALYTICS_ORIGINAL})
+    )
+
+
+def test_check_uses_efficient_structure_counter():
+    assert check_uses_efficient_structure(
+        _ctx(files={"analytics.py": _ANALYTICS_COUNTER})
+    )
+
+
+def test_check_uses_efficient_structure_set():
+    assert check_uses_efficient_structure(_ctx(files={"analytics.py": _ANALYTICS_SET}))
+
+
+def test_check_signature_preserved_original():
+    assert check_signature_preserved(_ctx(files={"analytics.py": _ANALYTICS_ORIGINAL}))
+
+
+def test_check_signature_preserved_counter():
+    assert check_signature_preserved(_ctx(files={"analytics.py": _ANALYTICS_COUNTER}))
+
+
+def test_check_signature_preserved_missing():
+    assert not check_signature_preserved(_ctx(files={"analytics.py": ""}))
+
+
+# ── remove-dead-code ──────────────────────────────────────────────────────────
+
+_UTILS_WITH_DEAD = """\
+def parse_record(data):
+    return {"id": data["id"], "value": _normalize_value(data.get("value", "")), "valid": validate_record(data)}
+
+def validate_record(data):
+    return "id" in data and "value" in data
+
+def _normalize_value(value):
+    return value.strip().lower()
+
+def _batch_normalize(items):
+    return [_normalize_value(item) for item in items]
+"""
+
+_UTILS_WITHOUT_DEAD = """\
+def parse_record(data):
+    return {"id": data["id"], "value": _normalize_value(data.get("value", "")), "valid": validate_record(data)}
+
+def validate_record(data):
+    return "id" in data and "value" in data
+
+def _normalize_value(value):
+    return value.strip().lower()
+"""
+
+_PROCESSOR_ORIGINAL = """\
+from utils import parse_record
+
+def process_records(raw_records):
+    results = []
+    for record in raw_records:
+        parsed = parse_record(record)
+        if parsed["valid"]:
+            results.append(parsed)
+    return results
+"""
+
+
+def test_check_dead_code_removed_detects_function():
+    assert not check_dead_code_removed(_ctx(files={"utils.py": _UTILS_WITH_DEAD}))
+
+
+def test_check_dead_code_removed_passes_when_removed():
+    assert check_dead_code_removed(_ctx(files={"utils.py": _UTILS_WITHOUT_DEAD}))
+
+
+def test_check_dead_code_removed_empty_file():
+    assert check_dead_code_removed(_ctx(files={"utils.py": ""}))
+
+
+def test_check_live_functions_intact_with_all():
+    assert check_live_functions_intact(_ctx(files={"utils.py": _UTILS_WITHOUT_DEAD}))
+
+
+def test_check_live_functions_intact_missing_one():
+    content = "def parse_record(data): pass\ndef validate_record(data): pass\n"
+    assert not check_live_functions_intact(_ctx(files={"utils.py": content}))
+
+
+def test_check_processor_unchanged_original():
+    assert check_processor_unchanged(_ctx(files={"processor.py": _PROCESSOR_ORIGINAL}))
+
+
+def test_check_processor_unchanged_missing():
+    assert not check_processor_unchanged(_ctx(files={"processor.py": ""}))
+
+
+# ── fix-mutable-default ───────────────────────────────────────────────────────
+
+_MUTABLE_DEFAULT_BUGGY = """\
+def collect_records(items, result=[]):
+    for item in items:
+        stripped = item.strip()
+        if stripped:
+            result.append(stripped)
+    return result
+
+
+def deduplicate(items, seen=[]):
+    for item in items:
+        if item not in seen:
+            seen.append(item)
+    return seen
+"""
+
+_MUTABLE_DEFAULT_FIXED = """\
+def collect_records(items, result=None):
+    if result is None:
+        result = []
+    for item in items:
+        stripped = item.strip()
+        if stripped:
+            result.append(stripped)
+    return result
+
+
+def deduplicate(items, seen=None):
+    if seen is None:
+        seen = []
+    for item in items:
+        if item not in seen:
+            seen.append(item)
+    return seen
+"""
+
+_MUTABLE_DEFAULT_FIXED_ALT = """\
+def collect_records(items, result=None):
+    out = result if result is not None else []
+    for item in items:
+        stripped = item.strip()
+        if stripped:
+            out.append(stripped)
+    return out
+
+
+def deduplicate(items, seen=None):
+    unique = seen if seen is not None else []
+    for item in items:
+        if item not in unique:
+            unique.append(item)
+    return unique
+"""
+
+_TESTS_PASSED_OUTPUT = """\
+test_collect_basic PASSED
+test_collect_strips_whitespace PASSED
+test_collect_skips_empty PASSED
+test_collect_independent_calls PASSED
+test_deduplicate_basic PASSED
+test_deduplicate_preserves_order PASSED
+test_deduplicate_independent_calls PASSED
+7 passed in 0.05s
+"""
+
+_TESTS_FAILED_OUTPUT = """\
+test_collect_independent_calls FAILED
+test_deduplicate_independent_calls FAILED
+5 passed, 2 failed in 0.04s
+"""
+
+
+def test_check_mutable_default_tests_pass_success():
+    assert check_mutable_default_tests_pass(
+        _ctx(stdout=_TESTS_PASSED_OUTPUT, exit_code=0)
+    )
+
+
+def test_check_mutable_default_tests_pass_failure():
+    assert not check_mutable_default_tests_pass(
+        _ctx(stdout=_TESTS_FAILED_OUTPUT, exit_code=1)
+    )
+
+
+def test_check_mutable_default_tests_pass_no_passed_word():
+    assert not check_mutable_default_tests_pass(_ctx(stdout="", exit_code=0))
+
+
+def test_check_no_mutable_default_arg_detects_list():
+    assert not check_no_mutable_default_arg(
+        _ctx(files={"records.py": _MUTABLE_DEFAULT_BUGGY})
+    )
+
+
+def test_check_no_mutable_default_arg_passes_fixed():
+    assert check_no_mutable_default_arg(
+        _ctx(files={"records.py": _MUTABLE_DEFAULT_FIXED})
+    )
+
+
+def test_check_no_mutable_default_arg_passes_alt_fixed():
+    assert check_no_mutable_default_arg(
+        _ctx(files={"records.py": _MUTABLE_DEFAULT_FIXED_ALT})
+    )
+
+
+def test_check_no_mutable_default_arg_empty_file():
+    assert check_no_mutable_default_arg(_ctx(files={"records.py": ""}))
+
+
+def test_check_uses_none_sentinel_fixed():
+    assert check_uses_none_sentinel(_ctx(files={"records.py": _MUTABLE_DEFAULT_FIXED}))
+
+
+def test_check_uses_none_sentinel_buggy():
+    assert not check_uses_none_sentinel(
+        _ctx(files={"records.py": _MUTABLE_DEFAULT_BUGGY})
+    )
+
+
+def test_check_uses_none_sentinel_alt_fixed():
+    assert check_uses_none_sentinel(
+        _ctx(files={"records.py": _MUTABLE_DEFAULT_FIXED_ALT})
+    )
+
+
+def test_check_independent_calls_verified_both_pass():
+    output = (
+        "test_collect_independent_calls PASSED\n"
+        "test_deduplicate_independent_calls PASSED\n"
+        "7 passed in 0.05s\n"
+    )
+    assert check_independent_calls_verified(_ctx(stdout=output, exit_code=0))
+
+
+def test_check_independent_calls_verified_one_fails():
+    output = (
+        "test_collect_independent_calls PASSED\n"
+        "test_deduplicate_independent_calls FAILED\n"
+        "6 passed, 1 failed\n"
+    )
+    assert not check_independent_calls_verified(_ctx(stdout=output, exit_code=1))
+
+
+def test_check_independent_calls_verified_missing():
+    assert not check_independent_calls_verified(_ctx(stdout="7 passed", exit_code=0))
+
+
+# --- add-docstrings scenario tests ---
+
+_UTILS_WITH_DOCSTRINGS = '''\
+import re
+
+
+def parse_args(input_str):
+    """Parse a shell-like argument string into a list of tokens.
+
+    Handles quoted strings (both single and double quotes) as single arguments.
+    Whitespace outside quotes separates arguments.
+
+    Args:
+        input_str: The input string to parse.
+
+    Returns:
+        A list of string tokens extracted from the input.
+    """
+    parts = []
+    current = ""
+    in_quotes = False
+    quote_char = None
+    for ch in input_str:
+        if ch in ('"', "'") and not in_quotes:
+            in_quotes = True
+            quote_char = ch
+        elif ch == quote_char and in_quotes:
+            in_quotes = False
+            quote_char = None
+        elif ch == " " and not in_quotes:
+            if current:
+                parts.append(current)
+                current = ""
+        else:
+            current += ch
+    if current:
+        parts.append(current)
+    return parts
+
+
+def validate_email(email):
+    """Validate and normalize an email address.
+
+    Checks basic email format and normalizes to lowercase.
+
+    Args:
+        email: The email address to validate.
+
+    Returns:
+        The normalized lowercase email address.
+
+    Raises:
+        ValueError: If email is empty, missing @, has empty local/domain parts,
+            or contains invalid characters.
+    """
+    if not email or "@" not in email:
+        raise ValueError(f"Invalid email: {email}")
+    local, domain = email.rsplit("@", 1)
+    if not local or not domain:
+        raise ValueError(f"Invalid email: {email}")
+    if not re.match(r"^[\\w.-]+$", local):
+        raise ValueError(f"Invalid email local part: {local}")
+    if "." not in domain:
+        raise ValueError(f"Invalid email domain: {domain}")
+    return email.lower()
+
+
+def compute_stats(numbers):
+    """Compute basic statistics for a list of numbers.
+
+    >>> compute_stats([1, 2, 3, 4, 5])
+    {\'mean\': 3.0, \'median\': 3.0, \'count\': 5}
+
+    Args:
+        numbers: A list of numeric values.
+
+    Returns:
+        A dict with keys "mean", "median", and "count".
+    """
+    if not numbers:
+        return {"mean": 0, "median": 0, "count": 0}
+    return {"mean": 3.0, "median": 3.0, "count": 5}
+'''
+
+
+def test_check_docstring_tests_pass():
+    assert check_docstring_tests_pass(_ctx(exit_code=0, stdout="all passed"))
+    assert not check_docstring_tests_pass(_ctx(exit_code=1, stdout="1 failed"))
+
+
+def test_check_all_functions_have_docstrings_true():
+    assert check_all_functions_have_docstrings(
+        _ctx(files={"utils.py": _UTILS_WITH_DOCSTRINGS})
+    )
+
+
+def test_check_all_functions_have_docstrings_false():
+    content = "def parse_args(input_str):\n    parts = []\n    return parts\n"
+    assert not check_all_functions_have_docstrings(_ctx(files={"utils.py": content}))
+
+
+def test_check_parse_args_documented_true():
+    assert check_parse_args_documented(_ctx(files={"utils.py": _UTILS_WITH_DOCSTRINGS}))
+
+
+def test_check_parse_args_documented_false():
+    content = 'def parse_args(input_str):\n    """Just a summary."""\n    pass\n'
+    assert not check_parse_args_documented(_ctx(files={"utils.py": content}))
+
+
+def test_check_parse_returns_documented_true():
+    assert check_parse_returns_documented(
+        _ctx(files={"utils.py": _UTILS_WITH_DOCSTRINGS})
+    )
+
+
+def test_check_parse_returns_documented_false():
+    content = 'def parse_args(input_str):\n    """Args: input_str - the string."""\n    pass\n'
+    assert not check_parse_returns_documented(_ctx(files={"utils.py": content}))
+
+
+def test_check_validate_email_raises_documented_true():
+    assert check_validate_email_raises_documented(
+        _ctx(files={"utils.py": _UTILS_WITH_DOCSTRINGS})
+    )
+
+
+def test_check_validate_email_raises_documented_false():
+    content = 'def validate_email(email):\n    """Validates email."""\n    pass\n'
+    assert not check_validate_email_raises_documented(_ctx(files={"utils.py": content}))
+
+
+def test_check_compute_stats_all_documented_true():
+    assert check_compute_stats_all_documented(
+        _ctx(files={"utils.py": _UTILS_WITH_DOCSTRINGS})
+    )
+
+
+def test_check_compute_stats_all_documented_false():
+    content = 'def compute_stats(numbers):\n    """Compute stats."""\n    return {}\n'
+    assert not check_compute_stats_all_documented(_ctx(files={"utils.py": content}))

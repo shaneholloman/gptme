@@ -189,7 +189,12 @@ def _translate_cursor_metadata(frontmatter: dict) -> LessonMetadata:
 
     # Translate globs to keywords
     # Note: YAML parses empty values (e.g., "globs:") as None, not missing
+    # Validate: bare string "globs: *.py" must become ["*.py"], not char iteration
     globs = frontmatter.get("globs") or []
+    if isinstance(globs, str):
+        globs = [globs]
+    elif not isinstance(globs, list):
+        globs = []
     keywords = []
     for glob in globs:
         keywords.extend(_glob_to_keywords(glob))
@@ -206,7 +211,12 @@ def _translate_cursor_metadata(frontmatter: dict) -> LessonMetadata:
 
     # Extract other Cursor-specific fields
     # Note: YAML parses empty values as None, not missing
+    # Validate: bare string "triggers: file_change" must become ["file_change"]
     triggers = frontmatter.get("triggers") or []
+    if isinstance(triggers, str):
+        triggers = [triggers]
+    elif not isinstance(triggers, list):
+        triggers = []
     version = frontmatter.get("version")
 
     return LessonMetadata(
@@ -363,6 +373,16 @@ def parse_lesson(path: Path) -> Lesson:
                             d for d in raw_depends if isinstance(d, str) and d.strip()
                         ]
 
+                        # Validate and filter tools (must be non-empty strings)
+                        raw_tools = match_data.get("tools", [])
+                        if isinstance(raw_tools, str):
+                            raw_tools = [raw_tools]
+                        elif not isinstance(raw_tools, list):
+                            raw_tools = []
+                        tools = [
+                            t for t in raw_tools if isinstance(t, str) and t.strip()
+                        ]
+
                         metadata = LessonMetadata(
                             name=name,
                             description=description,
@@ -370,7 +390,7 @@ def parse_lesson(path: Path) -> Lesson:
                             depends=depends,
                             keywords=keywords,
                             patterns=patterns,
-                            tools=match_data.get("tools", []),
+                            tools=tools,
                             status=status,
                         )
             except yaml.YAMLError as e:

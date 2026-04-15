@@ -69,8 +69,12 @@ class ConversationSession(BaseSession):
 
     # Server-specific fields (all have defaults, required for dataclass inheritance)
     generating: bool = False
+    generating_since: datetime | None = (
+        None  # When generation started (for stuck detection)
+    )
     last_error: str | None = None
     events: list[EventType] = field(default_factory=list)
+    _events_offset: int = 0  # number of events trimmed from front of list
     pending_tools: dict[str, ToolExecution] = field(default_factory=dict)
     auto_confirm_count: int = 0
     clients: set[str] = field(default_factory=set)
@@ -86,113 +90,235 @@ class ConversationSession(BaseSession):
     # Prevents duplicate /step calls from re-sending the same user message.
     acp_last_user_msg_index: int = -1
 
+    # Maximum events to keep in memory per session before trimming.
+    # Each LLM token generates one event, so a 10K-token response = 10K events.
+    # At ~200 bytes/event, 10K events ≈ 2MB. We trim to keep_last when exceeded.
+    _MAX_EVENTS = 10_000
+    _KEEP_EVENTS = 1_000
+
+    @property
+    def events_count(self) -> int:
+        """Absolute event count (including trimmed events)."""
+        return self._events_offset + len(self.events)
+
+    def get_events_since(self, abs_index: int) -> list[EventType]:
+        """Get events from an absolute index (accounting for trimmed events)."""
+        rel_index = max(0, abs_index - self._events_offset)
+        return self.events[rel_index:]
+
+    def trim_events(self) -> None:
+        """Trim old events when the list exceeds _MAX_EVENTS.
+
+        Only trims when no clients are connected to avoid breaking
+        in-flight SSE streams that reference absolute indices.
+        """
+        if len(self.events) <= self._MAX_EVENTS or self.clients:
+            return
+        trim_count = len(self.events) - self._KEEP_EVENTS
+        self._events_offset += trim_count
+        self.events = self.events[trim_count:]
+
 
 class SessionManager:
-    """Manages conversation sessions."""
+    """Manages conversation sessions.
+
+    Thread-safe: all access to ``_sessions`` and ``_conversation_sessions``
+    is serialized through ``_lock``.  Long-running side-effects (hook
+    triggers, ACP runtime cleanup) run outside the lock to avoid blocking
+    concurrent readers.
+    """
 
     _sessions: dict[str, ConversationSession] = {}
     _conversation_sessions: dict[str, set[str]] = defaultdict(set)
+    _lock = threading.Lock()
 
     @classmethod
     def create_session(cls, conversation_id: str) -> ConversationSession:
         """Create a new session for a conversation."""
         session_id = str(uuid.uuid4())
         session = ConversationSession(id=session_id, conversation_id=conversation_id)
-        cls._sessions[session_id] = session
-        cls._conversation_sessions[conversation_id].add(session_id)
+        with cls._lock:
+            cls._sessions[session_id] = session
+            cls._conversation_sessions[conversation_id].add(session_id)
         return session
 
     @classmethod
     def get_session(cls, session_id: str) -> ConversationSession | None:
         """Get a session by ID."""
-        return cls._sessions.get(session_id)
+        with cls._lock:
+            return cls._sessions.get(session_id)
+
+    @classmethod
+    def get_all_sessions(cls) -> list[tuple[str, ConversationSession]]:
+        """Return a snapshot of all (session_id, session) pairs."""
+        with cls._lock:
+            return list(cls._sessions.items())
 
     @classmethod
     def get_sessions_for_conversation(
         cls, conversation_id: str
     ) -> list[ConversationSession]:
         """Get all sessions for a conversation."""
-        # Snapshot the set with list() to prevent RuntimeError if another thread
-        # modifies _conversation_sessions during iteration (e.g. remove_session).
-        return [
-            cls._sessions[sid]
-            for sid in list(cls._conversation_sessions.get(conversation_id, set()))
-            if sid in cls._sessions
-        ]
+        with cls._lock:
+            return [
+                cls._sessions[sid]
+                for sid in list(cls._conversation_sessions.get(conversation_id, set()))
+                if sid in cls._sessions
+            ]
 
     @classmethod
     def add_event(cls, conversation_id: str, event: EventType) -> None:
         """Add an event to all sessions for a conversation."""
-        for session in cls.get_sessions_for_conversation(conversation_id):
+        sessions = cls.get_sessions_for_conversation(conversation_id)
+        for session in sessions:
             session.events.append(event)
-            session.touch()  # Update last_activity timestamp
-            session.event_flag.set()  # Signal that new events are available
+            session.trim_events()
+            session.touch()
+            session.event_flag.set()
+
+    _STUCK_GENERATING_TIMEOUT_MINUTES = 10
 
     @classmethod
     def clean_inactive_sessions(cls, max_age_minutes: int = 60) -> None:
-        """Clean up inactive sessions."""
-        cutoff = datetime.now(tz=timezone.utc) - timedelta(minutes=max_age_minutes)
-        to_remove = []
+        """Clean up inactive sessions.
 
-        for session_id, session in list(cls._sessions.items()):
-            if session.last_activity < cutoff and not session.generating:
-                to_remove.append(session_id)
+        Also detects sessions stuck in generating=True state: if a session has
+        been generating for longer than _STUCK_GENERATING_TIMEOUT_MINUTES, it is
+        force-cleaned to prevent permanent resource leaks.
 
-        for session_id in to_remove:
-            cls.remove_session(session_id)
+        Removal is performed atomically under a single lock acquisition to
+        prevent a TOCTOU race where a concurrent ``/step`` could start
+        generating on a session between the staleness check and its removal.
+        Side-effects (hook triggers, ACP cleanup) run after the lock is
+        released.
+        """
+        now = datetime.now(tz=timezone.utc)
+        cutoff = now - timedelta(minutes=max_age_minutes)
+        stuck_cutoff = now - timedelta(minutes=cls._STUCK_GENERATING_TIMEOUT_MINUTES)
 
-    @classmethod
-    def remove_session(cls, session_id: str) -> None:
-        """Remove a session."""
-        if session_id in cls._sessions:
-            conversation_id = cls._sessions[session_id].conversation_id
-            if conversation_id is None:
-                raise ValueError("Server sessions must have conversation_id")
+        # Collect post-lock work: (conversation_id, is_last, acp_runtime)
+        deferred: list[tuple[str, bool, AcpSessionRuntime | None]] = []
 
-            # Trigger SESSION_END hook when removing the last session for a conversation
-            is_last_session = (
-                conversation_id in cls._conversation_sessions
-                and len(cls._conversation_sessions[conversation_id]) == 1
-                and session_id in cls._conversation_sessions[conversation_id]
-            )
+        with cls._lock:
+            to_remove: list[str] = []
+            for session_id, session in cls._sessions.items():
+                if session.last_activity < cutoff and not session.generating:
+                    to_remove.append(session_id)
+                elif (
+                    session.generating
+                    and session.generating_since is not None
+                    and session.generating_since < stuck_cutoff
+                ):
+                    logger.warning(
+                        "Force-cleaning stuck session %s (generating since %s, "
+                        "exceeded %d min timeout)",
+                        session_id,
+                        session.generating_since.isoformat(),
+                        cls._STUCK_GENERATING_TIMEOUT_MINUTES,
+                    )
+                    session.generating = False
+                    to_remove.append(session_id)
 
-            if is_last_session:
+            # Remove all identified sessions while still holding the lock.
+            for session_id in to_remove:
+                session = cls._sessions[session_id]
+                conversation_id = session.conversation_id
+                if conversation_id is None:
+                    raise ValueError("Server sessions must have conversation_id")
+
+                is_last = (
+                    conversation_id in cls._conversation_sessions
+                    and len(cls._conversation_sessions[conversation_id]) == 1
+                    and session_id in cls._conversation_sessions[conversation_id]
+                )
+
+                if conversation_id in cls._conversation_sessions:
+                    cls._conversation_sessions[conversation_id].discard(session_id)
+                    if not cls._conversation_sessions[conversation_id]:
+                        del cls._conversation_sessions[conversation_id]
+
+                acp_rt = session.acp_runtime
+                del cls._sessions[session_id]
+                deferred.append((conversation_id, is_last, acp_rt))
+
+        # Phase 2: outside lock — long-running side-effects
+        for conversation_id, is_last, acp_rt in deferred:
+            if is_last:
                 try:
-                    # Load the conversation to trigger the hook
                     from ..logmanager import LogManager
 
                     manager = LogManager.load(conversation_id, lock=True)
-
                     logger.debug(
-                        f"Last session for conversation {conversation_id}, triggering SESSION_END hook"
+                        "Last session for conversation %s, triggering SESSION_END hook",
+                        conversation_id,
                     )
                     if session_end_msgs := trigger_hook(
                         HookType.SESSION_END,
                         manager=manager,
                     ):
                         for msg in session_end_msgs:
-                            manager.append(
-                                msg
-                            )  # Just append, no notify needed during cleanup
+                            manager.append(msg)
                 except Exception as e:
                     logger.warning(f"Failed to trigger SESSION_END hook: {e}")
+
+            if acp_rt is not None:
+                from .session_step import close_acp_runtime_bg
+
+                close_acp_runtime_bg(acp_rt)
+
+    @classmethod
+    def remove_session(cls, session_id: str) -> None:
+        """Remove a session.
+
+        Dict mutations happen under ``_lock``; hook triggers and ACP cleanup
+        run after the lock is released to avoid blocking other threads.
+        """
+        # Phase 1: under lock — gather info and remove from dicts
+        with cls._lock:
+            if session_id not in cls._sessions:
+                return
+            session = cls._sessions[session_id]
+            conversation_id = session.conversation_id
+            if conversation_id is None:
+                raise ValueError("Server sessions must have conversation_id")
+
+            is_last_session = (
+                conversation_id in cls._conversation_sessions
+                and len(cls._conversation_sessions[conversation_id]) == 1
+                and session_id in cls._conversation_sessions[conversation_id]
+            )
 
             if conversation_id in cls._conversation_sessions:
                 cls._conversation_sessions[conversation_id].discard(session_id)
                 if not cls._conversation_sessions[conversation_id]:
                     del cls._conversation_sessions[conversation_id]
 
-            # Close ACP runtime if present
-            acp_rt = cls._sessions[session_id].acp_runtime
-            if acp_rt is not None:
-                # Function-level import to avoid circular dependency:
-                # session_step imports session_models, so session_models
-                # cannot import session_step at module level.
-                from .session_step import close_acp_runtime_bg
-
-                close_acp_runtime_bg(acp_rt)
-
+            acp_rt = session.acp_runtime
             del cls._sessions[session_id]
+
+        # Phase 2: outside lock — long-running side-effects
+        if is_last_session:
+            try:
+                from ..logmanager import LogManager
+
+                manager = LogManager.load(conversation_id, lock=True)
+
+                logger.debug(
+                    f"Last session for conversation {conversation_id}, triggering SESSION_END hook"
+                )
+                if session_end_msgs := trigger_hook(
+                    HookType.SESSION_END,
+                    manager=manager,
+                ):
+                    for msg in session_end_msgs:
+                        manager.append(msg)
+            except Exception as e:
+                logger.warning(f"Failed to trigger SESSION_END hook: {e}")
+
+        if acp_rt is not None:
+            from .session_step import close_acp_runtime_bg
+
+            close_acp_runtime_bg(acp_rt)
 
     @classmethod
     def remove_all_sessions_for_conversation(cls, conversation_id: str) -> None:

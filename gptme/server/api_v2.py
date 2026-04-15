@@ -11,7 +11,7 @@ from dataclasses import replace
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
-from typing import cast
+from typing import Literal, cast
 
 import flask
 from dateutil.parser import isoparse
@@ -63,6 +63,31 @@ from .openapi_docs import (
 )
 
 logger = logging.getLogger(__name__)
+
+# Raster image extensions allowed for user avatars.
+# SVG excluded: can embed <script> tags (XSS via crafted SVG).
+_ALLOWED_AVATAR_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".ico"}
+
+
+def _is_valid_image_content(path: "Path") -> bool:
+    """Validate file content is a recognised image format using Pillow.
+
+    Extension checks can be bypassed by renaming a file; this validates the
+    actual content via magic-byte / header parsing.  Pillow is already a hard
+    runtime dependency (needed for vision support), so no extra install cost.
+    """
+    try:
+        from PIL import Image, UnidentifiedImageError
+
+        with Image.open(path) as img:
+            _ = img.format  # triggers format detection from file content
+        return True
+    except (UnidentifiedImageError, FileNotFoundError, IsADirectoryError, OSError):
+        return False
+    except Exception:
+        logger.warning("Unexpected error validating image %s", path, exc_info=True)
+        return False
+
 
 v2_api = flask.Blueprint("v2_api", __name__)
 
@@ -277,11 +302,16 @@ def api_conversation(conversation_id: str):
     if error := _validate_conversation_id(conversation_id):
         return error
 
+    try:
+        manager = LogManager.load(conversation_id, lock=False)
+    except FileNotFoundError:
+        return flask.jsonify(
+            {"error": f"Conversation not found: {conversation_id}"}
+        ), 404
+
     # Create and set config
     logdir = get_logs_dir() / conversation_id
     chat_config = ChatConfig.load_or_create(logdir, ChatConfig()).save()
-
-    manager = LogManager.load(conversation_id, lock=False)
     log_dict = manager.to_dict(branches=True)
 
     # make all paths relative to workspace or logdir (no "../" or absolute paths)
@@ -349,6 +379,37 @@ def api_conversation_put(conversation_id: str):
             400,
         )
 
+    # Validate all messages before creating any side effects (directories).
+    # This prevents orphaned directories when validation fails: if logdir.mkdir()
+    # runs before a 400 is returned, the same conversation_id gets a 409 on retry.
+    _RoleType = Literal["system", "user", "assistant"]
+    valid_roles = ("system", "user", "assistant")
+    validated_msgs: list[tuple[_RoleType, str, datetime]] = []
+    for msg in req_json.get("messages", []):
+        if msg.get("role") not in valid_roles:
+            return (
+                flask.jsonify(
+                    {
+                        "error": f"Invalid role: {msg.get('role')}. Must be one of: {valid_roles}"
+                    }
+                ),
+                400,
+            )
+        if "content" not in msg:
+            return flask.jsonify(
+                {"error": "Message missing required 'content' field"}
+            ), 400
+        if "timestamp" in msg:
+            try:
+                ts: datetime = isoparse(msg["timestamp"])
+            except (ValueError, OverflowError, TypeError):
+                return flask.jsonify(
+                    {"error": f"Invalid timestamp format: {msg['timestamp']}"}
+                ), 400
+        else:
+            ts = datetime.now(tz=timezone.utc)
+        validated_msgs.append((cast(_RoleType, msg["role"]), msg["content"], ts))
+
     # Create the log directory atomically to avoid TOCTOU race
     try:
         logdir.mkdir(parents=True)
@@ -375,23 +436,8 @@ def api_conversation_put(conversation_id: str):
         agent_path=chat_config.agent,
     )
 
-    valid_roles = ("system", "user", "assistant")
-    for msg in req_json.get("messages", []):
-        if msg.get("role") not in valid_roles:
-            return (
-                flask.jsonify(
-                    {
-                        "error": f"Invalid role: {msg.get('role')}. Must be one of: {valid_roles}"
-                    }
-                ),
-                400,
-            )
-        timestamp: datetime = (
-            isoparse(msg["timestamp"])
-            if "timestamp" in msg
-            else datetime.now(tz=timezone.utc)
-        )
-        msgs.append(Message(msg["role"], msg["content"], timestamp=timestamp))
+    for role, content, timestamp in validated_msgs:
+        msgs.append(Message(role, content, timestamp=timestamp))
 
     log = LogManager.load(logdir=logdir, initial_msgs=msgs, create=True)
     log.write()
@@ -435,6 +481,9 @@ def api_conversation_put(conversation_id: str):
 )
 def api_conversation_post(conversation_id: str):
     """Append a message to a conversation."""
+    if error := _validate_conversation_id(conversation_id):
+        return error
+
     req_json = flask.request.json
     if not req_json:
         return flask.jsonify({"error": "No JSON data provided"}), 400
@@ -955,11 +1004,45 @@ def api_conversation_config_patch(conversation_id: str):
     if error := _validate_conversation_id(conversation_id):
         return error
 
-    req_json = flask.request.json
-    if not req_json:
+    req_json = request.get_json(silent=True)
+    if req_json is None:
         return flask.jsonify({"error": "No JSON data provided"}), 400
+    if not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
 
     logdir = get_logs_dir() / conversation_id
+
+    # Guard: check conversation exists before any side-effecting operations.
+    # ChatConfig.save() creates the logdir on disk and set_config/init_tools mutate
+    # process-wide state, so the 404 check must come first.
+    if not logdir.exists():
+        return (
+            flask.jsonify({"error": f"Conversation not found: {conversation_id}"}),
+            404,
+        )
+
+    # Load conversation log BEFORE any side effects (config write, global state).
+    # A directory can exist without a valid log file (partial deletion, corruption),
+    # so we must verify the log is loadable before committing changes.
+    try:
+        manager = LogManager.load(conversation_id, lock=False)
+    except FileNotFoundError:
+        return (
+            flask.jsonify({"error": f"Conversation not found: {conversation_id}"}),
+            404,
+        )
+
+    # Reject config changes while generation is in progress — config PATCH rewrites
+    # system messages and mutates global state, which races with streaming.
+    sessions = SessionManager.get_sessions_for_conversation(conversation_id)
+    for sess in sessions:
+        if sess.generating:
+            return (
+                flask.jsonify(
+                    {"error": "Cannot update config while generation is in progress"}
+                ),
+                409,
+            )
 
     # Create and set config
     req_json["_logdir"] = logdir  # Pass logdir for "@log" workspace resolution
@@ -974,8 +1057,6 @@ def api_conversation_config_patch(conversation_id: str):
 
     tools = get_tools()
 
-    # Update system prompt with new tools
-    manager = LogManager.load(conversation_id, lock=False)
     if len(manager.log.messages) >= 1 and manager.log.messages[0].role == "system":
         # Remove leading system messages and replace with new ones
         # Use immutable Log interface instead of mutating the frozen dataclass's list
@@ -1035,6 +1116,20 @@ def api_conversation_agent_avatar(conversation_id: str):
         return error
 
     logdir = get_logs_dir() / conversation_id
+    if not logdir.exists():
+        return (
+            flask.jsonify({"error": f"Conversation not found: {conversation_id}"}),
+            404,
+        )
+
+    try:
+        LogManager.load(logdir, lock=False)
+    except FileNotFoundError:
+        return (
+            flask.jsonify({"error": f"Conversation not found: {conversation_id}"}),
+            404,
+        )
+
     chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
 
     agent_config = chat_config.agent_config
@@ -1059,8 +1154,14 @@ def api_conversation_agent_avatar(conversation_id: str):
     except ValueError:
         return flask.jsonify({"error": "Invalid avatar path"}), 400
 
+    if full_path.suffix.lower() not in _ALLOWED_AVATAR_EXTS:
+        return flask.jsonify({"error": "Avatar must be an image file"}), 400
+
     if not full_path.exists():
         return flask.jsonify({"error": "Avatar file not found"}), 404
+
+    if not _is_valid_image_content(full_path):
+        return flask.jsonify({"error": "Avatar must be a valid image file"}), 400
 
     return flask.send_file(full_path)
 
@@ -1089,8 +1190,14 @@ def _serve_agent_avatar(agent_path_str: str):
     except ValueError:
         return flask.jsonify({"error": "Invalid avatar path"}), 400
 
+    if full_path.suffix.lower() not in _ALLOWED_AVATAR_EXTS:
+        return flask.jsonify({"error": "Avatar must be an image file"}), 400
+
     if not full_path.exists():
         return flask.jsonify({"error": "Avatar file not found"}), 404
+
+    if not _is_valid_image_content(full_path):
+        return flask.jsonify({"error": "Avatar must be a valid image file"}), 400
 
     return flask.send_file(full_path)
 
@@ -1198,7 +1305,17 @@ def api_user_avatar():
 
     full_path = Path(avatar_path).expanduser().resolve()
 
+    # Security: validate path points to a raster image file to prevent serving
+    # sensitive files (e.g. ~/.ssh/id_rsa) via a malicious config value.
+    # SVG is excluded: it can embed <script> tags and execute JS in the
+    # server's origin when navigated to directly (XSS via crafted SVG).
+    if full_path.suffix.lower() not in _ALLOWED_AVATAR_EXTS:
+        return flask.jsonify({"error": "Avatar must be an image file"}), 400
+
     if not full_path.exists():
         return flask.jsonify({"error": "Avatar file not found"}), 404
+
+    if not _is_valid_image_content(full_path):
+        return flask.jsonify({"error": "Avatar must be a valid image file"}), 400
 
     return flask.send_file(full_path)

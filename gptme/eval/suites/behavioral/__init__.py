@@ -17,6 +17,7 @@ from typing import TYPE_CHECKING
 if TYPE_CHECKING:
     from gptme.eval.types import EvalSpec
 
+
 def _discover_tests() -> "list[EvalSpec]":
     """Auto-discover scenario modules; wrapped to avoid leaking loop vars."""
     package_dir = Path(__file__).parent
@@ -35,6 +36,21 @@ tests: list["EvalSpec"] = _discover_tests()
 
 # Re-export all checker functions for backward compatibility.
 # Tests and external code may import them directly from this package.
+from .add_deprecation_warning import (  # noqa: F401
+    check_deprecation_category,
+    check_deprecation_warning_issued,
+    check_docstring_updated,
+    check_migration_guidance,
+    check_tests_pass,
+)
+from .add_docstrings import (  # noqa: F401
+    check_all_functions_have_docstrings,
+    check_compute_stats_all_documented,
+    check_docstring_tests_pass,
+    check_parse_args_documented,
+    check_parse_returns_documented,
+    check_validate_email_raises_documented,
+)
 from .add_feature_preserve_default import (  # noqa: F401
     check_compat_has_default_param,
     check_compat_new_tests_exist,
@@ -66,6 +82,18 @@ from .extract_function_refactor import (  # noqa: F401
     check_extract_shared_module_exists,
     check_extract_tests_pass,
 )
+from .fix_data_mutation import (  # noqa: F401
+    check_apply_updates_returns_new_dict,
+    check_mutation_tests_pass,
+    check_tag_records_no_in_place_append,
+    check_test_file_unchanged,
+)
+from .fix_mutable_default import (  # noqa: F401
+    check_independent_calls_verified,
+    check_mutable_default_tests_pass,
+    check_no_mutable_default_arg,
+    check_uses_none_sentinel,
+)
 from .fix_security_path_traversal import (  # noqa: F401
     check_security_blocks_traversal,
     check_security_has_traversal_test,
@@ -83,6 +111,15 @@ from .handle_specific_exception import (  # noqa: F401
     check_config_no_bare_except,
     check_config_propagates_file_error,
     check_config_tests_pass,
+)
+from .implement_lru_cache import (  # noqa: F401
+    check_has_cache_structure,
+    check_has_capacity_limit,
+    check_has_eviction,
+    check_has_recency_tracking,
+)
+from .implement_lru_cache import (  # noqa: F401
+    check_tests_pass as check_lru_cache_tests_pass,
 )
 from .iterative_debug import (  # noqa: F401
     check_debug_fix_in_file,
@@ -109,12 +146,31 @@ from .noisy_worktree_fix import (  # noqa: F401
     check_noisy_worktree_fix_correct,
     check_noisy_worktree_tests_pass,
 )
+from .optimize_n_squared import (  # noqa: F401
+    check_no_nested_loop,
+    check_optimize_tests_pass,
+    check_signature_preserved,
+    check_uses_efficient_structure,
+)
 from .refactor_for_testability import (  # noqa: F401
     check_testability_generate_report_preserved,
     check_testability_has_pure_function,
     check_testability_no_file_io_in_unit_tests,
     check_testability_pure_function_tested,
     check_testability_tests_pass,
+)
+from .remove_dead_code import (  # noqa: F401
+    check_dead_code_removed,
+    check_dead_code_tests_pass,
+    check_live_functions_intact,
+    check_processor_unchanged,
+)
+from .retry_with_backoff import (  # noqa: F401
+    check_exponential_backoff,
+    check_max_retries,
+    check_retry_function_exists,
+    check_retry_imported,
+    check_retry_tests_pass,
 )
 from .scope_discipline_bugfix import (  # noqa: F401
     check_scope_mean_fixed,
@@ -141,6 +197,15 @@ from .use_existing_helper import (  # noqa: F401
     check_reuse_tests_pass,
     check_reuse_uses_normalize,
     check_reuse_utils_unchanged,
+)
+from .validate_user_input import (  # noqa: F401
+    check_custom_exception,
+    check_range_validation,
+    check_string_sanitization,
+    check_type_validation,
+)
+from .validate_user_input import (  # noqa: F401
+    check_tests_pass as check_validate_user_input_tests_pass,
 )
 from .write_test_suite import (  # noqa: F401
     check_write_tests_covers_extract_emails,

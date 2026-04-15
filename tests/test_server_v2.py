@@ -679,6 +679,20 @@ def test_v2_conversation_get(v2_conv, client: FlaskClient):
     assert "testing" in data["log"][0]["content"]
 
 
+def test_v2_conversation_get_returns_404_for_missing_conversation(
+    client: FlaskClient,
+):
+    """Missing conversations should return a structured 404 instead of a 500."""
+    conversation_id = f"missing-conversation-{random.randint(0, 1000000)}"
+
+    response = client.get(f"/api/v2/conversations/{conversation_id}")
+
+    assert response.status_code == 404
+    assert response.get_json() == {
+        "error": f"Conversation not found: {conversation_id}"
+    }
+
+
 def test_v2_create_conversation_default_system_prompt(
     client: FlaskClient, tmp_path, monkeypatch
 ):
@@ -930,6 +944,126 @@ def test_v2_chat_config_update_works(client: FlaskClient):
     response = client.get(f"/api/v2/conversations/{conversation_id}/config")
     config = ChatConfig.from_dict(response.get_json())
     assert config.to_dict() == input_config.to_dict()
+
+
+def test_v2_chat_config_update_missing_conversation_returns_404(client: FlaskClient):
+    """Test that updating config for a missing conversation returns a 404.
+
+    Also asserts that no orphaned directory or config file is created on disk,
+    and that the existence check fires before any side-effecting operations.
+    """
+    from gptme.dirs import get_logs_dir  # fmt: skip
+
+    input_config = ChatConfig(model="openai/gpt-4o")
+    input_config.tools = [t.name for t in get_toolchain(None) if not t.is_mcp]
+    input_config.mcp = MCPConfig()
+
+    conversation_id = "missing-conversation"
+    logdir = get_logs_dir() / conversation_id
+
+    response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/config",
+        json=input_config.to_dict(),
+    )
+
+    assert response.status_code == 404
+    assert response.get_json() == {
+        "error": f"Conversation not found: {conversation_id}"
+    }
+    # Ensure no orphaned directory or config file was created on disk
+    assert not logdir.exists(), (
+        f"Orphaned logdir was created at {logdir} despite 404 response"
+    )
+
+
+def test_v2_conversation_agent_avatar_missing_conversation_returns_404(
+    client: FlaskClient,
+):
+    """Missing conversations should return 404 before creating config side effects."""
+    import shutil  # fmt: skip
+
+    from gptme.dirs import get_logs_dir  # fmt: skip
+
+    conversation_id = "missing-avatar-conversation"
+    logdir = get_logs_dir() / conversation_id
+    if logdir.exists():
+        shutil.rmtree(logdir)
+    assert not logdir.exists()
+
+    response = client.get(f"/api/v2/conversations/{conversation_id}/agent/avatar")
+
+    assert response.status_code == 404
+    assert response.get_json() == {
+        "error": f"Conversation not found: {conversation_id}"
+    }
+    assert not logdir.exists(), (
+        f"Orphaned logdir was created at {logdir} despite 404 response"
+    )
+
+
+def test_v2_conversation_agent_avatar_orphaned_logdir_returns_404(
+    client: FlaskClient, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Avatar endpoint should reject logdirs without a conversation log."""
+    logdir = tmp_path / "logs" / "orphaned-avatar-conversation"
+    logdir.mkdir(parents=True)
+
+    monkeypatch.setattr("gptme.server.api_v2.get_logs_dir", lambda: tmp_path / "logs")
+
+    response = client.get(
+        "/api/v2/conversations/orphaned-avatar-conversation/agent/avatar"
+    )
+
+    assert response.status_code == 404
+    assert response.get_json() == {
+        "error": "Conversation not found: orphaned-avatar-conversation"
+    }
+
+
+@pytest.mark.parametrize(
+    "body",
+    [
+        [],  # empty array — was rejected by old truthiness guard
+        [1, 2, 3],  # non-empty array — the real regression: old guard accepted this
+        "string",  # JSON string
+        42,  # JSON number
+    ],
+)
+def test_v2_chat_config_patch_rejects_non_object_json(
+    client: FlaskClient, body: object
+):
+    """Config PATCH should reject JSON arrays/strings before config parsing."""
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+
+    response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/config",
+        json=body,
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "JSON body must be an object"}
+
+
+def test_v2_chat_config_patch_rejected_during_generation(client: FlaskClient):
+    """Config PATCH should return 409 when a session is actively generating."""
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+
+    with unittest.mock.patch(
+        "gptme.server.api_v2.SessionManager.get_sessions_for_conversation"
+    ) as mock_get:
+        mock_session = unittest.mock.MagicMock()
+        mock_session.generating = True
+        mock_get.return_value = [mock_session]
+
+        response = client.patch(
+            f"/api/v2/conversations/{conversation_id}/config",
+            json={"model": "openai/gpt-4o"},
+        )
+
+    assert response.status_code == 409
+    assert "generation is in progress" in response.get_json()["error"]
 
 
 @pytest.mark.parametrize(
@@ -1197,3 +1331,74 @@ def test_v2_step_last_error_set_on_failure(v2_conv, client: FlaskClient):
     assert "Model not found" in session.last_error
     # Session should not be stuck in generating state
     assert not session.generating
+
+
+def test_v2_create_conversation_missing_content(client: FlaskClient):
+    """Creating a conversation with a message missing 'content' returns 400."""
+    import uuid
+
+    conv_id = f"test-missing-content-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={
+            "messages": [{"role": "user"}],
+        },
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "content" in data["error"].lower()
+
+
+def test_v2_create_conversation_invalid_timestamp(client: FlaskClient):
+    """Creating a conversation with an invalid timestamp returns 400."""
+    import uuid
+
+    conv_id = f"test-bad-timestamp-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={
+            "messages": [
+                {"role": "user", "content": "hello", "timestamp": "not-a-date"}
+            ],
+        },
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "timestamp" in data["error"].lower()
+
+
+def test_v2_create_conversation_non_string_timestamp(client: FlaskClient):
+    """Creating a conversation with a non-string timestamp returns 400 (not 500)."""
+    import uuid
+
+    conv_id = f"test-numeric-ts-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={
+            "messages": [{"role": "user", "content": "hello", "timestamp": 12345}],
+        },
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "timestamp" in data["error"].lower()
+
+
+@pytest.mark.parametrize("body", [[], [1, 2, 3], "string", 42])
+def test_v2_tasks_put_rejects_non_object_json(client: FlaskClient, body: object):
+    """Task PUT should reject non-object JSON bodies with 400."""
+    create_resp = client.post(
+        "/api/v2/tasks",
+        json={"content": "test task for put validation"},
+    )
+    assert create_resp.status_code == 201
+    task_id = create_resp.get_json()["id"]
+
+    response = client.put(
+        f"/api/v2/tasks/{task_id}",
+        json=body,
+    )
+    assert response.status_code == 400
+    assert "object" in response.get_json()["error"].lower()

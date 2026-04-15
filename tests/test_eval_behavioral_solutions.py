@@ -9,12 +9,17 @@ This is critical infrastructure for idea #19 (eval-to-lesson feedback loop):
 before running expensive baseline experiments with real models, we need
 confidence that the checkers correctly identify good work.
 
-Covers all 16 behavioral scenarios:
+Covers all 31 behavioral scenarios:
   git-selective-commit, multi-file-rename, iterative-debug,
   stage-new-files, write-test-suite, test-driven-error-handling,
   merge-conflict-resolution, extract-function-refactor, debug-data-pipeline,
   scope-discipline-bugfix, add-logging, use-existing-helper,
-  add-feature-preserve-default, handle-specific-exception
+  add-feature-preserve-default, handle-specific-exception,
+  fix-security-path-traversal, refactor-for-testability, add-type-hints,
+  noisy-worktree-fix, fix-data-mutation, optimize-n-squared, remove-dead-code,
+  fix-mutable-default, add-deprecation-warning, add-docstrings, retry-with-backoff,
+  validate-user-input, rate-limiting, circuit-breaker, implement-lru-cache,
+  implement-event-emitter, implement-priority-queue, implement-memoization
 """
 
 import subprocess
@@ -597,6 +602,620 @@ def _apply_solution(workspace: Path, scenario_name: str) -> None:
             cwd=workspace,
         )
 
+    elif scenario_name == "fix-data-mutation":
+        # Fix both mutation bugs in records.py without touching test_records.py
+        (workspace / "records.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Record processing utilities.\"\"\"
+
+
+            def tag_records(records: list, tag: str) -> list:
+                \"\"\"Add a tag to each record and return the updated records.\"\"\"
+                return [{**record, "tags": record["tags"] + [tag]} for record in records]
+
+
+            def apply_updates(state: dict, updates: dict) -> dict:
+                \"\"\"Apply updates to state and return the new state.\"\"\"
+                return {**state, **updates}
+            """)
+        )
+
+    elif scenario_name == "optimize-n-squared":
+        # Rewrite find_duplicates using Counter for O(n) performance
+        (workspace / "analytics.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Analytics utilities.\"\"\"
+            from collections import Counter
+
+
+            def find_duplicates(items: list) -> list:
+                \"\"\"Return a sorted list of items that appear more than once in *items*.\"\"\"
+                counts = Counter(items)
+                return sorted(item for item, count in counts.items() if count > 1)
+            """)
+        )
+
+    elif scenario_name == "remove-dead-code":
+        # Remove the unused _batch_normalize function; keep everything else intact
+        (workspace / "utils.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Record processing utilities.\"\"\"
+
+
+            def parse_record(data: dict) -> dict:
+                \"\"\"Parse and normalize a record from raw input.\"\"\"
+                return {
+                    "id": data["id"],
+                    "value": _normalize_value(data.get("value", "")),
+                    "valid": validate_record(data),
+                }
+
+
+            def validate_record(data: dict) -> bool:
+                \"\"\"Return True if *data* contains the required fields.\"\"\"
+                return "id" in data and "value" in data
+
+
+            def _normalize_value(value: str) -> str:
+                \"\"\"Normalize a string value for storage.\"\"\"
+                return value.strip().lower()
+            """)
+        )
+
+    elif scenario_name == "add-docstrings":
+        # Add Google-style docstrings to all three functions in utils.py
+        (workspace / "utils.py").write_text(
+            textwrap.dedent("""\
+            import re
+
+
+            def parse_args(input_str):
+                \"\"\"Parse a string of arguments respecting quoted substrings.
+
+                Args:
+                    input_str: The input string to parse, where spaces separate
+                        tokens and quoted substrings are treated as single tokens.
+
+                Returns:
+                    list[str]: A list of parsed argument tokens.
+                \"\"\"
+                parts = []
+                current = ""
+                in_quotes = False
+                quote_char = None
+                for ch in input_str:
+                    if ch in ('"', "'") and not in_quotes:
+                        if current:
+                            parts.append(current)
+                            current = ""
+                        in_quotes = True
+                        quote_char = ch
+                    elif ch == quote_char and in_quotes:
+                        in_quotes = False
+                        quote_char = None
+                    elif ch == " " and not in_quotes:
+                        if current:
+                            parts.append(current)
+                            current = ""
+                    else:
+                        current += ch
+                if current:
+                    parts.append(current)
+                return parts
+
+
+            def validate_email(email):
+                \"\"\"Validate an email address and return it lowercased.
+
+                Args:
+                    email: The email address string to validate.
+
+                Returns:
+                    The email address converted to lowercase.
+
+                Raises:
+                    ValueError: If the email is empty, missing '@', has an
+                        empty local part or domain, has an invalid local part,
+                        or has a domain without a dot.
+                \"\"\"
+                if not email or "@" not in email:
+                    raise ValueError(f"Invalid email: {email}")
+                local, domain = email.rsplit("@", 1)
+                if not local or not domain:
+                    raise ValueError(f"Invalid email: {email}")
+                if not re.match(r"^[\\w.-]+$", local):
+                    raise ValueError(f"Invalid email local part: {local}")
+                if "." not in domain:
+                    raise ValueError(f"Invalid email domain: {domain}")
+                return email.lower()
+
+
+            def compute_stats(numbers):
+                \"\"\"Compute basic statistics for a list of numbers.
+
+                Args:
+                    numbers: A list of numeric values to summarize.
+
+                Returns:
+                    dict: A dictionary with keys 'mean', 'median', and 'count'.
+
+                Example:
+                    >>> compute_stats([1, 2, 3, 4, 5])
+                    {'mean': 3.0, 'median': 3.0, 'count': 5}
+                \"\"\"
+                if not numbers:
+                    return {"mean": 0, "median": 0, "count": 0}
+                n = len(numbers)
+                mean = sum(numbers) / n
+                sorted_nums = sorted(numbers)
+                if n % 2 == 0:
+                    median = (sorted_nums[n // 2 - 1] + sorted_nums[n // 2]) / 2
+                else:
+                    median = sorted_nums[n // 2]
+                return {"mean": mean, "median": median, "count": n}
+            """)
+        )
+
+    elif scenario_name == "fix-mutable-default":
+        # Apply the None-sentinel fix to both functions
+        (workspace / "records.py").write_text(
+            textwrap.dedent("""\
+            def collect_records(items, result=None):
+                \"\"\"Collect non-empty, stripped records into result list.\"\"\"
+                if result is None:
+                    result = []
+                for item in items:
+                    stripped = item.strip()
+                    if stripped:
+                        result.append(stripped)
+                return result
+
+
+            def deduplicate(items, seen=None):
+                \"\"\"Return unique items from *items* preserving order.\"\"\"
+                if seen is None:
+                    seen = []
+                for item in items:
+                    if item not in seen:
+                        seen.append(item)
+                return seen
+            """)
+        )
+
+    elif scenario_name == "add-deprecation-warning":
+        # Add warnings.warn() with DeprecationWarning to get_data()
+        (workspace / "api_client.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"API client module for the metrics service.\"\"\"
+
+            import urllib.request
+            import json
+            import warnings
+            from typing import Any
+
+
+            def fetch_metrics(endpoint: str, params: dict[str, str] | None = None) -> dict[str, Any]:
+                \"\"\"
+                Fetch metrics from the given endpoint.
+
+                Args:
+                    endpoint: The API endpoint URL
+                    params: Optional query parameters
+
+                Returns:
+                    The JSON response as a dictionary
+                \"\"\"
+                url = endpoint
+                if params:
+                    query = "&".join(f"{k}={v}" for k, v in params.items())
+                    url = f"{endpoint}?{query}"
+
+                with urllib.request.urlopen(url) as response:
+                    return json.loads(response.read().decode())
+
+
+            def get_summary(metrics: list[dict[str, Any]]) -> dict[str, float]:
+                \"\"\"
+                Calculate summary statistics from a list of metric dictionaries.
+
+                Args:
+                    metrics: List of metric dictionaries with 'value' keys
+
+                Returns:
+                    Dictionary with min, max, and average values
+                \"\"\"
+                if not metrics:
+                    return {"min": 0.0, "max": 0.0, "average": 0.0}
+
+                values = [m["value"] for m in metrics if "value" in m]
+                if not values:
+                    return {"min": 0.0, "max": 0.0, "average": 0.0}
+
+                return {
+                    "min": min(values),
+                    "max": max(values),
+                    "average": sum(values) / len(values),
+                }
+
+
+            # DEPRECATED: Use fetch_metrics instead
+            def get_data(url: str) -> dict[str, Any]:
+                \"\"\"
+                Fetch JSON data from a URL.
+
+                DEPRECATED: Use fetch_metrics() instead. This function will be removed
+                in a future version.
+
+                Args:
+                    url: The URL to fetch from
+
+                Returns:
+                    The JSON response as a dictionary
+                \"\"\"
+                warnings.warn(
+                    "get_data() is deprecated, use fetch_metrics() instead.",
+                    DeprecationWarning,
+                    stacklevel=2,
+                )
+                with urllib.request.urlopen(url) as response:
+                    return json.loads(response.read().decode())
+            """)
+        )
+
+    elif scenario_name == "retry-with-backoff":
+        (workspace / "api_client.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"API client for fetching user data.\"\"\"
+
+            import time
+            import requests
+
+
+            def retry_with_backoff(func, max_retries=3, base_delay=0.1):
+                \"\"\"Retry a function with exponential backoff.\"\"\"
+                for attempt in range(max_retries):
+                    try:
+                        return func()
+                    except Exception:
+                        if attempt < max_retries - 1:
+                            delay = base_delay * (2 ** attempt)
+                            time.sleep(delay)
+                        else:
+                            raise
+
+
+            def fetch_user(user_id: int) -> dict:
+                \"\"\"Fetch a user from the API. Retries on transient failures.\"\"\"
+                url = f"https://api.example.com/users/{user_id}"
+                def _fetch():
+                    response = requests.get(url, timeout=5)
+                    response.raise_for_status()
+                    return response.json()
+                return retry_with_backoff(_fetch)
+            """)
+        )
+
+    elif scenario_name == "validate-user-input":
+        (workspace / "user_service.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"User service for managing user profiles.\"\"\"
+
+
+            def create_user(name: str, age: int, email: str) -> dict:
+                \"\"\"Create a new user profile.
+
+                Args:
+                    name: Full name of the user.
+                    age: Age in years.
+                    email: Email address.
+
+                Returns:
+                    Dict with user info.
+                \"\"\"
+                if not isinstance(name, str):
+                    raise TypeError(f"name must be a string, got {type(name).__name__}")
+                if not isinstance(age, int):
+                    raise TypeError(f"age must be an integer, got {type(age).__name__}")
+                if not name.strip():
+                    raise ValueError("name must not be empty or whitespace-only")
+                if age < 0 or age > 150:
+                    raise ValueError(f"age must be between 0 and 150, got {age}")
+                return {"name": name, "age": age, "email": email}
+            """)
+        )
+
+    elif scenario_name == "circuit-breaker":
+        (workspace / "client.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"API client with circuit breaker pattern.\"\"\"
+
+            import urllib.request
+            import json
+
+
+            class CircuitOpenError(Exception):
+                \"\"\"Raised when circuit breaker is open.\"\"\"
+
+
+            class CircuitBreaker:
+                \"\"\"Circuit breaker: tracks failures and opens after threshold.\"\"\"
+
+                OPEN = "open"
+                CLOSED = "closed"
+                FAILURE_THRESHOLD = 3
+
+                def __init__(self):
+                    self.failure_count = 0
+                    self.state = self.CLOSED
+
+                def record_failure(self):
+                    self.failure_count += 1
+                    if self.failure_count >= self.FAILURE_THRESHOLD:
+                        self.state = self.OPEN
+
+                def record_success(self):
+                    self.failure_count = 0
+                    self.state = self.CLOSED
+
+                def is_open(self):
+                    return self.state == self.OPEN
+
+
+            class APIClient:
+                \"\"\"API client with circuit breaker protection.\"\"\"
+
+                def __init__(self, api_key: str):
+                    self.api_key = api_key
+                    self.base_url = "https://api.example.com"
+                    self._circuit_breaker = CircuitBreaker()
+
+                def get(self, endpoint: str) -> dict:
+                    \"\"\"Make a GET request, raising CircuitOpenError if circuit is open.\"\"\"
+                    if self._circuit_breaker.is_open():
+                        raise CircuitOpenError("Circuit is open")
+                    url = f"{self.base_url}/{endpoint}"
+                    req = urllib.request.Request(
+                        url, headers={"Authorization": f"Bearer {self.api_key}"}
+                    )
+                    try:
+                        with urllib.request.urlopen(req, timeout=10) as resp:
+                            result = json.loads(resp.read().decode())
+                            self._circuit_breaker.record_success()
+                            return result
+                    except urllib.error.HTTPError as e:
+                        if e.code >= 500:
+                            self._circuit_breaker.record_failure()
+                        raise
+            """)
+        )
+
+    elif scenario_name == "rate-limiting":
+        # Write the implemented solution with exponential backoff
+        (workspace / "client.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"API client for external service.\"\"\"
+
+            import urllib.request
+            import json
+            import time
+
+
+            class RateLimitError(Exception):
+                \"\"\"Raised when rate limit is exceeded.\"\"\"
+
+
+            class APIClient:
+                \"\"\"API client with rate limiting and exponential backoff.\"\"\"
+
+                def __init__(self, api_key: str, max_retries: int = 5, base_delay: float = 0.1):
+                    self.api_key = api_key
+                    self.base_url = "https://api.example.com"
+                    self.max_retries = max_retries
+                    self.base_delay = base_delay
+
+                def get(self, endpoint: str) -> dict:
+                    \"\"\"Make a GET request to the API with rate limit handling.
+
+                    Args:
+                        endpoint: The API endpoint path.
+
+                    Returns:
+                        Parsed JSON response as a dict.
+
+                    Raises:
+                        RateLimitError: When rate limit is exceeded after all retries.
+                        urllib.error.HTTPError: For non-rate-limit HTTP errors.
+                    \"\"\"
+                    url = f"{self.base_url}/{endpoint}"
+                    req = urllib.request.Request(url, headers={"Authorization": f"Bearer {self.api_key}"})
+                    for attempt in range(self.max_retries):
+                        try:
+                            with urllib.request.urlopen(req, timeout=10) as resp:
+                                return json.loads(resp.read().decode())
+                        except urllib.error.HTTPError as e:
+                            if e.code == 429:
+                                if attempt < self.max_retries - 1:
+                                    delay = self.base_delay * (2 ** attempt)
+                                    time.sleep(delay)
+                                else:
+                                    raise RateLimitError("Rate limit exceeded")
+                            else:
+                                raise
+                    raise RateLimitError("Rate limit exceeded")
+            """)
+        )
+
+    elif scenario_name == "implement-lru-cache":
+        (workspace / "cache.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Data access layer with LRU caching.\"\"\"
+
+            from collections import OrderedDict
+            from typing import Any
+
+
+            class DataStore:
+                \"\"\"Simulates a database or slow data source.\"\"\"
+
+                def __init__(self):
+                    self._call_count = 0
+                    self._data = {
+                        "user:1": {"id": 1, "name": "Alice"},
+                        "user:2": {"id": 2, "name": "Bob"},
+                        "user:3": {"id": 3, "name": "Carol"},
+                        "user:4": {"id": 4, "name": "Dave"},
+                        "user:5": {"id": 5, "name": "Eve"},
+                    }
+
+                @property
+                def call_count(self) -> int:
+                    return self._call_count
+
+                def get(self, key: str) -> Any:
+                    \"\"\"Fetch a record (simulates an expensive operation).\"\"\"
+                    self._call_count += 1
+                    return self._data.get(key)
+
+
+            class CachedDataStore:
+                \"\"\"DataStore wrapper with LRU (Least Recently Used) caching.\"\"\"
+
+                def __init__(self, store: DataStore, max_size: int = 3):
+                    self._store = store
+                    self._max_size = max_size
+                    self._cache: OrderedDict = OrderedDict()
+
+                def get(self, key: str) -> Any:
+                    \"\"\"Return the record for *key*, using cache when possible.\"\"\"
+                    if key in self._cache:
+                        self._cache.move_to_end(key)
+                        return self._cache[key]
+                    value = self._store.get(key)
+                    self._cache[key] = value
+                    if len(self._cache) > self._max_size:
+                        self._cache.popitem(last=False)
+                    return value
+            """)
+        )
+
+    elif scenario_name == "implement-memoization":
+        (workspace / "memo.py").write_text(
+            textwrap.dedent("""\
+            \"""Memoization decorator for caching expensive function calls.\"""
+            from functools import wraps
+
+
+            def memoize(fn):
+                \"""Cache results of *fn* based on its arguments.\"""
+                cache = {}
+
+                def wrapper(*args, **kwargs):
+                    key = (args, tuple(sorted(kwargs.items())))
+                    if key not in cache:
+                        cache[key] = fn(*args, **kwargs)
+                    return cache[key]
+                return wrapper
+
+
+            @memoize
+            def fibonacci(n):
+                \"""Compute the nth Fibonacci number (slow recursive implementation).\"""
+                if n <= 1:
+                    return n
+                return fibonacci(n - 1) + fibonacci(n - 2)
+
+
+            @memoize
+            def factorial(n):
+                \"""Compute n! (slow recursive implementation).\"""
+                if n <= 1:
+                    return 1
+                return n * factorial(n - 1)
+
+
+            def computeheavy(x, y):
+                \"""A non-decorated function to verify memoize works on any callable.\"""
+                return x ** y
+            """)
+        )
+
+    elif scenario_name == "implement-event-emitter":
+        (workspace / "emitter.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Simple event emitter (Observer pattern) implementation.\"\"\"
+
+            from collections import defaultdict
+            from typing import Callable
+
+
+            class EventEmitter:
+                \"\"\"Emit named events and notify registered listeners.\"\"\"
+
+                def __init__(self) -> None:
+                    self._handlers: dict[str, list[Callable]] = defaultdict(list)
+
+                def on(self, event: str, handler: Callable) -> None:
+                    self._handlers[event].append(handler)
+
+                def off(self, event: str, handler: Callable) -> None:
+                    try:
+                        self._handlers[event].remove(handler)
+                    except (KeyError, ValueError):
+                        pass
+
+                def emit(self, event: str, *args, **kwargs) -> None:
+                    for handler in list(self._handlers[event]):
+                        handler(*args, **kwargs)
+            """)
+        )
+
+    elif scenario_name == "implement-priority-queue":
+        (workspace / "priority_queue.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Task scheduler using a priority queue.\"\"\"
+
+            import heapq
+            from typing import Any
+
+
+            class PriorityQueue:
+                \"\"\"Min-heap priority queue for task scheduling.\"\"\"
+
+                def __init__(self, initial: list[tuple[int, Any]] | None = None):
+                    self._data: list[tuple[int, int, Any]] = []
+                    self._counter = 0
+                    if initial:
+                        for priority, item in initial:
+                            heapq.heappush(self._data, (priority, self._counter, item))
+                            self._counter += 1
+
+                def push(self, priority: int, item: Any) -> None:
+                    \"\"\"Insert an item with the given priority.\"\"\"
+                    heapq.heappush(self._data, (priority, self._counter, item))
+                    self._counter += 1
+
+                def pop(self) -> Any:
+                    \"\"\"Remove and return the highest-priority item.\"\"\"
+                    if not self._data:
+                        raise IndexError("pop from empty queue")
+                    return heapq.heappop(self._data)[2]
+
+                def peek(self) -> Any:
+                    \"\"\"Return the highest-priority item without removing it.\"\"\"
+                    if not self._data:
+                        raise IndexError("peek from empty queue")
+                    return self._data[0][2]
+
+                def __len__(self) -> int:
+                    \"\"\"Return the number of items in the queue.\"\"\"
+                    return len(self._data)
+
+                def is_empty(self) -> bool:
+                    \"\"\"Return True if the queue contains no items.\"\"\"
+                    return len(self._data) == 0
+            """)
+        )
+
     else:
         raise ValueError(f"Unknown scenario: {scenario_name}")
 
@@ -638,6 +1257,12 @@ def test_reference_solution_passes_all_checkers(
     """A correct reference solution should pass all checkers for the scenario."""
     spec = scenario
     name = spec["name"]
+
+    # Skip scenarios requiring external tools not available in the test env
+    if name == "add-type-hints":
+        result = _run("python3 -m mypy --version")
+        if result.returncode != 0:
+            pytest.skip("mypy not available")
 
     # Write scenario files
     for fname, content in spec["files"].items():

@@ -717,6 +717,70 @@ class TestWorkspaceEdgeCases:
         assert data["type"] == "text"
         assert len(data["content"]) == 100_000
 
+    def test_large_file_truncated(
+        self, client: FlaskClient, workspace_conv, monkeypatch
+    ):
+        """Test that files exceeding the preview limit are truncated."""
+        import gptme.server.workspace_api as ws_mod
+
+        # Use a tiny limit so we can test truncation without huge files
+        monkeypatch.setattr(ws_mod, "MAX_PREVIEW_BYTES", 50)
+
+        workspace = workspace_conv["workspace"]
+        large_file = workspace / "huge.txt"
+        large_file.write_text("a" * 200)
+
+        conv_id = workspace_conv["conversation_id"]
+        response = client.get(
+            f"/api/v2/conversations/{conv_id}/workspace/huge.txt/preview"
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data["type"] == "text"
+        assert len(data["content"]) == 50
+        assert data["truncated"] is True
+        assert data["total_size"] == 200
+
+    def test_small_file_not_truncated(self, client: FlaskClient, workspace_conv):
+        """Test that small files have no truncation metadata."""
+        conv_id = workspace_conv["conversation_id"]
+        response = client.get(
+            f"/api/v2/conversations/{conv_id}/workspace/readme.txt/preview"
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data["type"] == "text"
+        assert "truncated" not in data
+
+    def test_multibyte_utf8_truncation(
+        self, client: FlaskClient, workspace_conv, monkeypatch
+    ):
+        """Test that truncation respects byte boundaries, not character counts.
+
+        Each CJK character is 3 bytes in UTF-8. With a limit of 9 bytes and
+        10 CJK characters (30 bytes total), we expect exactly 3 characters
+        (9 bytes) returned — not 9 characters (27 bytes).
+        """
+        import gptme.server.workspace_api as ws_mod
+
+        monkeypatch.setattr(ws_mod, "MAX_PREVIEW_BYTES", 9)  # 3 CJK chars
+
+        workspace = workspace_conv["workspace"]
+        cjk_file = workspace / "cjk.txt"
+        # Each '中' is 3 bytes in UTF-8
+        cjk_file.write_text("中" * 10, encoding="utf-8")
+
+        conv_id = workspace_conv["conversation_id"]
+        response = client.get(
+            f"/api/v2/conversations/{conv_id}/workspace/cjk.txt/preview"
+        )
+        assert response.status_code == 200
+        data = response.get_json()
+        assert data["type"] == "text"
+        # 9 bytes = 3 CJK chars, not 9 chars
+        assert len(data["content"].replace("\ufffd", "")) == 3
+        assert data["truncated"] is True
+
     def test_special_characters_in_filename(self, client: FlaskClient, workspace_conv):
         """Test files with special characters in names."""
         workspace = workspace_conv["workspace"]

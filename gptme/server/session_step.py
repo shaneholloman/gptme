@@ -14,6 +14,7 @@ import os
 import threading
 import uuid
 from collections.abc import Iterable
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
 
@@ -122,7 +123,7 @@ def _run_health_check() -> None:
     SessionManager.clean_inactive_sessions(max_age_minutes=_SESSION_MAX_AGE_MINUTES)
 
     # 2. Check ACP subprocess health
-    for session_id, session in list(SessionManager._sessions.items()):
+    for session_id, session in SessionManager.get_all_sessions():
         # Snapshot to a local variable: a concurrent _cleanup_all_acp_sessions()
         # can set session.acp_runtime = None between reads, causing AttributeError.
         acp_runtime = session.acp_runtime
@@ -158,7 +159,7 @@ def _cleanup_all_acp_sessions() -> None:
     """
     acp_sessions = [
         (sid, s)
-        for sid, s in list(SessionManager._sessions.items())
+        for sid, s in SessionManager.get_all_sessions()
         if s.acp_runtime is not None
     ]
     if not acp_sessions:
@@ -346,6 +347,7 @@ async def _acp_step(
             {"type": "error", "error": "Internal error: ACP runtime not initialized"},
         )
         session.generating = False
+        session.generating_since = None
         return
     acp_runtime = session.acp_runtime  # snapshot to avoid TOCTOU races
 
@@ -388,6 +390,7 @@ async def _acp_step(
         }
         SessionManager.add_event(conversation_id, error_event)
         session.generating = False
+        session.generating_since = None
         return
 
     next_user_index = session.acp_last_user_msg_index + 1
@@ -399,6 +402,7 @@ async def _acp_step(
         }
         SessionManager.add_event(conversation_id, duplicate_error_event)
         session.generating = False
+        session.generating_since = None
         return
 
     SessionManager.add_event(conversation_id, {"type": "generation_started"})
@@ -479,6 +483,7 @@ async def _acp_step(
     finally:
         acp_runtime.set_on_update(None)
         session.generating = False
+        session.generating_since = None
 
 
 def _start_acp_step_thread(
@@ -489,6 +494,7 @@ def _start_acp_step_thread(
     """Start an ACP-backed step in a background thread."""
     session.last_error = None
     session.generating = True
+    session.generating_since = datetime.now(tz=timezone.utc)
 
     def _run() -> None:
         asyncio.run(_acp_step(conversation_id, session, workspace))
@@ -606,6 +612,7 @@ def step(
         }
         SessionManager.add_event(conversation_id, error_event)
         session.generating = False
+        session.generating_since = None
         return
 
     # Notify clients about generation status
@@ -735,9 +742,6 @@ def step(
                     conversation_id, session, tool_id, tooluse, model, chat_config
                 )
 
-        # Mark session as not generating
-        session.generating = False
-
     except Exception as e:
         logger.exception(f"Error during step execution: {e}")
         error_message = str(e) or "Generation failed"
@@ -749,7 +753,9 @@ def step(
         SessionManager.add_event(
             conversation_id, {"type": "error", "error": error_message}
         )
+    finally:
         session.generating = False
+        session.generating_since = None
 
 
 def start_tool_execution(
@@ -817,7 +823,7 @@ def start_tool_execution(
             for tool_output in tool_outputs:
                 _append_and_notify(manager, session, tool_output)
         except Exception as e:
-            logger.exception(f"Error executing tool {tooluse.__class__.__name__}: {e}")
+            logger.exception(f"Error executing tool {tooluse.tool}: {e}")
             tool_exec.status = ToolStatus.FAILED
 
             msg = Message("system", f"Error: {e!s}")
@@ -863,6 +869,7 @@ def _start_step_thread(
     # the /step route's guard.
     session.last_error = None
     session.generating = True
+    session.generating_since = datetime.now(tz=timezone.utc)
 
     def step_thread() -> None:
         step(

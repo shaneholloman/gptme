@@ -8,11 +8,17 @@ enabling proper single-page application routing.
 import http.server
 import os
 import socketserver
+from functools import partial
 from urllib.parse import urlsplit
 
 
 class SPAHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
     """HTTP request handler with SPA routing support."""
+
+    def list_directory(self, path):
+        """Disable directory listing."""
+        self.send_error(403, "Directory listing not allowed")
+        return None
 
     def do_GET(self):
         """Handle GET requests with SPA fallback."""
@@ -57,9 +63,15 @@ class SPAHTTPRequestHandler(http.server.SimpleHTTPRequestHandler):
         return http.server.SimpleHTTPRequestHandler.do_GET(self)
 
 
-def run_server(port=5701, bind="0.0.0.0"):
+def run_server(port=5701, bind="127.0.0.1"):
     """Run the HTTP server."""
-    with socketserver.TCPServer((bind, port), SPAHTTPRequestHandler) as httpd:
+    web_root = os.path.join(os.path.dirname(os.path.abspath(__file__)), "dist")
+    if not os.path.isdir(web_root):
+        raise FileNotFoundError(
+            f"Web root '{web_root}' not found. Run 'npm run build' first."
+        )
+    handler = partial(SPAHTTPRequestHandler, directory=web_root)
+    with socketserver.TCPServer((bind, port), handler) as httpd:
         print(f"Serving on {bind}:{port}")
         print("SPA routing enabled - serving index.html for non-asset routes")
         try:

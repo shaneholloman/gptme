@@ -11,6 +11,7 @@ import logging
 import time
 import uuid
 from collections.abc import Generator
+from datetime import datetime, timezone
 
 import flask
 from flask import request
@@ -57,6 +58,20 @@ from .session_step import (  # noqa: F401
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _get_request_json_object() -> dict | tuple[flask.Response, int]:
+    """Return request JSON as an object or a 400 error response.
+
+    Session endpoints expect JSON objects. Arrays/strings/numbers would make
+    later `.get()` access crash with AttributeError and return 500s.
+    """
+    req_json = request.get_json(silent=True)
+    if req_json is None:
+        return {}
+    if not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
+    return req_json
 
 
 # Re-export step-level symbols that other modules may import from here.
@@ -145,7 +160,7 @@ def api_conversation_events(conversation_id: str):
                         },
                         "auto_confirm": te.auto_confirm,
                     }
-                    for tid, te in session.pending_tools.items()
+                    for tid, te in list(session.pending_tools.items())
                     if te.status == ToolStatus.PENDING
                 ],
             }
@@ -154,14 +169,14 @@ def api_conversation_events(conversation_id: str):
             # Send immediate ping to ensure connection is established right away
             yield f"data: {flask.json.dumps({'type': 'ping'})}\n\n"
 
-            # Create an event queue
-            last_event_index = 0
+            # Track position using absolute event indices (offset-aware)
+            last_event_index = session.events_count
 
             while True:
                 # Check if there are new events
-                if last_event_index < (new_index := len(session.events)):
+                if last_event_index < (new_index := session.events_count):
                     # Send any new events
-                    for event in session.events[last_event_index:new_index]:
+                    for event in session.get_events_since(last_event_index):
                         yield f"data: {flask.json.dumps(event)}\n\n"
                     last_event_index = new_index
 
@@ -176,7 +191,7 @@ def api_conversation_events(conversation_id: str):
                 # Re-check after clearing: events may have arrived between the
                 # check above and the clear(), which would otherwise delay
                 # delivery by up to the full wait timeout.
-                if last_event_index < len(session.events):
+                if last_event_index < session.events_count:
                     continue
 
                 session.event_flag.wait(timeout=15)
@@ -230,7 +245,9 @@ def api_conversation_step(conversation_id: str):
     """Take a step in the conversation - generate a response or continue after tool execution."""
     if error := _validate_conversation_id(conversation_id):
         return error
-    req_json = flask.request.json or {}
+    req_json = _get_request_json_object()
+    if not isinstance(req_json, dict):
+        return req_json
     session_id = req_json.get("session_id")
 
     if not session_id:
@@ -308,6 +325,7 @@ def api_conversation_step(conversation_id: str):
         # check above and those calls — enough for a second request to slip through
         # on threaded WSGI servers.
         session.generating = True
+        session.generating_since = datetime.now(tz=timezone.utc)
 
     # Wrap setup in try/finally so any unexpected exception (get_default_model,
     # config I/O, etc.) resets the flag rather than leaving the session
@@ -374,8 +392,8 @@ def api_conversation_step(conversation_id: str):
         if acp_runtime is not None and model:
             acp_runtime.model = model
 
-        # Snapshot event count before starting, so we can detect new events below
-        initial_event_count = len(session.events)
+        # Snapshot absolute event count before starting, so we can detect new events below
+        initial_event_count = session.events_count
 
         # Route through ACP subprocess if the session has opted in
         if acp_runtime is not None:
@@ -407,6 +425,7 @@ def api_conversation_step(conversation_id: str):
     finally:
         if not _step_dispatched:
             session.generating = False
+            session.generating_since = None
 
     # Wait briefly for early errors (bad model, auth failure, empty messages, etc.)
     # so we can return them in the HTTP response instead of swallowing silently.
@@ -417,7 +436,7 @@ def api_conversation_step(conversation_id: str):
     deadline = time.monotonic() + _STARTUP_TIMEOUT
     while time.monotonic() < deadline:
         # Check new events since we started
-        new_events = session.events[initial_event_count:]
+        new_events = session.get_events_since(initial_event_count)
         for event in new_events:
             event_type = event.get("type") if isinstance(event, dict) else None
             if event_type == "error":
@@ -469,7 +488,9 @@ def api_conversation_tool_confirm(conversation_id: str):
     if error := _validate_conversation_id(conversation_id):
         return error
 
-    req_json = flask.request.json or {}
+    req_json = _get_request_json_object()
+    if not isinstance(req_json, dict):
+        return req_json
     session_id = req_json.get("session_id")
     tool_id = req_json.get("tool_id")
     action = req_json.get("action")
@@ -580,8 +601,8 @@ def api_conversation_tool_confirm(conversation_id: str):
     elif action == "auto":
         # Enable auto-confirmation for future tools
         count = req_json.get("count", 1)
-        if count <= 0:
-            return flask.jsonify({"error": "count must be positive"}), 400
+        if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
+            return flask.jsonify({"error": "count must be a positive integer"}), 400
 
         session.auto_confirm_count = count
 
@@ -618,7 +639,9 @@ def api_conversation_rerun(conversation_id: str):
         return error
     from ..tools import ToolUse
 
-    req_json = request.json or {}
+    req_json = _get_request_json_object()
+    if not isinstance(req_json, dict):
+        return req_json
     session_id = req_json.get("session_id")
 
     if not session_id:
@@ -730,7 +753,9 @@ def api_conversation_elicit_respond(conversation_id: str):
     """
     if error := _validate_conversation_id(conversation_id):
         return error
-    req_json = flask.request.json or {}
+    req_json = _get_request_json_object()
+    if not isinstance(req_json, dict):
+        return req_json
     elicit_id = req_json.get("elicit_id")
     action = req_json.get("action")
 
@@ -773,7 +798,9 @@ def api_conversation_interrupt(conversation_id: str):
     """Interrupt the current generation or tool execution."""
     if error := _validate_conversation_id(conversation_id):
         return error
-    req_json = flask.request.json or {}
+    req_json = _get_request_json_object()
+    if not isinstance(req_json, dict):
+        return req_json
     session_id = req_json.get("session_id")
 
     if not session_id:
@@ -791,6 +818,7 @@ def api_conversation_interrupt(conversation_id: str):
 
     # Mark session as not generating
     session.generating = False
+    session.generating_since = None
 
     # Clear pending tools
     session.pending_tools.clear()
