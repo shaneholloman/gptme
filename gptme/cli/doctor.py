@@ -7,6 +7,16 @@ Usage:
     gptme-doctor --fix        # Attempt to fix issues (future)
 """
 
+# Suppress requests' overly-strict version-compatibility warning before any
+# import path can pull in `requests`. Newer urllib3/chardet/charset_normalizer
+# work fine with requests; the warning just pollutes gptme-doctor output.
+import warnings
+
+warnings.filterwarnings(
+    "ignore",
+    message=r".*urllib3.*chardet.*charset_normalizer.*",
+)
+
 import importlib.util
 import logging
 import os
@@ -378,6 +388,30 @@ def _check_permissions(verbose: bool = False) -> list[CheckResult]:
     return results
 
 
+def _check_python_version(verbose: bool = False) -> list[CheckResult]:
+    """Check that Python version meets gptme's minimum requirement (3.10+)."""
+    version = sys.version_info
+    version_str = f"{version.major}.{version.minor}.{version.micro}"
+
+    if version >= (3, 10):
+        return [
+            CheckResult(
+                name="Version: Python",
+                status=CheckStatus.OK,
+                message=f"Python {version_str}",
+                details=sys.executable if verbose else None,
+            )
+        ]
+    return [
+        CheckResult(
+            name="Version: Python",
+            status=CheckStatus.ERROR,
+            message=f"Python {version_str} is below minimum (3.10)",
+            fix_hint="Upgrade to Python 3.10 or newer",
+        )
+    ]
+
+
 def _check_version(verbose: bool = False) -> list[CheckResult]:
     """Check if gptme is up to date by comparing with PyPI."""
     results = []
@@ -679,6 +713,7 @@ def run_diagnostics(verbose: bool = False) -> tuple[list[CheckResult], dict]:
     all_results: list[CheckResult] = []
 
     # Run all checks
+    all_results.extend(_check_python_version(verbose))
     all_results.extend(_check_version(verbose))
     all_results.extend(_check_config(verbose))
     all_results.extend(_check_api_keys(verbose))
