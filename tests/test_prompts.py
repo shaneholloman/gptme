@@ -1,4 +1,5 @@
 import os
+from types import SimpleNamespace
 
 import pytest
 
@@ -284,3 +285,86 @@ def test_workspace_git_status_in_prompt(tmp_path):
     content = "\n".join(msg.content for msg in msgs)
     assert "Git Status" in content
     assert "Branch" in content
+
+
+def test_prompt_workspace_can_skip_user_context(tmp_path, monkeypatch):
+    """User-level prompt files and AGENTS.md should be optional."""
+    from gptme.prompts import prompt_workspace
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# Local README")
+
+    config_dir = tmp_path / "config"
+    config_dir.mkdir()
+    user_agent = config_dir / "AGENTS.md"
+    user_agent.write_text("# User Agent Rules")
+    user_notes = tmp_path / "user-notes.md"
+    user_notes.write_text("absolute path leak")
+
+    cfg = SimpleNamespace(
+        user=SimpleNamespace(
+            prompt=SimpleNamespace(files=[str(user_notes)]),
+        )
+    )
+    monkeypatch.setattr(
+        "gptme.prompts.workspace.config_path",
+        str(config_dir / "config.toml"),
+    )
+    monkeypatch.setattr("gptme.prompts.workspace.get_config", lambda: cfg)
+
+    msgs_with_user = list(prompt_workspace(workspace, include_user_context=True))
+    msgs_without_user = list(prompt_workspace(workspace, include_user_context=False))
+
+    files_with_user = [str(f) for msg in msgs_with_user for f in msg.files]
+    files_without_user = [str(f) for msg in msgs_without_user for f in msg.files]
+
+    assert str((workspace / "README.md").resolve()) in files_with_user
+    assert str((workspace / "README.md").resolve()) in files_without_user
+    assert str(user_agent.resolve()) in files_with_user
+    assert str(user_notes.resolve()) in files_with_user
+    assert str(user_agent.resolve()) not in files_without_user
+    assert str(user_notes.resolve()) not in files_without_user
+
+
+def test_prompt_workspace_skip_home_agents_md(tmp_path, monkeypatch):
+    """~/AGENTS.md must not leak when workspace is under the home directory.
+
+    This covers the gap in the original test: eval workspaces default to
+    ~/.local/share/gptme/logs/..., so find_agent_files_in_tree walks through
+    the home dir and picks up ~/AGENTS.md unless the tree-walk is gated by
+    include_user_context.
+    """
+    from gptme.prompts import prompt_workspace
+
+    # Simulate a home dir and an eval workspace inside it
+    fake_home = tmp_path / "home" / "user"
+    fake_home.mkdir(parents=True)
+    eval_workspace = fake_home / ".local" / "share" / "gptme" / "logs" / "eval-task"
+    eval_workspace.mkdir(parents=True)
+
+    # Place an AGENTS.md in the fake home (the file that must not leak)
+    home_agents = fake_home / "AGENTS.md"
+    home_agents.write_text("# Home user agent rules — must not appear in evals")
+
+    # Also place a project-level AGENTS.md in the workspace itself
+    project_agents = eval_workspace / "AGENTS.md"
+    project_agents.write_text("# Project-level agent rules")
+
+    monkeypatch.setattr("pathlib.Path.home", lambda: fake_home)
+    # Minimal config with no user files
+    cfg = SimpleNamespace(user=SimpleNamespace(prompt=SimpleNamespace(files=[])))
+    monkeypatch.setattr("gptme.prompts.workspace.get_config", lambda: cfg)
+    monkeypatch.setattr(
+        "gptme.prompts.workspace.config_path",
+        str(fake_home / ".config" / "gptme" / "config.toml"),
+    )
+
+    msgs_without_user = list(
+        prompt_workspace(eval_workspace, include_user_context=False)
+    )
+    files_without_user = [str(f) for msg in msgs_without_user for f in msg.files]
+
+    assert str(home_agents.resolve()) not in files_without_user, (
+        "~/AGENTS.md must not appear in eval runs (include_user_context=False)"
+    )
