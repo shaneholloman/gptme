@@ -11,7 +11,7 @@ from ..init import init, init_logging
 from ..telemetry import init_telemetry, shutdown_telemetry
 from .app import create_app
 from .auth import get_server_token, init_auth
-from .constants import DEFAULT_FALLBACK_MODEL
+from .constants import _pick_fallback_model
 
 logger = logging.getLogger(__name__)
 
@@ -95,18 +95,24 @@ def serve(
         if not is_config_error:
             raise
 
-        # Handle model configuration errors with fallback
-        fallback_model = DEFAULT_FALLBACK_MODEL
+        # Handle model configuration errors with fallback.
+        # Pick a fallback that matches an available provider so we don't try
+        # (and fail) to use Anthropic when the user only has e.g. OpenAI keys.
+        fallback_model = _pick_fallback_model()
         logger.warning(
             f"No default model configured. Using fallback: {fallback_model}. "
             "Set MODEL environment variable or use --model flag for explicit configuration."
         )
+        # require_llm=False: if the fallback provider also has no API key
+        # (e.g. first-run Tauri with no keys configured), start the server
+        # in degraded mode so the user can configure a provider via the UI.
         init(
             fallback_model,
             interactive=False,
             tool_allowlist=None if tools is None else tools.split(","),
             tool_format="markdown",
             server=True,
+            require_llm=False,
         )
 
     # Initialize telemetry (server is API/WebUI driven, not CLI interactive)

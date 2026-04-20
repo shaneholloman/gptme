@@ -637,6 +637,28 @@ def test_project_config_to_toml():
     assert config_new == config
 
 
+def test_project_config_ignores_unknown_top_level_keys():
+    """Forward-compat: unknown top-level keys should warn, not crash.
+
+    Before this fix, any unrecognized top-level section in gptme.toml
+    (e.g. [user] placed in a project config, or a future section) would
+    be passed via **config_data to the dataclass constructor and raise
+    TypeError: unexpected keyword argument.
+    """
+    config_toml = """
+[prompt]
+files = ["README.md"]
+
+[user]
+name = "placed-in-project-config-by-mistake"
+
+[future_section_added_later]
+key = "value"
+"""
+    config = ProjectConfig.from_dict(tomlkit.loads(config_toml).unwrap())
+    assert config.files == ["README.md"]
+
+
 def test_resume_config_precedence():
     """Test that resume configuration respects saved config unless CLI overrides provided."""
     with tempfile.TemporaryDirectory() as tmpdir:
@@ -845,6 +867,35 @@ def test_user_identity_config_defaults():
     assert identity.name == "User"
     assert identity.about is None
     assert identity.response_preference is None
+
+
+def test_user_config_ignores_unknown_keys_in_prompt_and_user():
+    """Forward-compat: unknown keys in [prompt] or [user] should warn, not crash.
+
+    Reproduces gptme#2173: older gptme bundled in archived gptme-tauri v0.1.1
+    crashed with `TypeError: UserPromptConfig.__init__() got an unexpected keyword
+    argument 'files'` when reading a config written by a newer gptme.
+    """
+    config_toml = """
+[prompt]
+about_user = "Hi"
+future_field_added_by_newer_gptme = "should be ignored"
+
+[user]
+name = "Erik"
+some_future_user_key = 42
+
+[env]
+"""
+    with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
+        f.write(config_toml)
+        f.flush()
+        try:
+            config = load_user_config(f.name)
+            assert config.user.name == "Erik"
+            assert config.user.about == "Hi"
+        finally:
+            os.remove(f.name)
 
 
 def test_user_identity_config_partial_fallback():

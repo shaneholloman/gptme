@@ -15,6 +15,33 @@ from .skills import prompt_skills_summary
 
 logger = logging.getLogger(__name__)
 
+# Providers whose models tend to narrate tool use instead of emitting actual calls.
+# Inspired by Hermes/OpenClaw research on "describe without doing" drift.
+_TOOL_ENFORCEMENT_PROVIDERS = frozenset(
+    ["openai", "openai-subscription", "azure", "gemini", "xai"]
+)
+# Model name substrings that need enforcement when running under generic providers
+# (openrouter, groq, deepseek, nvidia, local).
+_TOOL_ENFORCEMENT_MODEL_FAMILIES = ("gpt-", "codex", "gemini", "gemma", "grok")
+
+_TOOL_USE_ENFORCEMENT_PROMPT = (
+    "\n\nWhen a tool is available for a task, call it immediately — do not describe "
+    "what you would do or which tool you would use. Every decision to use a tool "
+    "must produce an actual tool call in the same message."
+)
+
+
+def _needs_tool_use_enforcement(model_meta) -> bool:
+    """Return True for model families that tend to narrate instead of calling tools."""
+    if model_meta is None:
+        return False
+    provider = str(model_meta.provider)
+    if provider in _TOOL_ENFORCEMENT_PROVIDERS:
+        return True
+    # For pass-through providers, check the model name for known families.
+    model_name = model_meta.model.lower()
+    return any(family in model_name for family in _TOOL_ENFORCEMENT_MODEL_FAMILIES)
+
 
 def prompt_full(
     interactive: bool,
@@ -39,11 +66,16 @@ def prompt_short(
     interactive: bool,
     tools: list[ToolSpec],
     tool_format: ToolFormat,
+    model: str | None = None,
     agent_name: str | None = None,
 ) -> Generator[Message, None, None]:
     """Short prompt to start the conversation."""
-    yield from prompt_gptme(interactive, agent_name=agent_name, tool_format=tool_format)
-    yield from prompt_tools(examples=False, tools=tools, tool_format=tool_format)
+    yield from prompt_gptme(
+        interactive, model, agent_name=agent_name, tool_format=tool_format
+    )
+    yield from prompt_tools(
+        examples=False, tools=tools, tool_format=tool_format, model=model
+    )
     if interactive:
         yield from prompt_user(tool_format=tool_format)
     yield from prompt_project(tool_format=tool_format)
@@ -152,6 +184,8 @@ Proceed directly with the most appropriate actions to complete the task.
         + "\n\n"
         + (interactive_prompt if interactive else non_interactive_prompt)
     )
+    if _needs_tool_use_enforcement(model_meta):
+        full_prompt += _TOOL_USE_ENFORCEMENT_PROMPT
     if tool_format == "xml":
         full_prompt = _xml_section("role", xml_escape(full_prompt))
     yield Message("system", full_prompt)

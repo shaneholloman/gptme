@@ -325,6 +325,74 @@ class TestPromptGptme:
         assert content.startswith("<role>")
         assert content.endswith("</role>")
 
+    def test_tool_use_enforcement_for_openai(self):
+        """GPT-family models get explicit tool-use enforcement guidance."""
+        from gptme.prompts import prompt_gptme
+
+        mock_model = MagicMock()
+        mock_model.supports_reasoning = False
+        mock_model.full = "openai/gpt-5"
+        mock_model.provider = "openai"
+        mock_model.model = "gpt-5"
+
+        with patch("gptme.prompts.templates.get_model", return_value=mock_model):
+            msgs = list(prompt_gptme(interactive=True, model="openai/gpt-5"))
+        content = msgs[0].content
+        assert "call it immediately" in content
+
+    def test_tool_use_enforcement_for_xai(self):
+        """Grok-family models get explicit tool-use enforcement guidance."""
+        from gptme.prompts import prompt_gptme
+
+        mock_model = MagicMock()
+        mock_model.supports_reasoning = False
+        mock_model.full = "xai/grok-4"
+        mock_model.provider = "xai"
+        mock_model.model = "grok-4"
+
+        with patch("gptme.prompts.templates.get_model", return_value=mock_model):
+            msgs = list(prompt_gptme(interactive=True, model="xai/grok-4"))
+        assert "call it immediately" in msgs[0].content
+
+    def test_no_tool_use_enforcement_for_anthropic(self):
+        """Anthropic/Claude models do NOT get tool-use enforcement guidance."""
+        from gptme.prompts import prompt_gptme
+
+        mock_model = MagicMock()
+        mock_model.supports_reasoning = False
+        mock_model.full = "anthropic/claude-sonnet-4-6"
+        mock_model.provider = "anthropic"
+        mock_model.model = "claude-sonnet-4-6"
+
+        with patch("gptme.prompts.templates.get_model", return_value=mock_model):
+            msgs = list(
+                prompt_gptme(interactive=True, model="anthropic/claude-sonnet-4-6")
+            )
+        assert "call it immediately" not in msgs[0].content
+
+    def test_no_tool_use_enforcement_without_model(self):
+        """When no model is specified, enforcement guidance is not injected."""
+        from gptme.prompts import prompt_gptme
+
+        msgs = list(prompt_gptme(interactive=True, model=None))
+        assert "call it immediately" not in msgs[0].content
+
+    def test_no_tool_use_enforcement_for_gptq_models(self):
+        """GPTQ-quantized models (e.g. Llama-2-7B-GPTQ) must NOT get enforcement."""
+        from gptme.prompts import prompt_gptme
+
+        mock_model = MagicMock()
+        mock_model.supports_reasoning = False
+        mock_model.full = "openrouter/Llama-2-7B-GPTQ"
+        mock_model.provider = "openrouter"
+        mock_model.model = "llama-2-7b-gptq"
+
+        with patch("gptme.prompts.templates.get_model", return_value=mock_model):
+            msgs = list(
+                prompt_gptme(interactive=True, model="openrouter/Llama-2-7B-GPTQ")
+            )
+        assert "call it immediately" not in msgs[0].content
+
 
 # ---------------------------------------------------------------------------
 # prompt_full / prompt_short composition
@@ -458,6 +526,50 @@ class TestPromptComposition:
         assert "test-tool" in combined
         assert "### Examples" not in combined
         assert "example usage" not in combined
+
+    def test_prompt_short_passes_model_for_tool_enforcement(self):
+        """prompt_short propagates `model` so GPT/Gemini/Grok get enforcement guidance."""
+        from gptme.prompts.templates import prompt_short
+
+        mock_model = MagicMock()
+        mock_model.supports_reasoning = False
+        mock_model.full = "openai/gpt-5"
+        mock_model.provider = "openai"
+        mock_model.model = "gpt-5"
+
+        with patch("gptme.prompts.templates.get_model", return_value=mock_model):
+            msgs = list(
+                prompt_short(
+                    interactive=True,
+                    tools=[self._make_tool()],
+                    tool_format="markdown",
+                    model="openai/gpt-5",
+                )
+            )
+        combined = "\n".join(m.content for m in msgs)
+        assert "call it immediately" in combined
+
+    def test_prompt_short_no_enforcement_for_anthropic(self):
+        """prompt_short with Claude model must NOT include enforcement guidance."""
+        from gptme.prompts.templates import prompt_short
+
+        mock_model = MagicMock()
+        mock_model.supports_reasoning = False
+        mock_model.full = "anthropic/claude-sonnet-4-6"
+        mock_model.provider = "anthropic"
+        mock_model.model = "claude-sonnet-4-6"
+
+        with patch("gptme.prompts.templates.get_model", return_value=mock_model):
+            msgs = list(
+                prompt_short(
+                    interactive=True,
+                    tools=[self._make_tool()],
+                    tool_format="markdown",
+                    model="anthropic/claude-sonnet-4-6",
+                )
+            )
+        combined = "\n".join(m.content for m in msgs)
+        assert "call it immediately" not in combined
 
 
 # ---------------------------------------------------------------------------
