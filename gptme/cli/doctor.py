@@ -187,14 +187,29 @@ def _check_tools(verbose: bool = False) -> list[CheckResult]:
         ("git", "Version control"),
     ]
 
-    # Optional tools with their purpose
-    optional_tools = [
-        ("gh", "GitHub CLI - enables GitHub integration"),
-        ("tmux", "Terminal multiplexer - enables background tasks"),
-        ("lynx", "Text browser - fallback for web browsing"),
-        ("pdftotext", "PDF extraction - enables PDF reading"),
-        ("rg", "ripgrep - fast file searching"),
-        ("ast-grep", "AST-based code search"),
+    # Optional tools: (name, description, fix_hint or None for generic)
+    optional_tools: list[tuple[str, str, str | None]] = [
+        ("gh", "GitHub CLI - enables GitHub integration", None),
+        ("tmux", "Terminal multiplexer - enables background tasks", None),
+        (
+            "node",
+            "Node.js - required for npx-based MCP servers",
+            "Install from https://nodejs.org or via your package manager",
+        ),
+        (
+            "npx",
+            "npm package runner - runs MCP servers without install",
+            "Usually bundled with Node.js; on Debian/Ubuntu install `npm` separately",
+        ),
+        (
+            "docker",
+            "Docker - enables eval sandbox and containerized tasks",
+            "Install from https://docs.docker.com/get-docker/",
+        ),
+        ("lynx", "Text browser - fallback for web browsing", None),
+        ("pdftotext", "PDF extraction - enables PDF reading", None),
+        ("rg", "ripgrep - fast file searching", None),
+        ("ast-grep", "AST-based code search", None),
     ]
 
     # Check required tools
@@ -220,7 +235,7 @@ def _check_tools(verbose: bool = False) -> list[CheckResult]:
             )
 
     # Check optional tools
-    for tool, desc in optional_tools:
+    for tool, desc, fix_hint in optional_tools:
         path = shutil.which(tool)
         if path:
             results.append(
@@ -237,7 +252,7 @@ def _check_tools(verbose: bool = False) -> list[CheckResult]:
                     name=f"Tool: {tool}",
                     status=CheckStatus.WARNING,
                     message=f"Not found - {desc}",
-                    fix_hint=f"Install {tool} for additional features",
+                    fix_hint=fix_hint or f"Install {tool} for additional features",
                 )
             )
 
@@ -772,13 +787,13 @@ def print_results(results: list[CheckResult], summary: dict, verbose: bool = Fal
 
             table.add_row(emoji, name, msg)
 
-            # Show fix hints for errors/warnings
-            if result.fix_hint and result.status in (
-                CheckStatus.ERROR,
-                CheckStatus.WARNING,
+            # Show fix hints: always for errors/warnings; also for skipped
+            # checks when --verbose (e.g. unconfigured API keys).
+            if result.fix_hint and (
+                result.status in (CheckStatus.ERROR, CheckStatus.WARNING)
+                or (verbose and result.status == CheckStatus.SKIPPED)
             ):
-                if verbose or result.status == CheckStatus.ERROR:
-                    table.add_row("", "", f"  [dim]→ {result.fix_hint}[/dim]")
+                table.add_row("", "", f"  [dim]→ {result.fix_hint}[/dim]")
 
         console.print(table)
         console.print()
