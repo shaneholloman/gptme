@@ -13,7 +13,9 @@ from gptme.hooks.workspace_agents import (
     AGENT_BINARIES,
     AgentInfo,
     _extract_flag,
+    _format_agent_line,
     _format_duration,
+    _get_process_memory_mb,
     _has_flag,
     _init_tracking,
     _parse_etime,
@@ -112,6 +114,54 @@ class TestHasFlag:
 
 
 # ---------------------------------------------------------------------------
+#  Runtime parsers
+# ---------------------------------------------------------------------------
+
+
+class TestRuntimeParsers:
+    def test_codex_exec_is_autonomous(self) -> None:
+        from gptme.hooks.workspace_agents import _parse_codex
+
+        info = _parse_codex(
+            100,
+            ["codex", "exec", "--model", "gpt-5", "Fix flaky tests"],
+            "/workspace",
+        )
+        assert info.runtime == "codex"
+        assert info.mode == "autonomous"
+        assert info.model == "gpt-5"
+        assert info.cmdline_summary == "Fix flaky tests"
+
+    def test_codex_wrapped_exec_is_autonomous(self) -> None:
+        from gptme.hooks.workspace_agents import _parse_codex
+
+        info = _parse_codex(
+            100,
+            ["node", "/usr/bin/codex", "exec", "--model", "gpt-5", "Run tests"],
+            "/workspace",
+        )
+        assert info.mode == "autonomous"
+        assert info.cmdline_summary == "Run tests"
+
+    def test_codex_prompt_defaults_to_interactive(self) -> None:
+        from gptme.hooks.workspace_agents import _parse_codex
+
+        info = _parse_codex(
+            100,
+            ["codex", "--model", "gpt-5", "Investigate flaky tests"],
+            "/workspace",
+        )
+        assert info.mode == "interactive"
+        assert info.cmdline_summary == "Investigate flaky tests"
+
+    def test_codex_server_modes(self) -> None:
+        from gptme.hooks.workspace_agents import _parse_codex
+
+        info = _parse_codex(100, ["codex", "mcp-server"], "/workspace")
+        assert info.mode == "server"
+
+
+# ---------------------------------------------------------------------------
 #  Time parsing & formatting
 # ---------------------------------------------------------------------------
 
@@ -134,6 +184,48 @@ class TestParseEtime:
 
     def test_invalid(self) -> None:
         assert _parse_etime("abc") is None
+
+
+class TestGetProcessMemoryMb:
+    """Tests for _get_process_memory_mb — resident memory lookup."""
+
+    def test_current_process(self) -> None:
+        # Our own process has a real VmRSS; value should be a positive float.
+        mem = _get_process_memory_mb(os.getpid())
+        assert mem is not None
+        assert mem > 0.0
+
+    def test_missing_pid_returns_none(self) -> None:
+        # PID 2**31 - 1 is effectively guaranteed not to exist.
+        assert _get_process_memory_mb(2**31 - 1) is None
+
+
+class TestFormatAgentLineMemory:
+    """Tests for memory formatting in _format_agent_line."""
+
+    def test_memory_rendered_when_present(self) -> None:
+        agent = AgentInfo(
+            pid=123,
+            runtime="gptme",
+            cwd="/tmp",
+            mode="interactive",
+            uptime_seconds=60,
+            memory_mb=42.0,
+        )
+        line = _format_agent_line(agent)
+        assert "mem=42MB" in line
+
+    def test_memory_omitted_when_missing(self) -> None:
+        agent = AgentInfo(
+            pid=123,
+            runtime="gptme",
+            cwd="/tmp",
+            mode="interactive",
+            uptime_seconds=60,
+            memory_mb=None,
+        )
+        line = _format_agent_line(agent)
+        assert "mem=" not in line
 
 
 class TestFormatDuration:
@@ -292,6 +384,10 @@ class TestScanAgents:
                 "gptme.hooks.workspace_agents._get_process_timing",
                 return_value=(120, 5.0, "S"),
             ),
+            patch(
+                "gptme.hooks.workspace_agents._get_process_memory_mb",
+                return_value=None,
+            ),
             patch("os.path.realpath", side_effect=lambda p: p),
         ):
             agents = scan_agents(workspace=workspace)
@@ -320,6 +416,39 @@ class TestScanAgents:
         ):
             agents = scan_agents(workspace="/home/bob/project")
             assert len(agents) == 0
+
+    def test_keeps_codex_interactive_and_autonomous_rows_separate(self) -> None:
+        pids = [99991, 99992]
+
+        cmdlines = {
+            99991: ["codex", "--model", "gpt-5", "Inspect status"],
+            99992: ["codex", "exec", "--model", "gpt-5", "Run tests"],
+        }
+
+        with (
+            patch("gptme.hooks.workspace_agents._get_all_pids", return_value=pids),
+            patch(
+                "gptme.hooks.workspace_agents._get_process_cmdline",
+                side_effect=lambda pid: cmdlines[pid],
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_process_cwd",
+                return_value="/home/bob/project",
+            ),
+            patch("gptme.hooks.workspace_agents._get_git_branch", return_value="main"),
+            patch(
+                "gptme.hooks.workspace_agents._get_process_timing",
+                return_value=(120, 5.0, "S"),
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_process_memory_mb",
+                return_value=None,
+            ),
+            patch("os.path.realpath", side_effect=lambda p: p),
+        ):
+            agents = scan_agents(workspace="/home/bob/project")
+
+        assert [agent.mode for agent in agents] == ["interactive", "autonomous"]
 
 
 # ---------------------------------------------------------------------------

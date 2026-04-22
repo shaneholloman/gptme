@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import Any, cast
 
 import pytest
+import tomlkit
 
 from gptme.config import ChatConfig, MCPConfig
 from gptme.llm.models import ModelMeta, get_default_model
@@ -76,6 +77,156 @@ def test_v2_api_root(client: FlaskClient, monkeypatch):
         "external_session_catalog": False,
         "external_session_transcript": False,
     }
+    assert "provider_configured" in data
+
+
+def test_v2_api_root_provider_configured(client: FlaskClient, monkeypatch):
+    """provider_configured reflects whether get_default_model() returns a model."""
+    from gptme.llm.models.types import ModelMeta
+
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_external_session_provider", lambda: None
+    )
+
+    # No model configured → provider_configured should be False
+    monkeypatch.setattr("gptme.server.api_v2.get_default_model", lambda: None)
+    response = client.get("/api/v2")
+    data = response.get_json()
+    assert data["provider_configured"] is False
+
+    # Model configured → provider_configured should be True
+    fake_model = ModelMeta(
+        model="test-model",
+        provider="anthropic",
+        context=10000,
+        max_output=1000,
+    )
+    monkeypatch.setattr("gptme.server.api_v2.get_default_model", lambda: fake_model)
+    response = client.get("/api/v2")
+    data = response.get_json()
+    assert data["provider_configured"] is True
+
+
+def test_v2_user_api_key_persists_env_entry(client: FlaskClient, tmp_path, monkeypatch):
+    """Saving an API key should write the provider env var into user config."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "anthropic", "api_key": "  sk-ant-test-key  "},
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data == {
+        "status": "ok",
+        "provider": "anthropic",
+        "env_var": "ANTHROPIC_API_KEY",
+        "restart_required": True,
+    }
+
+    saved = tomlkit.loads(config_file.read_text()).unwrap()
+    assert saved["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
+
+
+def test_v2_user_api_key_persists_default_model(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """Saving an API key may also persist the selected default model."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={
+            "provider": "anthropic",
+            "api_key": "sk-ant-test-key",
+            "model": "anthropic/claude-sonnet-4-7",
+        },
+    )
+
+    assert response.status_code == 200
+    saved = tomlkit.loads(config_file.read_text()).unwrap()
+    assert saved["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
+    assert saved["env"]["MODEL"] == "anthropic/claude-sonnet-4-7"
+
+
+def test_v2_user_api_key_rejects_model_provider_mismatch(client: FlaskClient):
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={
+            "provider": "anthropic",
+            "api_key": "sk-ant-test-key",
+            "model": "openai/gpt-4.1",
+        },
+    )
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data == {"error": "Model openai/gpt-4.1 does not match provider anthropic"}
+
+
+def test_v2_user_api_key_rejects_unknown_provider(client: FlaskClient):
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "bogus", "api_key": "sk-test"},
+    )
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data == {"error": "Unknown provider: bogus"}
+
+
+def test_v2_user_default_model_persists_and_applies(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """Saving a default model should write env.MODEL and update runtime state."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    applied: dict[str, ModelMeta] = {}
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.setattr("gptme.llm.init_llm", lambda provider: None)
+    monkeypatch.setattr(
+        "gptme.server.api_v2.set_default_model",
+        lambda model: applied.setdefault("model", model),
+    )
+
+    response = client.post(
+        "/api/v2/user/default-model",
+        json={"model": "anthropic/claude-sonnet-4-7"},
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data == {
+        "status": "ok",
+        "model": "anthropic/claude-sonnet-4-7",
+        "restart_required": False,
+    }
+
+    saved = tomlkit.loads(config_file.read_text()).unwrap()
+    assert saved["env"]["MODEL"] == "anthropic/claude-sonnet-4-7"
+    assert applied["model"].full == "anthropic/claude-sonnet-4-7"
+
+
+def test_v2_user_default_model_rejects_unqualified_model(client: FlaskClient):
+    response = client.post(
+        "/api/v2/user/default-model",
+        json={"model": "anthropic"},
+    )
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data == {"error": "model must be fully qualified as provider/model"}
 
 
 class _FakeExternalSessionItem:

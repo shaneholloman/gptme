@@ -73,6 +73,7 @@ One of the first agent CLIs created (Spring 2023) — and still in very active d
   - [🔌 Extensibility: Plugins, Skills & Lessons](#-extensibility-plugins-skills--lessons)
   - [🔗 Integrations: MCP & ACP](#-integrations-mcp--acp)
   - [🤖 Autonomous Agents](#-autonomous-agents)
+  - [🛡 Guardrails](#-guardrails)
   - [🛠 Use Cases](#-use-cases)
   - [🛠 Developer Perks](#-developer-perks)
   - [🚧 In Progress](#-in-progress)
@@ -350,6 +351,16 @@ Multiple specialized agents can run in parallel — e.g. Bob (engineering) and [
 
 See the [Autonomous Agents docs](https://gptme.org/docs/agents.html) for the full guide.
 
+### 🛡 Guardrails
+
+Persistent agents need guardrails around the full loop, not just tool permissions:
+
+- **Input guardrails** — structured task selectors in the agent workspace keep work focused and reduce thrashing on notifications or ambiguous work. Bob uses a CASCADE-style selector for this layer.
+- **Pre-action guardrails** — [lessons][docs-lessons] inject situational guidance before the agent acts.
+- **Output guardrails** — [hooks][docs-hooks] and [pre-commit checks](https://gptme.org/docs/usage.html#pre-commit-integration) validate file changes before control returns to the user.
+
+This stack is simple and composable: selectors improve work choice, lessons steer behavior, and checks verify the result. You can add evals on top later, but the baseline guardrail loop already exists.
+
 ### 🛠 Use Cases
 
 - 🖥 **Development:** Write and run code faster with AI assistance.
@@ -594,7 +605,7 @@ Contributions welcome! See the [contributing guide](https://gptme.org/docs/contr
 [discord]: https://discord.gg/NMaCmmkxWv
 [github]: https://github.com/gptme/gptme
 [gptme.vim]: https://github.com/gptme/gptme.vim
-[gptme-webui]: https://github.com/gptme/gptme-webui
+[gptme-webui]: https://github.com/gptme/gptme/tree/master/webui
 [gptme-rag]: https://github.com/gptme/gptme-rag
 [gptme-contrib]: https://github.com/gptme/gptme-contrib
 [gptme-tauri]: https://github.com/gptme/gptme-tauri

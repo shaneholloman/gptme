@@ -150,6 +150,53 @@ class ApiRootResponse(BaseModel):
     capabilities: ApiCapabilities = Field(
         ..., description="Advertised optional server capabilities"
     )
+    provider_configured: bool = Field(
+        True,
+        description="Whether an LLM provider is configured. False means the server started in degraded mode with no API keys or cloud auth. Clients should surface onboarding UI when false.",
+    )
+
+
+class UserApiKeySaveRequest(BaseModel):
+    """Request to save a provider API key into user config."""
+
+    provider: str = Field(..., description="Provider slug, e.g. anthropic or openai")
+    api_key: str = Field(..., description="Provider API key to persist in [env]")
+    model: str | None = Field(
+        None,
+        description="Optional fully qualified default model to persist in [env.MODEL]",
+    )
+
+
+class UserApiKeySaveResponse(BaseModel):
+    """Response after persisting a provider API key."""
+
+    status: str = Field(..., description="Operation status")
+    provider: str = Field(..., description="Provider slug that was saved")
+    env_var: str = Field(..., description="Env var written into user config")
+    restart_required: bool = Field(
+        True,
+        description="Whether the running server must be restarted before the new key is guaranteed to take effect",
+    )
+
+
+class UserDefaultModelSaveRequest(BaseModel):
+    """Request to save a default model into user config."""
+
+    model: str = Field(
+        ...,
+        description="Fully qualified default model to persist in [env.MODEL]",
+    )
+
+
+class UserDefaultModelSaveResponse(BaseModel):
+    """Response after persisting a default model."""
+
+    status: str = Field(..., description="Operation status")
+    model: str = Field(..., description="Fully qualified default model that was saved")
+    restart_required: bool = Field(
+        False,
+        description="Whether the running server must be restarted before the new model is guaranteed to take effect",
+    )
 
 
 class ExternalSessionListItem(BaseModel):

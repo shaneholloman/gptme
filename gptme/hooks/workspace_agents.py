@@ -111,6 +111,7 @@ class AgentInfo:
     uptime_seconds: int | None = None
     cpu_seconds: float | None = None
     process_state: str | None = None  # S=sleeping, R=running, T=stopped, Z=zombie
+    memory_mb: float | None = None  # resident set size in MB
     stale: bool = False
     stale_reason: str | None = None
     extra: dict[str, Any] = field(default_factory=dict)
@@ -263,6 +264,47 @@ def _get_process_timing(pid: int) -> tuple[int | None, float | None, str | None]
     return None, None, None
 
 
+def _get_process_memory_mb(pid: int) -> float | None:
+    """Get process resident memory in MB, cross-platform.
+
+    Linux reads ``/proc/<pid>/status`` (``VmRSS``); macOS falls back to
+    ``ps -o rss=``. Returns ``None`` if the value can't be determined (e.g.
+    the process exited, or the kernel doesn't expose VmRSS for it).
+    """
+    system = platform.system()
+    if system == "Linux":
+        try:
+            for line in Path(f"/proc/{pid}/status").read_text().splitlines():
+                if line.startswith("VmRSS:"):
+                    parts = line.split()
+                    # Format: "VmRSS:\t  12345 kB"
+                    if len(parts) >= 2:
+                        return int(parts[1]) / 1024.0
+            return None
+        except (OSError, ValueError):
+            return None
+    elif system == "Darwin":
+        try:
+            out = subprocess.check_output(
+                ["ps", "-p", str(pid), "-o", "rss="],
+                stderr=subprocess.DEVNULL,
+                text=True,
+                timeout=10,
+            ).strip()
+            if not out:
+                return None
+            return int(out) / 1024.0
+        except (
+            subprocess.CalledProcessError,
+            subprocess.TimeoutExpired,
+            FileNotFoundError,
+            ValueError,
+        ):
+            return None
+    # TODO: Windows
+    return None
+
+
 def _parse_etime(s: str) -> int | None:
     """Parse ps etime/cputime format: ``[[DD-]HH:]MM:SS[.xx]`` → seconds."""
     if not s:
@@ -369,6 +411,37 @@ def _extract_flag(cmdline: list[str], *flags: str) -> str | None:
 def _has_flag(cmdline: list[str], *flags: str) -> bool:
     """Check if any of the given flags are present."""
     return any(arg in flags for arg in cmdline)
+
+
+def _positionals_after_flags(cmdline: list[str], *, value_flags: set[str]) -> list[str]:
+    """Return positional args, skipping values consumed by known flags."""
+    positionals: list[str] = []
+    skip_next = False
+
+    for arg in cmdline[1:]:
+        if skip_next:
+            skip_next = False
+            continue
+        if arg == "--":
+            break
+        if arg.startswith("-"):
+            if "=" in arg:
+                continue
+            if arg in value_flags:
+                skip_next = True
+            continue
+        positionals.append(arg)
+
+    return positionals
+
+
+def _runtime_cmdline(cmdline: list[str], *runtime_binaries: str) -> list[str]:
+    """Trim interpreter prefixes so parsers start at the actual runtime binary."""
+    for idx, arg in enumerate(cmdline[:3]):
+        basename = re.sub(r"\.exe$", "", os.path.basename(arg))
+        if basename in runtime_binaries:
+            return cmdline[idx:]
+    return cmdline
 
 
 # ---------------------------------------------------------------------------
@@ -496,14 +569,78 @@ def _parse_gptme(pid: int, cmdline: list[str], cwd: str) -> AgentInfo:
 
 def _parse_codex(pid: int, cmdline: list[str], cwd: str) -> AgentInfo:
     """Extract metadata from a Codex process."""
-    model = _extract_flag(cmdline, "--model", "-m")
+    runtime_cmdline = _runtime_cmdline(cmdline, "codex")
+    model = _extract_flag(runtime_cmdline, "--model", "-m")
+    autonomous_commands = {"exec", "e", "review"}
+    server_commands = {"mcp-server", "app-server"}
+    interactive_commands = {"resume", "fork", "cloud"}
+    known_commands = (
+        autonomous_commands
+        | server_commands
+        | interactive_commands
+        | {
+            "login",
+            "logout",
+            "mcp",
+            "completion",
+            "sandbox",
+            "debug",
+            "apply",
+            "a",
+            "features",
+            "help",
+        }
+    )
+    positionals = _positionals_after_flags(
+        runtime_cmdline,
+        value_flags={
+            "-a",
+            "-c",
+            "-C",
+            "-i",
+            "-m",
+            "-p",
+            "-s",
+            "--add-dir",
+            "--ask-for-approval",
+            "--cd",
+            "--config",
+            "--disable",
+            "--enable",
+            "--image",
+            "--local-provider",
+            "--model",
+            "--profile",
+            "--sandbox",
+        },
+    )
+    subcommand = positionals[0] if positionals else None
+
+    if subcommand in autonomous_commands:
+        mode = "autonomous"
+        summary_parts = positionals[1:]
+    elif subcommand in server_commands:
+        mode = "server"
+        summary_parts = positionals[1:]
+    elif subcommand is None or subcommand not in known_commands:
+        mode = "interactive"
+        summary_parts = positionals
+    elif subcommand in interactive_commands:
+        mode = "interactive"
+        summary_parts = positionals[1:]
+    else:
+        mode = "unknown"
+        summary_parts = positionals[1:]
+
+    summary = " ".join(summary_parts[:6]).strip()
+
     return AgentInfo(
         pid=pid,
         runtime="codex",
         cwd=cwd,
         model=model,
-        mode="unknown",
-        cmdline_summary=" ".join(cmdline[:5]),
+        mode=mode,
+        cmdline_summary=summary or " ".join(runtime_cmdline[:5]),
     )
 
 
@@ -677,6 +814,7 @@ def scan_agents(workspace: str | None = None) -> list[AgentInfo]:
         info.uptime_seconds = timing_uptime
         info.cpu_seconds = timing_cpu
         info.process_state = timing_state
+        info.memory_mb = _get_process_memory_mb(pid)
 
         assess_staleness(info)
         agents.append(info)
@@ -721,6 +859,9 @@ def _format_agent_line(agent: AgentInfo) -> str:
         parts.append("[STALE]")
     elif agent.uptime_seconds is not None:
         parts.append(f"up {_format_duration(agent.uptime_seconds)}")
+
+    if agent.memory_mb is not None:
+        parts.append(f"mem={agent.memory_mb:.0f}MB")
 
     return " ".join(parts)
 

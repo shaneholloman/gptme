@@ -32,11 +32,11 @@ ENV_REASONING = "GPTME_REASONING"
 ENV_REASONING_BUDGET = "GPTME_REASONING_BUDGET"
 ENV_THINKING_EFFORT = "GPTME_THINKING_EFFORT"
 
-# Ergonomic named levels that map to budget_tokens values, mirroring the
-# ``low``/``medium``/``high``/``xhigh``/``max`` levels Anthropic exposes via
-# ``output_config.effort`` (Opus 4.7+). True ``xhigh``/``max`` semantics
-# (adaptive thinking) require a newer ``anthropic`` SDK than gptme currently
-# pins; these values are approximations until that bump lands. See #2183.
+# Named effort levels → budget_tokens fallback values.  When the installed
+# anthropic SDK exposes ``output_config.effort`` (>= 0.77) these are only
+# used as the ``budget_tokens`` guard for max_tokens clamping; the true
+# effort semantics (including ``xhigh``/``max`` adaptive thinking) are passed
+# via ``output_config``.  On older SDKs they serve as the sole signal.
 _THINKING_EFFORT_BUDGETS: dict[str, int] = {
     "low": 2000,
     "medium": 8000,
@@ -44,11 +44,31 @@ _THINKING_EFFORT_BUDGETS: dict[str, int] = {
     "xhigh": 24000,
     "max": 32000,
 }
+_EffortLevel = Literal["low", "medium", "high", "xhigh", "max"]
+
+# Models that reject the legacy ``thinking: {type: "enabled", budget_tokens: N}``
+# format with HTTP 400 and require ``thinking: {type: "adaptive"}`` + the
+# ``output_config.effort`` parameter.  See
+# https://platform.claude.com/docs/en/docs/build-with-claude/extended-thinking
+# ("Manual extended thinking is no longer supported on Claude Opus 4.7 or
+# later models and returns a 400 error.")
+_ADAPTIVE_THINKING_MODELS: frozenset[str] = frozenset({"claude-opus-4-7"})
 
 if TYPE_CHECKING:
     # noreorder
     import anthropic.types  # fmt: skip
     from anthropic import Anthropic  # fmt: skip
+
+# output_config.effort was added in anthropic SDK 0.77.  On older installs the
+# effort levels still work via the budget_tokens shim above; xhigh/max are
+# approximations until the user upgrades.  No SDK constraint bump required —
+# the code degrades gracefully.
+try:
+    import anthropic.types as _anthropic_types
+except ImportError:
+    _HAS_OUTPUT_CONFIG = False
+else:
+    _HAS_OUTPUT_CONFIG = hasattr(_anthropic_types, "OutputConfigParam")
 
 logger = logging.getLogger(__name__)
 
@@ -186,13 +206,7 @@ def _resolve_thinking_budget() -> int:
     budget_raw = os.environ.get(ENV_REASONING_BUDGET)
 
     if effort is not None:
-        level = effort.strip().lower()
-        if level not in _THINKING_EFFORT_BUDGETS:
-            valid = ", ".join(_THINKING_EFFORT_BUDGETS)
-            raise ValueError(
-                f"Invalid {ENV_THINKING_EFFORT} value: {effort!r}. "
-                f"Must be one of: {valid}."
-            )
+        level = _normalize_effort_level(effort)
         if budget_raw is not None:
             logger.warning(
                 "Both %s and %s set; using %s=%s",
@@ -214,8 +228,84 @@ def _resolve_thinking_budget() -> int:
         ) from parse_err
 
 
+def _normalize_effort_level(effort: str) -> _EffortLevel:
+    level = effort.strip().lower()
+    if level not in _THINKING_EFFORT_BUDGETS:
+        valid = ", ".join(_THINKING_EFFORT_BUDGETS)
+        raise ValueError(
+            f"Invalid {ENV_THINKING_EFFORT} value: {effort!r}. Must be one of: {valid}."
+        )
+    return cast(_EffortLevel, level)
+
+
+def _resolve_effort_level() -> _EffortLevel | None:
+    """Return the raw effort level from ``GPTME_THINKING_EFFORT``, or ``None``.
+
+    Returns ``None`` when the env var is not set (i.e. the budget is driven
+    by ``GPTME_REASONING_BUDGET`` instead).
+    """
+    effort = os.environ.get(ENV_THINKING_EFFORT)
+    if effort is None:
+        return None
+    return _normalize_effort_level(effort)
+
+
+class _OutputConfig(TypedDict):
+    effort: _EffortLevel
+
+
+class _OutputConfigKwargs(TypedDict, total=False):
+    output_config: _OutputConfig
+
+
+def _output_config_kwargs(*, use_thinking: bool) -> _OutputConfigKwargs:
+    if not (use_thinking and _HAS_OUTPUT_CONFIG):
+        return {}
+
+    effort_level = _resolve_effort_level()
+    if effort_level is None:
+        return {}
+
+    return {"output_config": {"effort": effort_level}}
+
+
+def _requires_adaptive_thinking(model: str) -> bool:
+    """Return True if ``model`` rejects legacy ``thinking.type=enabled`` with 400.
+
+    Such models only accept adaptive thinking (``thinking.type=adaptive``)
+    plus ``output_config.effort``.  Handles bare names, vendor prefixes, and
+    Anthropic's dated-release suffixes (e.g. ``claude-opus-4-7-20260401``).
+    """
+    # Strip vendor prefix: "anthropic/claude-opus-4-7" -> "claude-opus-4-7",
+    # "openrouter/anthropic/claude-opus-4-7" -> "claude-opus-4-7".
+    base = model.rsplit("/", 1)[-1]
+    if base in _ADAPTIVE_THINKING_MODELS:
+        return True
+    # Match dated-release suffix: "claude-opus-4-7-20260401".
+    return any(base.startswith(known + "-") for known in _ADAPTIVE_THINKING_MODELS)
+
+
+def _build_thinking_param(
+    model: str, use_thinking: bool, thinking_budget: int
+) -> dict[str, object] | None:
+    """Build the ``thinking`` kwarg for Anthropic's messages API.
+
+    Returns ``None`` when thinking is disabled so callers can substitute
+    the SDK's ``NOT_GIVEN`` sentinel.  Branches on model capability:
+
+    - Adaptive-only models (Opus 4.7+): ``{"type": "adaptive"}`` (effort
+      flows through ``output_config`` separately).
+    - All other reasoning models: ``{"type": "enabled", "budget_tokens": N}``.
+    """
+    if not use_thinking:
+        return None
+    if _requires_adaptive_thinking(model):
+        return {"type": "adaptive"}
+    return {"type": "enabled", "budget_tokens": thinking_budget}
+
+
 def _adjust_thinking_budget(
-    max_tokens: int, thinking_budget: int, use_thinking: bool
+    max_tokens: int, thinking_budget: int, use_thinking: bool, model: str = ""
 ) -> tuple[int, bool]:
     """Clamp thinking_budget to fit within max_tokens for Anthropic's extended thinking.
 
@@ -225,8 +315,13 @@ def _adjust_thinking_budget(
 
     Always reserves at least _MIN_RESPONSE_TOKENS for the actual response;
     disables thinking entirely when max_tokens is too small to be useful.
+
+    Adaptive-thinking models (Opus 4.7+) have no ``budget_tokens`` constraint —
+    the API allocates tokens internally — so the clamping logic is skipped for them.
     """
-    if not use_thinking or max_tokens >= thinking_budget + _MIN_RESPONSE_TOKENS:
+    if not use_thinking or _requires_adaptive_thinking(model):
+        return thinking_budget, use_thinking
+    if max_tokens >= thinking_budget + _MIN_RESPONSE_TOKENS:
         return thinking_budget, use_thinking
     new_budget = max_tokens - _MIN_RESPONSE_TOKENS
     if new_budget <= 0:
@@ -507,10 +602,16 @@ def chat(
         max_tokens if max_tokens is not None else (model_meta.max_output or 4096)
     )
     thinking_budget, use_thinking = _adjust_thinking_budget(
-        max_tokens, thinking_budget, use_thinking
+        max_tokens, thinking_budget, use_thinking, model=model
     )
 
-    response = _anthropic.messages.create(
+    # Pass output_config.effort when the SDK supports it (>= 0.77) and
+    # GPTME_THINKING_EFFORT is set.  This enables true xhigh/max semantics
+    # (adaptive thinking) that budget_tokens cannot express.
+    output_config_kwargs = _output_config_kwargs(use_thinking=use_thinking)
+    thinking_param = _build_thinking_param(model, use_thinking, thinking_budget)
+
+    response = _anthropic.messages.create(  # type: ignore[call-overload, misc]
         model=api_model,
         messages=messages_dicts,
         system=system_messages,
@@ -518,11 +619,8 @@ def chat(
         top_p=TOP_P if not model_meta.supports_reasoning else NOT_GIVEN,
         max_tokens=max_tokens,
         tools=tools_dict or NOT_GIVEN,
-        thinking=(
-            {"type": "enabled", "budget_tokens": thinking_budget}
-            if use_thinking
-            else NOT_GIVEN
-        ),
+        thinking=thinking_param if thinking_param is not None else NOT_GIVEN,
+        **output_config_kwargs,
         # We set a timeout for non-streaming requests to prevent Anthropic's
         # "Streaming is strongly recommended" warning/error.
         timeout=60,
@@ -603,10 +701,13 @@ def stream(
         max_tokens if max_tokens is not None else (model_meta.max_output or 4096)
     )
     thinking_budget, use_thinking = _adjust_thinking_budget(
-        max_tokens, thinking_budget, use_thinking
+        max_tokens, thinking_budget, use_thinking, model=model
     )
 
-    with _anthropic.messages.stream(
+    output_config_kwargs = _output_config_kwargs(use_thinking=use_thinking)
+    thinking_param = _build_thinking_param(model, use_thinking, thinking_budget)
+
+    with _anthropic.messages.stream(  # type: ignore[call-arg, misc]
         model=api_model,
         messages=messages_dicts,
         system=system_messages,
@@ -614,11 +715,8 @@ def stream(
         top_p=TOP_P if not model_meta.supports_reasoning else NOT_GIVEN,
         max_tokens=max_tokens,
         tools=tools_dict or NOT_GIVEN,
-        thinking=(
-            {"type": "enabled", "budget_tokens": thinking_budget}
-            if use_thinking
-            else NOT_GIVEN
-        ),
+        thinking=thinking_param if thinking_param is not None else NOT_GIVEN,  # type: ignore[arg-type]
+        **output_config_kwargs,
     ) as stream:
         for chunk in stream:
             match chunk.type:
@@ -896,26 +994,42 @@ def _transform_system_messages(
     """Transform system messages into Anthropic's expected format.
 
     This function:
-    1. Extracts the first system message as the main system prompt
+    1. Extracts the leading static system prompt messages as the main system prompt
     2. Transforms subsequent system messages into <system> tags in user messages
     3. Merges consecutive user messages
     4. Applies cache control to optimize performance
 
     Note: Anthropic allows up to 4 cache breakpoints in a conversation.
     We use this to cache:
-    1. The system prompt (if long enough)
+    1. The static bootstrap prompt (if long enough)
     2. Earlier messages in multi-turn conversations
 
     Returns:
         tuple[list[Message], list[TextBlockParam]]: Transformed messages and system messages
     """
+    from ..prompts import SYSTEM_PROMPT_CACHE_BOUNDARY
+
     if not messages or messages[0].role != "system":
         raise ValueError(
             f"First message must be a system message, got {messages[0].role if messages else 'empty list'}"
         )
-    system_prompt = messages[0].content
+
     messages = messages.copy()
-    messages.pop(0)
+    system_prompt_parts = [messages.pop(0).content]
+
+    # Anthropic only allows a single top-level system prompt. Fold the static
+    # bootstrap prefix into that block so project/agent prompt files remain in
+    # the cacheable prefix instead of being downgraded into a synthetic user
+    # message that changes whenever context_cmd output changes.
+    while (
+        messages
+        and messages[0].role == "system"
+        and messages[0].call_id is None
+        and messages[0].content != SYSTEM_PROMPT_CACHE_BOUNDARY
+    ):
+        system_prompt_parts.append(messages.pop(0).content)
+
+    system_prompt = "\n\n".join(system_prompt_parts)
 
     # Convert subsequent system messages into <system> messages,
     # unless a `call_id` is present, indicating the tool_format is 'tool'.

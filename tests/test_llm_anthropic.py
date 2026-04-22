@@ -4,10 +4,17 @@ import os
 import pytest
 
 from gptme.llm.llm_anthropic import (
+    _HAS_OUTPUT_CONFIG,
+    _adjust_thinking_budget,
+    _build_thinking_param,
+    _output_config_kwargs,
     _prepare_messages_for_api,
+    _requires_adaptive_thinking,
+    _resolve_effort_level,
     _resolve_thinking_budget,
 )
 from gptme.message import Message
+from gptme.prompts import SYSTEM_PROMPT_CACHE_BOUNDARY
 from gptme.tools import get_tool, init_tools
 
 
@@ -25,7 +32,7 @@ def test_message_conversion():
     assert system_messages == [
         {
             "type": "text",
-            "text": "Initial Message",
+            "text": "Initial Message\n\nProject prompt",
             "cache_control": {"type": "ephemeral"},
         }
     ]
@@ -36,7 +43,7 @@ def test_message_conversion():
             "content": [
                 {
                     "type": "text",
-                    "text": "<system>Project prompt</system>\n\nFirst user prompt",
+                    "text": "First user prompt",
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
@@ -66,7 +73,7 @@ def test_message_conversion_without_tools():
             "content": [
                 {
                     "type": "text",
-                    "text": "<system>Project prompt</system>\n\nFirst user prompt",
+                    "text": "First user prompt",
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
@@ -143,7 +150,7 @@ def test_message_conversion_with_tools():
             "content": [
                 {
                     "type": "text",
-                    "text": "<system>Project prompt</system>\n\nFirst user prompt",
+                    "text": "First user prompt",
                     "cache_control": {"type": "ephemeral"},
                 }
             ],
@@ -216,10 +223,6 @@ def test_message_conversion_with_tool_and_non_tool():
 
     assert messages_dicts == [
         {
-            "role": "user",
-            "content": [{"type": "text", "text": "<system>Project prompt</system>"}],
-        },
-        {
             "role": "assistant",
             "content": [
                 {
@@ -260,6 +263,41 @@ def test_message_conversion_with_tool_and_non_tool():
                 }
             ],
         },
+    ]
+
+
+def test_boundary_keeps_dynamic_context_out_of_static_system_prompt():
+    messages = [
+        Message(role="system", content="Core prompt"),
+        Message(role="system", content="Static workspace prompt"),
+        Message(role="system", content=SYSTEM_PROMPT_CACHE_BOUNDARY),
+        Message(role="system", content="Dynamic context"),
+        Message(role="user", content="Actual user prompt"),
+    ]
+
+    messages_dicts, system_messages, _ = _prepare_messages_for_api(messages, None)
+
+    assert system_messages == [
+        {
+            "type": "text",
+            "text": "Core prompt\n\nStatic workspace prompt",
+            "cache_control": {"type": "ephemeral"},
+        }
+    ]
+
+    assert messages_dicts == [
+        {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "<system>"
+                    + SYSTEM_PROMPT_CACHE_BOUNDARY
+                    + "</system>\n\n<system>Dynamic context</system>\n\nActual user prompt",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
     ]
 
 
@@ -511,3 +549,202 @@ class TestResolveThinkingBudget:
             and "GPTME_REASONING_BUDGET" in rec.message
             for rec in caplog.records
         )
+
+
+class TestResolveEffortLevel:
+    """_resolve_effort_level returns the raw level string or None."""
+
+    def setup_method(self):
+        self._saved = os.environ.pop("GPTME_THINKING_EFFORT", None)
+
+    def teardown_method(self):
+        if self._saved is None:
+            os.environ.pop("GPTME_THINKING_EFFORT", None)
+        else:
+            os.environ["GPTME_THINKING_EFFORT"] = self._saved
+
+    def test_returns_none_when_not_set(self):
+        assert _resolve_effort_level() is None
+
+    @pytest.mark.parametrize("level", ["low", "medium", "high", "xhigh", "max"])
+    def test_returns_level_string(self, level):
+        os.environ["GPTME_THINKING_EFFORT"] = level
+        assert _resolve_effort_level() == level
+
+    def test_normalises_to_lowercase(self):
+        os.environ["GPTME_THINKING_EFFORT"] = "XHIGH"
+        assert _resolve_effort_level() == "xhigh"
+
+    def test_raises_on_invalid_level(self):
+        os.environ["GPTME_THINKING_EFFORT"] = "extreme"
+        with pytest.raises(ValueError, match="Invalid GPTME_THINKING_EFFORT"):
+            _resolve_effort_level()
+
+
+class TestOutputConfigKwargs:
+    def setup_method(self):
+        self._saved = os.environ.pop("GPTME_THINKING_EFFORT", None)
+
+    def teardown_method(self):
+        if self._saved is None:
+            os.environ.pop("GPTME_THINKING_EFFORT", None)
+        else:
+            os.environ["GPTME_THINKING_EFFORT"] = self._saved
+
+    def test_returns_empty_when_not_using_thinking(self, monkeypatch):
+        monkeypatch.setattr("gptme.llm.llm_anthropic._HAS_OUTPUT_CONFIG", True)
+        os.environ["GPTME_THINKING_EFFORT"] = "xhigh"
+
+        assert _output_config_kwargs(use_thinking=False) == {}
+
+    def test_returns_empty_when_sdk_does_not_support_output_config(self, monkeypatch):
+        monkeypatch.setattr("gptme.llm.llm_anthropic._HAS_OUTPUT_CONFIG", False)
+        os.environ["GPTME_THINKING_EFFORT"] = "xhigh"
+
+        assert _output_config_kwargs(use_thinking=True) == {}
+
+    def test_returns_empty_when_effort_is_unset(self, monkeypatch):
+        monkeypatch.setattr("gptme.llm.llm_anthropic._HAS_OUTPUT_CONFIG", True)
+
+        assert _output_config_kwargs(use_thinking=True) == {}
+
+    def test_returns_output_config_when_supported(self, monkeypatch):
+        monkeypatch.setattr("gptme.llm.llm_anthropic._HAS_OUTPUT_CONFIG", True)
+        os.environ["GPTME_THINKING_EFFORT"] = "XHIGH"
+
+        assert _output_config_kwargs(use_thinking=True) == {
+            "output_config": {"effort": "xhigh"}
+        }
+
+
+def test_has_output_config_is_bool():
+    """_HAS_OUTPUT_CONFIG must be a bool (True when SDK >= 0.77)."""
+    assert isinstance(_HAS_OUTPUT_CONFIG, bool)
+
+
+class TestRequiresAdaptiveThinking:
+    """Opus 4.7+ rejects ``thinking.type=enabled`` with HTTP 400."""
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-7",
+            "anthropic/claude-opus-4-7",
+            "openrouter/anthropic/claude-opus-4-7",
+            "claude-opus-4-7-20260401",
+            "anthropic/claude-opus-4-7-20260401",
+        ],
+    )
+    def test_adaptive_required(self, model):
+        assert _requires_adaptive_thinking(model) is True
+
+    @pytest.mark.parametrize(
+        "model",
+        [
+            "claude-opus-4-6",
+            "claude-sonnet-4-6",
+            "claude-opus-4-5-20251101",
+            "anthropic/claude-opus-4-6",
+            "openrouter/anthropic/claude-sonnet-4-5",
+            "claude-haiku-4-5",
+        ],
+    )
+    def test_legacy_still_used(self, model):
+        assert _requires_adaptive_thinking(model) is False
+
+
+class TestBuildThinkingParam:
+    """_build_thinking_param dispatches on model and thinking flag."""
+
+    def test_disabled_returns_none(self):
+        assert (
+            _build_thinking_param(
+                "claude-opus-4-7", use_thinking=False, thinking_budget=8000
+            )
+            is None
+        )
+
+    def test_opus_47_returns_adaptive(self):
+        # Opus 4.7 gets ``{"type": "adaptive"}`` — never legacy, regardless of budget.
+        assert _build_thinking_param(
+            "claude-opus-4-7", use_thinking=True, thinking_budget=8000
+        ) == {"type": "adaptive"}
+
+    def test_opus_47_adaptive_ignores_budget(self):
+        # Budget is irrelevant once adaptive: effort flows via output_config.
+        assert _build_thinking_param(
+            "claude-opus-4-7", use_thinking=True, thinking_budget=32000
+        ) == {"type": "adaptive"}
+
+    def test_opus_46_returns_legacy_enabled(self):
+        assert _build_thinking_param(
+            "claude-opus-4-6", use_thinking=True, thinking_budget=12345
+        ) == {"type": "enabled", "budget_tokens": 12345}
+
+    def test_sonnet_returns_legacy_enabled(self):
+        assert _build_thinking_param(
+            "claude-sonnet-4-6", use_thinking=True, thinking_budget=4000
+        ) == {"type": "enabled", "budget_tokens": 4000}
+
+    def test_openrouter_prefix_opus_47(self):
+        assert _build_thinking_param(
+            "openrouter/anthropic/claude-opus-4-7",
+            use_thinking=True,
+            thinking_budget=8000,
+        ) == {"type": "adaptive"}
+
+
+class TestAdjustThinkingBudgetAdaptive:
+    """_adjust_thinking_budget must not disable thinking for adaptive models."""
+
+    def test_adaptive_model_small_max_tokens_keeps_thinking(self):
+        # Legacy logic would disable thinking here (budget=8000 > max_tokens=100).
+        # For Opus 4.7 (adaptive), budget_tokens is irrelevant — thinking stays on.
+        budget, use_thinking = _adjust_thinking_budget(
+            max_tokens=100,
+            thinking_budget=8000,
+            use_thinking=True,
+            model="claude-opus-4-7",
+        )
+        assert use_thinking is True
+        assert budget == 8000  # unchanged; adaptive doesn't use this field
+
+    def test_adaptive_model_tiny_max_tokens_keeps_thinking(self):
+        # Even max_tokens=1 must not suppress adaptive thinking.
+        budget, use_thinking = _adjust_thinking_budget(
+            max_tokens=1,
+            thinking_budget=8000,
+            use_thinking=True,
+            model="claude-opus-4-7",
+        )
+        assert use_thinking is True
+
+    def test_adaptive_model_prefixed_keeps_thinking(self):
+        budget, use_thinking = _adjust_thinking_budget(
+            max_tokens=50,
+            thinking_budget=16000,
+            use_thinking=True,
+            model="anthropic/claude-opus-4-7",
+        )
+        assert use_thinking is True
+
+    def test_legacy_model_small_max_tokens_disables_thinking(self):
+        # Legacy path unchanged: Opus 4.6 with tiny max_tokens still disables.
+        _, use_thinking = _adjust_thinking_budget(
+            max_tokens=50,
+            thinking_budget=8000,
+            use_thinking=True,
+            model="claude-opus-4-6",
+        )
+        assert use_thinking is False
+
+    def test_adaptive_thinking_disabled_returns_unchanged(self):
+        # use_thinking=False stays False regardless of model.
+        budget, use_thinking = _adjust_thinking_budget(
+            max_tokens=100,
+            thinking_budget=8000,
+            use_thinking=False,
+            model="claude-opus-4-7",
+        )
+        assert use_thinking is False
+        assert budget == 8000
