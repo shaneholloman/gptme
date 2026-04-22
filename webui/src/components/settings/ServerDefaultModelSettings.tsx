@@ -3,6 +3,7 @@ import { Button } from '@/components/ui/button';
 import { ModelPickerButton } from '@/components/ModelPicker';
 import { useApi } from '@/contexts/ApiContext';
 import { useModels } from '@/hooks/useModels';
+import { useUserSettings } from '@/hooks/useUserSettings';
 import { toast } from 'sonner';
 
 type SaveDefaultModelResponse = {
@@ -13,12 +14,23 @@ type SaveDefaultModelResponse = {
 
 export function ServerDefaultModelSettings() {
   const { api } = useApi();
-  const { models, defaultModel, recommendedModels, isLoading, error } = useModels();
+  const { models, recommendedModels, isLoading: modelsLoading, error: modelsError } = useModels();
+  const {
+    settings,
+    isLoading: settingsLoading,
+    error: settingsError,
+    refetch: refetchSettings,
+  } = useUserSettings();
   const [selectedModel, setSelectedModel] = useState<string>('');
-  const [savedModel, setSavedModel] = useState<string | null>(null);
+  const [userSelected, setUserSelected] = useState(false);
   const [isSaving, setIsSaving] = useState(false);
 
-  const effectiveDefaultModel = savedModel || defaultModel;
+  const isLoading = modelsLoading || settingsLoading;
+  const error = modelsError || settingsError;
+
+  // Server-authoritative default model from /api/v2/user/settings
+  const serverDefaultModel = settings?.default_model ?? null;
+
   const fallbackModel = useMemo(() => {
     if (models.length === 0) {
       return '';
@@ -29,19 +41,20 @@ export function ServerDefaultModelSettings() {
     );
   }, [models, recommendedModels]);
 
+  // Server default wins over the fallback as long as the user hasn't explicitly picked.
+  // Without this, useModels resolves first → sets fallback → useUserSettings resolves later
+  // → the (current => current || serverDefault) guard is a no-op, silently diverging picker
+  // from the "Current default" label.
   useEffect(() => {
-    if (savedModel) {
-      setSelectedModel(savedModel);
+    if (userSelected) return;
+    if (serverDefaultModel) {
+      setSelectedModel(serverDefaultModel);
       return;
     }
-    if (defaultModel) {
-      setSelectedModel((current) => current || defaultModel);
-      return;
-    }
-    if (!selectedModel && fallbackModel) {
+    if (fallbackModel) {
       setSelectedModel(fallbackModel);
     }
-  }, [defaultModel, fallbackModel, savedModel, selectedModel]);
+  }, [serverDefaultModel, fallbackModel, userSelected]);
 
   const handleSave = async () => {
     if (!selectedModel) {
@@ -70,7 +83,10 @@ export function ServerDefaultModelSettings() {
       }
 
       const result = data as SaveDefaultModelResponse;
-      setSavedModel(result.model);
+      // Refetch from server to reflect the saved state authoritatively.
+      // Reset userSelected so the refetch can update the picker to the confirmed model.
+      setUserSelected(false);
+      refetchSettings();
       toast.success(
         result.restart_required
           ? 'Default model saved. Restart the server to apply it.'
@@ -83,6 +99,8 @@ export function ServerDefaultModelSettings() {
     }
   };
 
+  const configuredProviders = settings?.providers_configured ?? [];
+
   return (
     <div className="space-y-3 rounded-lg border p-4">
       <div>
@@ -92,9 +110,22 @@ export function ServerDefaultModelSettings() {
         </p>
       </div>
 
-      {effectiveDefaultModel && (
+      {configuredProviders.length > 0 && (
+        <div className="flex flex-wrap gap-1">
+          {configuredProviders.map((provider) => (
+            <span
+              key={provider}
+              className="rounded-full bg-muted px-2 py-0.5 text-xs text-muted-foreground"
+            >
+              {provider}
+            </span>
+          ))}
+        </div>
+      )}
+
+      {serverDefaultModel && (
         <p className="text-xs text-muted-foreground">
-          Current default: <code>{effectiveDefaultModel}</code>
+          Current default: <code>{serverDefaultModel}</code>
         </p>
       )}
 
@@ -103,7 +134,10 @@ export function ServerDefaultModelSettings() {
       ) : (
         <ModelPickerButton
           value={selectedModel}
-          onSelect={setSelectedModel}
+          onSelect={(model) => {
+            setSelectedModel(model);
+            setUserSelected(true);
+          }}
           disabled={isLoading || isSaving || models.length === 0}
           placeholder={isLoading ? 'Loading models…' : 'Select model'}
         />
