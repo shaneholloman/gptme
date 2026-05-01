@@ -1,8 +1,9 @@
 import '@testing-library/jest-dom';
-import { fireEvent, render, screen, waitFor } from '@testing-library/react';
+import { act, fireEvent, render, screen, waitFor } from '@testing-library/react';
 import { observable } from '@legendapp/state';
 import { SetupWizard } from '../SetupWizard';
 import { SettingsProvider } from '@/contexts/SettingsContext';
+import { setupWizard$ } from '@/stores/setupWizard';
 
 const mockConnect = jest.fn();
 const mockOpen = jest.fn();
@@ -61,15 +62,47 @@ jest.mock('@legendapp/state/react', () => ({
   use$: (obs: { get: () => unknown }) => obs.get(),
 }));
 
-jest.mock('@/components/ui/dialog', () => ({
-  Dialog: ({ open, children }: { open: boolean; children: React.ReactNode }) =>
-    open ? <div>{children}</div> : null,
-  DialogContent: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  DialogDescription: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  DialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  DialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
-  DialogTitle: ({ children }: { children: React.ReactNode }) => <h1>{children}</h1>,
-}));
+// Mock the Dialog primitives. The real DialogContent (from `@/components/ui/dialog`)
+// renders a Radix `<DialogPrimitive.Close>` X button that calls `onOpenChange(false)`
+// when clicked. Mirror that here so tests can exercise the close behavior wired
+// through `onOpenChange` (e.g. the welcome step's X close → closeWizard path).
+jest.mock('@/components/ui/dialog', () => {
+  const DialogContext = (jest.requireActual('react') as typeof import('react')).createContext<
+    ((open: boolean) => void) | null
+  >(null);
+  const useContext = (jest.requireActual('react') as typeof import('react')).useContext;
+  return {
+    Dialog: ({
+      open,
+      onOpenChange,
+      children,
+    }: {
+      open: boolean;
+      onOpenChange?: (open: boolean) => void;
+      children: React.ReactNode;
+    }) =>
+      open ? (
+        <DialogContext.Provider value={onOpenChange ?? null}>
+          <div>{children}</div>
+        </DialogContext.Provider>
+      ) : null,
+    DialogContent: ({ children }: { children: React.ReactNode }) => {
+      const onOpenChange = useContext(DialogContext);
+      return (
+        <div>
+          {children}
+          <button aria-label="Close" onClick={() => onOpenChange?.(false)}>
+            <span>X</span>
+          </button>
+        </div>
+      );
+    },
+    DialogDescription: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+    DialogFooter: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+    DialogHeader: ({ children }: { children: React.ReactNode }) => <div>{children}</div>,
+    DialogTitle: ({ children }: { children: React.ReactNode }) => <h1>{children}</h1>,
+  };
+});
 
 jest.mock('@/components/ui/button', () => ({
   Button: ({ children, ...props }: React.ButtonHTMLAttributes<HTMLButtonElement>) => (
@@ -103,6 +136,9 @@ describe('SetupWizard', () => {
   beforeEach(() => {
     localStorage.clear();
     isConnected$.set(false);
+    setupWizard$.step.set('welcome');
+    setupWizard$.open.set(false);
+    setupWizard$.providerStatusVersion.set(0);
     mockConnect.mockReset();
     mockOpen.mockReset();
     mockFetch.mockReset();
@@ -125,6 +161,44 @@ describe('SetupWizard', () => {
     Object.defineProperty(window, 'open', {
       writable: true,
       value: mockOpen,
+    });
+  });
+
+  it('closes the wizard via Skip on the welcome step and persists hasCompletedSetup', async () => {
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(screen.getByRole('heading', { name: /welcome to gptme/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /skip for now/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: /welcome to gptme/i })).not.toBeInTheDocument();
+    });
+
+    expect(JSON.parse(localStorage.getItem('gptme-settings') || '{}')).toMatchObject({
+      hasCompletedSetup: true,
+    });
+  });
+
+  it('closes the wizard via the X close button and persists hasCompletedSetup', async () => {
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(screen.getByRole('heading', { name: /welcome to gptme/i })).toBeInTheDocument();
+    fireEvent.click(screen.getByRole('button', { name: /^close$/i }));
+
+    await waitFor(() => {
+      expect(screen.queryByRole('heading', { name: /welcome to gptme/i })).not.toBeInTheDocument();
+    });
+
+    expect(JSON.parse(localStorage.getItem('gptme-settings') || '{}')).toMatchObject({
+      hasCompletedSetup: true,
     });
   });
 
@@ -185,6 +259,7 @@ describe('SetupWizard', () => {
         hasCompletedSetup: true,
       });
     });
+    expect(setupWizard$.providerStatusVersion.get()).toBe(1);
     expect(screen.getByRole('heading', { name: /you're all set/i })).toBeInTheDocument();
   });
 
@@ -230,6 +305,35 @@ describe('SetupWizard', () => {
     expect(screen.getByRole('option', { name: /deepseek/i })).toBeInTheDocument();
     expect(JSON.parse(localStorage.getItem('gptme-settings') || '{}')).not.toMatchObject({
       hasCompletedSetup: true,
+    });
+  });
+
+  it('reopens directly to provider setup when requested externally', async () => {
+    localStorage.setItem('gptme-settings', JSON.stringify({ hasCompletedSetup: true }));
+
+    const { rerender } = render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    expect(
+      screen.queryByRole('heading', { name: /configure a provider/i })
+    ).not.toBeInTheDocument();
+
+    act(() => {
+      setupWizard$.step.set('provider');
+      setupWizard$.open.set(true);
+    });
+
+    rerender(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
     });
   });
 
@@ -305,6 +409,41 @@ describe('SetupWizard', () => {
         baseUrl: 'https://bob.example.com',
         authToken: 'secret-token',
         useAuthToken: true,
+      });
+    });
+  });
+
+  it('submits remote server form when pressing Enter in the URL field', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: false,
+      serverStatus: {
+        running: false,
+        port: 5700,
+        port_available: false,
+        manages_local_server: false,
+      },
+    });
+    mockConnect.mockResolvedValue(undefined);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /remote server/i }));
+    const urlInput = screen.getByPlaceholderText('https://bob.example.com');
+    fireEvent.change(urlInput, { target: { value: 'https://bob.example.com/' } });
+    fireEvent.keyDown(urlInput, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledWith({
+        baseUrl: 'https://bob.example.com',
+        authToken: null,
+        useAuthToken: false,
       });
     });
   });
@@ -417,6 +556,135 @@ describe('SetupWizard', () => {
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: /you're all set/i })).toBeInTheDocument();
     });
+  });
+
+  it('saves an API key when pressing Enter in the API key field', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({
+          models: [
+            {
+              id: 'anthropic/claude-sonnet-4-7',
+              provider: 'anthropic',
+              model: 'claude-sonnet-4-7',
+            },
+          ],
+          recommended: ['anthropic/claude-sonnet-4-7'],
+        }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ status: 'ok', env_var: 'ANTHROPIC_API_KEY' }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: true }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+    mockInvokeTauri.mockResolvedValue(undefined);
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    const apiKeyInput = screen.getByLabelText(/api key/i);
+    fireEvent.change(apiKeyInput, { target: { value: 'sk-ant-test-key' } });
+    fireEvent.keyDown(apiKeyInput, { key: 'Enter' });
+
+    await waitFor(() => {
+      expect(mockFetch).toHaveBeenCalledWith('http://127.0.0.1:5700/api/v2/user/api-key', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+        },
+        body: JSON.stringify({
+          provider: 'anthropic',
+          api_key: 'sk-ant-test-key',
+          model: 'anthropic/claude-sonnet-4-7',
+        }),
+      });
+    });
+  });
+
+  it('does not submit API key on Enter when the field is empty', async () => {
+    mockIsTauriEnvironment.mockReturnValue(true);
+    mockUseTauriServerStatus.mockReturnValue({
+      isLoading: false,
+      managesLocalServer: true,
+      serverStatus: {
+        running: true,
+        port: 5700,
+        port_available: false,
+        manages_local_server: true,
+      },
+    });
+    mockFetch
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ provider_configured: false }),
+      })
+      .mockResolvedValueOnce({
+        ok: true,
+        status: 200,
+        json: async () => ({ models: [], recommended: [] }),
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /monitor local/i }));
+    fireEvent.click(screen.getByRole('button', { name: /connect/i }));
+
+    await waitFor(() => {
+      expect(screen.getByRole('heading', { name: /configure a provider/i })).toBeInTheDocument();
+    });
+
+    const apiKeyInput = screen.getByLabelText(/api key/i);
+    fireEvent.keyDown(apiKeyInput, { key: 'Enter' });
+
+    // No POST to /api/v2/user/api-key should have been made.
+    const calls = mockFetch.mock.calls.map((c) => c[0]);
+    expect(calls).not.toContain('http://127.0.0.1:5700/api/v2/user/api-key');
   });
 
   it('shows an error instead of falsely completing when the restarted server never comes back', async () => {

@@ -184,7 +184,7 @@ jobs:
 
       - name: Generate Tauri icons
         shell: bash
-        run: cd tauri && npm run tauri icon ../webui/public/logo.png || true
+        run: cd tauri && npm run tauri icon app-icon.png || true
 
       - name: Fix ICO for Windows Resource Compiler
         if: runner.os == 'Windows'
@@ -342,6 +342,10 @@ jobs:
           merge-multiple: true
           path: tauri/bins
 
+      - name: Fix sidecar permissions
+        shell: bash
+        run: chmod +x tauri/bins/gptme-server-* || true
+
       - name: Create placeholder icons for tauri::generate_context!
         shell: bash
         run: |
@@ -354,7 +358,7 @@ jobs:
 
       - name: Generate Tauri icons
         shell: bash
-        run: cd tauri && npm run tauri icon ../webui/public/logo.png || true
+        run: cd tauri && npm run tauri icon app-icon.png || true
 
       - name: Fix ICO for Windows Resource Compiler
         if: runner.os == 'Windows'
@@ -395,6 +399,29 @@ jobs:
           CERT_INFO=$(security find-identity -v -p codesigning build.keychain | head -n 1)
           SIGNING_IDENTITY=$(echo "$CERT_INFO" | awk -F'"' '{print $2}')
           echo "APPLE_SIGNING_IDENTITY=$SIGNING_IDENTITY" >> $GITHUB_ENV
+
+      - name: Codesign sidecar binary (macOS)
+        if: matrix.platform == 'macos-latest' && env.HAS_APPLE_SIGNING == 'true'
+        shell: bash
+        run: |
+          # Tauri only signs the .app bundle, not sidecar binaries.
+          # macOS Gatekeeper rejects unsigned binaries inside signed apps,
+          # so we must codesign the PyInstaller-built sidecar before bundling.
+          # Entitlements allow JIT and unsigned memory access (required by PyInstaller).
+          # See: https://github.com/tauri-apps/tauri/discussions/2269
+          TRIPLE=$(rustc -Vv | grep host | cut -f2 -d' ')
+          SIDECAR="tauri/bins/gptme-server-${TRIPLE}"
+          if [ -f "$SIDECAR" ]; then
+            echo "Signing sidecar: $SIDECAR"
+            codesign --force --options runtime --timestamp \
+              --entitlements tauri/entitlements.plist \
+              --sign "$APPLE_SIGNING_IDENTITY" \
+              "$SIDECAR"
+            codesign --verify --verbose "$SIDECAR"
+          else
+            echo "Warning: Sidecar not found at $SIDECAR, skipping codesign"
+            ls -la tauri/bins/ || true
+          fi
 
       - name: Set Tauri bundle version from release tag
         shell: bash
@@ -463,7 +490,7 @@ jobs:
           APPLE_CERTIFICATE_PASSWORD: ${{ secrets.APPLE_CERTIFICATE_PASSWORD }}
           APPLE_SIGNING_IDENTITY: ${{ env.APPLE_SIGNING_IDENTITY }}
           APPLE_ID: ${{ secrets.APPLE_ID }}
-          APPLE_ID_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
+          APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
         with:
           projectPath: tauri

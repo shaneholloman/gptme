@@ -99,6 +99,10 @@ class ConversationResponse(BaseModel):
     name: str = Field(..., description="Conversation name")
     log: list[dict] = Field(..., description="Message history as raw objects")
     workspace: str = Field(..., description="Workspace path")
+    session: dict | None = Field(
+        None,
+        description="Most-recently-active session state (id, generating, last_error); omitted when no session exists",
+    )
 
 
 class ConversationListResponse(BaseModel):
@@ -147,6 +151,7 @@ class ApiRootResponse(BaseModel):
 
     message: str = Field(..., description="API description")
     documentation: str = Field(..., description="Documentation URL")
+    version: str = Field(..., description="gptme server version")
     capabilities: ApiCapabilities = Field(
         ..., description="Advertised optional server capabilities"
     )
@@ -206,9 +211,31 @@ class UserSettingsResponse(BaseModel):
         ...,
         description="Provider slugs that have an API key or OAuth token configured",
     )
+    provider_sources: dict[str, dict[str, str | None]] = Field(
+        default_factory=dict,
+        description=(
+            "Per-provider configuration metadata. Each entry includes "
+            "`auth_source` (env var or `oauth`) and `effective_source` "
+            "(`env`, `config.local.toml`, `config.toml`, or `oauth`)."
+        ),
+    )
     default_model: str | None = Field(
         None,
         description="Fully qualified default model from config, or null if unset",
+    )
+    default_model_source: str | None = Field(
+        None,
+        description=(
+            "Where the current MODEL value comes from: `env`, `config.local.toml`, "
+            "`config.toml`, or null if unset."
+        ),
+    )
+    config_files: dict[str, str | bool] = Field(
+        default_factory=dict,
+        description=(
+            "Paths and merge behavior for user config files, including the main "
+            "config path, local override path, and the write target used by the UI."
+        ),
     )
 
 

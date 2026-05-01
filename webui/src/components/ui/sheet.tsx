@@ -54,18 +54,52 @@ interface SheetContentProps
 const SheetContent = React.forwardRef<
   React.ElementRef<typeof SheetPrimitive.Content>,
   SheetContentProps
->(({ side = 'right', className, children, ...props }, ref) => (
-  <SheetPortal>
-    <SheetOverlay />
-    <SheetPrimitive.Content ref={ref} className={cn(sheetVariants({ side }), className)} {...props}>
-      {children}
-      <SheetPrimitive.Close className="absolute right-4 top-4 rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-secondary">
-        <X className="h-4 w-4" />
-        <span className="sr-only">Close</span>
-      </SheetPrimitive.Close>
-    </SheetPrimitive.Content>
-  </SheetPortal>
-));
+>(({ side = 'right', className, children, style, ...props }, ref) => {
+  // Inline style wins over className, so safe-area padding is applied reliably
+  // even when consumers use p-0. This mirrors the MenuBar fix (paddingTop on
+  // the container itself) vs the SheetHeader marginTop approach which failed.
+  // All current consumers use p-0 and manage their own layout, so we apply
+  // env() directly — 0px on non-notched/desktop (correct for p-0), actual
+  // inset on notched mobile. Consumers adding default p-6 padding should
+  // explicitly manage top/bottom padding alongside their className.
+  const safeStyle: React.CSSProperties = {
+    ...style,
+    ...(side === 'left' || side === 'right'
+      ? {
+          paddingTop: 'env(safe-area-inset-top, 0px)',
+          paddingBottom: 'env(safe-area-inset-bottom, 0px)',
+        }
+      : side === 'top'
+        ? { paddingTop: 'env(safe-area-inset-top, 0px)' }
+        : side === 'bottom'
+          ? { paddingBottom: 'env(safe-area-inset-bottom, 0px)' }
+          : {}),
+  };
+
+  return (
+    <SheetPortal>
+      <SheetOverlay />
+      <SheetPrimitive.Content
+        ref={ref}
+        className={cn(sheetVariants({ side }), className)}
+        style={safeStyle}
+        {...props}
+      >
+        {children}
+        <SheetPrimitive.Close
+          className="absolute rounded-sm opacity-70 ring-offset-background transition-opacity hover:opacity-100 focus:outline-none focus:ring-2 focus:ring-ring focus:ring-offset-2 disabled:pointer-events-none data-[state=open]:bg-secondary"
+          style={{
+            top: 'calc(1rem + env(safe-area-inset-top, 0px))',
+            right: 'calc(1rem + env(safe-area-inset-right, 0px))',
+          }}
+        >
+          <X className="h-4 w-4" />
+          <span className="sr-only">Close</span>
+        </SheetPrimitive.Close>
+      </SheetPrimitive.Content>
+    </SheetPortal>
+  );
+});
 SheetContent.displayName = SheetPrimitive.Content.displayName;
 
 const SheetHeader = ({ className, ...props }: React.HTMLAttributes<HTMLDivElement>) => (

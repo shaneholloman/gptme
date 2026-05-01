@@ -147,6 +147,11 @@ export function ApiProvider({
         const connected = await client.checkConnection();
         console.log('[ApiContext] Connected:', connected);
         if (!connected) {
+          // Build an informative error from the structured probe result
+          const probe = client.lastConnectionResult$.get();
+          if (probe && !probe.ok) {
+            throw new Error(probe.message);
+          }
           throw new Error('Failed to connect to API');
         }
 
@@ -163,8 +168,29 @@ export function ApiProvider({
         console.error('Failed to connect to API:', error);
         client.setConnected(false);
 
+        const probe = client.lastConnectionResult$.get();
         let errorMessage = 'Could not connect to gptme instance.';
-        if (error instanceof Error) {
+        if (probe && !probe.ok) {
+          // Show the URL we tried, distinguish 401 from "server not running",
+          // and explain CORS issues so users know what to fix.
+          errorMessage += ` Tried ${probe.url}.`;
+          if (probe.reason === 'http_error' && probe.status === 401) {
+            errorMessage +=
+              ' Server is running but rejected the request (401). Check the API key / auth token in settings.';
+          } else if (probe.reason === 'http_error' && probe.status === 403) {
+            errorMessage += ' Server returned 403 Forbidden — check auth token / permissions.';
+          } else if (probe.reason === 'http_error') {
+            errorMessage += ` ${probe.message}.`;
+          } else if (probe.reason === 'cors') {
+            errorMessage += ` ${probe.message}.`;
+          } else if (probe.reason === 'parse_error') {
+            errorMessage += ` ${probe.message} — is this URL really a gptme server?`;
+          } else if (probe.reason === 'timeout') {
+            errorMessage += ` ${probe.message}.`;
+          } else {
+            errorMessage += ` ${probe.message}.`;
+          }
+        } else if (error instanceof Error) {
           if (error.message.includes('NetworkError') || error.message.includes('CORS')) {
             errorMessage +=
               ' CORS issue detected - ensure the server has CORS enabled and is accepting requests from ' +
@@ -263,6 +289,19 @@ export function ApiProvider({
         }
       } catch (error) {
         console.log(`[ApiContext] Auto-connect attempt ${autoConnectAttempts} failed:`, error);
+      }
+
+      // CORS / Private Network Access failures don't recover by retrying within
+      // the session. The user has a manual "Retry connection" button; spamming
+      // 10 attempts just clutters the console with the same error.
+      const lastResult = client.lastConnectionResult$.get();
+      if (lastResult && !lastResult.ok && lastResult.reason === 'cors') {
+        console.log('[ApiContext] CORS/PNA failure — stopping auto-connect (use manual reconnect)');
+        stopAutoConnect();
+        if (!isInitialAttempt) {
+          toast.error('Server blocked the connection (CORS) — check server config');
+        }
+        return;
       }
 
       const delay = INITIAL_RETRY_DELAY * Math.pow(2, autoConnectAttempts - 1);

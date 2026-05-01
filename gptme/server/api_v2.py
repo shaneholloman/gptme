@@ -6,6 +6,7 @@ Session management, tool execution, and agent creation are handled by separate m
 """
 
 import logging
+import os
 import shutil
 from dataclasses import replace
 from datetime import datetime, timezone
@@ -17,6 +18,7 @@ import flask
 from dateutil.parser import isoparse
 from flask import request
 
+from gptme.__version__ import __version__
 from gptme.config import (
     ChatConfig,
     Config,
@@ -40,6 +42,7 @@ from gptme.prompts import get_prompt
 
 from ..commands import handle_cmd
 from ..config import get_project_config
+from ..config.user import get_user_config_env_source, get_user_config_runtime_info
 from ..dirs import get_logs_dir
 from ..logmanager import Log, LogManager, get_user_conversations
 from ..message import Message
@@ -188,6 +191,7 @@ def api_root():
         {
             "message": "gptme v2 API",
             "documentation": "https://gptme.org/docs/server.html",
+            "version": __version__,
             "capabilities": capabilities,
             "provider_configured": provider_configured,
         }
@@ -406,6 +410,22 @@ def api_conversation(conversation_id: str):
         }
         if chat_config.agent:
             log_dict["agent"]["path"] = str(chat_config.agent)
+
+    # Surface session-level state so REST polling clients can see generation
+    # status and the last step error without subscribing to SSE.
+    # Errors during /step propagate via SSE error events, but clients that
+    # only poll the conversation would otherwise see {"status": "ok"} from
+    # /step and never learn the LLM call failed.
+    sessions = SessionManager.get_sessions_for_conversation(conversation_id)
+    if sessions:
+        # Pick the most recently active session — it's the one a polling
+        # client would care about.
+        latest = max(sessions, key=lambda s: s.last_activity)
+        log_dict["session"] = {
+            "id": latest.id,
+            "generating": latest.generating,
+            "last_error": latest.last_error,
+        }
 
     return flask.jsonify(log_dict)
 
@@ -1401,13 +1421,23 @@ def api_user_api_key():
     set_config_value(f"env.{env_var}", trimmed_api_key, reload=False)
     if trimmed_model is not None:
         set_config_value("env.MODEL", trimmed_model, reload=False)
-    logger.info("Saved %s to user config via /api/v2/user/api-key", env_var)
+
+    # Apply the new key immediately so the running server picks it up without restart.
+    # os.environ takes priority over the config file in Config.get_env(), so the next
+    # LLM call will use the new key.
+    os.environ[env_var] = trimmed_api_key
+    if trimmed_model is not None:
+        os.environ["MODEL"] = trimmed_model
+
+    logger.info(
+        "Saved %s to user config via /api/v2/user/api-key (applied live)", env_var
+    )
     return flask.jsonify(
         {
             "status": "ok",
             "provider": provider,
             "env_var": env_var,
-            "restart_required": True,
+            "restart_required": False,
         }
     )
 
@@ -1507,10 +1537,24 @@ def api_user_settings():
     """Return the current user settings state."""
     available = list_available_providers()
     providers = [str(provider) for provider, _ in available]
+    provider_sources = {
+        str(provider): {
+            "auth_source": auth_source,
+            "effective_source": (
+                "oauth"
+                if auth_source == "oauth"
+                else get_user_config_env_source(auth_source)
+            ),
+        }
+        for provider, auth_source in available
+    }
     default_model = get_default_model()
     return flask.jsonify(
         {
             "providers_configured": providers,
+            "provider_sources": provider_sources,
             "default_model": default_model.full if default_model else None,
+            "default_model_source": get_user_config_env_source("MODEL"),
+            "config_files": get_user_config_runtime_info(),
         }
     )

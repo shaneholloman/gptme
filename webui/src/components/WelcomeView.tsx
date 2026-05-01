@@ -7,17 +7,23 @@ import { toast } from 'sonner';
 import { use$ } from '@legendapp/state/react';
 import { observable } from '@legendapp/state';
 import { ChatInput, type ChatOptions } from '@/components/ChatInput';
-import { History, Server } from 'lucide-react';
+import { History, Server, Copy, RotateCcw } from 'lucide-react';
 import { useSettings } from '@/contexts/SettingsContext';
 import { ExamplesSection } from '@/components/ExamplesSection';
 import { serverRegistry$, getConnectedServers } from '@/stores/servers';
 import { getExamples } from '@/utils/examples';
+import { settingsModal$ } from '@/stores/settingsModal';
+import { fetchProviderConfigured } from '@/utils/providerStatus';
+import { setupWizard$ } from '@/stores/setupWizard';
+import { Alert, AlertDescription, AlertTitle } from '@/components/ui/alert';
 import {
   DropdownMenu,
   DropdownMenuContent,
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+
+const DEFAULT_LOCAL_SERVER_URLS = new Set(['http://127.0.0.1:5700', 'http://localhost:5700']);
 
 export const WelcomeView = () => {
   const [inputValue, setInputValue] = useState(
@@ -34,15 +40,24 @@ export const WelcomeView = () => {
   }, [inputValue]);
 
   const [isSubmitting, setIsSubmitting] = useState(false);
+  const [isRetryingConnection, setIsRetryingConnection] = useState(false);
+  const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null);
   const navigate = useNavigate();
-  const { api, isConnected$, connectionConfig, switchServer } = useApi();
+  const { api, isConnected$, connectionConfig, switchServer, connect } = useApi();
   const queryClient = useQueryClient();
   const isConnected = use$(isConnected$);
+  const providerStatusVersion = use$(setupWizard$.providerStatusVersion);
   const registry = use$(serverRegistry$);
   const connectedServers = getConnectedServers();
   const activeServer = registry.servers.find((s) => s.id === registry.activeServerId);
   const showServerPicker = connectedServers.length > 1;
   const quickSuggestions = getExamples('welcome-suggestions', 'mixed', 4);
+  const activeServerBaseUrl = (activeServer?.baseUrl || connectionConfig.baseUrl).replace(
+    /\/+$/,
+    ''
+  );
+  const isDefaultLocalServer = DEFAULT_LOCAL_SERVER_URLS.has(activeServerBaseUrl);
+  const serverCommand = `gptme-server --cors-origin='${window.location.origin}'`;
 
   // Create observables that ChatInput expects
   const autoFocus$ = observable(true);
@@ -88,6 +103,53 @@ export const WelcomeView = () => {
     }
   };
 
+  const handleRetryConnection = async () => {
+    setIsRetryingConnection(true);
+    try {
+      await connect();
+      // connect() shows toast.success on real connection and returns silently on no-op
+    } catch {
+      // connect() already shows toast.error on failure; swallow to avoid double-toast
+    } finally {
+      setIsRetryingConnection(false);
+    }
+  };
+
+  const handleCopyServerCommand = async () => {
+    try {
+      await navigator.clipboard.writeText(serverCommand);
+      toast.success('Start command copied to clipboard');
+    } catch {
+      toast.error('Failed to copy start command');
+    }
+  };
+
+  useEffect(() => {
+    if (!isConnected) {
+      setProviderConfigured(null);
+      return;
+    }
+
+    const controller = new AbortController();
+
+    const fetchProviderStatus = async () => {
+      try {
+        setProviderConfigured(
+          await fetchProviderConfigured(connectionConfig.baseUrl, api.authHeader, controller.signal)
+        );
+      } catch (error) {
+        if (error instanceof Error && error.name === 'AbortError') {
+          return;
+        }
+        setProviderConfigured(null);
+      }
+    };
+
+    void fetchProviderStatus();
+
+    return () => controller.abort();
+  }, [api.authHeader, connectionConfig.baseUrl, isConnected, providerStatusVersion]);
+
   const { settings } = useSettings();
   const bg = settings.welcomeBackground;
   // Determine if the background is an image URL or a CSS gradient/color
@@ -121,6 +183,94 @@ export const WelcomeView = () => {
                 </p>
               </div>
             </div>
+
+            {!isConnected && (
+              <Alert className="mx-auto w-full max-w-2xl border-amber-500/30 bg-amber-500/10 text-left">
+                <Server className="h-4 w-4 text-amber-700 dark:text-amber-300" />
+                <AlertTitle>
+                  {isDefaultLocalServer
+                    ? 'No gptme server connected'
+                    : `Cannot reach ${activeServer?.name || 'the configured server'}`}
+                </AlertTitle>
+                <AlertDescription className="space-y-3">
+                  <p>
+                    {isDefaultLocalServer
+                      ? 'Start a local gptme server or point the app at another server before starting a chat.'
+                      : 'Check the server URL and auth token, then retry the connection.'}
+                  </p>
+                  {isDefaultLocalServer && (
+                    <code className="block rounded-md border border-amber-500/20 bg-background/80 px-3 py-2 font-mono text-xs">
+                      {serverCommand}
+                    </code>
+                  )}
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => void handleRetryConnection()}
+                      disabled={isRetryingConnection}
+                    >
+                      <RotateCcw className="mr-2 h-4 w-4" />
+                      {isRetryingConnection ? 'Retrying...' : 'Retry connection'}
+                    </Button>
+                    {isDefaultLocalServer && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => void handleCopyServerCommand()}
+                      >
+                        <Copy className="mr-2 h-4 w-4" />
+                        Copy start command
+                      </Button>
+                    )}
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => settingsModal$.set({ open: true, category: 'servers' })}
+                    >
+                      Server settings
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
+            )}
+
+            {isConnected && providerConfigured === false && (
+              <Alert className="mx-auto w-full max-w-2xl border-sky-500/30 bg-sky-500/10 text-left">
+                <Server className="h-4 w-4 text-sky-700 dark:text-sky-300" />
+                <AlertTitle>Provider setup required</AlertTitle>
+                <AlertDescription className="space-y-3">
+                  <p>
+                    This server is reachable, but it does not have an LLM provider configured yet.
+                    Finish setup to add an API key or switch to gptme.ai before starting a chat.
+                  </p>
+                  <div className="flex flex-wrap gap-2">
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="secondary"
+                      onClick={() => {
+                        setupWizard$.step.set('provider');
+                        setupWizard$.open.set(true);
+                      }}
+                    >
+                      Finish setup
+                    </Button>
+                    <Button
+                      type="button"
+                      size="sm"
+                      variant="outline"
+                      onClick={() => settingsModal$.set({ open: true, category: 'servers' })}
+                    >
+                      Server settings
+                    </Button>
+                  </div>
+                </AlertDescription>
+              </Alert>
+            )}
 
             <div className="mx-auto w-full max-w-2xl [&_textarea]:min-h-[80px] [&_textarea]:text-base">
               <ChatInput

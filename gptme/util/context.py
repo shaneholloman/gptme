@@ -15,7 +15,11 @@ from datetime import datetime
 from pathlib import Path
 
 from ..config import get_config
-from ..constants import CONTENT_SIZE_INFO_THRESHOLD, CONTENT_SIZE_WARN_THRESHOLD
+from ..constants import (
+    CONTENT_SIZE_INFO_THRESHOLD,
+    CONTENT_SIZE_WARN_THRESHOLD,
+    INCLUDE_PATHS_MAX_CONTENT,
+)
 from ..message import Message
 from ..tools import has_tool
 from .gh import (
@@ -513,28 +517,55 @@ def include_paths(msg: Message, workspace: Path | None = None) -> Message:
 
     append_msg = ""
     files = []
+    total_content_size = 0
+    skipped_paths: list[str] = []
 
     # Process file paths
     for word in file_paths:
         logger.debug(f"potential path: {word=}")
         # If not using fresh context, include text file contents in the message
-        if not use_fresh_context() and (
-            contents := _resource_to_codeblock(word, confirmed_urls=None)
-        ):
-            append_msg += "\n\n" + contents
-        else:
-            # if we found a non-text file, include it in msg.files
-            file = _parse_prompt_files(word)
-            if file:
-                # Store path relative to workspace if provided
-                file = file.expanduser()
-                if workspace and not file.is_absolute():
-                    try:
-                        file = file.absolute().relative_to(workspace)
-                    except ValueError:
-                        file = file.absolute()
-                logger.debug(f"auto-attaching file: {file}")
-                files.append(file)
+        if not use_fresh_context():
+            if total_content_size >= INCLUDE_PATHS_MAX_CONTENT:
+                # Budget exhausted: skip entirely (text and binary alike)
+                skipped_paths.append(word)
+                continue
+            if (
+                # Fast stat-based pre-check: skip reading if even the truncated content
+                # (capped at CONTENT_SIZE_WARN_THRESHOLD by _check_content_size) would
+                # exceed the remaining budget.  Path.stat() is a single syscall — far
+                # cheaper than reading the file only to discard the content.
+                (f := Path(word).expanduser()).is_file()
+                and min(f.stat().st_size, CONTENT_SIZE_WARN_THRESHOLD)
+                + total_content_size
+                > INCLUDE_PATHS_MAX_CONTENT
+            ):
+                mime, _ = mimetypes.guess_type(str(f))
+                if not mime or mime.startswith("text/"):
+                    skipped_paths.append(word)
+                    continue  # text file: skip binary handling too
+                # Binary/image file: fall through so it still gets attached via msg.files
+                # (binary attachments are not counted against the text budget)
+            elif contents := _resource_to_codeblock(word, confirmed_urls=None):
+                content_size = len(contents)
+                if total_content_size + content_size > INCLUDE_PATHS_MAX_CONTENT:
+                    skipped_paths.append(word)
+                    continue  # text file: skip binary handling
+                total_content_size += content_size
+                append_msg += "\n\n" + contents
+                continue  # processed as text: skip binary handling
+        # Binary/image attachment: runs when use_fresh_context() or
+        # _resource_to_codeblock returned None (binary file unrepresentable as text)
+        file = _parse_prompt_files(word)
+        if file:
+            # Store path relative to workspace if provided
+            file = file.expanduser()
+            if workspace and not file.is_absolute():
+                try:
+                    file = file.absolute().relative_to(workspace)
+                except ValueError:
+                    file = file.absolute()
+            logger.debug(f"auto-attaching file: {file}")
+            files.append(file)
 
     # Process URLs (only confirmed ones in interactive mode)
     for url in urls_found:
@@ -542,10 +573,25 @@ def include_paths(msg: Message, workspace: Path | None = None) -> Message:
             logger.debug(f"Skipping unconfirmed URL: {url}")
             continue
         logger.debug(f"potential url: {url=}")
-        if not use_fresh_context() and (
-            contents := _resource_to_codeblock(url, confirmed_urls=confirmed_urls)
-        ):
-            append_msg += "\n\n" + contents
+        if not use_fresh_context():
+            # Early exit: skip network fetch entirely if budget already exhausted
+            if total_content_size >= INCLUDE_PATHS_MAX_CONTENT:
+                skipped_paths.append(url)
+                continue
+            if contents := _resource_to_codeblock(url, confirmed_urls=confirmed_urls):
+                content_size = len(contents)
+                if total_content_size + content_size > INCLUDE_PATHS_MAX_CONTENT:
+                    skipped_paths.append(url)
+                    continue
+                total_content_size += content_size
+                append_msg += "\n\n" + contents
+
+    if skipped_paths:
+        logger.warning(
+            f"include_paths: per-message content budget reached "
+            f"({total_content_size}/{INCLUDE_PATHS_MAX_CONTENT} chars used); "
+            f"skipped {len(skipped_paths)} path(s) to stay within limit: {skipped_paths}"
+        )
 
     if files:
         logger.debug(
@@ -591,7 +637,8 @@ def _find_potential_paths(content: str) -> list[str]:
     # List current directory contents for relative path matching
     cwd_files = [f.name for f in Path.cwd().iterdir()]
 
-    paths = []
+    paths: list[str] = []
+    seen_paths: set[str] = set()
 
     def is_path_like(word: str) -> bool:
         """Helper to check if a word looks like a path.
@@ -626,12 +673,19 @@ def _find_potential_paths(content: str) -> list[str]:
         """Strip leading @ from path references (e.g. @src/file.py -> src/file.py)."""
         return word.removeprefix("@")
 
+    def _add_path(word: str) -> None:
+        """Add a path to the list if not already seen (preserves first-seen order)."""
+        path = _strip_at_prefix(word)
+        if path not in seen_paths:
+            seen_paths.add(path)
+            paths.append(path)
+
     # First find backtick-wrapped content
     for match in re.finditer(r"`([^`]+)`", content_no_xml):
         word = match.group(1).strip()
         word = word.rstrip("?").rstrip(".").rstrip(",").rstrip("!")
         if is_path_like(word):
-            paths.append(_strip_at_prefix(word))
+            _add_path(word)
 
     # Then find non-backtick-wrapped words
     # Remove backtick-wrapped content first to avoid double-processing
@@ -643,7 +697,7 @@ def _find_potential_paths(content: str) -> list[str]:
             continue
 
         if is_path_like(word):
-            paths.append(_strip_at_prefix(word))
+            _add_path(word)
 
     return paths
 

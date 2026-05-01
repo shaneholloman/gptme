@@ -8,6 +8,7 @@ import {
   DialogTrigger,
 } from '@/components/ui/dialog';
 import { Button } from '@/components/ui/button';
+import { Input } from '@/components/ui/input';
 import { Label } from '@/components/ui/label';
 import { Switch } from '@/components/ui/switch';
 import { Separator } from '@/components/ui/separator';
@@ -18,6 +19,8 @@ import { cn } from '@/lib/utils';
 import { ServerConfiguration } from '@/components/settings/ServerConfiguration';
 import { use$ } from '@legendapp/state/react';
 import { settingsModal$, type SettingsCategory } from '@/stores/settingsModal';
+import { setupWizard$ } from '@/stores/setupWizard';
+import { getPrimaryClient } from '@/stores/serverClients';
 export type { SettingsCategory } from '@/stores/settingsModal';
 export { settingsModal$ } from '@/stores/settingsModal';
 
@@ -64,6 +67,17 @@ export const SettingsModal = forwardRef<HTMLButtonElement, SettingsModalProps>(
     const { theme, setTheme } = useTheme();
     const [open, setOpen] = useState(false);
     const [activeCategory, setActiveCategory] = useState<SettingsCategory>('appearance');
+    const [serverVersion, setServerVersion] = useState<string | null>(null);
+
+    useEffect(() => {
+      if (activeCategory !== 'about') return;
+      const client = getPrimaryClient();
+      if (!client) return;
+      client
+        .getServerInfo()
+        .then((info) => setServerVersion(info.version ?? null))
+        .catch(() => setServerVersion(null));
+    }, [activeCategory]);
 
     // Allow external code to open the modal to a specific category
     const externalRequest = use$(settingsModal$);
@@ -197,6 +211,24 @@ export const SettingsModal = forwardRef<HTMLButtonElement, SettingsModalProps>(
                   onCheckedChange={(checked) => updateSettings({ chimeEnabled: checked })}
                 />
               </div>
+
+              <div className="space-y-2">
+                <Label htmlFor="voice-server-url" className="text-sm">
+                  Voice server URL
+                </Label>
+                <p className="text-xs text-muted-foreground">
+                  WebSocket URL of a running gptme-voice-server instance, e.g.{' '}
+                  <code className="rounded bg-muted px-1">ws://localhost:5700/voice</code>. Leave
+                  empty to hide the voice button.
+                </p>
+                <Input
+                  id="voice-server-url"
+                  type="text"
+                  placeholder="ws://localhost:5700/voice"
+                  value={settings.voiceServerUrl}
+                  onChange={(e) => updateSettings({ voiceServerUrl: e.target.value.trim() })}
+                />
+              </div>
             </div>
           );
 
@@ -277,6 +309,13 @@ export const SettingsModal = forwardRef<HTMLButtonElement, SettingsModalProps>(
               </div>
 
               <div className="space-y-4">
+                {serverVersion && (
+                  <div className="space-y-1">
+                    <h4 className="text-sm font-medium">Version</h4>
+                    <p className="font-mono text-sm text-muted-foreground">gptme {serverVersion}</p>
+                  </div>
+                )}
+
                 <div className="space-y-3">
                   <h4 className="text-sm font-medium">Related Projects</h4>
                   <div className="flex flex-col space-y-2">
@@ -298,6 +337,28 @@ export const SettingsModal = forwardRef<HTMLButtonElement, SettingsModalProps>(
                       <ExternalLink className="mr-2 h-3 w-3" />
                       gptme-webui - Web interface
                     </a>
+                  </div>
+                </div>
+
+                <Separator />
+
+                <div className="space-y-2">
+                  <h4 className="text-sm font-medium">Setup Wizard</h4>
+                  <div className="flex items-center justify-between">
+                    <p className="text-xs text-muted-foreground">
+                      Re-run the setup wizard to change server or sign in to gptme.ai
+                    </p>
+                    <Button
+                      variant="outline"
+                      size="sm"
+                      onClick={() => {
+                        setOpen(false);
+                        setupWizard$.step.set('welcome');
+                        setupWizard$.open.set(true);
+                      }}
+                    >
+                      Re-run Setup
+                    </Button>
                   </div>
                 </div>
 
@@ -333,14 +394,8 @@ export const SettingsModal = forwardRef<HTMLButtonElement, SettingsModalProps>(
 
     return (
       <Dialog open={open} onOpenChange={setOpen}>
-        <DialogTrigger asChild>
-          {children || (
-            <Button variant="ghost" size="icon" aria-label="Open settings">
-              <Settings className="h-4 w-4" />
-            </Button>
-          )}
-        </DialogTrigger>
-        <DialogContent className="max-h-[80vh] max-w-4xl p-0">
+        {children !== undefined && <DialogTrigger asChild>{children}</DialogTrigger>}
+        <DialogContent className="flex max-h-[80vh] max-w-4xl flex-col overflow-hidden p-0">
           <DialogHeader className="border-b px-6 py-3">
             <DialogTitle className="flex items-center gap-2">
               <Settings className="h-5 w-5" />
@@ -349,9 +404,9 @@ export const SettingsModal = forwardRef<HTMLButtonElement, SettingsModalProps>(
             <DialogDescription>Customize your gptme experience</DialogDescription>
           </DialogHeader>
 
-          <div className="flex min-h-[500px]">
+          <div className="flex min-h-0 min-w-0 flex-1">
             {/* Sidebar */}
-            <div className="w-64 border-r bg-muted/20 p-4">
+            <div className="w-64 overflow-y-auto border-r bg-muted/20 p-4">
               <nav className="space-y-1">
                 {categories.map((category) => {
                   const Icon = category.icon;
@@ -378,7 +433,9 @@ export const SettingsModal = forwardRef<HTMLButtonElement, SettingsModalProps>(
             </div>
 
             {/* Content */}
-            <div className="flex-1 overflow-y-auto p-6">{renderCategoryContent()}</div>
+            <div className="min-h-0 min-w-0 flex-1 overflow-y-auto p-6">
+              {renderCategoryContent()}
+            </div>
           </div>
         </DialogContent>
       </Dialog>

@@ -61,6 +61,45 @@ def test_find_potential_paths_empty():
     assert _find_potential_paths("just some text") == []
 
 
+def test_find_potential_paths_deduplication():
+    """Paths mentioned multiple times should appear only once in the result."""
+    content = """
+    See `./scripts/foo.py --flag` for details.
+    Also `./scripts/foo.py --other` does the same.
+    And again: `./scripts/foo.py`
+    The plain word /abs/path appears twice: /abs/path
+    """
+    paths = _find_potential_paths(content)
+
+    # Each unique path must appear exactly once, even if mentioned multiple times
+    assert paths.count("./scripts/foo.py --flag") == 1
+    assert paths.count("/abs/path") == 1
+
+    # All unique paths should still be present
+    assert "./scripts/foo.py --flag" in paths
+    assert "/abs/path" in paths
+
+
+def test_include_paths_no_duplicate_embeddings(tmp_path, monkeypatch):
+    """include_paths must not embed the same file content multiple times."""
+    from gptme.message import Message
+    from gptme.util.context import include_paths
+
+    monkeypatch.chdir(tmp_path)
+    data_file = tmp_path / "data.txt"
+    data_file.write_text("unique-content-marker")
+
+    # Reference the same file four times
+    msg = Message(
+        "user",
+        "See `data.txt` and also `data.txt`. Then `data.txt` again and data.txt bare.",
+    )
+    result = include_paths(msg)
+
+    # The unique marker should appear exactly once, not four times
+    assert result.content.count("unique-content-marker") == 1
+
+
 def test_include_paths_skips_system_messages():
     """Test that include_paths skips role=system messages (tool output) entirely."""
     from gptme.message import Message
@@ -302,6 +341,48 @@ def test_include_paths_image_in_text(tmp_path):
     # Image should be auto-attached to msg.files
     assert len(result.files) == 1
     assert Path(str(result.files[0])).name == "screenshot.png"
+
+
+def test_include_paths_per_message_size_budget(tmp_path, monkeypatch, caplog):
+    """include_paths must stop embedding files once the per-message budget is exceeded."""
+    import logging
+
+    from gptme.message import Message
+    from gptme.util.context import include_paths
+
+    monkeypatch.chdir(tmp_path)
+
+    # Create several moderately sized files that collectively exceed the budget
+    # INCLUDE_PATHS_MAX_CONTENT = 200_000. Create 3 files at ~80KB each (~240KB total)
+    chunk_size = 80_000
+    files = []
+    for i in range(3):
+        f = tmp_path / f"doc_{i}.txt"
+        # Use unique per-file content so dedup doesn't interfere
+        body = f"marker_{i}_" + "x" * (chunk_size - len(f"marker_{i}_"))
+        f.write_text(body)
+        files.append(f)
+
+    # Reference all three files in the message
+    refs = "\n".join(f"`{f.name}`" for f in files)
+    msg = Message("user", f"Read these:\n{refs}")
+    caplog.set_level(logging.WARNING)
+
+    result = include_paths(msg)
+
+    # First two files should be embedded (~160KB), third should be skipped
+    assert "marker_0_" in result.content
+    assert "marker_1_" in result.content
+    assert "marker_2_" not in result.content
+
+    # Warning should be logged about the skipped paths
+    log_messages = [r.message for r in caplog.records if r.levelno == logging.WARNING]
+    assert any("per-message content budget reached" in m for m in log_messages)
+    assert any("doc_2.txt" in m for m in log_messages)
+
+    # Skipped file must not be attached via msg.files (budget bypass via _parse_prompt_files)
+    attached_names = [f.name for f in (result.files or []) if isinstance(f, Path)]
+    assert "doc_2.txt" not in attached_names
 
 
 def test_embed_attached_preserves_image_files(tmp_path):

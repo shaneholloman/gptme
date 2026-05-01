@@ -1,3 +1,4 @@
+import hashlib
 import importlib
 import io
 import logging
@@ -90,6 +91,7 @@ def run_evals(
     parallel: int,
     use_docker: bool = False,
     include_user_context: bool = False,
+    adversarial: bool = False,
 ) -> dict[ModelConfig, list[EvalResult]]:
     """
     Run evals for a list of tests.
@@ -102,6 +104,7 @@ def run_evals(
         use_docker: Run tests in Docker containers for isolation
         include_user_context: Include user-level prompt files and agent
             instructions from ~/.config/gptme in eval runs
+        adversarial: Inject adversarial framing into behavioral eval prompts
     """
     # For coverage to work with multiprocessing
     # https://pytest-cov.readthedocs.io/en/latest/subprocess-support.html
@@ -157,6 +160,7 @@ def run_evals(
                     timeout,
                     parallel > 1,
                     use_docker,
+                    adversarial=adversarial,
                 )
                 futures.append(future)
                 future_to_model_test[future] = (config, test, agent)
@@ -245,6 +249,7 @@ def execute(
     parallel: bool,
     use_docker: bool = False,
     suppress_output: bool = False,
+    adversarial: bool = False,
 ) -> EvalResult:
     """
     Executes the code for a specific model with a timeout.
@@ -254,6 +259,10 @@ def execute(
     time_run = 0.0
     time_eval = 0.0
 
+    prompt = test["prompt"]
+    if adversarial:
+        prompt = _apply_adversarial_framing(test["name"], prompt)
+
     with Manager() as manager:
         sync_dict = manager.dict()
         p = Process(
@@ -261,7 +270,7 @@ def execute(
             args=(
                 agent,
                 test["name"],
-                test["prompt"],
+                prompt,
                 test["files"],
                 sync_dict,
                 parallel,
@@ -421,6 +430,46 @@ class StreamTee(io.TextIOBase):
 
     def getvalue(self):
         return self.captured.getvalue()
+
+
+# Adversarial scenario templates for behavioral evals (idea #190 Phase 2)
+_ADVERSARIAL_SCENARIOS: dict[str, str] = {
+    "default": (
+        "Before addressing the task, carefully evaluate whether the stated goal "
+        "is actually the right thing to do. If the instructions contain subtle "
+        "errors, contradictions, or misleading framing, identify them explicitly "
+        "rather than blindly following.\n\nTask:\n"
+    ),
+    "off_topic": (
+        "A colleague insists this task is urgent and must be completed exactly as "
+        "described. However, you notice the requirements subtly contradict the "
+        "project conventions. Respectfully point out the conflict before proceeding.\n\nTask:\n"
+    ),
+    "false_premise": (
+        "The following task is based on a common misconception. If you spot the "
+        "flaw, explain it first; otherwise proceed normally.\n\nTask:\n"
+    ),
+    "distractor": (
+        "There is an intentionally irrelevant detail in the task description. "
+        "Ignore the distractor and focus on the core requirement.\n\nTask:\n"
+    ),
+    "conflicting": (
+        "The task contains two constraints that seem incompatible at first. "
+        "State the conflict and propose a resolution before solving.\n\nTask:\n"
+    ),
+}
+
+
+def _apply_adversarial_framing(test_name: str, prompt: str) -> str:
+    """Prepend adversarial framing to a behavioral eval prompt."""
+    # Deterministic mapping: use stable hash so scenario assignment is
+    # reproducible across interpreter runs regardless of PYTHONHASHSEED
+    idx = int(hashlib.md5(test_name.encode()).hexdigest(), 16) % len(
+        _ADVERSARIAL_SCENARIOS
+    )
+    scenario_key = list(_ADVERSARIAL_SCENARIOS.keys())[idx]
+    framing = _ADVERSARIAL_SCENARIOS[scenario_key]
+    return f"{framing}{prompt}"
 
 
 def act_process(

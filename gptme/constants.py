@@ -10,6 +10,12 @@ import os
 TEMPERATURE = float(os.getenv("TEMPERATURE", "0"))
 TOP_P = float(os.getenv("TOP_P", "0.1"))
 
+# Verbosity level for GPT-5+ OpenAI models. One of "low", "medium", "high".
+# Unset (default) means the parameter is not sent and OpenAI's default applies.
+# NOTE: getting the environment variable like this ignores if it is set in the gptme config
+# See: https://platform.openai.com/docs/guides/latest-model
+OPENAI_VERBOSITY = os.getenv("OPENAI_VERBOSITY")
+
 # separator for multiple rounds of prompts on the command line
 # demarcates the end of the user's prompt, and start of the assistant's response
 # e.g. /gptme "generate a poem" "-" "save it to poem.txt"
@@ -59,3 +65,7 @@ MAX_PROMPT_QUEUE_SIZE = 100
 # Content above WARN threshold logs warning and gets truncated
 CONTENT_SIZE_INFO_THRESHOLD = 50_000  # 50KB - log info
 CONTENT_SIZE_WARN_THRESHOLD = 100_000  # 100KB - warn and truncate
+
+# Maximum total characters to append via include_paths across all files/URLs
+# Prevents context-window saturation when prompts reference many large files
+INCLUDE_PATHS_MAX_CONTENT = 200_000  # 200KB

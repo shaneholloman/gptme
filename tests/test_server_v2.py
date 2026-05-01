@@ -114,6 +114,7 @@ def test_v2_user_api_key_persists_env_entry(client: FlaskClient, tmp_path, monke
     config_file = tmp_path / "config.toml"
     monkeypatch.setattr(user_mod, "config_path", str(config_file))
     monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
 
     response = client.post(
         "/api/v2/user/api-key",
@@ -126,11 +127,34 @@ def test_v2_user_api_key_persists_env_entry(client: FlaskClient, tmp_path, monke
         "status": "ok",
         "provider": "anthropic",
         "env_var": "ANTHROPIC_API_KEY",
-        "restart_required": True,
+        "restart_required": False,
     }
 
     saved = tomlkit.loads(config_file.read_text()).unwrap()
     assert saved["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
+
+
+def test_v2_user_api_key_applies_to_env_immediately(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """Saving an API key should apply it to os.environ immediately (no restart needed)."""
+    import os
+
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "anthropic", "api_key": "sk-ant-live-key"},
+    )
+
+    assert response.status_code == 200
+    assert response.get_json()["restart_required"] is False
+    assert os.environ.get("ANTHROPIC_API_KEY") == "sk-ant-live-key"
 
 
 def test_v2_user_api_key_persists_default_model(
@@ -142,6 +166,8 @@ def test_v2_user_api_key_persists_default_model(
     config_file = tmp_path / "config.toml"
     monkeypatch.setattr(user_mod, "config_path", str(config_file))
     monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.delenv("MODEL", raising=False)
 
     response = client.post(
         "/api/v2/user/api-key",
@@ -1570,12 +1596,40 @@ def test_v2_user_settings_returns_providers_and_model(client: FlaskClient, monke
         "gptme.server.api_v2.list_available_providers",
         lambda: [("anthropic", "ANTHROPIC_API_KEY")],
     )
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_user_config_env_source",
+        lambda key: (
+            "config.local.toml"
+            if key == "ANTHROPIC_API_KEY"
+            else "config.toml"
+            if key == "MODEL"
+            else None
+        ),
+    )
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_user_config_runtime_info",
+        lambda: {
+            "config_path": "~/.config/gptme/config.toml",
+            "local_config_path": "~/.config/gptme/config.local.toml",
+            "local_config_exists": True,
+            "write_target": "~/.config/gptme/config.toml",
+            "local_overrides_main": True,
+        },
+    )
 
     response = client.get("/api/v2/user/settings")
     assert response.status_code == 200
     data = response.get_json()
     assert data["providers_configured"] == ["anthropic"]
+    assert data["provider_sources"] == {
+        "anthropic": {
+            "auth_source": "ANTHROPIC_API_KEY",
+            "effective_source": "config.local.toml",
+        }
+    }
     assert data["default_model"] == "anthropic/claude-sonnet-4-5"
+    assert data["default_model_source"] == "config.toml"
+    assert data["config_files"]["write_target"] == "~/.config/gptme/config.toml"
 
 
 def test_v2_user_settings_no_providers_no_model(client: FlaskClient, monkeypatch):
@@ -1585,9 +1639,25 @@ def test_v2_user_settings_no_providers_no_model(client: FlaskClient, monkeypatch
         lambda: [],
     )
     monkeypatch.setattr("gptme.server.api_v2.get_default_model", lambda: None)
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_user_config_env_source", lambda _key: None
+    )
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_user_config_runtime_info",
+        lambda: {
+            "config_path": "~/.config/gptme/config.toml",
+            "local_config_path": "~/.config/gptme/config.local.toml",
+            "local_config_exists": False,
+            "write_target": "~/.config/gptme/config.toml",
+            "local_overrides_main": True,
+        },
+    )
 
     response = client.get("/api/v2/user/settings")
     assert response.status_code == 200
     data = response.get_json()
     assert data["providers_configured"] == []
+    assert data["provider_sources"] == {}
     assert data["default_model"] is None
+    assert data["default_model_source"] is None
+    assert data["config_files"]["local_config_exists"] is False
