@@ -28,6 +28,7 @@ from ..config import setup_config_from_cli
 from ..constants import MULTIPROMPT_SEPARATOR
 from ..dirs import get_logs_dir
 from ..init import init_logging
+from ..llm import reply as llm_reply
 from ..llm.models import get_recommended_model
 from ..logmanager import ConversationMeta, get_user_conversations
 from ..message import Message
@@ -144,8 +145,11 @@ The interface provides /commands during a conversation:
 Utilities (gptme-util):
   gptme-util tools list       List all tools and their availability
   gptme-util tools info TOOL  Show detailed tool instructions/examples
+  gptme-util skills list      List discoverable skills in the current workspace
+  gptme-util skills show NAME Show a skill or lesson by name
   gptme-util chats list       List past conversations
   gptme-util chats search Q   Search conversations for query
+  gptme-util chats send ID MSG Queue a prompt for a running chat
   gptme-util chats rename     Rename a conversation
   gptme-util models list      List available models
   gptme-util context index    Index project files for RAG
@@ -206,6 +210,13 @@ Run 'gptme-util --help' for all utility commands."""
     "non_interactive",
     is_flag=True,
     help="Non-interactive mode. Implies --no-confirm.",
+)
+@click.option(
+    "--output-format",
+    "output_format",
+    type=click.Choice(["text", "json"]),
+    default="text",
+    help="Output format for non-interactive mode. 'json' emits one JSON object per line on stdout.",
 )
 @click.option(
     "--system",
@@ -294,6 +305,30 @@ Run 'gptme-util --help' for all utility commands."""
     hidden=True,
 )
 @click.option(
+    "--architect",
+    "architect_enabled",
+    is_flag=True,
+    help="Enable architect/editor split mode: plan with strong model, execute with cheap model.",
+)
+@click.option(
+    "--architect-model",
+    "architect_model",
+    default=None,
+    help="Model to use for the architect (planning) turn. E.g. openai/o3, anthropic/claude-opus-4-7.",
+)
+@click.option(
+    "--editor-model",
+    "editor_model",
+    default=None,
+    help="Model to use for the editor (execution) turn. E.g. anthropic/claude-sonnet-4-5, openai/gpt-5-mini.",
+)
+@click.option(
+    "--auto-accept-architect",
+    "auto_accept_architect",
+    is_flag=True,
+    help="Skip user confirmation between architect and editor turns.",
+)
+@click.option(
     "--output-schema",
     "output_schema",
     default=None,
@@ -313,6 +348,7 @@ def main(
     verbose: bool,
     no_confirm: bool,
     non_interactive: bool,
+    output_format: str,
     show_hidden: bool,
     version: bool,
     version_json: bool,
@@ -321,6 +357,10 @@ def main(
     agent_path: str | None,
     profile: bool,
     multi_tool: bool | None,
+    architect_enabled: bool,
+    architect_model: str | None,
+    editor_model: str | None,
+    auto_accept_architect: bool,
     context_include: tuple[str, ...],
     output_schema: str | None,
 ):
@@ -544,7 +584,8 @@ def main(
 
     # Register atexit handler to show conversation ID on exit
     def goodbye_handler():
-        print(f"\nGoodbye! (resume with: gptme --name {logdir.name})")
+        if output_format != "json":
+            print(f"\nGoodbye! (resume with: gptme --name {logdir.name})")
 
     atexit.register(goodbye_handler)
 
@@ -588,6 +629,24 @@ def main(
     # as they're already in the loaded log
     log_file = logdir / "conversation.jsonl"
     is_existing_conversation = log_file.exists() and log_file.stat().st_size > 0
+
+    # Validate --output-format json and --non-interactive requirements early,
+    # before the expensive get_prompt() call (which can take 10+ seconds).
+    # This avoids CI timeouts when the CLI will just exit with usage error.
+    if output_format == "json" and not non_interactive:
+        logger.error("--output-format json is only allowed with --non-interactive.")
+        sys.exit(1)
+
+    if not interactive and not prompt_msgs and not is_existing_conversation:
+        logger.error(
+            "Non-interactive mode requires a prompt. Provide a prompt as an argument, "
+            "use --resume to continue an existing conversation, or pipe input via stdin.\n\n"
+            "Examples:\n"
+            "  gptme --non-interactive 'hello world'\n"
+            "  gptme --non-interactive --resume\n"
+            "  echo 'hello' | gptme --non-interactive"
+        )
+        sys.exit(1)
 
     if is_existing_conversation:
         logger.debug("Existing conversation found, skipping initial prompt generation")
@@ -645,17 +704,98 @@ def main(
                 "Verify the module is installed and the class name is correct."
             )
 
-    # Validate non-interactive mode requires a prompt or existing conversation
-    if not interactive and not prompt_msgs and not is_existing_conversation:
-        logger.error(
-            "Non-interactive mode requires a prompt. Provide a prompt as an argument, "
-            "use --resume to continue an existing conversation, or pipe input via stdin.\n\n"
-            "Examples:\n"
-            "  gptme --non-interactive 'hello world'\n"
-            "  gptme --non-interactive --resume\n"
-            "  echo 'hello' | gptme --non-interactive"
+    # Architect/editor split: if enabled via CLI flag OR via TOML config
+    _toml_architect_enabled = bool(
+        config.project and config.project.architect and config.project.architect.enabled
+    )
+    if (
+        (architect_enabled or _toml_architect_enabled)
+        and prompt_msgs
+        and not is_existing_conversation
+    ):
+        # Determine architect model: CLI flag > config > default model
+        _arch_model = architect_model or (
+            config.project
+            and config.project.architect
+            and config.project.architect.architect_model
         )
-        sys.exit(1)
+        # Determine editor model: CLI flag > config > current model
+        _editor_model = editor_model or (
+            config.project
+            and config.project.architect
+            and config.project.architect.editor_model
+        )
+        _auto_accept = auto_accept_architect or (
+            config.project
+            and config.project.architect
+            and config.project.architect.auto_accept
+        )
+
+        # Use the architect model for the planning turn, or fall back
+        _arch_model = _arch_model or config.chat.model
+        assert _arch_model, "Architect mode requires a model to be configured"
+
+        # Construct architect messages from first user prompt
+        from ..prompts.architect import (
+            make_architect_messages,
+            make_editor_injection,
+        )
+
+        # Build architect messages: stripped context (no tool docs).
+        # Do NOT include initial_msgs — the full tool-laden system prompt contradicts
+        # the design intent of a stripped planning context where the model sees
+        # only ARCHITECT_SYSTEM_PROMPT + the user's request.
+        first_prompt = prompt_msgs[0]
+        architect_msgs = make_architect_messages(first_prompt.content)
+
+        logger.info(
+            "Architect mode: planning with %s, will edit with %s",
+            _arch_model,
+            _editor_model or _arch_model,
+        )
+
+        # Run architect turn
+        architect_response = llm_reply(
+            architect_msgs,
+            model=_arch_model,
+            stream=False,
+            tools=None,  # architect has no tools (planning only)
+            workspace=workspace_path,
+        )
+
+        plan_text = architect_response.content.strip()
+        logger.info("Architect plan generated (%d chars)", len(plan_text))
+
+        # Confirmation gate: show plan and ask before handing off to editor
+        if not _auto_accept and not no_confirm:
+            from ..util import console
+
+            console.print("\n[bold]Architect plan:[/bold]")
+            console.print(plan_text)
+            console.print()
+            answer = input("Proceed with editor turn? [y/N] ").strip().lower()
+            if answer not in ("y", "yes"):
+                logger.info("Architect turn cancelled by user.")
+                return
+
+        if len(prompt_msgs) > 1:
+            logger.warning(
+                "Architect mode: %d extra prompt message(s) beyond the first will be dropped. "
+                "Only the first user message is used for planning.",
+                len(prompt_msgs) - 1,
+            )
+
+        # Inject plan as system message + editor prompt, replace original prompt
+        editor_injection = make_editor_injection(plan_text)
+        config.chat.model = _editor_model or _arch_model
+        prompt_msgs = [
+            Message(
+                first_prompt.role,
+                f"The architect's plan is in the system message above. "
+                f"Implement it now.\n\nOriginal request: {first_prompt.content}",
+            )
+        ]
+        initial_msgs = list(initial_msgs) + [editor_injection]
 
     try:
         chat(
@@ -671,6 +811,7 @@ def main(
             config.chat.tools,
             config.chat.tool_format,
             output_schema_type,
+            output_format,
         )
     except (RuntimeError, Exception) as e:
         logger.error("Fatal error occurred")

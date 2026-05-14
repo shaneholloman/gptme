@@ -93,6 +93,8 @@ _TRUNC_PRE_TOKENS_DEFAULT = 2000
 _TRUNC_POST_TOKENS_DEFAULT = 8000
 _TRUNC_STDERR_PRE_TOKENS_DEFAULT = 2000
 _TRUNC_STDERR_POST_TOKENS_DEFAULT = 2000
+_GIT_LOG_PREVIEW_LINES = 20
+_GH_LIST_PREVIEW_LINES = 10
 
 
 candidates = (
@@ -1065,6 +1067,159 @@ def _get_truncation_budget(
     return _resolve(pre_env, default_pre), _resolve(post_env, default_post)
 
 
+def _default_model_name() -> str:
+    from ..llm.models import get_default_model  # fmt: skip
+
+    model = get_default_model()
+    return model.model if model else "cl100k_base"
+
+
+def _matches_git_log_oneline(cmd: str) -> bool:
+    if any(ch in cmd for ch in "\n|;&<>`$"):
+        return False
+
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+
+    if len(tokens) < 3 or tokens[:2] != ["git", "log"]:
+        return False
+
+    return any(token == "--oneline" for token in tokens[2:])
+
+
+def _matches_gh_list(cmd: str) -> bool:
+    """Detect ``gh issue list`` or ``gh pr list`` commands (tabular output only)."""
+    if any(ch in cmd for ch in "\n|;&<>`$"):
+        return False
+
+    try:
+        tokens = shlex.split(cmd)
+    except ValueError:
+        return False
+
+    if len(tokens) < 3 or tokens[0] != "gh":
+        return False
+
+    if not (tokens[1] in ("issue", "pr") and tokens[2] == "list"):
+        return False
+
+    # Reject JSON output formats — truncating a JSON array at line boundaries
+    # produces invalid JSON that the model cannot parse.
+    flags = tokens[3:]
+    for i, tok in enumerate(flags):
+        if tok.startswith("--json"):
+            return False
+        if tok.startswith("--format="):
+            return False
+        if tok == "--format" and i + 1 < len(flags) and flags[i + 1] == "json":
+            return False
+
+    return True
+
+
+def _format_git_log_preview(cmd: str, stdout: str, logdir: Path | None) -> str | None:
+    lines = [line for line in strip_ansi_codes(stdout).splitlines() if line.strip()]
+    if len(lines) <= _GIT_LOG_PREVIEW_LINES:
+        return None
+
+    saved_path: Path | None = None
+    if logdir:
+        _, saved_path = save_large_output(
+            content=stdout,
+            logdir=logdir,
+            output_type="shell",
+            command_info=cmd,
+        )
+
+    omitted = len(lines) - _GIT_LOG_PREVIEW_LINES
+    preview = "\n".join(
+        lines[:_GIT_LOG_PREVIEW_LINES] + [f"... ({omitted} more commits omitted) ..."]
+    )
+
+    detail = f"Showing first {_GIT_LOG_PREVIEW_LINES} of {len(lines)} commits."
+    if saved_path:
+        detail += (
+            f" Full output saved to {saved_path}; read that file for the complete list."
+        )
+    else:
+        detail += (
+            " Full output was not saved because no conversation logdir is active."
+            " To get the full list, pipe through cat: `git log --oneline | cat`."
+        )
+    detail += " Use `git show <sha>` for a specific commit."
+
+    body = detail + "\n\n" + md_codeblock("stdout", preview)
+
+    if logdir and saved_path:
+        model_name = _default_model_name()
+        try:
+            record_context_savings(
+                logdir=logdir,
+                source="shell",
+                original_tokens=len_tokens(stdout, model_name),
+                kept_tokens=len_tokens(body, model_name),
+                command_info=f"git_log_oneline: {cmd}",
+                saved_path=saved_path,
+            )
+        except OSError as e:
+            logger.warning("Failed to record compact shell telemetry: %s", e)
+
+    return body
+
+
+def _format_gh_list_preview(cmd: str, stdout: str, logdir: Path | None) -> str | None:
+    """Format a compact preview for ``gh issue list`` / ``gh pr list`` output."""
+    lines = [line for line in strip_ansi_codes(stdout).splitlines() if line.strip()]
+    if len(lines) <= _GH_LIST_PREVIEW_LINES:
+        return None
+
+    saved_path: Path | None = None
+    if logdir:
+        _, saved_path = save_large_output(
+            content=stdout,
+            logdir=logdir,
+            output_type="shell",
+            command_info=cmd,
+        )
+
+    omitted = len(lines) - _GH_LIST_PREVIEW_LINES
+    preview = "\n".join(
+        lines[:_GH_LIST_PREVIEW_LINES] + [f"... ({omitted} more items omitted) ..."]
+    )
+
+    detail = f"Showing first {_GH_LIST_PREVIEW_LINES} of {len(lines)} items."
+    if saved_path:
+        detail += (
+            f" Full output saved to {saved_path}; read that file for the complete list."
+        )
+    else:
+        detail += (
+            " Full output was not saved because no conversation logdir is active."
+            f" To get the full list, pipe through cat: `{cmd} | cat`."
+        )
+    detail += " Use `gh issue view <number>` or `gh pr view <number>` for details."
+
+    body = detail + "\n\n" + md_codeblock("stdout", preview)
+
+    if logdir and saved_path:
+        model_name = _default_model_name()
+        try:
+            record_context_savings(
+                logdir=logdir,
+                source="shell",
+                original_tokens=len_tokens(stdout, model_name),
+                kept_tokens=len_tokens(body, model_name),
+                command_info=f"gh_list: {cmd}",
+                saved_path=saved_path,
+            )
+        except OSError as e:
+            logger.warning("Failed to record compact shell telemetry: %s", e)
+
+    return body
+
+
 def _format_shell_output(
     cmd: str,
     stdout: str,
@@ -1081,33 +1236,61 @@ def _format_shell_output(
     stdout = strip_ansi_codes(stdout)
     stderr = strip_ansi_codes(stderr)
 
-    # Apply shortening logic with output storage
-    pre_tokens, post_tokens = _get_truncation_budget(
-        "GPTME_SHELL_TRUNC_PRE_TOKENS",
-        "GPTME_SHELL_TRUNC_POST_TOKENS",
-        default_pre=_TRUNC_PRE_TOKENS_DEFAULT,
-        default_post=_TRUNC_POST_TOKENS_DEFAULT,
-    )
-    stderr_pre_tokens, stderr_post_tokens = _get_truncation_budget(
-        "GPTME_SHELL_TRUNC_STDERR_PRE_TOKENS",
-        "GPTME_SHELL_TRUNC_STDERR_POST_TOKENS",
-        default_pre=_TRUNC_STDERR_PRE_TOKENS_DEFAULT,
-        default_post=_TRUNC_STDERR_POST_TOKENS_DEFAULT,
-    )
-    stdout = _shorten_stdout(
-        stdout,
-        pre_tokens=pre_tokens,
-        post_tokens=post_tokens,
-        logdir=logdir,
-        cmd=cmd,
-    )
-    stderr = _shorten_stdout(
-        stderr,
-        pre_tokens=stderr_pre_tokens,
-        post_tokens=stderr_post_tokens,
-        logdir=logdir,
-        cmd=f"{cmd} (stderr)",
-    )
+    compact_stdout = None
+    if (
+        returncode == 0
+        and stdout
+        and not stderr
+        and not interrupted
+        and not timed_out
+        and _matches_git_log_oneline(cmd)
+    ):
+        try:
+            compact_stdout = _format_git_log_preview(cmd, stdout, logdir)
+        except OSError as e:
+            logger.warning("Failed to format compact shell output: %s", e)
+
+    if compact_stdout is None and (
+        returncode == 0
+        and stdout
+        and not stderr
+        and not interrupted
+        and not timed_out
+        and _matches_gh_list(cmd)
+    ):
+        try:
+            compact_stdout = _format_gh_list_preview(cmd, stdout, logdir)
+        except OSError as e:
+            logger.warning("Failed to format compact shell output: %s", e)
+
+    if compact_stdout is None:
+        # Apply shortening logic with output storage
+        pre_tokens, post_tokens = _get_truncation_budget(
+            "GPTME_SHELL_TRUNC_PRE_TOKENS",
+            "GPTME_SHELL_TRUNC_POST_TOKENS",
+            default_pre=_TRUNC_PRE_TOKENS_DEFAULT,
+            default_post=_TRUNC_POST_TOKENS_DEFAULT,
+        )
+        stderr_pre_tokens, stderr_post_tokens = _get_truncation_budget(
+            "GPTME_SHELL_TRUNC_STDERR_PRE_TOKENS",
+            "GPTME_SHELL_TRUNC_STDERR_POST_TOKENS",
+            default_pre=_TRUNC_STDERR_PRE_TOKENS_DEFAULT,
+            default_post=_TRUNC_STDERR_POST_TOKENS_DEFAULT,
+        )
+        stdout = _shorten_stdout(
+            stdout,
+            pre_tokens=pre_tokens,
+            post_tokens=post_tokens,
+            logdir=logdir,
+            cmd=cmd,
+        )
+        stderr = _shorten_stdout(
+            stderr,
+            pre_tokens=stderr_pre_tokens,
+            post_tokens=stderr_post_tokens,
+            logdir=logdir,
+            cmd=f"{cmd} (stderr)",
+        )
 
     # Format header
     if timed_out:
@@ -1135,11 +1318,13 @@ def _format_shell_output(
     msg = _format_block_smart(header, cmd_display, lang="bash") + "\n\n"
 
     # Add output
-    if stdout:
+    if compact_stdout:
+        msg += compact_stdout + "\n\n"
+    elif stdout:
         msg += _format_block_smart("", stdout, "stdout").lstrip() + "\n\n"
     if stderr:
         msg += _format_block_smart("", stderr, "stderr").lstrip() + "\n\n"
-    if not stdout and not stderr:
+    if not compact_stdout and not stdout and not stderr:
         if timed_out:
             msg += "No output before timeout\n"
         elif interrupted:
@@ -1176,28 +1361,7 @@ def execute_shell_impl(
         if e.args and isinstance(e.args[0], tuple) and len(e.args[0]) == 2:
             stdout, stderr = e.args[0]
 
-        # Terminate subprocess gracefully
-        logger.info("Shell command interrupted, sending SIGINT to subprocess")
-        try:
-            if _is_windows:
-                shell.process.terminate()
-                shell.process.wait(timeout=2.0)
-            else:
-                pgid = os.getpgid(shell.process.pid)
-                os.killpg(pgid, signal.SIGINT)
-                shell.process.wait(timeout=2.0)
-        except subprocess.TimeoutExpired:
-            logger.info("Process didn't exit gracefully, terminating")
-            try:
-                if _is_windows:
-                    shell.process.kill()
-                else:
-                    pgid = os.getpgid(shell.process.pid)
-                    os.killpg(pgid, signal.SIGTERM)
-            except Exception:
-                pass
-        except Exception as e:
-            logger.warning(f"Error terminating interrupted process: {e}")
+        _terminate_interrupted_shell(shell)
 
         returncode = shell.process.returncode
         interrupted = True
@@ -1223,8 +1387,37 @@ def execute_shell_impl(
         raise KeyboardInterrupt from None
 
 
+def _terminate_interrupted_shell(
+    shell: ShellSession, log_context: str = "Shell command"
+) -> None:
+    logger.info("%s interrupted, sending SIGINT to subprocess", log_context)
+    try:
+        if _is_windows:
+            shell.process.terminate()
+            shell.process.wait(timeout=2.0)
+        else:
+            pgid = os.getpgid(shell.process.pid)
+            os.killpg(pgid, signal.SIGINT)
+            shell.process.wait(timeout=2.0)
+    except subprocess.TimeoutExpired:
+        logger.info("Process didn't exit gracefully, terminating")
+        try:
+            if _is_windows:
+                shell.process.kill()
+            else:
+                pgid = os.getpgid(shell.process.pid)
+                os.killpg(pgid, signal.SIGTERM)
+        except Exception:
+            pass
+    except Exception as e:
+        logger.warning("Error terminating interrupted process: %s", e)
+
+
 def get_path_fn(*args, **kwargs) -> Path | None:
-    return None
+    from ..logmanager import LogManager  # fmt: skip
+
+    manager = LogManager.get_current_log()
+    return manager.logdir if manager and manager.logdir else None
 
 
 def _execute_preceding_commands(
@@ -1267,6 +1460,23 @@ def _execute_preceding_commands(
             )
     except Exception as e:
         yield Message("system", f"Error running preceding commands: {e}")
+
+
+def _get_timeout() -> float | None:
+    timeout: float | None = 1200.0
+    timeout_env = os.environ.get("GPTME_SHELL_TIMEOUT")
+    if timeout_env is not None:
+        try:
+            timeout = float(timeout_env)
+            if timeout <= 0:
+                timeout = None
+        except ValueError:
+            logger.warning(
+                "Invalid GPTME_SHELL_TIMEOUT value: %s, using default 1200s (20 minutes)",
+                timeout_env,
+            )
+            timeout = 1200.0
+    return timeout
 
 
 def execute_shell(
@@ -1346,20 +1556,7 @@ def execute_shell(
             return
         # Fall through to regular shell execution for other kill commands
 
-    # Check for timeout from environment variable
-    # Default to 20 minutes (1200s) if not set
-    timeout: float | None = 1200.0
-    timeout_env = os.environ.get("GPTME_SHELL_TIMEOUT")
-    if timeout_env is not None:
-        try:
-            timeout = float(timeout_env)
-            if timeout <= 0:
-                timeout = None  # Disable timeout if set to 0 or negative
-        except ValueError:
-            logger.warning(
-                f"Invalid GPTME_SHELL_TIMEOUT value: {timeout_env}, using default 1200s (20 minutes)"
-            )
-            timeout = 1200.0
+    timeout = _get_timeout()
 
     # Check with shellcheck if available
     has_issues, should_block, shellcheck_msg = check_with_shellcheck(cmd)
@@ -1451,18 +1648,43 @@ def _shorten_stdout(
 
     # If truncation will happen, save full output to file
     saved_path = None
-    if (will_truncate_by_lines or will_truncate_by_tokens) and logdir:
-        command_info = f"Command: {cmd}" if cmd else None
-        original_tokens = (
-            len(tokens) if (will_truncate_by_tokens and tokenizer is not None) else None
-        )
-        _, saved_path = save_large_output(
-            content=stdout,
-            logdir=logdir,
-            output_type="shell",
-            command_info=command_info,
-            original_tokens=original_tokens,
-        )
+    if will_truncate_by_lines or will_truncate_by_tokens:
+        # Fallback: if the caller didn't pass logdir (e.g. a code path that
+        # bypassed execute_shell's get_path_fn), try the current LogManager
+        # context directly. This avoids silent telemetry loss in cases where
+        # the parameter wasn't threaded through correctly.
+        if logdir is None:
+            from ..logmanager import LogManager  # fmt: skip
+
+            manager = LogManager.get_current_log()
+            if manager and manager.logdir:
+                logdir = manager.logdir
+                logger.debug(
+                    "_shorten_stdout: recovered logdir from current LogManager"
+                )
+
+        if logdir is not None:
+            command_info = f"Command: {cmd}" if cmd else None
+            original_tokens = (
+                len(tokens)
+                if (will_truncate_by_tokens and tokenizer is not None)
+                else None
+            )
+            _, saved_path = save_large_output(
+                content=stdout,
+                logdir=logdir,
+                output_type="shell",
+                command_info=command_info,
+                original_tokens=original_tokens,
+            )
+        else:
+            logger.warning(
+                "_shorten_stdout: truncating output but no logdir is available; "
+                "full output will not be saved and context-savings ledger entry "
+                "will be skipped (cmd=%s, lines=%s)",
+                cmd,
+                len(lines),
+            )
 
     # NOTE: This can cause issues when, for example, reading a CSV with dates in the first column
     if strip_dates:

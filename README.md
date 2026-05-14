@@ -106,7 +106,7 @@ active development.
 - **2024-10** - [First viral tweet](https://x.com/rohanpaul_ai/status/1841999030999470326) bringing widespread attention
 - **2024-08** - [Show HN](https://news.ycombinator.com/item?id=41204256), Anthropic Claude support, tmux tool
 - **2023-09** - [Initial public release](https://news.ycombinator.com/item?id=37394845) on HN, [Reddit](https://www.reddit.com/r/LocalLLaMA/comments/16atlia/), [Twitter](https://x.com/ErikBjare/status/1699097896451289115)
-- **2023-03** - [Initial commit](https://github.com/gptme/gptme/commit/d00e9aae68cbd6b89bbc474ed7721d08796dc) - one of the first agent CLIs
+- **2023-03** - [Initial commit](https://github.com/gptme/gptme/commit/d00e9aae68cbd6b89bbc474ed7721d08798f96dc) - one of the first agent CLIs
 
 
 <!-- source of truth: docs/timeline.rst and docs/changelog.rst -->
@@ -405,11 +405,14 @@ This stack is simple and composable: selectors improve work choice, lessons stee
 ### Prerequisites
 
 - Python 3.10 or newer
-- An API key for at least one LLM provider:
-  - [Anthropic](https://console.anthropic.com/) (set `ANTHROPIC_API_KEY`)
-  - [OpenAI](https://platform.openai.com/) (set `OPENAI_API_KEY`)
-  - [OpenRouter](https://openrouter.ai/) (set `OPENROUTER_API_KEY`)
-  - Local models via `llama.cpp` (no key required — see [providers docs][docs-providers])
+- Credentials for at least one LLM provider:
+  - OpenRouter can be configured interactively with `/account setup openrouter`
+    inside gptme, using browser OAuth onboarding.
+  - You can also set API keys manually for [Anthropic](https://console.anthropic.com/)
+    (`ANTHROPIC_API_KEY`), [OpenAI](https://platform.openai.com/)
+    (`OPENAI_API_KEY`), [OpenRouter](https://openrouter.ai/)
+    (`OPENROUTER_API_KEY`), and other providers.
+  - Local models via `llama.cpp` need no key — see [providers docs][docs-providers].
 
 ### Installation
 

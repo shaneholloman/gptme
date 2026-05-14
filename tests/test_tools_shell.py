@@ -2,17 +2,28 @@ import json
 import os
 import tempfile
 from collections.abc import Generator
+from pathlib import Path
+from unittest.mock import MagicMock, patch
 
 import pytest
 
 from gptme.tools.shell import (
     ShellSession,
+    _format_gh_list_preview,
+    _format_git_log_preview,
     _format_shell_output,
     _get_truncation_budget,
+    _matches_gh_list,
+    _matches_git_log_oneline,
     _shorten_stdout,
+    get_path_fn,
     is_denylisted,
     split_commands,
 )
+
+
+def _fixture_text(name: str) -> str:
+    return (Path(__file__).parent / "data" / name).read_text(encoding="utf-8")
 
 
 @pytest.fixture
@@ -488,6 +499,69 @@ def test_shorten_stdout_records_context_savings(tmp_path):
     assert rows[0]["saved_tokens"] > 0
 
 
+def test_get_path_fn_uses_current_logdir(tmp_path):
+    manager = MagicMock()
+    manager.logdir = tmp_path
+
+    with patch("gptme.logmanager.LogManager.get_current_log", return_value=manager):
+        assert get_path_fn() == tmp_path
+
+
+def test_shorten_stdout_falls_back_to_current_logdir(tmp_path):
+    """When logdir param is None, _shorten_stdout falls back to LogManager."""
+    stdout = "\n".join(f"line {i}" for i in range(200))
+
+    manager = MagicMock()
+    manager.logdir = tmp_path
+
+    with patch("gptme.logmanager.LogManager.get_current_log", return_value=manager):
+        shortened = _shorten_stdout(
+            stdout,
+            pre_lines=5,
+            post_lines=5,
+            logdir=None,
+            cmd="git log --oneline",
+        )
+
+    ledger = tmp_path / "context-savings.jsonl"
+    assert ledger.exists(), "context-savings.jsonl should be written via fallback"
+    rows = [json.loads(line) for line in ledger.read_text().splitlines()]
+    assert "full output saved to" in shortened
+    assert len(rows) == 1
+    assert rows[0]["source"] == "shell"
+    assert rows[0]["saved_tokens"] > 0
+
+
+def test_shorten_stdout_warns_when_no_logdir_available(tmp_path, caplog):
+    """When neither logdir param nor LogManager has a logdir, log a warning."""
+    import logging
+
+    stdout = "\n".join(f"line {i}" for i in range(200))
+
+    with (
+        patch("gptme.logmanager.LogManager.get_current_log", return_value=None),
+        caplog.at_level(logging.WARNING, logger="gptme.tools.shell"),
+    ):
+        shortened = _shorten_stdout(
+            stdout,
+            pre_lines=5,
+            post_lines=5,
+            logdir=None,
+            cmd="echo hello",
+        )
+
+    # Truncation still happens (preserves context budget) but no save and no record
+    assert "lines truncated" in shortened
+    assert "full output saved to" not in shortened
+    assert not (tmp_path / "context-savings.jsonl").exists()
+    # And we got a warning so the case is visible in logs
+    assert any(
+        "no logdir is available" in record.message for record in caplog.records
+    ), (
+        f"Expected warning about missing logdir, got: {[r.message for r in caplog.records]}"
+    )
+
+
 def test_truncation_budget_default(monkeypatch):
     monkeypatch.delenv("GPTME_SHELL_TRUNC_PRE_TOKENS", raising=False)
     monkeypatch.delenv("GPTME_SHELL_TRUNC_POST_TOKENS", raising=False)
@@ -548,6 +622,273 @@ def test_format_shell_output_lower_threshold_records_savings(monkeypatch, tmp_pa
         json.loads(line) for line in ledger.read_text().splitlines() if line.strip()
     ]
     assert any(row["source"] == "shell" and row["saved_tokens"] > 0 for row in rows)
+
+
+def test_format_git_log_preview_records_context_savings(tmp_path):
+    stdout = _fixture_text("git-log-oneline.txt")
+
+    preview = _format_git_log_preview("git log --oneline", stdout, tmp_path)
+
+    assert preview is not None
+    assert "Showing first 20 of 27 commits." in preview
+    assert "more commits omitted" in preview
+    assert "Full output saved to" in preview
+
+    ledger = tmp_path / "context-savings.jsonl"
+    rows = [
+        json.loads(line) for line in ledger.read_text().splitlines() if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["source"] == "shell"
+    assert rows[0]["command_info"] == "git_log_oneline: git log --oneline"
+
+
+def test_format_git_log_preview_without_logdir_does_not_save():
+    stdout = _fixture_text("git-log-oneline.txt")
+
+    with patch("gptme.tools.shell.save_large_output") as save_large_output:
+        preview = _format_git_log_preview("git log --oneline", stdout, None)
+
+    assert preview is not None
+    assert "Showing first 20 of 27 commits." in preview
+    assert (
+        "Full output was not saved because no conversation logdir is active" in preview
+    )
+    assert "git log --oneline | cat" in preview
+    assert "Use `shell` for a raw rerun" not in preview
+    save_large_output.assert_not_called()
+
+
+def test_format_git_log_preview_skips_short_logs(tmp_path):
+    stdout = "\n".join(_fixture_text("git-log-oneline.txt").splitlines()[:3])
+
+    preview = _format_git_log_preview("git log --oneline", stdout, tmp_path)
+
+    assert preview is None
+    assert not (tmp_path / "context-savings.jsonl").exists()
+
+
+def test_format_shell_output_uses_git_log_preview(tmp_path):
+    stdout = _fixture_text("git-log-oneline.txt")
+
+    output = _format_shell_output(
+        cmd="git log --oneline",
+        stdout=stdout,
+        stderr="",
+        returncode=0,
+        interrupted=False,
+        allowlisted=False,
+        logdir=tmp_path,
+    )
+
+    assert "Ran command: `git log --oneline`" in output
+    assert "Showing first 20 of 27 commits." in output
+    assert "more commits omitted" in output
+    assert "Full output saved to" in output
+    assert "tool-outputs/shell" in output
+
+
+def test_format_shell_output_falls_back_when_git_log_preview_save_fails(tmp_path):
+    stdout = _fixture_text("git-log-oneline.txt")
+
+    with patch("gptme.tools.shell.save_large_output", side_effect=OSError("disk full")):
+        output = _format_shell_output(
+            cmd="git log --oneline",
+            stdout=stdout,
+            stderr="",
+            returncode=0,
+            interrupted=False,
+            allowlisted=False,
+            logdir=tmp_path,
+        )
+
+    assert "Showing first 20" not in output
+    assert "7d0c0de fix: wire context savings to current conversation logdir" in output
+    assert "92a3b4d chore: prep compact wrapper follow-up PR" in output
+
+
+def test_format_shell_output_keeps_git_log_preview_when_telemetry_fails(tmp_path):
+    stdout = _fixture_text("git-log-oneline.txt")
+
+    with patch(
+        "gptme.tools.shell.record_context_savings",
+        side_effect=OSError("ledger write failed"),
+    ):
+        output = _format_shell_output(
+            cmd="git log --oneline",
+            stdout=stdout,
+            stderr="",
+            returncode=0,
+            interrupted=False,
+            allowlisted=False,
+            logdir=tmp_path,
+        )
+
+    assert "Showing first 20 of 27 commits." in output
+    assert "Full output saved to" in output
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git log --oneline",
+        "git log --decorate --oneline -n 5",
+        "git log '--oneline'",
+    ],
+)
+def test_matches_git_log_oneline_accepts_supported_shapes(cmd):
+    assert _matches_git_log_oneline(cmd) is True
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "git status --oneline",
+        "git log",
+        "git log --oneline | cat",
+        "git log --oneline; pwd",
+        "git log --oneline\npwd",
+        "git log --oneline > out.txt",
+        "git log '--oneline",
+        "git log --oneline $(id)",
+        "git log --oneline `id`",
+        "git log --oneline $HOME",
+    ],
+)
+def test_matches_git_log_oneline_rejects_unsupported_shapes(cmd):
+    assert _matches_git_log_oneline(cmd) is False
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh issue list",
+        "gh pr list",
+        "gh issue list --state open",
+        "gh pr list --limit 50",
+    ],
+)
+def test_matches_gh_list_accepts_supported_shapes(cmd):
+    assert _matches_gh_list(cmd) is True
+
+
+@pytest.mark.parametrize(
+    "cmd",
+    [
+        "gh run list",
+        "gh repo list",
+        "gh issue view 1",
+        "gh issue list | cat",
+        "gh issue list; pwd",
+        "gh issue list\npwd",
+        "gh issue list > out.txt",
+        "gh issue list $(id)",
+        "gh issue list `id`",
+        "gh issue list $HOME",
+        # JSON output: truncating a JSON array at line boundaries produces invalid JSON
+        "gh issue list --json number,title",
+        "gh issue list --json number",
+        "gh pr list --json number,state",
+        "gh issue list --format json",
+        "gh pr list --format json",
+        "gh issue list --format=json",
+        "gh pr list --format=json",
+    ],
+)
+def test_matches_gh_list_rejects_unsupported_shapes(cmd):
+    assert _matches_gh_list(cmd) is False
+
+
+def test_format_gh_list_preview_records_context_savings(tmp_path):
+    stdout = _fixture_text("gh-issue-list.txt")
+
+    preview = _format_gh_list_preview("gh issue list", stdout, tmp_path)
+
+    assert preview is not None
+    assert "Showing first 10 of 25 items." in preview
+    assert "more items omitted" in preview
+    assert "Full output saved to" in preview
+
+    ledger = tmp_path / "context-savings.jsonl"
+    rows = [
+        json.loads(line) for line in ledger.read_text().splitlines() if line.strip()
+    ]
+    assert len(rows) == 1
+    assert rows[0]["source"] == "shell"
+    assert rows[0]["command_info"] == "gh_list: gh issue list"
+
+
+def test_format_gh_list_preview_without_logdir_does_not_save():
+    stdout = _fixture_text("gh-issue-list.txt")
+
+    with patch("gptme.tools.shell.save_large_output") as save_large_output:
+        preview = _format_gh_list_preview("gh issue list", stdout, None)
+
+    assert preview is not None
+    assert "Showing first 10 of 25 items." in preview
+    assert (
+        "Full output was not saved because no conversation logdir is active" in preview
+    )
+    assert "gh issue list | cat" in preview
+    save_large_output.assert_not_called()
+
+
+def test_format_gh_list_preview_without_logdir_uses_actual_cmd():
+    """Hint must echo the real command, not always say 'gh issue list'."""
+    stdout = _fixture_text("gh-issue-list.txt")
+
+    preview = _format_gh_list_preview("gh pr list --limit 50", stdout, None)
+
+    assert preview is not None
+    assert "gh pr list --limit 50 | cat" in preview
+    assert "gh issue list | cat" not in preview
+
+
+def test_format_gh_list_preview_skips_short_lists(tmp_path):
+    stdout = "\n".join(_fixture_text("gh-issue-list.txt").splitlines()[:3])
+
+    preview = _format_gh_list_preview("gh issue list", stdout, tmp_path)
+
+    assert preview is None
+    assert not (tmp_path / "context-savings.jsonl").exists()
+
+
+def test_format_shell_output_uses_gh_list_preview(tmp_path):
+    stdout = _fixture_text("gh-issue-list.txt")
+
+    output = _format_shell_output(
+        cmd="gh issue list",
+        stdout=stdout,
+        stderr="",
+        returncode=0,
+        interrupted=False,
+        allowlisted=False,
+        logdir=tmp_path,
+    )
+
+    assert "Ran command: `gh issue list`" in output
+    assert "Showing first 10 of 25 items." in output
+    assert "more items omitted" in output
+    assert "Full output saved to" in output
+
+
+def test_format_shell_output_uses_gh_list_preview_for_pr_list(tmp_path):
+    stdout = _fixture_text("gh-issue-list.txt")
+
+    output = _format_shell_output(
+        cmd="gh pr list",
+        stdout=stdout,
+        stderr="",
+        returncode=0,
+        interrupted=False,
+        allowlisted=False,
+        logdir=tmp_path,
+    )
+
+    assert "Ran command: `gh pr list`" in output
+    assert "Showing first 10 of" in output
+    assert "more items omitted" in output
+    assert "Full output saved to" in output
 
 
 def test_is_denylisted_pattern_matches():

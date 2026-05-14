@@ -532,6 +532,11 @@ def aggregate_and_display_results(result_files: list[str]):
     is_flag=True,
     help="Inject adversarial framing into behavioral eval prompts (idea #190 Phase 2).",
 )
+@click.option(
+    "--no-lessons",
+    is_flag=True,
+    help="Disable lesson auto-inclusion during eval runs (for no-context baselines).",
+)
 def main(
     eval_names_or_result_files: list[str],
     _model: list[str],
@@ -549,6 +554,7 @@ def main(
     trends: bool = False,
     trend_days: int = 90,
     adversarial: bool = False,
+    no_lessons: bool = False,
 ):
     """
     Run evals for gptme.
@@ -805,6 +811,7 @@ def main(
         use_docker,
         include_user_context=user_context,
         adversarial=adversarial,
+        no_lessons=no_lessons,
     )
     if not json_output:
         print("=== Finished ===")
@@ -1001,6 +1008,7 @@ def write_results(
             "Tool Format",
             "Test",
             "Passed",
+            "Score",
             "Total Duration",
             "Generation Time",
             "Run Time",
@@ -1020,6 +1028,14 @@ def write_results(
                     else False
                 )
 
+                # Partial-credit score: how many individual checkers passed
+                if result.results:
+                    passed_count = sum(1 for c in result.results if c.passed)
+                    total_count = len(result.results)
+                    score = f"{passed_count}/{total_count}"
+                else:
+                    score = ""
+
                 # Use model/tool_format/test_name directory layout
                 test_dir = results_dir / config.model / config.tool_format / result.name
                 test_dir.mkdir(parents=True, exist_ok=True)
@@ -1035,6 +1051,7 @@ def write_results(
                     "Tool Format": config.tool_format,
                     "Test": result.name,
                     "Passed": "true" if passed else "false",
+                    "Score": score,
                     "Total Duration": round(sum(result.timings.values()), 2),
                     "Generation Time": round(result.timings["gen"], 2),
                     "Run Time": round(result.timings["run"], 2),

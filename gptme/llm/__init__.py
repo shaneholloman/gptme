@@ -33,6 +33,7 @@ from .provider_plugins import (
 )
 
 logger = logging.getLogger(__name__)
+_max_tokens_env_warned = False
 
 
 # Cheap/fast default model per provider for first-run / fallback scenarios.
@@ -145,6 +146,39 @@ def _get_agent_name(config: Config) -> str | None:
     return agent_config.name if agent_config and agent_config.name else None
 
 
+def _resolve_max_tokens(model: str, max_tokens: int | None) -> int | None:
+    """Apply the GPTME_MAX_TOKENS env override for OpenRouter models only."""
+
+    if max_tokens is not None:
+        return max_tokens
+
+    if get_provider_from_model(model) != "openrouter":
+        return None
+
+    raw = get_config().get_env("GPTME_MAX_TOKENS")
+    if raw is None or raw == "":
+        return None
+
+    global _max_tokens_env_warned
+    try:
+        parsed = int(raw)
+    except ValueError:
+        if not _max_tokens_env_warned:
+            logger.warning("Invalid GPTME_MAX_TOKENS value: %r, ignoring", raw)
+            _max_tokens_env_warned = True
+        return None
+
+    if parsed <= 0:
+        if not _max_tokens_env_warned:
+            logger.warning(
+                "GPTME_MAX_TOKENS must be a positive integer, got %r; ignoring", raw
+            )
+            _max_tokens_env_warned = True
+        return None
+
+    return parsed
+
+
 @trace_function(name="llm.reply", attributes={"component": "llm"})
 def reply(
     messages: list[Message],
@@ -255,6 +289,7 @@ def _chat_complete(
 ) -> tuple[str, MessageMetadata | None]:
     if max_tokens is not None and max_tokens <= 0:
         raise ValueError(f"max_tokens must be a positive integer, got {max_tokens}")
+    max_tokens = _resolve_max_tokens(model, max_tokens)
     provider = get_provider_from_model(model)
 
     # Providers with native constrained decoding support
@@ -328,6 +363,7 @@ def _stream(
     output_schema: type | None = None,
     max_tokens: int | None = None,
 ) -> _StreamWithMetadata:
+    max_tokens = _resolve_max_tokens(model, max_tokens)
     provider = get_provider_from_model(model)
     # Custom providers and plugin providers are OpenAI-compatible, route through OpenAI path
     if (
@@ -614,24 +650,35 @@ def list_available_providers() -> list[tuple[Provider, str]]:
         auth_source is an env var name for API key providers, or "oauth" for
         OAuth-based providers like openai-subscription.
     """
+    from ..credentials import STORED_CREDENTIALS_SOURCE, list_stored_credentials
+
     config = get_config()
     available = []
+    seen: set[str] = set()
 
     for provider, env_var in PROVIDER_API_KEYS.items():
         if config.get_env(env_var):
             available.append((cast(Provider, provider), env_var))
+            seen.add(provider)
+
+    for provider, _api_key in list_stored_credentials():
+        if provider not in seen:
+            available.append((cast(Provider, provider), STORED_CREDENTIALS_SOURCE))
+            seen.add(provider)
 
     # Check OAuth-based providers (no API key, use token file)
     # Note: compute path directly to avoid side-effecting mkdir in _get_token_storage_path()
     _config_dir = Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config"))
     _token_path = _config_dir / "gptme" / "oauth" / "openai_subscription.json"
-    if _token_path.exists():
+    if _token_path.exists() and "openai-subscription" not in seen:
         available.append((cast(Provider, "openai-subscription"), "oauth"))
+        seen.add("openai-subscription")
 
     # Include plugin providers that have their API key configured
     for plugin_name, env_var in get_plugin_api_keys().items():
-        if config.get_env(env_var):
+        if config.get_env(env_var) and plugin_name not in seen:
             available.append((CustomProvider(plugin_name), env_var))
+            seen.add(plugin_name)
 
     return available
 

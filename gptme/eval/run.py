@@ -26,6 +26,7 @@ from .agents import Agent, GPTMe
 from .agents.claude_code import ClaudeCodeAgent, is_claude_code_model
 from .cost import get_eval_costs
 from .execenv import DockerExecutionEnv, SimpleExecutionEnv
+from .pass_rate_gate import apply_gate, load_pass_rate_data
 from .types import (
     CaseResult,
     EvalResult,
@@ -92,6 +93,7 @@ def run_evals(
     use_docker: bool = False,
     include_user_context: bool = False,
     adversarial: bool = False,
+    no_lessons: bool = False,
 ) -> dict[ModelConfig, list[EvalResult]]:
     """
     Run evals for a list of tests.
@@ -105,6 +107,7 @@ def run_evals(
         include_user_context: Include user-level prompt files and agent
             instructions from ~/.config/gptme in eval runs
         adversarial: Inject adversarial framing into behavioral eval prompts
+        no_lessons: Disable lesson auto-inclusion during eval runs
     """
     # For coverage to work with multiprocessing
     # https://pytest-cov.readthedocs.io/en/latest/subprocess-support.html
@@ -126,6 +129,14 @@ def run_evals(
         if not evals:
             logger.warning("No evals to run")
         return {}
+    # Load natural pass-rate gate data once per run (Phase 3, idea #228).
+    # Opt-in via $GPTME_EVAL_PASS_RATE_GATE_FILE; missing => no override.
+    pass_rate_data = load_pass_rate_data()
+    if pass_rate_data:
+        logger.info(
+            "Pass-rate gate enabled: %d models in lookup",
+            len(pass_rate_data.get("lookup", {})),
+        )
     model_results: dict[ModelConfig, dict[str, EvalResult]] = defaultdict(dict)
     parallel = min(n_runs, parallel)
     with ProcessPoolExecutor(parallel) as executor:
@@ -153,6 +164,35 @@ def run_evals(
                         include_user_context=include_user_context,
                         use_docker=use_docker,
                     )
+                # Conditional lesson injection by task type (Phase 2, idea #228).
+                # Suppress lessons for creative-restructuring tasks (they are harmed
+                # by lesson context per crossover-effect analysis). Structured-process
+                # tasks use the global no_lessons flag as-is.
+                eval_no_lessons = no_lessons
+                task_type = test.get("task_type")
+                if task_type == "creative_restructuring":
+                    eval_no_lessons = True
+                    logger.debug(
+                        "Suppressing lessons for %s (task_type=creative_restructuring)",
+                        test["name"],
+                    )
+                # Natural pass-rate gate (Phase 3, idea #228).
+                # When per-(model,eval) holdout data says lessons help/hurt with
+                # statistical confidence, override the task_type default. Falls back
+                # to ``eval_no_lessons`` from above when no recommendation exists.
+                eval_no_lessons, pr_decision = apply_gate(
+                    model=config.model,
+                    eval_name=test["name"],
+                    no_lessons=eval_no_lessons,
+                    data=pass_rate_data,
+                )
+                if pr_decision != "default":
+                    logger.debug(
+                        "Pass-rate gate %s lessons for %s (model=%s)",
+                        pr_decision,
+                        test["name"],
+                        config.model,
+                    )
                 future = executor.submit(
                     execute,
                     test,
@@ -161,6 +201,7 @@ def run_evals(
                     parallel > 1,
                     use_docker,
                     adversarial=adversarial,
+                    no_lessons=eval_no_lessons,
                 )
                 futures.append(future)
                 future_to_model_test[future] = (config, test, agent)
@@ -250,6 +291,7 @@ def execute(
     use_docker: bool = False,
     suppress_output: bool = False,
     adversarial: bool = False,
+    no_lessons: bool = False,
 ) -> EvalResult:
     """
     Executes the code for a specific model with a timeout.
@@ -262,6 +304,12 @@ def execute(
     prompt = test["prompt"]
     if adversarial:
         prompt = _apply_adversarial_framing(test["name"], prompt)
+
+    # Disable lesson auto-injection for no-lessons baseline runs.
+    # Save/restore to prevent env bleed across reused ProcessPoolExecutor workers.
+    _prev_lessons_env = os.environ.get("GPTME_LESSONS_AUTO_INCLUDE")
+    if no_lessons:
+        os.environ["GPTME_LESSONS_AUTO_INCLUDE"] = "false"
 
     with Manager() as manager:
         sync_dict = manager.dict()
@@ -278,7 +326,14 @@ def execute(
             ),
         )
 
-        p.start()
+        try:
+            p.start()
+        finally:
+            # Restore parent env immediately after fork; child already has its own copy.
+            if _prev_lessons_env is None:
+                os.environ.pop("GPTME_LESSONS_AUTO_INCLUDE", None)
+            else:
+                os.environ["GPTME_LESSONS_AUTO_INCLUDE"] = _prev_lessons_env
         try:
             p.join(timeout)
             status: Status = "success"

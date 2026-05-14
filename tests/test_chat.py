@@ -86,6 +86,7 @@ def test_include_paths_no_duplicate_embeddings(tmp_path, monkeypatch):
     from gptme.util.context import include_paths
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GPTME_DISABLE_PATH_INCLUDE", raising=False)
     data_file = tmp_path / "data.txt"
     data_file.write_text("unique-content-marker")
 
@@ -236,6 +237,7 @@ def test_include_paths_at_prefix(tmp_path, monkeypatch):
     from gptme.util.context import include_paths
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GPTME_DISABLE_PATH_INCLUDE", raising=False)
     test_file = tmp_path / "config.toml"
     test_file.write_text("[settings]\nkey = 'value'\n")
 
@@ -337,7 +339,7 @@ Also check `./outside/xml.py` which should be found.
     assert "/another/xml/path.csv" not in paths
 
 
-def test_include_paths_image_auto_attach(tmp_path):
+def test_include_paths_image_auto_attach(tmp_path, monkeypatch):
     """Image files in user messages should be auto-attached to msg.files.
 
     This verifies the full pipeline: _find_potential_paths detects the path,
@@ -347,6 +349,7 @@ def test_include_paths_image_auto_attach(tmp_path):
     from gptme.message import Message
     from gptme.util.context import include_paths
 
+    monkeypatch.delenv("GPTME_DISABLE_PATH_INCLUDE", raising=False)
     # Create a minimal PNG file (valid header)
     img_file = tmp_path / "test.png"
     img_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
@@ -362,7 +365,7 @@ def test_include_paths_image_auto_attach(tmp_path):
     assert str(img_file) in result.content
 
 
-def test_include_paths_image_in_text(tmp_path):
+def test_include_paths_image_in_text(tmp_path, monkeypatch):
     """Image paths embedded in natural language text should be auto-attached.
 
     Simulates the scenario where a user types 'View this image ~/test.png'
@@ -371,6 +374,7 @@ def test_include_paths_image_in_text(tmp_path):
     from gptme.message import Message
     from gptme.util.context import include_paths
 
+    monkeypatch.delenv("GPTME_DISABLE_PATH_INCLUDE", raising=False)
     # Create a minimal PNG file
     img_file = tmp_path / "screenshot.png"
     img_file.write_bytes(b"\x89PNG\r\n\x1a\n" + b"\x00" * 100)
@@ -392,6 +396,7 @@ def test_include_paths_per_message_size_budget(tmp_path, monkeypatch, caplog):
     from gptme.util.context import include_paths
 
     monkeypatch.chdir(tmp_path)
+    monkeypatch.delenv("GPTME_DISABLE_PATH_INCLUDE", raising=False)
 
     # Create several moderately sized files that collectively exceed the budget
     # INCLUDE_PATHS_MAX_CONTENT = 200_000. Create 3 files at ~80KB each (~240KB total)
@@ -454,7 +459,7 @@ def test_embed_attached_preserves_image_files(tmp_path):
     assert any(Path(str(f)).name == "photo.png" for f in result.files)
 
 
-def test_image_auto_attach_end_to_end(tmp_path):
+def test_image_auto_attach_end_to_end(tmp_path, monkeypatch):
     """End-to-end test: image path in user text → include_paths → embed → msgs2dicts.
 
     Verifies that an image mentioned by path in a user message survives the
@@ -462,6 +467,9 @@ def test_image_auto_attach_end_to_end(tmp_path):
     """
     from gptme.message import Message, msgs2dicts
     from gptme.util.context import embed_attached_file_content, include_paths
+
+    # Ensure GPTME_DISABLE_PATH_INCLUDE does not interfere
+    monkeypatch.delenv("GPTME_DISABLE_PATH_INCLUDE", raising=False)
 
     # Create a minimal PNG
     img_file = tmp_path / "paste_20260225.png"
@@ -580,6 +588,99 @@ def test_chained_prompts_complete_exits_when_last():
             model=None,
             interactive=False,
         )
+
+
+def test_external_queued_prompts_are_drained_between_turns(tmp_path):
+    """Queued prompts on disk should be picked up by the next loop iteration."""
+    import sys
+
+    from gptme.chat import _run_chat_loop
+    from gptme.prompt_queue import get_prompt_queue_path, queue_prompt
+
+    _chat_mod = sys.modules["gptme.chat"]
+
+    logdir = tmp_path / "chat"
+    logdir.mkdir()
+    queue_prompt(logdir, "queued prompt")
+
+    manager = MagicMock()
+    manager.log = MagicMock()
+    manager.workspace = tmp_path
+    manager.logdir = logdir
+
+    processed: list[str] = []
+
+    def mock_append(msg):
+        processed.append(msg.content)
+
+    manager.append.side_effect = mock_append
+
+    with (
+        patch.object(_chat_mod, "_process_message_conversation", return_value=None),
+        patch.object(_chat_mod, "trigger_hook", return_value=[]),
+        patch.object(_chat_mod, "include_paths", side_effect=lambda msg, ws: msg),
+        patch.object(_chat_mod, "execute_cmd", return_value=False),
+    ):
+        _run_chat_loop(
+            manager=manager,
+            prompt_queue=[],
+            stream=False,
+            tool_format="markdown",
+            model=None,
+            interactive=False,
+        )
+
+    assert processed == ["queued prompt"]
+    assert not get_prompt_queue_path(logdir).exists()
+
+
+def test_complete_checks_external_queue_before_exiting(tmp_path):
+    """External queued prompts should keep the loop alive after complete."""
+    import sys
+
+    from gptme.chat import _run_chat_loop
+    from gptme.message import Message
+    from gptme.prompt_queue import get_prompt_queue_path, queue_prompt
+    from gptme.tools.complete import SessionCompleteException
+
+    _chat_mod = sys.modules["gptme.chat"]
+
+    logdir = tmp_path / "chat"
+    logdir.mkdir()
+    queue_prompt(logdir, "queued follow-up")
+
+    manager = MagicMock()
+    manager.log = MagicMock()
+    manager.workspace = tmp_path
+    manager.logdir = logdir
+
+    call_count = 0
+
+    def mock_process(*args, **kwargs):
+        nonlocal call_count
+        call_count += 1
+        if call_count == 1:
+            raise SessionCompleteException("first prompt done")
+
+    with (
+        patch.object(
+            _chat_mod, "_process_message_conversation", side_effect=mock_process
+        ),
+        patch.object(_chat_mod, "trigger_hook", return_value=[]),
+        patch.object(_chat_mod, "include_paths", side_effect=lambda msg, ws: msg),
+        patch.object(_chat_mod, "execute_cmd", return_value=False),
+    ):
+        _run_chat_loop(
+            manager=manager,
+            prompt_queue=[Message("user", "first prompt")],
+            stream=False,
+            tool_format="markdown",
+            model=None,
+            interactive=False,
+        )
+
+    assert call_count == 2
+    assert not get_prompt_queue_path(logdir).exists()
 
 
 def test_complete_hook_does_not_refire_on_next_prompt():
