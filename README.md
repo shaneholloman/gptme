@@ -94,7 +94,7 @@ active development.
 ## 📢 News
 
 - **Coming soon** - [gptme.ai](https://gptme.ai) service for running agents in the cloud; [gptme desktop](https://github.com/gptme/gptme-tauri) app for easy local use.
-- **2026-01** - [gptme-agent-template](https://github.com/gptme/gptme-agent-template) v0.4: [Bob](https://github.com/TimeToBuildBob) reaches 1700+ autonomous sessions, autonomous run loops, enhanced context generation
+- **2026-01** - [gptme-agent-template](https://github.com/gptme/gptme-agent-template) v0.4: [Bob](https://github.com/TimeToBuildBob) has run extensively as an autonomous agent, autonomous run loops, enhanced context generation
 - **2025-12** - [v0.31.0](https://github.com/gptme/gptme/releases/tag/v0.31.0): Background jobs, form tool, cost tracking, content-addressable storage
 - **2025-11** - [v0.30.0](https://github.com/gptme/gptme/releases/tag/v0.30.0): Plugin system, context compression, subagent planner mode
 - **2025-10** - [v0.29.0](https://github.com/gptme/gptme/releases/tag/v0.29.0): Lessons system for contextual guidance, MCP discovery & dynamic loading, token awareness; [Bob](https://github.com/TimeToBuildBob) begins autonomous runs with GitHub monitoring
@@ -467,6 +467,9 @@ gptme -y 'run the test suite and fix any failing tests'
 
 # Fully non-interactive/autonomous mode (no user interaction possible, safe for scripts/CI)
 gptme -n 'run the test suite and fix any failing tests'
+
+# Machine-readable automation output (JSONL on stdout)
+gptme --non-interactive --output-format json 'summarize the current git diff'
 ```
 
 For more, see the [Getting Started][docs-getting-started] guide and the [Examples][docs-examples] in the [documentation][docs].
@@ -548,6 +551,9 @@ Options:
   -r, --resume           Load most recent conversation.
   -y, --no-confirm       Skip all confirmation prompts.
   -n, --non-interactive  Non-interactive mode. Implies --no-confirm.
+  --output-format [text|json]
+                         Output format for non-interactive mode. 'json'
+                         emits one JSON object per line on stdout.
   --system TEXT          System prompt. Options: 'full', 'short', or something
                          custom.
   -t, --tools TEXT       Tools to allow as comma-separated list. Available:
@@ -561,6 +567,11 @@ Options:
   --version              Show version and configuration information
   --help                 Show this message and exit.
 ```
+
+Pair ``--non-interactive`` with ``--output-format json`` when stdout needs to
+be machine-readable, for example in CI or a supervising process. Use
+``--resume`` to continue an existing automated conversation or pick up queued
+follow-up prompts without passing a new prompt.
 
 ## 🌍 Ecosystem
 
@@ -645,3 +656,201 @@ Contributions welcome! See the [contributing guide](https://gptme.org/docs/contr
 [docs-mcp]: https://gptme.org/docs/mcp.html
 [docs-acp]: https://gptme.org/docs/acp.html
 [anthropic-computer-use]: https://www.anthropic.com/news/3-5-models-and-computer-use
+
+## ❓ FAQ
+
+### What is gptme?
+
+gptme is a **personal AI agent that runs anywhere a terminal runs** — your laptop, SSH sessions, tmux, headless servers, CI pipelines. It's provider-agnostic, local-first, and unconstrained: ships with shell, Python, web, vision, and everything else an agent needs. Pronounced /ʤiː piː tiː miː/ like "GPT-ME".
+
+### How does gptme compare to other AI coding assistants?
+
+| Feature | gptme | Claude Code | Cursor | Warp |
+|---------|-------|-------------|--------|------|
+| **Environment** | Any terminal | Terminal | IDE | Terminal |
+| **Autonomy** | Autonomous agents | One-shot | IDE-assisted | Terminal AI |
+| **Local-first** | ✅ Full support | ❌ API required | ❌ API required | ❌ API required |
+| **MCP Support** | ✅ Built-in | ✅ Built-in | ❌ | ❌ |
+| **Plugin System** | ✅ Full plugins | ❌ | ✅ Extensions | ❌ |
+| **Web Browsing** | ✅ Playwright | ❌ | ❌ | ❌ |
+| **Vision** | ✅ Screenshots/Images | ✅ | ✅ | ❌ |
+| **Self-hosting** | ✅ Full control | ❌ | ❌ | ❌ |
+
+### How do I install gptme?
+
+**Prerequisites**: Python 3.10+
+
+**Installation**:
+```bash
+pip install gptme
+# or
+pipx install gptme
+```
+
+**First Run**:
+```bash
+gptme
+```
+
+### What AI providers does gptme support?
+
+gptme supports multiple AI providers:
+
+| Provider | Setup | Features |
+|----------|-------|----------|
+| **Anthropic** | `ANTHROPIC_API_KEY` | Claude models |
+| **OpenAI** | `OPENAI_API_KEY` | GPT models |
+| **Google** | `GEMINI_API_KEY` | Gemini models |
+| **xAI** | `XAI_API_KEY` | Grok models |
+| **DeepSeek** | `DEEPSEEK_API_KEY` | DeepSeek models |
+| **OpenRouter** | `OPENROUTER_API_KEY` | Multi-provider gateway |
+| **llama.cpp** | Local server | OpenAI-compatible local models |
+
+### How do I use local models?
+
+Use **llama.cpp** for fully local operation:
+
+1. Start llama.cpp server:
+```bash
+llama-server --model ./models/llama-3.gguf --port 8080
+```
+
+2. Configure gptme:
+```bash
+export OPENAI_BASE_URL=http://localhost:8080/v1
+gptme -m local/<model-name>
+```
+
+### What tools does gptme have?
+
+gptme ships with comprehensive tools:
+
+- **shell**: Execute commands in terminal
+- **python**: Run Python code
+- **patch**: Make incremental file edits
+- **browser**: Browse web via Playwright
+- **vision**: Process images/screenshots
+- **tmux**: Manage tmux sessions
+- **morph**: Fast file transformations
+- **form**: Interactive forms
+- **mcp**: MCP tool discovery and use
+
+### How does the MCP integration work?
+
+gptme has **built-in MCP support**:
+
+- **MCP Discovery**: Automatically discovers MCP servers
+- **Dynamic Loading**: Loads MCP tools on demand
+- **Tool Integration**: MCP tools work like native tools
+
+Example MCP servers supported:
+- GitHub MCP
+- Puppeteer MCP
+- SQLite MCP
+- Custom MCP servers
+
+### What is the Lessons system?
+
+The **Lessons system** provides contextual guidance and best practices that are automatically included when relevant:
+
+- **Project-specific lessons**: Custom guidance for your project
+- **Best practices**: Coding patterns and conventions
+- **Context injection**: Automatic context based on situation
+
+### How do I create autonomous agents?
+
+Use **gptme-agent-template** for persistent autonomous agents:
+
+1. Clone template:
+```bash
+git clone https://github.com/gptme/gptme-agent-template
+```
+
+2. Configure agent:
+```yaml
+# config.yaml
+name: "MyAgent"
+role: "Code reviewer"
+schedule: "hourly"
+```
+
+3. Run:
+```bash
+python agent.py
+```
+
+See [Bob](https://github.com/TimeToBuildBob) for an example autonomous agent that has been running continuously since late 2024.
+
+### What is the plugin system?
+
+gptme has a **full plugin system**:
+
+- **Skills**: Custom tools and capabilities
+- **Hooks**: Pre/post execution hooks
+- **Integrations**: External service connectors
+- **Community plugins**: [gptme-contrib](https://github.com/gptme/gptme-contrib) repository
+
+Example plugins:
+- Twitter/X bot
+- Discord bot
+- Email tools
+- Consortium (multi-agent)
+
+### How do I use gptme in CI/CD?
+
+gptme runs in **CI pipelines**:
+
+```yaml
+# GitHub Actions
+- name: Run gptme
+  run: |
+    pip install gptme
+    gptme --non-interactive "Review PR and suggest improvements"
+```
+
+### What are the use cases?
+
+gptme is general-purpose but excels at:
+
+- **Coding**: Write, refactor, debug code
+- **Research**: Web browsing, data collection
+- **Automation**: File management, CI tasks
+- **Documentation**: Generate docs, summaries
+- **Testing**: Write tests, run tests, fix failures
+- **DevOps**: Server management, deployment
+
+### How do I configure gptme?
+
+Configuration via environment variables:
+
+```bash
+# Provider selection
+export GPTME_MODEL=anthropic/claude-sonnet-4-6
+
+# API keys
+export ANTHROPIC_API_KEY=your-key
+
+# Logging level
+export GPTME_LOG_LEVEL=INFO
+```
+
+### How do I handle errors?
+
+gptme is **self-correcting**:
+
+- Output feeds back to assistant
+- Automatic retry on errors
+- User intervention when needed
+
+### Where can I find more resources?
+
+- **Website**: [gptme.org](https://gptme.org)
+- **Documentation**: [docs.gptme.org](https://gptme.org/docs/)
+- **Examples**: [Examples](https://gptme.org/docs/examples.html)
+- **Downloads**: [Downloads](https://gptme.org/downloads/)
+- **Discord**: [Discord Community](https://discord.gg/NMaCmmkxWv)
+- **Twitter**: [@gptmeorg](https://x.com/gptmeorg)
+
+---
+
+**Happy Terminal Agent Building!** 🤖

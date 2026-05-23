@@ -651,12 +651,15 @@ def execute_gh(
         yield from _passthrough_gh(args, code)
 
 
-instructions = """Use this tool when GitHub work needs fewer round-trips, structured CI data,
-or safer merges than a raw `gh` shell command.
+instructions = """### When to use
 
-Refs: full URLs, `owner/repo#N`, `#N`, or bare `N` in a git repo.
+Use `gh` instead of shell for GitHub issues, PRs, CI runs, and merges.
+Native paths collapse API calls, keep CI state structured, and add merge
+safety guards easy to miss with raw shell commands.
 
-Native paths help the agent finish GitHub tasks with less hallucination risk:
+Refs: full URLs, `owner/repo#N`, `#N`, or bare `N`.
+
+Native paths help avoid hallucination:
 - `gh issue view <ref>` gets issue body and comments in one result
 - `gh pr view <ref>` gets PR body, comments, review threads, CI, and mergeability in one result
 - `gh pr status <ref> [commit_sha]` returns structured CI state with run IDs
@@ -664,7 +667,7 @@ Native paths help the agent finish GitHub tasks with less hallucination risk:
 - `gh pr merge <ref> ...` adds squash-by-default and optional head-commit protection
 - `gh run view <run-id>` extracts failed-job logs
 
-All other valid `gh` subcommands pass through unchanged."""
+All other `gh` subcommands pass through unchanged."""
 
 
 def examples(tool_format):

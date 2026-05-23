@@ -127,6 +127,20 @@ The ``-`` separator allows you to chain multiple prompts together, letting the a
 
 This is particularly useful for breaking down complex tasks into steps and creating :doc:`automation` workflows.
 
+Queue follow-up prompts
+^^^^^^^^^^^^^^^^^^^^^^^
+
+If another ``gptme`` process is already busy in a conversation, queue the next
+user turn from a second terminal instead of waiting for the current step to
+finish:
+
+.. code-block:: bash
+
+    gptme-util chats send chat-123 "once the tests finish, summarize the failures"
+
+The running conversation will drain the queued prompt on its next turn. Use
+``gptme-util chats list`` if you need to look up the conversation ID first.
+
 Tool Selection Patterns
 ^^^^^^^^^^^^^^^^^^^^^^^
 
@@ -182,6 +196,25 @@ The ``--non-interactive`` flag runs gptme in a mode that terminates after comple
     gptme --non-interactive 'create a snake game using curses in snake.py, dont run it' '-' 'make the snake green and the apple red'
 
 Note: ``--non-interactive`` implies ``--no-confirm``, so you don't need to specify both.
+
+Machine-readable output
+^^^^^^^^^^^^^^^^^^^^^^^
+
+Pair ``--non-interactive`` with ``--output-format json`` when stdout needs to
+be consumed by another program. In JSON mode, gptme emits one JSON object per
+line on stdout (JSONL):
+
+.. code-block:: bash
+
+    gptme --non-interactive --output-format json 'summarize this repository'
+
+Use ``--resume`` to continue an existing automated conversation without
+supplying a new prompt. This also picks up any queued follow-up prompts for the
+current conversation before exiting:
+
+.. code-block:: bash
+
+    gptme --non-interactive --output-format json --resume
 
 .. _pre-commit:
 

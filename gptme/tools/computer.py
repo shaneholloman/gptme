@@ -352,7 +352,6 @@ def _macos_key(key_sequence: str) -> None:
         raise RuntimeError(f"Failed to send key sequence: {e.stderr}") from e
 
 
-# TODO: write test for mouse move and mouse position, since it's unreliable
 def _macos_mouse_move(x: int, y: int) -> None:
     """
     Move mouse using cliclick on macOS.
@@ -891,6 +890,15 @@ def _parse_key_sequence(key_sequence: str) -> list[KeySequenceOperation]:
 instructions = """
 You can interact with the computer through the `computer` Python function.
 Works on both Linux (X11) and macOS.
+
+### When to use the computer tool
+
+Use computer for GUI interactions that cannot be done through the shell: clicking
+elements in running applications, typing into GUI windows, taking screenshots to
+verify visual state, and keyboard shortcuts in desktop apps. Prefer the shell or
+tmux over computer for anything that has a CLI equivalent. Use computer when the
+task requires direct screen interaction — for example, operating a browser UI,
+a desktop app, or an interactive installer that has no headless mode.
 
 The key input syntax works consistently across platforms with:
 

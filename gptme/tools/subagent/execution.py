@@ -19,6 +19,7 @@ from typing import TYPE_CHECKING, Literal
 
 from ...message import Message
 from .. import get_tools, set_tools
+from .._allowlist import matching_allowlist_tools, tool_matches_allowlist
 
 if TYPE_CHECKING:
     from .types import ReturnType, Status, Subagent, SubtaskDef
@@ -118,7 +119,7 @@ def _create_subagent_thread(
         profile_name: Optional agent profile to apply (system prompt + hard tool enforcement)
     """
     # noreorder
-    from gptme import chat  # fmt: skip
+    from gptme.chat import chat  # fmt: skip
     from gptme.executor import prepare_execution_environment  # fmt: skip
     from gptme.llm.models import set_default_model  # fmt: skip
 
@@ -147,7 +148,11 @@ def _create_subagent_thread(
         loaded_tools = get_tools()
         loaded_names = {t.name for t in loaded_tools}
         # Warn about unknown tool names in profile (typos, missing extras)
-        unknown = set(tool_allowlist) - loaded_names
+        unknown = {
+            pattern
+            for pattern in tool_allowlist
+            if not matching_allowlist_tools(pattern, loaded_tools)
+        }
         if unknown:
             logger.warning(
                 "Profile '%s' references unknown tools: %s (available: %s)",
@@ -155,7 +160,11 @@ def _create_subagent_thread(
                 ", ".join(sorted(unknown)),
                 ", ".join(sorted(loaded_names)),
             )
-        available_tools = [t for t in loaded_tools if t.name in tool_allowlist]
+        available_tools = [
+            tool
+            for tool in loaded_tools
+            if tool_matches_allowlist(tool.name, tool_allowlist)
+        ]
         # Always include the complete tool so subagent can signal completion
         complete_tools = [t for t in loaded_tools if t.name == "complete"]
         for ct in complete_tools:

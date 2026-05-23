@@ -453,17 +453,26 @@ tool = ToolSpec(
     name="lessons",
     desc="Lesson system for structured guidance",
     instructions="""
-Use lessons to learn and remember skills/tools/workflows, improve your performance, and avoid known failure modes.
+### When to use the lessons tool
 
-How lessons help you:
-- Automatically included when relevant keywords or tools match
-- Extracted from both user and assistant messages in the conversation
-- Session-wide limit (default 20) prevents context bloat
+Lessons are auto-injected on keyword and tool matches. Use `/lesson` only to
+search for missing guidance (`/lesson search <topic>`), browse patterns
+(`/lesson list`), or refresh after lesson files change (`/lesson refresh`).
 
-Leverage lessons for self-improvement:
-- Pay attention to lessons included in context
+Do not re-read or "apply" lessons explicitly; follow the ones already in
+context.
+
+Use lessons to remember useful patterns and avoid known failure modes.
+
+How lessons help:
+- Auto-included when relevant keywords or tools match
+- Extracted from user and assistant messages
+- Session limit (default 20) prevents context bloat
+
+For self-improvement:
+- Pay attention to included lessons
 - Apply patterns and avoid anti-patterns
-- Reference lessons when making decisions
+- Reference lessons in decisions
 - Learn from past failures documented in lessons
 """.strip(),
     examples="",

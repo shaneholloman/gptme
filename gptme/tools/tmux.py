@@ -112,6 +112,24 @@ def _run_tmux_command(cmd: list[str]) -> subprocess.CompletedProcess:
     return result
 
 
+def _run_tmux_command_with_retry(
+    cmd: list[str], retries: int = 10, delay: float = 0.1
+) -> subprocess.CompletedProcess:
+    """Retry follow-up tmux commands while a new session target becomes ready."""
+    last_error: subprocess.CalledProcessError | None = None
+    for attempt in range(retries):
+        try:
+            return _run_tmux_command(cmd)
+        except subprocess.CalledProcessError as error:
+            last_error = error
+            if attempt == retries - 1:
+                raise
+            sleep(delay)
+
+    assert last_error is not None
+    raise last_error
+
+
 def get_sessions() -> list[str]:
     try:
         output = subprocess.run(
@@ -214,10 +232,10 @@ def new_session(command: str) -> Message:
 
     # set session size
     cmd = ["tmux", "resize-window", "-t", session_id, "-x", "120", "-y", "40"]
-    _run_tmux_command(cmd)
+    _run_tmux_command_with_retry(cmd)
 
     cmd = ["tmux", "send-keys", "-t", session_id, command, "Enter"]
-    _run_tmux_command(cmd)
+    _run_tmux_command_with_retry(cmd)
 
     # sleep 1s and capture output
     sleep(1)
@@ -519,16 +537,14 @@ def execute_tmux(
 instructions = """
 You can use the tmux tool to run long-lived and/or interactive applications in a tmux session.
 
-This tool is suitable to run long-running commands or interactive applications that require user input.
-Examples of such commands are: `npm run dev`, `npm create vue@latest`, `python3 server.py`, `python3 train.py`, etc.
+### When to use tmux
 
-Available commands:
-- new-session <command>: Start a new tmux session with the given command
-- send-keys <session_id> <keys> [<keys>]: Send keys to the specified session
-- inspect-pane <session_id>: Show the current content of the specified pane
-- wait <session_id> [timeout] [stable_time]: Wait for output to stabilize (default: 60s timeout, 3s stable)
-- kill-session <session_id>: Terminate the specified tmux session
-- list-sessions: Show all active tmux sessions
+Use tmux for interactive applications requiring ongoing keyboard input or output
+inspection: REPLs, TUIs, interactive installers, and persistent processes you
+need to revisit. Prefer tmux over the shell's `bg` command when the application
+requires send-keys interaction or repeated pane inspection. Use `wait
+<session_id> [timeout] [stable_time]` when you need output to stabilize before
+continuing.
 """
 # TODO: change the "commands" to Python functions registered with the Python tool?
 

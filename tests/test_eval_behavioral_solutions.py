@@ -9,17 +9,18 @@ This is critical infrastructure for idea #19 (eval-to-lesson feedback loop):
 before running expensive baseline experiments with real models, we need
 confidence that the checkers correctly identify good work.
 
-Covers all 31 behavioral scenarios:
+Covers all 33 behavioral scenarios:
   git-selective-commit, multi-file-rename, iterative-debug,
   stage-new-files, write-test-suite, test-driven-error-handling,
   merge-conflict-resolution, extract-function-refactor, debug-data-pipeline,
-  scope-discipline-bugfix, add-logging, use-existing-helper,
+  scope-discipline-bugfix, bounded-bugfix-with-decoys, add-logging, use-existing-helper,
   add-feature-preserve-default, handle-specific-exception,
   fix-security-path-traversal, refactor-for-testability, add-type-hints,
   noisy-worktree-fix, fix-data-mutation, optimize-n-squared, remove-dead-code,
   fix-mutable-default, add-deprecation-warning, add-docstrings, retry-with-backoff,
   validate-user-input, rate-limiting, circuit-breaker, implement-lru-cache,
-  implement-event-emitter, implement-priority-queue, implement-memoization
+  implement-event-emitter, implement-priority-queue, implement-memoization,
+  root-cause-pipeline-debug
 """
 
 import subprocess
@@ -266,6 +267,51 @@ def _apply_solution(workspace: Path, scenario_name: str) -> None:
                 "return total / len(numbers) + 1  # BUG: spurious +1",
                 "return total / len(numbers)",
             )
+        )
+
+    elif scenario_name == "bounded-bugfix-with-decoys":
+        (workspace / "pricing.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Pricing helpers.\"\"\"
+
+
+            def calculate_total(
+                subtotal_cents: int, *, customer_tier: str = "standard", coupon_pct: int = 0
+            ) -> int:
+                \"\"\"Return the final checkout total in cents.\"\"\"
+                if subtotal_cents < 0:
+                    raise ValueError("subtotal must be non-negative")
+                if not 0 <= coupon_pct <= 100:
+                    raise ValueError("coupon_pct must be between 0 and 100")
+                fee_cents = 0 if customer_tier == "premium" else 199
+                discounted_subtotal = subtotal_cents * (100 - coupon_pct) // 100
+                return discounted_subtotal + fee_cents
+
+
+            def describe_tier(customer_tier: str) -> str:
+                \"\"\"Return a short human label for the tier.\"\"\"
+                return f"{customer_tier} checkout"
+
+
+            def format_receipt(total_cents: int) -> str:
+                \"\"\"Render a cents total as a dollar string.\"\"\"
+                return f"${total_cents / 100:.2f}"
+            """)
+        )
+        tests_path = workspace / "tests/test_pricing.py"
+        tests_path.write_text(
+            tests_path.read_text()
+            + textwrap.dedent("""\
+
+
+            def test_coupon_does_not_discount_service_fee_regression():
+                assert calculate_total(2500, customer_tier="standard", coupon_pct=25) == 2074
+            """)
+        )
+        _run("git add pricing.py tests/test_pricing.py", cwd=workspace)
+        _run(
+            'git commit -m "fix(pricing): keep service fee outside coupon discount"',
+            cwd=workspace,
         )
 
     elif scenario_name == "add-logging":
@@ -1213,6 +1259,90 @@ def _apply_solution(workspace: Path, scenario_name: str) -> None:
                 def is_empty(self) -> bool:
                     \"\"\"Return True if the queue contains no items.\"\"\"
                     return len(self._data) == 0
+            """)
+        )
+
+    elif scenario_name == "minimal-feature-preserve-default-with-decoys":
+        # Identical to add-feature-preserve-default: add include_chars param
+        # and append new tests. Decoys should not be touched.
+        (workspace / "text_stats.py").write_text(
+            textwrap.dedent("""\
+            def summarize(text, include_chars=False):
+                \"\"\"Return a dict with word and line counts for the given text.\"\"\"
+                if not text:
+                    result = {"words": 0, "lines": 0}
+                else:
+                    words = len(text.split())
+                    lines = len(text.splitlines())
+                    result = {"words": words, "lines": lines}
+                if include_chars:
+                    result["chars"] = len(text) if text else 0
+                return result
+            """)
+        )
+        original = (workspace / "test_text_stats.py").read_text()
+        (workspace / "test_text_stats.py").write_text(
+            original
+            + textwrap.dedent("""\
+
+            def test_include_chars_true():
+                result = summarize("hello world", include_chars=True)
+                assert result == {"words": 2, "lines": 1, "chars": 11}
+
+
+            def test_include_chars_empty():
+                result = summarize("", include_chars=True)
+                assert result == {"words": 0, "lines": 0, "chars": 0}
+
+
+            def test_include_chars_false_explicit():
+                result = summarize("hello", include_chars=False)
+                assert set(result.keys()) == {"words", "lines"}
+            """)
+        )
+
+    elif scenario_name == "root-cause-pipeline-debug":
+        (workspace / "normalize.py").write_text(
+            textwrap.dedent("""\
+            \"\"\"Normalizes transaction records for reporting.\"\"\"
+
+
+            def normalize_amounts(transactions):
+                \"\"\"Convert amount fields to float and drop incomplete records.\"\"\"
+                result = []
+                for t in transactions:
+                    amount = t.get("amount")
+                    if amount is None:
+                        continue
+                    t["amount"] = float(amount)
+                    result.append(t)
+                return result
+
+
+            def normalize(transactions):
+                \"\"\"Apply all normalization steps.\"\"\"
+                return normalize_amounts(transactions)
+            """)
+        )
+
+        tests_path = workspace / "test_pipeline.py"
+        tests_path.write_text(
+            tests_path.read_text()
+            + textwrap.dedent("""\
+
+
+            def test_pipeline_filters_missing_amounts_regression(tmp_path):
+                data = [
+                    {"id": 1, "name": "Item A", "amount": 10.0},
+                    {"id": 2, "name": "Item B"},
+                    {"id": 3, "name": "Item C", "amount": 20.0},
+                ]
+                p = tmp_path / "regression.json"
+                p.write_text(json.dumps(data))
+                result = run_pipeline(str(p))
+                assert result["total"] == 30.0
+                assert result["count"] == 2
+                assert result["average"] == 15.0
             """)
         )
 

@@ -389,33 +389,28 @@ todo = ToolSpec(
     desc="Manage an in-session todo list (ephemeral, not persisted across conversations)",
     block_types=["todo"],
     instructions="""
-Use this tool to manage todos in the current conversation context.
+### When to use the todo tool
+
+Use todo as working memory for 3+ step tasks in the current conversation.
+For persistent cross-session tracking, use `gptodo` or task files instead.
+
+Manage todos for the current conversation.
 
 Subcommands:
-- `todo read` - Display the current todo list
-- `todo write` - Modify todos (with operations in content block)
+- `todo read` - Show the current todo list
+- `todo write` - Edit todos
 
-Write operations (in content block):
-- add "todo text" - Add a new todo item
-- update ID state - Update todo state (pending/in_progress/completed/paused)
-- update ID "new text" - Update todo text
-- remove ID - Remove a todo item
+Write operations:
+- add "todo text" - Add an item
+- update ID state - Set state (pending/in_progress/completed/paused)
+- update ID "new text" - Rename an item
+- remove ID - Remove an item
 - clear - Clear all todos
-- clear completed - Clear only completed todos
+- clear completed - Clear completed todos
 
 States: pending, in_progress, completed, paused
 
-Use this tool frequently for complex multi-step tasks to:
-- Break down large tasks into smaller steps
-- Track progress through complex workflows
-- Provide visibility into your work plan
-- Stay organized during long conversations
-
-The todo list is ephemeral and conversation-scoped.
-For persistent cross-conversation tasks, use the task management system.
-
-Auto-replay: Todo operations are automatically replayed when resuming conversations
-to restore your todo list state.
+Todo state is auto-replayed when resuming the conversation.
     """.strip(),
     examples=examples_todo,
     execute=execute_todo,

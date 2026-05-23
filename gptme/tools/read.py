@@ -25,6 +25,12 @@ Paths can be relative or absolute.
 For files, output includes line numbers for easy reference.
 For directories, output shows a flat listing of immediate files and subdirectories.
 
+### When to use read
+
+Reading a file directly gives you its exact, current content with line numbers —
+eliminating guesswork from memory, file names, or comments. Prefer `read` over
+those shortcuts when the file itself is the source of truth.
+
 To read multiple files in a single call, put one path per line in the code block.
 Lines beginning with '#' are treated as comments and skipped.
 The line-range parameters (start_line, end_line) only apply when reading a single file.

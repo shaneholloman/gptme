@@ -23,6 +23,11 @@ Create or overwrite a file with the given content.
 
 The path can be relative to the current directory, or absolute.
 If the current directory changes, the path will be relative to the new directory.
+
+### When to use save vs patch
+
+Use `save` for new files, full rewrites, or edits that touch most of a file.
+Use `patch` for targeted edits to existing files; it keeps surrounding content intact.
 """.strip()
 
 instructions_format = {

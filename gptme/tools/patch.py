@@ -26,17 +26,18 @@ from .base import (
 instructions = """
 To patch/modify files, we use an adapted version of git conflict markers.
 
-This can be used to edit files, without having to rewrite the whole file.
-Multiple ORIGINAL/UPDATED blocks can be included in a single patch to make several changes at once.
-Try to keep each patch as small as possible. Avoid placeholders, as they may make the patch fail.
+Multiple ORIGINAL/UPDATED blocks can make several changes in one patch.
+Keep patches small. Scope each change to a function/class. Avoid placeholders
+in ORIGINAL blocks; they must match the file exactly or the patch will fail.
 
-To keep patches small, try to scope each change to imports/function/class.
-If the total patch is large, consider using the save tool to rewrite the whole file.
+### When to use patch vs save
 
-Note: When patching markdown files, avoid replacing partial codeblocks (e.g., just the opening
-or closing backticks). The patch content is parsed as nested markdown, which requires complete
-codeblocks. For simple codeblock boundary changes (like modifying a language tag), use shell
-commands like `sed` or `perl` instead.
+Use `patch` for targeted edits to existing files.
+Use `save` for new files, full rewrites, or changes too large for patch markers.
+
+Note: When patching markdown, avoid replacing partial codeblocks (just the opening
+or closing backticks). The parser needs complete codeblocks. For simple
+codeblock-boundary changes (like a language tag), use `sed` or `perl` instead.
 """.strip()
 
 instructions_format = {

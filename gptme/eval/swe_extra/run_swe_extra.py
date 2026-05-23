@@ -5,13 +5,23 @@ from pathlib import Path
 
 from gptme.dirs import get_logs_dir
 from gptme.eval.agents.swebench import SWEBenchAgent
-from gptme.eval.swe_extra.swe_bench_extra_data import (
-    load_instance_by_id,
-    load_top_50_easiest_task_instances,
-)
 from gptme.eval.swebench import SWEBenchInfo
 from gptme.logmanager import LogManager
 from gptme.tools import init_tools
+
+
+def load_instance_by_id(*args, **kwargs):
+    from gptme.eval.swe_extra.swe_bench_extra_data import load_instance_by_id as impl
+
+    return impl(*args, **kwargs)
+
+
+def load_top_50_easiest_task_instances(*args, **kwargs):
+    from gptme.eval.swe_extra.swe_bench_extra_data import (
+        load_top_50_easiest_task_instances as impl,
+    )
+
+    return impl(*args, **kwargs)
 
 
 def get_most_recent_log_dir():
@@ -33,6 +43,21 @@ def clear_branch(resume_dir: Path, branch: str) -> None:
     manager._branches[branch].messages.clear()
     manager.write()
     print(f"Cleared branch {branch}")
+
+
+def evaluate_instance_or_exit(
+    agent: SWEBenchAgent,
+    instance: dict,
+    *,
+    model: str,
+    resume_dir: Path | None = None,
+) -> None:
+    """Surface staged-runner unavailability without a traceback wall."""
+
+    try:
+        agent.evaluate_instance(instance, model=model, resume_dir=resume_dir)
+    except NotImplementedError as exc:
+        raise SystemExit(str(exc)) from exc
 
 
 def main(
@@ -73,10 +98,15 @@ def main(
         if branch_to_clear:
             clear_branch(resume_path, branch_to_clear)
 
-        agent.evaluate_instance(instance, model=info.model_name, resume_dir=resume_path)
+        evaluate_instance_or_exit(
+            agent,
+            instance,
+            model=info.model_name,
+            resume_dir=resume_path,
+        )
     else:
         instance = load_top_50_easiest_task_instances()[0]
-        agent.evaluate_instance(instance, model=model)
+        evaluate_instance_or_exit(agent, instance, model=model)
 
 
 def cli():

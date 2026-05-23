@@ -874,8 +874,9 @@ def test_v2_create_conversation_default_system_prompt(
     client: FlaskClient, tmp_path, monkeypatch
 ):
     """Test creating a V2 conversation with a default system prompt."""
-    # Use tmp_path as workspace to avoid workspace context message
-    monkeypatch.chdir(tmp_path)
+    # Explicitly set tmp_path as workspace to avoid workspace context message.
+    # New conversations now default to an isolated logdir/workspace directory,
+    # so this test must not rely on cwd fallback behavior.
     # Explicitly disable chat history for this test
     monkeypatch.setenv("GPTME_CHAT_HISTORY", "false")
     # Pin env var so test is deterministic regardless of caller's environment
@@ -900,13 +901,14 @@ def test_v2_create_conversation_default_system_prompt(
     response = client.put(
         f"/api/v2/conversations/{convname}",
         json={
+            "config": {"chat": {"workspace": str(tmp_path)}},
             "messages": [
                 {
                     "role": "user",
                     "content": "Hello, this is a test message.",
                     "timestamp": datetime.now(tz=timezone.utc).isoformat(),
                 }
-            ]
+            ],
         },
     )
     assert response.status_code == 200
@@ -1141,6 +1143,15 @@ def test_v2_interrupt(v2_conv, client: FlaskClient):
     assert "interrupted" in data["message"].lower()
 
 
+def _normalize_config_for_comparison(config_dict: dict) -> dict:
+    """Normalize config dict for comparison by removing server-managed fields."""
+    result = config_dict.copy()
+    # workspace is now managed per-conversation by the server
+    if "chat" in result and "workspace" in result["chat"]:
+        del result["chat"]["workspace"]
+    return result
+
+
 def test_v2_chat_config_saved_on_conversation_create(client: FlaskClient):
     """Test that the chat config is saved on conversation create."""
     input_config = ChatConfig(model="openai/gpt-4o")
@@ -1165,7 +1176,9 @@ def test_v2_chat_config_saved_on_conversation_create(client: FlaskClient):
     print("old config", input_config.to_dict())
     print("-" * 80)
     print("new config", config.to_dict())
-    assert config.to_dict() == input_config.to_dict()
+    assert _normalize_config_for_comparison(
+        config.to_dict()
+    ) == _normalize_config_for_comparison(input_config.to_dict())
 
 
 def test_v2_chat_config_saved_separately_for_each_conversation(client: FlaskClient):
@@ -1183,12 +1196,16 @@ def test_v2_chat_config_saved_separately_for_each_conversation(client: FlaskClie
     response_1 = client.get(f"/api/v2/conversations/{conversation_id_1}")
     data_1 = response_1.get_json()
     config_1 = ChatConfig.from_logdir(Path(data_1["logfile"]).parent)
-    assert config_1.to_dict() == input_config_1.to_dict()
+    assert _normalize_config_for_comparison(
+        config_1.to_dict()
+    ) == _normalize_config_for_comparison(input_config_1.to_dict())
 
     response_2 = client.get(f"/api/v2/conversations/{conversation_id_2}")
     data_2 = response_2.get_json()
     config_2 = ChatConfig.from_logdir(Path(data_2["logfile"]).parent)
-    assert config_2.to_dict() == input_config_2.to_dict()
+    assert _normalize_config_for_comparison(
+        config_2.to_dict()
+    ) == _normalize_config_for_comparison(input_config_2.to_dict())
 
 
 def test_v2_chat_config_get_works(client: FlaskClient):
@@ -1202,7 +1219,9 @@ def test_v2_chat_config_get_works(client: FlaskClient):
     config = ChatConfig.from_dict(response.get_json())
     print("config", config.to_dict())
     print("input_config", input_config.to_dict())
-    assert config.to_dict() == input_config.to_dict()
+    assert _normalize_config_for_comparison(
+        config.to_dict()
+    ) == _normalize_config_for_comparison(input_config.to_dict())
 
 
 def test_v2_chat_config_update_works(client: FlaskClient):
@@ -1214,7 +1233,9 @@ def test_v2_chat_config_update_works(client: FlaskClient):
 
     response = client.get(f"/api/v2/conversations/{conversation_id}/config")
     config = ChatConfig.from_dict(response.get_json())
-    assert config.to_dict() == input_config.to_dict()
+    assert _normalize_config_for_comparison(
+        config.to_dict()
+    ) == _normalize_config_for_comparison(input_config.to_dict())
 
     input_config.model = "openai/gpt-4o-mini"
     response = client.patch(
@@ -1224,7 +1245,9 @@ def test_v2_chat_config_update_works(client: FlaskClient):
 
     response = client.get(f"/api/v2/conversations/{conversation_id}/config")
     config = ChatConfig.from_dict(response.get_json())
-    assert config.to_dict() == input_config.to_dict()
+    assert _normalize_config_for_comparison(
+        config.to_dict()
+    ) == _normalize_config_for_comparison(input_config.to_dict())
 
 
 def test_v2_chat_config_update_missing_conversation_returns_404(client: FlaskClient):

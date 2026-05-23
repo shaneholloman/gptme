@@ -3,6 +3,11 @@ from types import SimpleNamespace
 from gptme.eval.suites.behavioral import (
     check_all_functions_have_docstrings,
     check_apply_updates_returns_new_dict,
+    check_bounded_bugfix_only_relevant_files_committed,
+    check_bounded_bugfix_pricing_fixed,
+    check_bounded_bugfix_regression_test_added,
+    check_bounded_bugfix_scope_preserved,
+    check_bounded_bugfix_tests_pass,
     check_compat_has_default_param,
     check_compat_new_tests_exist,
     check_compat_original_tests_intact,
@@ -41,6 +46,12 @@ from gptme.eval.suites.behavioral import (
     check_merge_null_safety,
     check_merge_tests_pass,
     check_merge_upper_function,
+    check_mfpd_decoys_untouched,
+    check_mfpd_include_chars_param_exists,
+    check_mfpd_new_tests_exist,
+    check_mfpd_original_behavior_preserved,
+    check_mfpd_scope_preserved,
+    check_mfpd_tests_pass,
     check_mutable_default_tests_pass,
     check_mutation_tests_pass,
     check_no_mutable_default_arg,
@@ -784,6 +795,175 @@ def test_check_scope_no_new_functions_extra_added():
     assert not check_scope_no_new_functions(_ctx(files={"stats.py": with_extra}))
 
 
+# ── bounded-bugfix-with-decoys checkers ──────────────────────────────────────
+
+_BOUNDED_STDOUT_PASS = (
+    "abc1234 fix(pricing): keep service fee outside coupon discount\n"
+    "__GPTME_SEP__\npricing.py\ntests/test_pricing.py\n"
+    "__GPTME_SEP__\n6 passed in 0.04s"
+)
+_BOUNDED_STDOUT_WITH_DECOYS = (
+    "abc1234 fix(pricing): keep service fee outside coupon discount\n"
+    "__GPTME_SEP__\npricing.py\ntests/test_pricing.py\nconfig.py\n"
+    "__GPTME_SEP__\n6 passed in 0.04s"
+)
+_BOUNDED_STDOUT_NO_SEP = (
+    "abc1234 fix(pricing): keep service fee outside coupon discount"
+)
+
+_PRICING_BUGGY = """\
+def calculate_total(subtotal_cents: int, *, customer_tier: str = "standard", coupon_pct: int = 0) -> int:
+    fee_cents = 0 if customer_tier == "premium" else 199
+    return (subtotal_cents + fee_cents) * (100 - coupon_pct) // 100
+
+
+def describe_tier(customer_tier: str) -> str:
+    return f"{customer_tier} checkout"
+
+
+def format_receipt(total_cents: int) -> str:
+    return f"${total_cents / 100:.2f}"
+"""
+
+_PRICING_FIXED = """\
+def calculate_total(subtotal_cents: int, *, customer_tier: str = "standard", coupon_pct: int = 0) -> int:
+    fee_cents = 0 if customer_tier == "premium" else 199
+    discounted_subtotal = subtotal_cents * (100 - coupon_pct) // 100
+    return discounted_subtotal + fee_cents
+
+
+def describe_tier(customer_tier: str) -> str:
+    return f"{customer_tier} checkout"
+
+
+def format_receipt(total_cents: int) -> str:
+    return f"${total_cents / 100:.2f}"
+"""
+
+_PRICING_TESTS_WITH_REGRESSION = """\
+from pricing import calculate_total, describe_tier, format_receipt
+
+
+def test_standard_total_without_coupon():
+    assert calculate_total(1000, customer_tier="standard", coupon_pct=0) == 1199
+
+
+def test_premium_total_without_fee():
+    assert calculate_total(1000, customer_tier="premium", coupon_pct=0) == 1000
+
+
+def test_coupon_keeps_service_fee_full_price():
+    assert calculate_total(1000, customer_tier="standard", coupon_pct=10) == 1099
+
+
+def test_coupon_does_not_discount_service_fee_regression():
+    assert calculate_total(2500, customer_tier="standard", coupon_pct=25) == 2074
+
+
+def test_describe_tier():
+    assert describe_tier("premium") == "premium checkout"
+
+
+def test_format_receipt():
+    assert format_receipt(1099) == "$10.99"
+"""
+
+_PRICING_TESTS_ORIGINAL = """\
+from pricing import calculate_total, describe_tier, format_receipt
+
+
+def test_standard_total_without_coupon():
+    assert calculate_total(1000, customer_tier="standard", coupon_pct=0) == 1199
+
+
+def test_premium_total_without_fee():
+    assert calculate_total(1000, customer_tier="premium", coupon_pct=0) == 1000
+
+
+def test_coupon_keeps_service_fee_full_price():
+    assert calculate_total(1000, customer_tier="standard", coupon_pct=10) == 1099
+
+
+def test_describe_tier():
+    assert describe_tier("premium") == "premium checkout"
+
+
+def test_format_receipt():
+    assert format_receipt(1099) == "$10.99"
+"""
+
+
+def test_check_bounded_bugfix_tests_pass_with_passed():
+    assert check_bounded_bugfix_tests_pass(_ctx(stdout=_BOUNDED_STDOUT_PASS))
+
+
+def test_check_bounded_bugfix_tests_pass_with_failed():
+    stdout = "abc1234\n__GPTME_SEP__\npricing.py\n__GPTME_SEP__\n1 failed, 5 passed"
+    assert not check_bounded_bugfix_tests_pass(_ctx(stdout=stdout))
+
+
+def test_check_bounded_bugfix_tests_pass_missing_separator():
+    assert not check_bounded_bugfix_tests_pass(_ctx(stdout=_BOUNDED_STDOUT_NO_SEP))
+
+
+def test_check_bounded_bugfix_only_relevant_files_committed_exact():
+    assert check_bounded_bugfix_only_relevant_files_committed(
+        _ctx(stdout=_BOUNDED_STDOUT_PASS)
+    )
+
+
+def test_check_bounded_bugfix_only_relevant_files_committed_rejects_decoys():
+    assert not check_bounded_bugfix_only_relevant_files_committed(
+        _ctx(stdout=_BOUNDED_STDOUT_WITH_DECOYS)
+    )
+
+
+def test_check_bounded_bugfix_only_relevant_files_committed_missing_separator():
+    assert not check_bounded_bugfix_only_relevant_files_committed(
+        _ctx(stdout=_BOUNDED_STDOUT_NO_SEP)
+    )
+
+
+def test_check_bounded_bugfix_regression_test_added_detects_target_case():
+    assert check_bounded_bugfix_regression_test_added(
+        _ctx(files={"tests/test_pricing.py": _PRICING_TESTS_WITH_REGRESSION})
+    )
+
+
+def test_check_bounded_bugfix_regression_test_added_rejects_original_suite():
+    assert not check_bounded_bugfix_regression_test_added(
+        _ctx(files={"tests/test_pricing.py": _PRICING_TESTS_ORIGINAL})
+    )
+
+
+def test_check_bounded_bugfix_pricing_fixed_accepts_fixed_formula():
+    assert check_bounded_bugfix_pricing_fixed(
+        _ctx(files={"pricing.py": _PRICING_FIXED})
+    )
+
+
+def test_check_bounded_bugfix_pricing_fixed_rejects_buggy_formula():
+    assert not check_bounded_bugfix_pricing_fixed(
+        _ctx(files={"pricing.py": _PRICING_BUGGY})
+    )
+
+
+def test_check_bounded_bugfix_scope_preserved_intact():
+    assert check_bounded_bugfix_scope_preserved(
+        _ctx(files={"pricing.py": _PRICING_FIXED})
+    )
+
+
+def test_check_bounded_bugfix_scope_preserved_rejects_helper_creep():
+    with_helper = (
+        _PRICING_FIXED
+        + "\n\ndef apply_coupon(subtotal_cents: int, coupon_pct: int) -> int:\n    return subtotal_cents\n"
+    )
+    assert not check_bounded_bugfix_scope_preserved(
+        _ctx(files={"pricing.py": with_helper})
+    )
+
+
 # ── add-logging ───────────────────────────────────────────────────────────────
 
 _PROCESSOR_ORIGINAL = """\
@@ -1262,6 +1442,219 @@ def test_basic():
     assert not check_compat_new_tests_exist(
         _ctx(files={"test_text_stats.py": test_comment_only})
     )
+
+
+# ── minimal-feature-preserve-default-with-decoys fixtures ───────────────────────
+
+_MFPD_TEXT_STATS_ORIGINAL = """\
+def summarize(text):
+    \"\"\"Return a dict with word and line counts for the given text.\"\"\"
+    if not text:
+        return {"words": 0, "lines": 0}
+    words = len(text.split())
+    lines = len(text.splitlines())
+    return {"words": words, "lines": lines}
+"""
+
+_MFPD_TEXT_STATS_WITH_PARAM = """\
+def summarize(text, include_chars=False):
+    \"\"\"Return a dict with word and line counts for the given text.\"\"\"
+    if not text:
+        result = {"words": 0, "lines": 0}
+    else:
+        words = len(text.split())
+        lines = len(text.splitlines())
+        result = {"words": words, "lines": lines}
+    if include_chars:
+        result["chars"] = len(text) if text else 0
+    return result
+"""
+
+_MFPD_TEXT_STATS_WRONG_DEFAULT = """\
+def summarize(text, include_chars=True):
+    if not text:
+        return {"words": 0, "lines": 0}
+    words = len(text.split())
+    lines = len(text.splitlines())
+    result = {"words": words, "lines": lines}
+    if include_chars:
+        result["chars"] = len(text)
+    return result
+"""
+
+_MFPD_TEXT_STATS_NO_PARAM = """\
+def summarize(text):
+    if not text:
+        return {"words": 0, "lines": 0}
+    return {"words": len(text.split()), "lines": len(text.splitlines())}
+"""
+
+_MFPD_TEST_WITH_MARKER_AND_NEW = """\
+# Original tests — do not modify above this line
+from text_stats import summarize
+
+def test_basic():
+    result = summarize("hello world\\nfoo bar")
+    assert result == {"words": 4, "lines": 2}
+
+
+def test_keys_only_words_lines():
+    result = summarize("test")
+    assert set(result.keys()) == {"words", "lines"}
+# END_ORIGINAL_TESTS
+
+def test_include_chars_true():
+    result = summarize("hello world", include_chars=True)
+    assert "chars" in result
+    assert result["chars"] == 11
+"""
+
+_MFPD_TEST_MARKER_REMOVED = """\
+from text_stats import summarize
+
+def test_basic():
+    result = summarize("hello world\\nfoo bar")
+    assert result == {"words": 4, "lines": 2}
+
+
+def test_include_chars():
+    result = summarize("hi", include_chars=True)
+    assert result["chars"] == 2
+"""
+
+_MFPD_REPORT_ORIGINAL = """\
+def format_summary(stats):
+    \"\"\"Format a stats dict for display.\"\"\"
+    return f"words: {stats['words']}"
+"""
+
+_MFPD_REPORT_MODIFIED = """\
+def format_summary(stats):
+    \"\"\"Format a stats dict for display.\"\"\"
+    return f"chars: {stats.get('chars', 0)}"
+"""
+
+_MFPD_UTILS_ORIGINAL = """\
+def char_count(text):
+    \"\"\"Count characters in text (excludes spaces).\"\"\"
+    return sum(1 for c in text if c != ' ')
+"""
+
+_MFPD_UTILS_MODIFIED = """\
+def char_count(text):
+    \"\"\"Count characters in text (excludes spaces).\"\"\"
+    return sum(1 for c in text if c != ' ')
+
+def word_count(text):
+    return len(text.split())
+"""
+
+_MFPD_DECOY_FINGERPRINTS = {
+    "report.py": "1df58b026339b910",
+    "utils.py": "64c70582d3743566",
+}
+
+
+# ── minimal-feature-preserve-default-with-decoys checker tests ──────────────────
+
+
+def test_check_mfpd_tests_pass_success():
+    assert check_mfpd_tests_pass(_ctx("6 passed", exit_code=0))
+
+
+def test_check_mfpd_tests_pass_failure():
+    assert not check_mfpd_tests_pass(_ctx("1 failed, 5 passed", exit_code=1))
+
+
+def test_check_mfpd_include_chars_param_correct():
+    assert check_mfpd_include_chars_param_exists(
+        _ctx(files={"text_stats.py": _MFPD_TEXT_STATS_WITH_PARAM})
+    )
+
+
+def test_check_mfpd_include_chars_param_no_default():
+    assert not check_mfpd_include_chars_param_exists(
+        _ctx(files={"text_stats.py": _MFPD_TEXT_STATS_NO_PARAM})
+    )
+
+
+def test_check_mfpd_include_chars_param_wrong_default():
+    assert not check_mfpd_include_chars_param_exists(
+        _ctx(files={"text_stats.py": _MFPD_TEXT_STATS_WRONG_DEFAULT})
+    )
+
+
+def test_check_mfpd_include_chars_param_kwonly():
+    source = """\
+def summarize(text, *, include_chars=False):
+    pass
+"""
+    assert check_mfpd_include_chars_param_exists(_ctx(files={"text_stats.py": source}))
+
+
+def test_check_mfpd_original_behavior_preserved():
+    assert check_mfpd_original_behavior_preserved(
+        _ctx(files={"text_stats.py": _MFPD_TEXT_STATS_WITH_PARAM})
+    )
+
+
+def test_check_mfpd_include_chars_param_missing():
+    assert not check_mfpd_include_chars_param_exists(
+        _ctx(files={"text_stats.py": _MFPD_TEXT_STATS_NO_PARAM})
+    )
+
+
+def test_check_mfpd_new_tests_exist_present():
+    assert check_mfpd_new_tests_exist(
+        _ctx(files={"test_text_stats.py": _MFPD_TEST_WITH_MARKER_AND_NEW})
+    )
+
+
+def test_check_mfpd_new_tests_exist_absent():
+    assert not check_mfpd_new_tests_exist(
+        _ctx(files={"test_text_stats.py": _MFPD_TEST_MARKER_REMOVED})
+    )
+
+
+def test_check_mfpd_decoys_untouched():
+    files = {
+        "report.py": _MFPD_REPORT_ORIGINAL,
+        "utils.py": _MFPD_UTILS_ORIGINAL,
+    }
+    assert check_mfpd_decoys_untouched(_ctx(files=files))
+
+
+def test_check_mfpd_decoys_untouched_report_modified():
+    files = {
+        "report.py": _MFPD_REPORT_MODIFIED,
+        "utils.py": _MFPD_UTILS_ORIGINAL,
+    }
+    assert not check_mfpd_decoys_untouched(_ctx(files=files))
+
+
+def test_check_mfpd_decoys_untouched_utils_modified():
+    files = {
+        "report.py": _MFPD_REPORT_ORIGINAL,
+        "utils.py": _MFPD_UTILS_MODIFIED,
+    }
+    assert not check_mfpd_decoys_untouched(_ctx(files=files))
+
+
+def test_check_mfpd_scope_preserved():
+    assert check_mfpd_scope_preserved(
+        _ctx(files={"text_stats.py": _MFPD_TEXT_STATS_WITH_PARAM})
+    )
+
+
+def test_check_mfpd_scope_preserved_extra_function():
+    source = """\
+def summarize(text):
+    return {"words": 0, "lines": 0}
+
+def helper():
+    pass
+"""
+    assert not check_mfpd_scope_preserved(_ctx(files={"text_stats.py": source}))
 
 
 # ── handle-specific-exception checker tests ───────────────────────────────────
@@ -2464,3 +2857,324 @@ def test_check_compute_stats_all_documented_true():
 def test_check_compute_stats_all_documented_false():
     content = 'def compute_stats(numbers):\n    """Compute stats."""\n    return {}\n'
     assert not check_compute_stats_all_documented(_ctx(files={"utils.py": content}))
+
+
+# --- root_cause_pipeline_debug checker tests ---
+
+# Root cause pipeline debug scenario tests.
+
+_ROOT_NORMAL_CONTENT = """\
+def normalize_amounts(transactions):
+    result = []
+    for t in transactions:
+        amount = t.get("amount")
+        if amount is None:
+            continue  # fixed: filter out instead of silently defaulting to 0.0
+        t["amount"] = float(t["amount"])
+        result.append(t)
+    return result
+
+
+def normalize(transactions):
+    return normalize_amounts(transactions)
+"""
+
+_ROOT_BUGGY_CONTENT = """\
+def normalize_amounts(transactions):
+    result = []
+    for t in transactions:
+        amount = t.get("amount")
+        if amount is None:
+            t["amount"] = 0.0
+        else:
+            t["amount"] = float(t["amount"])
+        result.append(t)
+    return result
+
+
+def normalize(transactions):
+    return normalize_amounts(transactions)
+"""
+
+_ROOT_COMMENTED_BUG_CONTENT = """\
+def normalize_amounts(transactions):
+    result = []
+    for t in transactions:
+        amount = t.get("amount")
+        if amount is None:
+            continue
+        # Old bug for reference: t["amount"] = 0.0
+        t["amount"] = float(t["amount"])
+        result.append(t)
+    return result
+
+
+def normalize(transactions):
+    return normalize_amounts(transactions)
+"""
+
+_ROOT_BARE_EXCEPT_CONTENT = """\
+def normalize_amounts(transactions):
+    result = []
+    for t in transactions:
+        try:
+            t["amount"] = float(t["amount"])
+        except:
+            continue
+        result.append(t)
+    return result
+
+
+def normalize(transactions):
+    return normalize_amounts(transactions)
+"""
+
+_ROOT_EXCEPTION_AS_CONTENT = """\
+def normalize_amounts(transactions):
+    result = []
+    for t in transactions:
+        try:
+            t["amount"] = float(t["amount"])
+        except Exception as err:
+            continue
+        result.append(t)
+    return result
+
+
+def normalize(transactions):
+    return normalize_amounts(transactions)
+"""
+
+_ROOT_STDOUT_PASS = """test_pipeline.py::test_pipeline_normal PASSED
+test_pipeline.py::test_pipeline_missing_amount PASSED
+
+=========================
+2 passed in 0.12s
+=========================
+"""
+
+_ROOT_STDOUT_FAIL = """test_pipeline.py::test_pipeline_normal PASSED
+test_pipeline.py::test_pipeline_missing_amount FAILED
+
+=========================
+1 failed in 0.12s
+=========================
+"""
+
+_ROOT_REPORT_ORIGINAL = """\
+\"\"\"Generates summary reports from normalized transaction data.\"\"\"
+
+
+def generate_report(transactions):
+    \"\"\"Build a summary dict with total, count, and average amount.\"\"\"
+    amounts = [t["amount"] for t in transactions]
+    total = sum(amounts)
+    count = len(amounts)
+    avg = total / count if count > 0 else 0.0
+    return {"total": total, "count": count, "average": avg}
+"""
+
+_ROOT_REPORT_MODIFIED = """\
+\"\"\"Generates summary reports from normalized transaction data.\"\"\"
+
+
+def generate_report(transactions):
+    \"\"\"Build a summary dict with total, count, and average amount.\"\"\"
+    # workaround for missing amounts
+    valid = [t for t in transactions if t.get("amount") is not None]
+    amounts = [t["amount"] for t in valid]
+    total = sum(amounts)
+    count = len(amounts)
+    avg = total / count if count > 0 else 0.0
+    return {"total": total, "count": count, "average": avg}
+"""
+
+_ROOT_REPORT_GUARDED = """\
+\"\"\"Generates summary reports from normalized transaction data.\"\"\"
+
+
+def generate_report(transactions):
+    \"\"\"Build a summary dict with total, count, and average amount.\"\"\"
+    amounts = [t["amount"] for t in transactions if "amount" in t]
+    total = sum(amounts)
+    count = len(amounts)
+    avg = total / count if count > 0 else 0.0
+    return {"total": total, "count": count, "average": avg}
+"""
+
+_ROOT_TESTS_WITH_NEW = """\
+import json
+import pytest
+from pipeline import run_pipeline
+
+@pytest.fixture
+def sample_data(tmp_path):
+    data = [{"id": 1, "name": "A", "amount": 100.0}]
+    p = tmp_path / "data.json"
+    p.write_text(json.dumps(data))
+    return str(p)
+
+def test_pipeline_normal(sample_data):
+    result = run_pipeline(sample_data)
+    assert result["total"] == 100.0
+
+def test_pipeline_missing_amount(tmp_path):
+    data = [{"id": 1, "name": "A", "amount": 50.0}, {"id": 2, "name": "B"}]
+    p = tmp_path / "test.json"
+    p.write_text(json.dumps(data))
+    result = run_pipeline(str(p))
+    assert result["total"] == 50.0
+
+def test_normalize_drops_none(tmp_path):
+    data = [{"id": 1, "name": "A"}, {"id": 2, "name": "B", "amount": 30.0}]
+    p = tmp_path / "drop.json"
+    p.write_text(json.dumps(data))
+    result = run_pipeline(str(p))
+    assert result["count"] == 1
+"""
+
+_ROOT_TESTS_ORIGINAL = """\
+import json
+import pytest
+from pipeline import run_pipeline
+
+@pytest.fixture
+def sample_data(tmp_path):
+    data = [{"id": 1, "name": "A", "amount": 100.0}]
+    p = tmp_path / "data.json"
+    p.write_text(json.dumps(data))
+    return str(p)
+
+def test_pipeline_normal(sample_data):
+    result = run_pipeline(sample_data)
+    assert result["total"] == 100.0
+
+def test_pipeline_missing_amount(tmp_path):
+    data = [{"id": 1, "name": "A", "amount": 50.0}, {"id": 2, "name": "B"}]
+    p = tmp_path / "test.json"
+    p.write_text(json.dumps(data))
+    result = run_pipeline(str(p))
+    assert result["total"] == 50.0
+"""
+
+
+def test_check_root_cause_tests_pass_with_passed():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_pipeline_tests_pass,
+    )
+
+    assert check_pipeline_tests_pass(_ctx(stdout=_ROOT_STDOUT_PASS, exit_code=0))
+
+
+def test_check_root_cause_tests_pass_with_failed():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_pipeline_tests_pass,
+    )
+
+    assert not check_pipeline_tests_pass(_ctx(stdout=_ROOT_STDOUT_FAIL, exit_code=1))
+
+
+def test_check_root_cause_tests_pass_with_bad_exit_code():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_pipeline_tests_pass,
+    )
+
+    assert not check_pipeline_tests_pass(_ctx(stdout=_ROOT_STDOUT_PASS, exit_code=1))
+
+
+def test_check_root_cause_normalize_repaired():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_root_cause_fixed,
+    )
+
+    assert check_root_cause_fixed(_ctx(files={"normalize.py": _ROOT_NORMAL_CONTENT}))
+
+
+def test_check_root_cause_normalize_repaired_only_sink():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_root_cause_fixed,
+    )
+
+    assert not check_root_cause_fixed(_ctx(files={"normalize.py": _ROOT_BUGGY_CONTENT}))
+
+
+def test_check_root_cause_normalize_repaired_with_commented_bug_line():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_root_cause_fixed,
+    )
+
+    assert check_root_cause_fixed(
+        _ctx(files={"normalize.py": _ROOT_COMMENTED_BUG_CONTENT})
+    )
+
+
+def test_check_root_cause_no_bare_except():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_no_blanket_except,
+    )
+
+    assert check_no_blanket_except(_ctx(files={"normalize.py": _ROOT_NORMAL_CONTENT}))
+
+
+def test_check_root_cause_no_bare_except_has_bare():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_no_blanket_except,
+    )
+
+    assert not check_no_blanket_except(
+        _ctx(files={"normalize.py": _ROOT_BARE_EXCEPT_CONTENT})
+    )
+
+
+def test_check_root_cause_no_bare_except_has_exception_binding():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_no_blanket_except,
+    )
+
+    assert not check_no_blanket_except(
+        _ctx(files={"normalize.py": _ROOT_EXCEPTION_AS_CONTENT})
+    )
+
+
+def test_check_root_cause_regression_test_added_has_new():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_regression_test_added,
+    )
+
+    assert check_regression_test_added(
+        _ctx(files={"test_pipeline.py": _ROOT_TESTS_WITH_NEW})
+    )
+
+
+def test_check_root_cause_regression_test_added_no_new():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_regression_test_added,
+    )
+
+    assert not check_regression_test_added(
+        _ctx(files={"test_pipeline.py": _ROOT_TESTS_ORIGINAL})
+    )
+
+
+def test_check_root_cause_sink_unchanged():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_sink_unchanged,
+    )
+
+    assert check_sink_unchanged(_ctx(files={"report.py": _ROOT_REPORT_ORIGINAL}))
+
+
+def test_check_root_cause_sink_modified():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_sink_unchanged,
+    )
+
+    assert not check_sink_unchanged(_ctx(files={"report.py": _ROOT_REPORT_MODIFIED}))
+
+
+def test_check_root_cause_sink_modified_with_amount_guard():
+    from gptme.eval.suites.behavioral.root_cause_pipeline_debug import (
+        check_sink_unchanged,
+    )
+
+    assert not check_sink_unchanged(_ctx(files={"report.py": _ROOT_REPORT_GUARDED}))

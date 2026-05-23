@@ -6,11 +6,10 @@ import re
 import time
 from collections.abc import Generator, Iterable
 from functools import lru_cache, wraps
-from typing import TYPE_CHECKING, Any, TypedDict, cast
+from typing import TYPE_CHECKING, Any, cast
 
 import requests
 from openai import NOT_GIVEN, NotGiven
-from typing_extensions import NotRequired
 
 from ..config import Config, get_config
 from ..constants import OPENAI_VERBOSITY, TEMPERATURE, TOP_P
@@ -23,6 +22,20 @@ from .models import (
     ModelMeta,
     Provider,
     is_custom_provider,
+)
+from .openai_responses import (
+    ContentPart,
+    MessageContent,
+    MessageDict,
+    ToolCall,
+    ToolCallFunction,
+    _content_to_responses_input,  # noqa: F401
+    _extract_usage_token_counts,
+    _filter_duplicate_thinking_text,
+    _longest_suffix_prefix,
+    _messages_dicts_to_responses_input,
+    _obj_get,
+    _tool_spec_to_responses_tool,
 )
 from .utils import (
     apply_cache_control,
@@ -41,6 +54,11 @@ if TYPE_CHECKING:
 clients: dict[Provider, "OpenAI"] = {}
 logger = logging.getLogger(__name__)
 
+__all__ = [
+    "ContentPart",
+    "MessageContent",
+]
+
 
 def _get_provider_api_key(config: Config, provider: Provider, env_var: str) -> str:
     """Resolve a provider key from env/config first, then credentials.toml."""
@@ -54,63 +72,6 @@ def _get_provider_api_key(config: Config, provider: Provider, env_var: str) -> s
     )
 
 
-# Type definitions for message dictionaries used in API transformations
-class ContentPart(TypedDict):
-    """A content part in a multimodal message."""
-
-    type: str  # "text", "image_url", etc. - always required
-    text: NotRequired[str]  # For text parts
-    image_url: NotRequired[dict[str, str]]  # For image parts: {"url": "data:..."}
-
-
-# Type alias for message content (can be string, list of parts, or None)
-MessageContent = str | list[ContentPart | str] | None
-
-
-class ToolCallFunction(TypedDict):
-    """Function details in a tool call."""
-
-    name: str
-    arguments: str
-
-
-class ToolCall(TypedDict):
-    """A tool call in an assistant message."""
-
-    id: str
-    type: str  # "function"
-    function: ToolCallFunction
-
-
-class MessageDict(TypedDict):
-    """
-    Dictionary representation of a chat message for API calls.
-
-    This type covers the internal message format used when preparing
-    messages for various LLM providers. Not all fields are present
-    in all messages - the required fields vary by role.
-    """
-
-    # Core fields (always required)
-    role: str  # "system", "user", "assistant", "tool"
-    content: MessageContent
-
-    # Tool-related fields (optional)
-    tool_calls: NotRequired[list[ToolCall]]  # For assistant messages that call tools
-    tool_call_id: NotRequired[str]  # For tool response messages
-    call_id: NotRequired[
-        str
-    ]  # Legacy field for tool responses (converted to tool_call_id)
-
-    # Reasoning/thinking fields (for models with thinking/reasoning support)
-    reasoning_content: NotRequired[str]
-
-    # Multimodal fields
-    files: NotRequired[
-        list[str]
-    ]  # Image/file attachments as file paths (processed before API call)
-
-
 # OPENROUTER_APP_HEADERS canonical definition is in gptme.llm.constants;
 # re-exported here for backward compatibility with existing
 # `from gptme.llm.llm_openai import OPENROUTER_APP_HEADERS` imports.
@@ -121,32 +82,12 @@ def _record_usage(usage, model: str) -> MessageMetadata | None:
     if not usage:
         return None
 
-    # Extract token counts (OpenAI uses different field names than Anthropic)
-    prompt_tokens = getattr(usage, "prompt_tokens", None)
-    output_tokens = getattr(usage, "completion_tokens", None)
-    details = getattr(usage, "prompt_tokens_details", None)
-    cache_read_tokens = getattr(details, "cached_tokens", None)
-    # OpenRouter currently exposes cache writes in two response shapes:
-    # 1) legacy passthrough: usage.cache_creation_input_tokens
-    # 2) current nested usage: usage.prompt_tokens_details.cache_write_tokens
-    # Keep both so telemetry survives provider/schema drift.
-    cache_creation_tokens = getattr(usage, "cache_creation_input_tokens", None)
-    if cache_creation_tokens is None:
-        cache_creation_tokens = getattr(details, "cache_write_tokens", None)
-    total_tokens = getattr(usage, "total_tokens", None)
-
-    # subtract cache_read_tokens AND cache_creation_tokens from prompt_tokens
-    # to avoid double counting — OpenRouter/Anthropic reports prompt_tokens as
-    # the inclusive total.
-    # Ensure we have actual integers, not Mock objects from tests
-    if isinstance(prompt_tokens, int):
-        cache_read = cache_read_tokens if isinstance(cache_read_tokens, int) else 0
-        cache_create = (
-            cache_creation_tokens if isinstance(cache_creation_tokens, int) else 0
-        )
-        input_tokens = prompt_tokens - cache_read - cache_create
-    else:
-        input_tokens = None
+    counts = _extract_usage_token_counts(usage)
+    input_tokens = counts.input_tokens
+    output_tokens = counts.output_tokens
+    cache_read_tokens = counts.cache_read_tokens
+    cache_creation_tokens = counts.cache_creation_tokens
+    total_tokens = counts.total_tokens
 
     # Determine the provider for telemetry
     # For OpenRouter models, detect the underlying provider from the model string
@@ -227,6 +168,100 @@ def _make_response_format(output_schema):
         "type": "json_schema",
         "json_schema": {"name": schema_name, "schema": json_schema, "strict": True},
     }
+
+
+def _responses_api_enabled() -> bool:
+    value = os.environ.get("GPTME_OPENAI_RESPONSES_API")
+    if value is None:
+        return False
+    return value.strip().lower() in {"1", "true", "yes", "on"}
+
+
+def _should_use_responses_api(
+    provider: Provider, model_meta: ModelMeta, client: "OpenAI"
+) -> bool:
+    return (
+        provider == "openai"
+        and model_meta.supports_responses_api
+        and not _is_proxy(client)
+        and _responses_api_enabled()
+    )
+
+
+_VALID_VERBOSITY = {"low", "medium", "high"}
+_verbosity_warned = False  # warn at most once per process lifetime
+
+
+def _make_responses_text_config(
+    output_schema, model_meta: ModelMeta
+) -> dict[str, Any] | None:
+    text_config: dict[str, Any] = {}
+
+    if output_schema is not None:
+        text_config["format"] = {
+            "type": "json_schema",
+            "name": output_schema.__name__,
+            "schema": output_schema.model_json_schema(),
+            "strict": True,
+        }
+
+    if OPENAI_VERBOSITY and model_meta.model.startswith("gpt-5"):
+        global _verbosity_warned
+        if OPENAI_VERBOSITY not in _VALID_VERBOSITY:
+            if not _verbosity_warned:
+                logger.warning(
+                    "OPENAI_VERBOSITY=%r is not one of %s; ignoring.",
+                    OPENAI_VERBOSITY,
+                    sorted(_VALID_VERBOSITY),
+                )
+                _verbosity_warned = True
+        else:
+            text_config["verbosity"] = OPENAI_VERBOSITY
+
+    return text_config or None
+
+
+def _prepare_messages_for_responses_api(
+    messages: list[Message],
+    model: str,
+    tools: list[ToolSpec] | None,
+) -> tuple[str | None, list[dict[str, Any]], list[dict[str, Any]] | None]:
+    from .models import get_model  # fmt: skip
+
+    model_meta = get_model(model)
+    messages_dicts: Iterable[dict[str, Any]] = _process_msgs(
+        msgs2dicts(messages), model_meta
+    )
+
+    if tools:
+        messages_dicts = _merge_tool_results_with_same_call_id(
+            _handle_tools(messages_dicts)
+        )
+
+    typed_messages = _transform_msgs_for_special_provider(messages_dicts, model_meta)
+    messages_list = list(typed_messages)
+    instructions, input_items = _messages_dicts_to_responses_input(messages_list)
+    responses_tools = (
+        [_tool_spec_to_responses_tool(tool) for tool in tools] if tools else None
+    )
+    return instructions, input_items, responses_tools
+
+
+def _log_responses_reasoning(item: Any) -> None:
+    summary = _obj_get(item, "summary") or []
+    summary_text = "\n".join(
+        part.text if hasattr(part, "text") else part.get("text", "") for part in summary
+    ).strip()
+    if summary_text:
+        logger.info("Reasoning content: %s", summary_text)
+        return
+
+    content = _obj_get(item, "content") or []
+    content_text = "\n".join(
+        part.text if hasattr(part, "text") else part.get("text", "") for part in content
+    ).strip()
+    if content_text:
+        logger.info("Reasoning content: %s", content_text)
 
 
 def _init_openai_client(
@@ -642,10 +677,6 @@ def retry_generator_on_openai_error(max_retries: int = 5, base_delay: float = 1.
     return decorator
 
 
-_VALID_VERBOSITY = {"low", "medium", "high"}
-_verbosity_warned = False  # warn at most once per process lifetime
-
-
 def _maybe_apply_verbosity(body: dict[str, Any], model_meta: ModelMeta) -> None:
     """Add verbosity request-body field for GPT-5+ models when set.
 
@@ -694,6 +725,54 @@ def chat(
 
     # make the model name prefix with the provider if using LLM_PROXY, to make proxy aware of the provider
     api_model = model if is_proxy else base_model
+
+    if _should_use_responses_api(provider, model_meta, client):
+        instructions, input_items, responses_tools = (
+            _prepare_messages_for_responses_api(messages, model, tools)
+        )
+        text_config = _make_responses_text_config(output_schema, model_meta)
+
+        response_kwargs: dict[str, Any] = {
+            "model": api_model.split("@")[0],
+            "input": input_items,
+            "store": False,
+        }
+        if instructions is not None:
+            response_kwargs["instructions"] = instructions
+        if responses_tools is not None:
+            response_kwargs["tools"] = responses_tools
+        if text_config is not None:
+            response_kwargs["text"] = text_config
+        if max_tokens is not None:
+            response_kwargs["max_output_tokens"] = max_tokens
+        if not is_reasoner:
+            response_kwargs["temperature"] = TEMPERATURE
+            response_kwargs["top_p"] = TOP_P
+
+        response = client.responses.create(**response_kwargs)
+        metadata = _record_usage(response.usage, model)
+
+        result: list[str] = []
+        for item in response.output:
+            item_type = _obj_get(item, "type")
+            if item_type == "reasoning":
+                _log_responses_reasoning(item)
+            elif item_type == "function_call":
+                name = _obj_get(item, "name", "").strip()
+                call_id = _obj_get(item, "call_id", "").strip()
+                arguments = _obj_get(item, "arguments", "")
+                result.append(f"@{name}({call_id}): {arguments}")
+            elif item_type == "message":
+                for part in _obj_get(item, "content", []) or []:
+                    part_type = _obj_get(part, "type")
+                    if part_type == "output_text":
+                        result.append(_obj_get(part, "text", ""))
+                    elif part_type == "refusal":
+                        result.append(_obj_get(part, "refusal", ""))
+
+        if not result:
+            raise ValueError("Responses API returned no usable output items")
+        return "\n".join(part for part in result if part), metadata
 
     from openai.types.chat import ChatCompletionMessageToolCall  # fmt: skip
 
@@ -846,6 +925,155 @@ def extra_body(
     return body
 
 
+def _stream_responses(
+    messages: list[Message],
+    model: str,
+    tools: list[ToolSpec] | None,
+    model_meta: ModelMeta,
+    output_schema=None,
+    max_tokens: int | None = None,
+) -> Generator[str, None, MessageMetadata | None]:
+    """Stream via the OpenAI Responses API (used for GPT-5 class models).
+
+    Convergence note: If the reasoning/wrapping logic here and in
+    llm_openai_subscription.py grow further apart, consider merging the
+    streaming loop into a shared _stream_responses_events() helper that
+    accepts an event iterator.  Both providers use the same Responses API
+    SSE event types (output_text.delta, reasoning_text.delta,
+    function_call_arguments.delta, output_item.added, completed).  The
+    only differences are auth, base URL, and the request body shape —
+    all of which are upstream of the event loop.
+    """
+    from . import _get_base_model, get_provider_from_model  # fmt: skip
+
+    provider = get_provider_from_model(model)
+    client = get_client(provider)
+    is_proxy = _is_proxy(client)
+    base_model = _get_base_model(model)
+    api_model = model if is_proxy else base_model
+    is_reasoner = model_meta.supports_reasoning
+
+    instructions, input_items, responses_tools = _prepare_messages_for_responses_api(
+        messages, model, tools
+    )
+    text_config = _make_responses_text_config(output_schema, model_meta)
+
+    kwargs: dict[str, Any] = {
+        "model": api_model.split("@")[0],
+        "input": input_items,
+        "store": False,
+        "stream": True,
+    }
+    if instructions is not None:
+        kwargs["instructions"] = instructions
+    if responses_tools is not None:
+        kwargs["tools"] = responses_tools
+    if text_config is not None:
+        kwargs["text"] = text_config
+    if max_tokens is not None:
+        kwargs["max_output_tokens"] = max_tokens
+    if not is_reasoner:
+        kwargs["temperature"] = TEMPERATURE
+        kwargs["top_p"] = TOP_P
+
+    # Track function-call items: output_index -> (item_id, name, call_id)
+    func_call_items: dict[int, tuple[str, str, str]] = {}
+    header_emitted: set[int] = set()
+    # Guard against double-wrapping: some models emit BOTH structured
+    # reasoning deltas AND raw <thinking> tags in output_text.delta.
+    # If structured reasoning was seen, skip text-tag conversion so
+    # the output doesn't become <think><think>...</think></think>.
+    seen_reasoning_delta = False
+    in_reasoning_block = False
+    in_duplicate_thinking_block = False
+    # Buffer for detecting <thinking> / </thinking> tags split across
+    # SSE chunks (max tag length is ~11 characters).
+    pending = ""
+    captured_metadata: MessageMetadata | None = None
+
+    stream = client.responses.create(**kwargs)
+
+    for event in stream:
+        if event.type == "response.output_item.added":
+            item = event.item
+            if _obj_get(item, "type") == "function_call":
+                func_call_items[event.output_index] = (
+                    _obj_get(item, "id") or _obj_get(item, "call_id") or "",
+                    _obj_get(item, "name", ""),
+                    _obj_get(item, "call_id", ""),
+                )
+
+        elif event.type == "response.reasoning_text.delta":
+            if not in_reasoning_block:
+                # Flush any partial-tag buffer before opening think block
+                if pending:
+                    yield pending.replace("<thinking>", "<think>").replace(
+                        "</thinking>", "</think>"
+                    )
+                    pending = ""
+                yield "<think>\n"
+                in_reasoning_block = True
+                seen_reasoning_delta = True
+            yield event.delta
+
+        elif event.type == "response.output_text.delta":
+            if in_reasoning_block:
+                yield "\n</think>\n"
+                in_reasoning_block = False
+
+            delta_text = event.delta
+            if delta_text:
+                # Combine with any previous partial-tag buffer
+                text = pending + delta_text
+                pending = ""
+
+                if seen_reasoning_delta:
+                    text, pending, in_duplicate_thinking_block = (
+                        _filter_duplicate_thinking_text(
+                            text, in_thinking_block=in_duplicate_thinking_block
+                        )
+                    )
+                else:
+                    # Hold back potential partial tag suffix to check in
+                    # next chunk. A trailing `<` is buffered because it
+                    # could be the start of either <thinking> or
+                    # </thinking>.
+                    for tag in ("<thinking>", "</thinking>"):
+                        pending = _longest_suffix_prefix(text, tag)
+                        if pending:
+                            text = text[: -len(pending)]
+                            break
+
+                    # Convert <thinking>/</thinking> to <think>/</think>
+                    text = text.replace("<thinking>", "<think>").replace(
+                        "</thinking>", "</think>"
+                    )
+                if text:
+                    yield text
+
+        elif event.type == "response.function_call_arguments.delta":
+            output_index = event.output_index
+            if output_index not in header_emitted:
+                _, name, call_id = func_call_items.get(output_index, ("", "", ""))
+                yield f"\n@{name}({call_id}): "
+                header_emitted.add(output_index)
+            yield event.delta
+
+        elif event.type == "response.completed":
+            if event.response.usage:
+                captured_metadata = _record_usage(event.response.usage, model)
+
+    # Flush any remaining state.
+    if in_reasoning_block:
+        yield "\n</think>\n"
+    if pending and not in_duplicate_thinking_block:
+        yield pending.replace("<thinking>", "<think>").replace(
+            "</thinking>", "</think>"
+        )
+
+    return captured_metadata
+
+
 @retry_generator_on_openai_error()
 def stream(
     messages: list[Message],
@@ -870,6 +1098,18 @@ def stream(
 
     # make the model name prefix with the provider if using LLM_PROXY, to make proxy aware of the provider
     api_model = model if is_proxy else base_model
+
+    # Dispatch to Responses API streaming when enabled for GPT-5 class models
+    if _should_use_responses_api(provider, model_meta, client):
+        captured_metadata = yield from _stream_responses(
+            messages,
+            model,
+            tools,
+            model_meta,
+            output_schema=output_schema,
+            max_tokens=max_tokens,
+        )
+        return captured_metadata
 
     messages_dicts, tools_dict = _prepare_messages_for_api(messages, model, tools)
     response_format = _make_response_format(output_schema)

@@ -5,13 +5,14 @@ Elicitation supports multiple input types:
 - ``text``: Free-form text input
 - ``choice``: Single selection from options
 - ``multi_choice``: Multiple selections from options
-- ``secret``: Hidden input (API keys, passwords) - NOT added to LLM context
+- ``secret``: Hidden input (API keys, passwords) with UI redaction
 - ``confirmation``: Yes/No question
 - ``form``: Multiple fields collected at once
 
-Secret values are handled specially: they are stored/used as directed by the
-agent but are NEVER added to the conversation history, ensuring credentials
-don't leak into the LLM context.
+Secret values are handled specially: the value is hidden from the chat display
+(``hide=True``) so it does not appear on screen, but it is passed to the LLM
+in-context so the agent can act on it (e.g. set it as an env var). The value
+is stored in the on-disk conversation log.
 """
 
 import json
@@ -33,16 +34,31 @@ from .base import (
 logger = logging.getLogger(__name__)
 
 instructions = """
-Request structured input from the user. Supports these types:
+### When to use elicit
+
+Use elicit when you need structured user input that a plain text reply cannot
+cleanly provide:
+- **secret** — API keys, passwords, tokens. The value is hidden from the chat
+  display so it does not appear over someone's shoulder; the LLM still receives
+  it in-context so it can act on it (e.g. export as an env var or pass to a
+  command). The conversation log on disk will contain the value.
+- **choice / multi_choice** — present a fixed set of options so the user
+  selects rather than types a free-form answer that you then have to parse.
+- **confirmation** — ask yes/no before a destructive or irreversible action.
+- **form** — collect several related fields in one interaction instead of a
+  back-and-forth sequence.
+
+Do **not** use elicit for simple open-ended questions that read naturally in
+chat — a plain assistant message is clearer and less disruptive in those cases.
+
+### Input types
+
 - text: Free-form text input
 - choice: Single selection from a list (specify options)
 - multi_choice: Multiple selections from a list (specify options)
-- secret: Hidden input for API keys/passwords (NOT stored in conversation)
+- secret: Hidden from display; LLM receives the value in-context to act on it
 - confirmation: Yes/No question
 - form: Multiple fields at once (specify JSON field definitions)
-
-For secrets: the value is returned to you but NOT added to conversation history.
-Use the secret type when asking for API keys, passwords, or other credentials.
 """.strip()
 
 instructions_format = {
@@ -55,7 +71,7 @@ def examples(tool_format):
 ### Ask for a secret API key
 
 > User: Set up the OpenAI integration
-> Assistant: I need your OpenAI API key to proceed. It will not be stored in the conversation.
+> Assistant: I need your OpenAI API key to proceed. It will be hidden from normal chat display.
 {
         ToolUse(
             "elicit",
@@ -64,7 +80,7 @@ def examples(tool_format):
                 {
                     "type": "secret",
                     "prompt": "Enter your OpenAI API key:",
-                    "description": "Required for the OpenAI integration. Will not be logged.",
+                    "description": "Required for the OpenAI integration. Hidden from normal chat display.",
                 },
                 indent=2,
             ),
@@ -190,8 +206,7 @@ def execute_elicit(
 ) -> Generator[Message, None, None]:
     """Execute elicitation and return user's response.
 
-    For secret types, the value is returned to the agent but a redacted
-    message is stored in conversation history (to avoid leaking credentials).
+    For secret types, the value is returned to the agent with UI redaction.
     """
     if not code:
         yield Message("system", "No elicitation spec provided")

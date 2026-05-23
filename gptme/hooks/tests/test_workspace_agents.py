@@ -14,13 +14,19 @@ import pytest
 from gptme.hooks.workspace_agents import (
     AGENT_BINARIES,
     AgentInfo,
+    _configure_windows_kernel32_process_functions,
     _extract_flag,
     _format_agent_line,
     _format_duration,
+    _get_all_pids,
+    _get_process_cmdline,
+    _get_process_cwd,
     _get_process_memory_mb,
+    _get_process_timing,
     _has_flag,
     _init_tracking,
     _parse_etime,
+    _split_windows_cmdline,
     assess_staleness,
     detect_runtime,
     scan_agents,
@@ -219,6 +225,288 @@ class TestGetProcessMemoryMb:
     def test_missing_pid_returns_none(self) -> None:
         # PID 2**31 - 1 is effectively guaranteed not to exist.
         assert _get_process_memory_mb(2**31 - 1) is None
+
+
+class TestWindowsProcessIntrospection:
+    def test_configure_windows_kernel32_process_functions(self) -> None:
+        import ctypes
+        from ctypes import wintypes
+
+        class FakeFunction:
+            def __init__(self) -> None:
+                self.argtypes = None
+                self.restype = None
+
+        class FakeKernel32:
+            def __init__(self) -> None:
+                self.OpenProcess = FakeFunction()
+                self.CloseHandle = FakeFunction()
+
+        kernel32 = FakeKernel32()
+
+        _configure_windows_kernel32_process_functions(kernel32, ctypes, wintypes)
+
+        assert kernel32.OpenProcess.argtypes == [
+            wintypes.DWORD,
+            wintypes.BOOL,
+            wintypes.DWORD,
+        ]
+        assert kernel32.OpenProcess.restype == wintypes.HANDLE
+        assert kernel32.CloseHandle.argtypes == [wintypes.HANDLE]
+        assert kernel32.CloseHandle.restype == wintypes.BOOL
+
+    def test_split_windows_cmdline_direct(self) -> None:
+        import ctypes
+
+        raw_cmdline = 'codex exec --model "gpt-5" "Run tests"'
+        expected = ["codex", "exec", "--model", "gpt-5", "Run tests"]
+        local_free_calls: list[object] = []
+
+        class FakeCommandLineToArgvW:
+            def __init__(self) -> None:
+                self.restype = None
+                self.argtypes = None
+                self.calls: list[str] = []
+
+            def __call__(self, cmdline: str, argc_ref: object) -> list[str]:
+                argc_ref._obj.value = len(expected)  # type: ignore[attr-defined]
+                self.calls.append(cmdline)
+                return expected
+
+        class FakeShell32:
+            def __init__(self, parser: FakeCommandLineToArgvW) -> None:
+                self.CommandLineToArgvW = parser
+
+        class FakeKernel32:
+            def LocalFree(self, ptr: object) -> None:
+                local_free_calls.append(ptr)
+
+        parser = FakeCommandLineToArgvW()
+
+        def fake_windll(
+            name: str, *args: object, **kwargs: object
+        ) -> FakeShell32 | FakeKernel32:
+            if name == "shell32":
+                return FakeShell32(parser)
+            if name == "kernel32":
+                return FakeKernel32()
+            raise AssertionError(f"Unexpected DLL: {name}")
+
+        with patch.object(ctypes, "WinDLL", side_effect=fake_windll, create=True):
+            assert _split_windows_cmdline(raw_cmdline) == expected
+
+        assert parser.calls == [raw_cmdline]
+        assert parser.restype == ctypes.POINTER(ctypes.c_wchar_p)
+        assert parser.argtypes == [
+            ctypes.c_wchar_p,
+            ctypes.POINTER(ctypes.c_int),
+        ]
+        assert local_free_calls == [expected]
+
+    def test_split_windows_cmdline_falls_back_on_typeerror(self) -> None:
+        import ctypes
+
+        raw_cmdline = 'codex exec --model "gpt-5" "Run tests"'
+        local_free_calls: list[object] = []
+
+        class FakeCommandLineToArgvW:
+            def __init__(self) -> None:
+                self.restype = None
+                self.argtypes = None
+
+            def __call__(self, cmdline: str, argc_ref: object) -> int:
+                argc_ref._obj.value = 1  # type: ignore[attr-defined]
+                return 123
+
+        class FakeShell32:
+            def __init__(self, parser: FakeCommandLineToArgvW) -> None:
+                self.CommandLineToArgvW = parser
+
+        class FakeKernel32:
+            def LocalFree(self, ptr: object) -> None:
+                local_free_calls.append(ptr)
+
+        parser = FakeCommandLineToArgvW()
+
+        def fake_windll(
+            name: str, *args: object, **kwargs: object
+        ) -> FakeShell32 | FakeKernel32:
+            if name == "shell32":
+                return FakeShell32(parser)
+            if name == "kernel32":
+                return FakeKernel32()
+            raise AssertionError(f"Unexpected DLL: {name}")
+
+        with patch.object(ctypes, "WinDLL", side_effect=fake_windll, create=True):
+            assert _split_windows_cmdline(raw_cmdline) == [
+                "codex",
+                "exec",
+                "--model",
+                "gpt-5",
+                "Run tests",
+            ]
+
+        assert local_free_calls == [123]
+
+    def test_get_process_cwd_windows_dispatch(self) -> None:
+        with (
+            patch(
+                "gptme.hooks.workspace_agents.platform.system", return_value="Windows"
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_windows_process_strings",
+                return_value=(r"C:\\workspace", "codex exec"),
+            ),
+        ):
+            assert _get_process_cwd(123) == r"C:\\workspace"
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError("boom"),
+            AttributeError("boom"),
+            TypeError("boom"),
+            ValueError("boom"),
+        ],
+    )
+    def test_get_process_cwd_windows_dispatch_handles_lookup_error(
+        self, error: Exception
+    ) -> None:
+        with (
+            patch(
+                "gptme.hooks.workspace_agents.platform.system", return_value="Windows"
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_windows_process_strings",
+                side_effect=error,
+            ),
+        ):
+            assert _get_process_cwd(123) is None
+
+    def test_get_process_cmdline_windows_dispatch(self) -> None:
+        raw_cmdline = 'codex exec --model "gpt-5" "Run tests"'
+        expected = ["codex", "exec", "--model", "gpt-5", "Run tests"]
+        with (
+            patch(
+                "gptme.hooks.workspace_agents.platform.system", return_value="Windows"
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_windows_process_strings",
+                return_value=(r"C:\\workspace", raw_cmdline),
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._split_windows_cmdline",
+                return_value=expected,
+            ) as mock_split,
+        ):
+            assert _get_process_cmdline(123) == expected
+        mock_split.assert_called_once_with(raw_cmdline)
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError("boom"),
+            AttributeError("boom"),
+            TypeError("boom"),
+            ValueError("boom"),
+        ],
+    )
+    def test_get_process_cmdline_windows_dispatch_handles_lookup_error(
+        self, error: Exception
+    ) -> None:
+        with (
+            patch(
+                "gptme.hooks.workspace_agents.platform.system", return_value="Windows"
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_windows_process_strings",
+                side_effect=error,
+            ),
+        ):
+            assert _get_process_cmdline(123) == []
+
+    def test_get_all_pids_windows_dispatch(self) -> None:
+        with (
+            patch(
+                "gptme.hooks.workspace_agents.platform.system", return_value="Windows"
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_windows_pids",
+                return_value=[101, 202],
+            ),
+        ):
+            assert _get_all_pids() == [101, 202]
+
+    def test_get_process_timing_windows_dispatch(self) -> None:
+        expected = (120, 4.5, None)
+        with (
+            patch(
+                "gptme.hooks.workspace_agents.platform.system", return_value="Windows"
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_windows_process_timing",
+                return_value=expected,
+            ),
+        ):
+            assert _get_process_timing(123) == expected
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError("boom"),
+            AttributeError("boom"),
+            TypeError("boom"),
+            ValueError("boom"),
+        ],
+    )
+    def test_get_process_timing_windows_dispatch_handles_lookup_error(
+        self, error: Exception
+    ) -> None:
+        with (
+            patch(
+                "gptme.hooks.workspace_agents.platform.system", return_value="Windows"
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_windows_process_timing",
+                side_effect=error,
+            ),
+        ):
+            assert _get_process_timing(123) == (None, None, None)
+
+    def test_get_process_memory_windows_dispatch(self) -> None:
+        with (
+            patch(
+                "gptme.hooks.workspace_agents.platform.system", return_value="Windows"
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_windows_process_memory_mb",
+                return_value=64.0,
+            ),
+        ):
+            assert _get_process_memory_mb(123) == 64.0
+
+    @pytest.mark.parametrize(
+        "error",
+        [
+            OSError("boom"),
+            AttributeError("boom"),
+            TypeError("boom"),
+            ValueError("boom"),
+        ],
+    )
+    def test_get_process_memory_windows_dispatch_handles_lookup_error(
+        self, error: Exception
+    ) -> None:
+        with (
+            patch(
+                "gptme.hooks.workspace_agents.platform.system", return_value="Windows"
+            ),
+            patch(
+                "gptme.hooks.workspace_agents._get_windows_process_memory_mb",
+                side_effect=error,
+            ),
+        ):
+            assert _get_process_memory_mb(123) is None
 
 
 class TestFormatAgentLineMemory:

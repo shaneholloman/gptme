@@ -397,6 +397,52 @@ def test_subagent_status_unknown_agent():
         subagent_status("nonexistent-agent-xyz")
 
 
+def test_subagent_status_missing_log_returns_failure():
+    """Finished subagents without a log should fail cleanly instead of raising."""
+    from gptme.tools.subagent import Subagent
+
+    sa = Subagent(
+        agent_id="test-missing-log",
+        prompt="test prompt",
+        thread=None,
+        logdir=Path("/tmp/does-not-exist"),
+        model=None,
+    )
+
+    with patch.object(
+        Subagent, "get_log", side_effect=FileNotFoundError("missing log")
+    ):
+        result = sa.status()
+
+    assert result.status == "failure"
+    assert "conversation log" in (result.result or "")
+
+
+@patch("gptme.tools.subagent.api.notify_completion")
+@patch(
+    "gptme.tools.subagent.execution._create_subagent_thread",
+    side_effect=RuntimeError("boom"),
+)
+def test_subagent_wait_returns_failure_when_thread_startup_raises(
+    _mock_create_thread: MagicMock, _mock_notify_completion: MagicMock
+):
+    """Thread-mode startup failures should be cached for subagent_wait/status."""
+    from gptme.tools.subagent import _subagent_results, subagent_wait
+
+    _subagents.clear()
+    _subagent_results.clear()
+
+    try:
+        subagent(agent_id="test-thread-fail", prompt="Simple task")
+
+        result = subagent_wait("test-thread-fail", timeout=1)
+        assert result["status"] == "failure"
+        assert result["result"] == "boom"
+    finally:
+        _subagents.clear()
+        _subagent_results.clear()
+
+
 @pytest.mark.slow
 @pytest.mark.eval
 def test_subagent_wait_basic():
@@ -587,7 +633,6 @@ def test_subprocess_actual_process_creation():
 def test_subprocess_command_includes_required_flags():
     """Test that subprocess command includes all required gptme flags."""
     import subprocess
-    import sys
     import tempfile
     from pathlib import Path
 
@@ -1139,7 +1184,7 @@ def test_profile_hard_tool_enforcement():
         patch.object(
             gptme.tools.subagent.execution, "get_tools", return_value=mock_tools
         ),
-        patch.object(sys.modules["gptme"], "chat"),
+        patch.object(sys.modules["gptme.chat"], "chat"),
         patch.object(
             gptme.executor,
             "prepare_execution_environment",
@@ -1196,7 +1241,7 @@ def test_profile_no_restriction_skips_set_tools():
         patch.object(
             gptme.tools.subagent.execution, "get_tools", return_value=mock_tools
         ),
-        patch.object(sys.modules["gptme"], "chat"),
+        patch.object(sys.modules["gptme.chat"], "chat"),
         patch.object(
             gptme.executor,
             "prepare_execution_environment",
@@ -1281,7 +1326,7 @@ def test_create_subagent_thread_warns_on_unknown_profile_tools(tmp_path):
         patch("gptme.tools.subagent.execution.get_tools", return_value=tools),
         patch("gptme.executor.prepare_execution_environment"),
         patch("gptme.prompts.get_prompt", mock_prompt),
-        patch("gptme.chat", mock_chat),
+        patch.object(sys.modules["gptme.chat"], "chat", mock_chat),
         patch("gptme.tools.subagent.execution.logger.warning", mock_warn),
     ):
         _create_subagent_thread(
@@ -1304,6 +1349,71 @@ def test_create_subagent_thread_warns_on_unknown_profile_tools(tmp_path):
     assert filtered_names == {"read", "complete"}
 
     # Ensure chat got the user prompt message
+    prompt_msgs = mock_chat.call_args.args[0]
+    assert prompt_msgs == [Message("user", "test")]
+
+
+def test_create_subagent_thread_profile_glob_filters_tools(tmp_path):
+    """Glob tool allowlists should filter grouped MCP tools without warnings."""
+    from unittest.mock import MagicMock, patch
+
+    from gptme.message import Message
+    from gptme.profiles import Profile
+    from gptme.tools.base import ToolSpec
+    from gptme.tools.subagent.execution import _create_subagent_thread
+
+    profile = Profile(
+        name="discord-reader",
+        description="discord only",
+        tools=["discord.*"],
+    )
+    tools = [
+        ToolSpec(name="discord.read_channel", desc="", is_mcp=True),
+        ToolSpec(name="discord.send_message", desc="", is_mcp=True),
+        ToolSpec(name="shell", desc=""),
+        ToolSpec(name="complete", desc=""),
+    ]
+
+    mock_prompt = MagicMock(return_value=[])
+    mock_chat = MagicMock()
+    mock_warn = MagicMock()
+    set_tools_calls: list[list[str]] = []
+
+    def spy_set_tools(filtered_tools):
+        set_tools_calls.append([tool.name for tool in filtered_tools])
+
+    with (
+        patch("gptme.profiles.get_profile", return_value=profile),
+        patch("gptme.tools.subagent.execution.get_tools", return_value=tools),
+        patch("gptme.tools.subagent.execution.set_tools", side_effect=spy_set_tools),
+        patch("gptme.executor.prepare_execution_environment"),
+        patch("gptme.prompts.get_prompt", mock_prompt),
+        patch.object(sys.modules["gptme.chat"], "chat", mock_chat),
+        patch("gptme.tools.subagent.execution.logger.warning", mock_warn),
+    ):
+        _create_subagent_thread(
+            prompt="test",
+            logdir=tmp_path,
+            model=None,
+            context_mode="full",
+            context_include=None,
+            workspace=tmp_path,
+            profile_name="discord-reader",
+        )
+
+    mock_warn.assert_not_called()
+    assert set_tools_calls == [
+        ["discord.read_channel", "discord.send_message", "complete"]
+    ]
+
+    filtered_tools = mock_prompt.call_args.args[0]
+    filtered_names = {t.name for t in filtered_tools}
+    assert filtered_names == {
+        "discord.read_channel",
+        "discord.send_message",
+        "complete",
+    }
+
     prompt_msgs = mock_chat.call_args.args[0]
     assert prompt_msgs == [Message("user", "test")]
 

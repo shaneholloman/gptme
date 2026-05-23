@@ -8,6 +8,7 @@ Tests browse_workspace and preview_file endpoints, including:
 - Error handling
 """
 
+import shutil
 from pathlib import Path
 from uuid import uuid4
 
@@ -28,6 +29,15 @@ from gptme.server.workspace_api import (  # fmt: skip
 
 # Mark tests that require the server and add timeouts
 pytestmark = [pytest.mark.timeout(10)]
+
+
+def _replace_workspace_link(workspace_link: Path, target: Path) -> None:
+    """Replace a conversation workspace path with a symlink for test setup."""
+    if workspace_link.is_symlink() or workspace_link.is_file():
+        workspace_link.unlink()
+    elif workspace_link.is_dir():
+        shutil.rmtree(workspace_link)
+    workspace_link.symlink_to(target)
 
 
 # ============================================================
@@ -358,9 +368,7 @@ def workspace_conv(client: FlaskClient, tmp_path: Path):
 
     # Symlink the workspace directory
     workspace_link = manager.logdir / "workspace"
-    if workspace_link.exists() or workspace_link.is_symlink():
-        workspace_link.unlink()
-    workspace_link.symlink_to(workspace)
+    _replace_workspace_link(workspace_link, workspace)
 
     yield {
         "conversation_id": convname,
@@ -692,9 +700,7 @@ class TestWorkspaceEdgeCases:
         empty_ws = tmp_path / "empty_workspace"
         empty_ws.mkdir()
         workspace_link = manager.logdir / "workspace"
-        if workspace_link.exists() or workspace_link.is_symlink():
-            workspace_link.unlink()
-        workspace_link.symlink_to(empty_ws)
+        _replace_workspace_link(workspace_link, empty_ws)
 
         response = client.get(f"/api/v2/conversations/{convname}/workspace")
         assert response.status_code == 200

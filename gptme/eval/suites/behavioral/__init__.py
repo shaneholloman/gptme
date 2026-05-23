@@ -71,6 +71,13 @@ from .add_type_hints import (  # noqa: F401
     check_typehints_mypy_passes,
     check_typehints_uses_generic_collection,
 )
+from .bounded_bugfix_with_decoys import (  # noqa: F401
+    check_bounded_bugfix_only_relevant_files_committed,
+    check_bounded_bugfix_pricing_fixed,
+    check_bounded_bugfix_regression_test_added,
+    check_bounded_bugfix_scope_preserved,
+    check_bounded_bugfix_tests_pass,
+)
 from .debug_data_pipeline import (  # noqa: F401
     check_pipeline_extract_emails_fixed,
     check_pipeline_source_unchanged,
@@ -133,6 +140,14 @@ from .merge_conflict_resolution import (  # noqa: F401
     check_merge_tests_pass,
     check_merge_upper_function,
 )
+from .minimal_feature_preserve_default_with_decoys import (  # noqa: F401
+    check_mfpd_decoys_untouched,
+    check_mfpd_include_chars_param_exists,
+    check_mfpd_new_tests_exist,
+    check_mfpd_original_behavior_preserved,
+    check_mfpd_scope_preserved,
+    check_mfpd_tests_pass,
+)
 from .multi_file_rename import (  # noqa: F401
     check_rename_new_name_in_geometry,
     check_rename_no_old_name,
@@ -171,6 +186,17 @@ from .retry_with_backoff import (  # noqa: F401
     check_retry_function_exists,
     check_retry_imported,
     check_retry_tests_pass,
+)
+from .root_cause_pipeline_debug import (  # noqa: F401
+    check_no_blanket_except,
+    check_root_cause_fixed,
+    check_sink_unchanged,
+)
+from .root_cause_pipeline_debug import (  # noqa: F401
+    check_pipeline_tests_pass as check_root_cause_pipeline_tests_pass,
+)
+from .root_cause_pipeline_debug import (  # noqa: F401
+    check_regression_test_added as check_root_cause_regression_test_added,
 )
 from .scope_discipline_bugfix import (  # noqa: F401
     check_scope_mean_fixed,

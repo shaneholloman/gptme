@@ -24,10 +24,13 @@ from gptme.tools.subagent import _subagents
 
 logger = logging.getLogger(__name__)
 
-# Set at session start if Anthropic API quota is exhausted
+# Set at session start if Anthropic API quota is exhausted or API key is invalid
 _anthropic_quota_exhausted = False
+# Human-readable reason for why requires_api tests are being skipped
+_anthropic_skip_reason = "Anthropic API quota exhausted or invalid API key"
 
-# Error patterns that indicate API quota/rate-limit exhaustion
+# Error patterns that indicate Anthropic API quota/rate-limit exhaustion.
+# Keep these Anthropic-specific to avoid silently masking failures from other providers.
 _QUOTA_ERROR_PATTERNS = [
     "usage limits",
     "rate limit",
@@ -36,6 +39,9 @@ _QUOTA_ERROR_PATTERNS = [
     "insufficient_quota",
     "exceeded your current quota",
     "spending limit",
+    # Anthropic-specific authentication failures — treat as "can't run API tests"
+    "authentication_error",
+    "invalid x-api-key",
 ]
 
 
@@ -52,9 +58,10 @@ def has_api_key() -> bool:
 
 
 def _check_anthropic_quota_exhausted() -> bool:
-    """Make a minimal API call to detect if the Anthropic quota is exhausted.
+    """Make a minimal API call to detect if Anthropic API tests should be skipped.
 
-    Returns True if quota is exhausted, False if API is available or key not configured.
+    Returns True if quota is exhausted or the API key is invalid/missing,
+    False if the API is available or ANTHROPIC_API_KEY is not configured.
     Runs whenever ANTHROPIC_API_KEY is configured, regardless of MODEL env var.
     """
     config = get_config()
@@ -81,6 +88,11 @@ def _check_anthropic_quota_exhausted() -> bool:
         return False
     except anthropic.RateLimitError as e:
         logger.warning(f"Anthropic API rate limited: {e}")
+        return True
+    except anthropic.AuthenticationError as e:
+        logger.warning(
+            f"Anthropic API key invalid — requires_api tests will be skipped: {e}"
+        )
         return True
     except Exception:
         return False
@@ -117,7 +129,7 @@ def pytest_runtest_makereport(item, call):
         error_str = str(call.excinfo.value).lower()
         if any(pattern in error_str for pattern in _QUOTA_ERROR_PATTERNS):
             report.outcome = "skipped"
-            report.longrepr = f"API quota exhausted during test: {call.excinfo.value}"
+            report.longrepr = f"API quota exhausted or invalid credentials during test: {call.excinfo.value}"
 
     return report
 
@@ -134,7 +146,7 @@ def pytest_collection_modifyitems(config, items):
             if "requires_api" in item.keywords:
                 item.add_marker(skip_api)
     elif _anthropic_quota_exhausted:
-        skip_api = pytest.mark.skip(reason="Anthropic API quota exhausted")
+        skip_api = pytest.mark.skip(reason=_anthropic_skip_reason)
         for item in items:
             if "requires_api" in item.keywords:
                 item.add_marker(skip_api)

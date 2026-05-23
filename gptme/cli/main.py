@@ -149,7 +149,7 @@ Utilities (gptme-util):
   gptme-util skills show NAME Show a skill or lesson by name
   gptme-util chats list       List past conversations
   gptme-util chats search Q   Search conversations for query
-  gptme-util chats send ID MSG Queue a prompt for a running chat
+  gptme-util chats send ID MSG Queue a prompt for a running chat from another terminal
   gptme-util chats rename     Rename a conversation
   gptme-util models list      List available models
   gptme-util context index    Index project files for RAG
@@ -550,7 +550,9 @@ def main(
     # join prompts, grouped by `-` if present, since that's the separator for "chained"/multiple-round prompts
     sep = "\n\n" + MULTIPROMPT_SEPARATOR
     prompts = [p.strip() for p in "\n\n".join(prompts).split(sep) if p]
-    # TODO: referenced file paths in multiprompts should be read when run, not when parsed
+    # File paths in multiprompts are expanded at runtime by include_paths() in
+    # _run_chat_loop (gptme/chat.py:194), not at parse time. Each prompt from the
+    # queue goes through include_paths when popped, ensuring fresh content.
     prompt_msgs = [Message("user", p) for p in prompts]
 
     def inject_stdin(prompt_msgs, piped_input: str | None) -> list[Message]:

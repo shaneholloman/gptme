@@ -37,6 +37,39 @@ def test_init_tools_allowlist():
     assert len(get_tools()) == 2
 
 
+def test_init_tools_allowlist_glob_matches_mcp_tools():
+    from gptme.tools.base import ToolSpec
+
+    fake_tools = [
+        ToolSpec(name="discord.read_channel", desc="Read", is_mcp=True),
+        ToolSpec(name="discord.send_message", desc="Send", is_mcp=True),
+        ToolSpec(name="save", desc="Save"),
+    ]
+
+    clear_tools()
+    with patch("gptme.tools.get_available_tools", return_value=fake_tools):
+        init_tools(allowlist=["discord.*"])
+
+    assert [tool.name for tool in get_tools()] == [
+        "discord.read_channel",
+        "discord.send_message",
+    ]
+
+
+def test_init_tools_error_explains_loaded_tools_mismatch():
+    from gptme.tools.base import ToolSpec
+
+    clear_tools()
+    fake_tools = [ToolSpec(name="save", desc="Save")]
+
+    with (
+        patch("gptme.tools.get_toolchain", return_value=[]),
+        patch("gptme.tools.get_available_tools", return_value=fake_tools),
+        pytest.raises(ValueError, match="should have been loaded"),
+    ):
+        init_tools(allowlist=["save"])
+
+
 def test_init_tools_allowlist_from_env():
     clear_tools()  # ensure clean state regardless of test ordering
 
@@ -387,6 +420,52 @@ def test_get_toolchain_nonstrict_skips_missing():
     tool_names = [t.name for t in tools]
     assert "save" in tool_names
     assert "nonexistent_tool_xyz" not in tool_names
+
+
+def test_get_toolchain_glob_matches_mcp_tools():
+    """Glob allowlists should match grouped MCP tool names."""
+    from gptme.tools.base import ToolSpec
+
+    fake_tools = [
+        ToolSpec(name="discord.read_channel", desc="Read", is_mcp=True),
+        ToolSpec(name="discord.send_message", desc="Send", is_mcp=True),
+        ToolSpec(name="save", desc="Save"),
+    ]
+
+    with patch("gptme.tools.get_available_tools", return_value=fake_tools):
+        tools = get_toolchain(["discord.*"], strict=True)
+
+    assert [tool.name for tool in tools] == [
+        "discord.read_channel",
+        "discord.send_message",
+    ]
+
+
+def test_get_toolchain_warns_when_plain_allowlist_excludes_mcp_tools(caplog):
+    """Plain allowlists should warn when they filter out available MCP tools."""
+    from gptme.tools.base import ToolSpec
+
+    clear_tools()
+    fake_tools = [
+        ToolSpec(name="discord.read_channel", desc="Read", is_mcp=True),
+        ToolSpec(name="discord.send_message", desc="Send", is_mcp=True),
+        ToolSpec(name="save", desc="Save"),
+    ]
+
+    with (
+        patch("gptme.tools.get_available_tools", return_value=fake_tools),
+        caplog.at_level("WARNING", logger="gptme.tools"),
+    ):
+        tools = get_toolchain(["save"], strict=True)
+        repeated_tools = get_toolchain(["save"], strict=True)
+
+    assert [tool.name for tool in tools] == ["save"]
+    assert [tool.name for tool in repeated_tools] == ["save"]
+    assert caplog.text.count("Tool allowlist excluded MCP tools") == 1
+    assert "Tool allowlist excluded MCP tools" in caplog.text
+    assert "discord.read_channel" in caplog.text
+    assert "discord.send_message" in caplog.text
+    assert "<server>.*" in caplog.text
 
 
 def test_tool_descriptions_within_openai_limit():

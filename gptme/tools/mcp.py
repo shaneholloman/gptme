@@ -493,23 +493,24 @@ tool = ToolSpec(
     name="mcp",
     desc="Search, discover, and manage MCP servers",
     instructions="""
-Search, load, and manage MCP servers. Loaded server tools available as `<server-name>.<tool-name>`. Search queries the Official MCP Registry (registry.modelcontextprotocol.io).
+### When to use the mcp tool
 
-**Resource Commands:**
-- `resources list <server>` - List available resources
-- `resources read <server> <uri>` - Read a resource by URI
-- `templates list <server>` - List resource templates
+Use mcp to discover, load, inspect, and manage MCP servers:
+- `/mcp search <capability>` finds new servers
+- `/mcp load <server-name>` loads one
+- `/mcp list` shows what is already loaded
 
-**Prompt Commands:**
-- `prompts list <server>` - List available prompts
-- `prompts get <server> <name> [args]` - Get a prompt with optional args
+Do not use mcp to call loaded tools; invoke them directly as
+`<server-name>.<tool-name>`.
 
-**Roots Commands** (operational boundaries):
-- `roots list [server]` - List configured roots
-- `roots add <server> <uri> [name]` - Add a root URI
-- `roots remove <server> <uri>` - Remove a root
+Search uses the Official MCP Registry (registry.modelcontextprotocol.io).
 
-Roots are advisory URIs (file paths, HTTP URLs) defining workspace boundaries.
+Other commands:
+- `info <server>` shows server details
+- `resources list/read` browses server resources
+- `templates list` lists resource templates
+- `prompts list/get` lists or fetches prompts
+- `roots list/add/remove` manages advisory workspace roots
 """.strip(),
     examples=examples,
     execute=execute_mcp,

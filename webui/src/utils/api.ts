@@ -1,6 +1,7 @@
 import { type CreateAgentResponse, type CreateAgentRequest } from '@/components/CreateAgentDialog';
 import type {
   ApiError,
+  ApiErrorDetails,
   ChatConfig,
   ConversationResponse,
   CreateConversationRequest,
@@ -23,10 +24,24 @@ type HeadersInit = globalThis.HeadersInit;
 // Error type for API client
 export class ApiClientError extends Error {
   status?: number;
+  code?: string;
+  type?: string;
+  details?: ApiErrorDetails;
 
-  constructor(message: string, status?: number) {
+  constructor(
+    message: string,
+    status?: number,
+    options?: {
+      code?: string;
+      type?: string;
+      details?: ApiErrorDetails;
+    }
+  ) {
     super(message);
     this.status = status;
+    this.code = options?.code;
+    this.type = options?.type;
+    this.details = options?.details;
     this.name = 'ApiClientError';
   }
 
@@ -35,9 +50,101 @@ export class ApiClientError extends Error {
   }
 }
 
+export function getApiErrorPresentation(
+  error: unknown,
+  options?: {
+    fallbackTitle?: string;
+    fallbackDescription?: string;
+  }
+): { title: string; description: string } {
+  let title = options?.fallbackTitle ?? 'Error';
+  let description = options?.fallbackDescription ?? 'Something went wrong';
+
+  if (ApiClientError.isApiError(error)) {
+    description = error.message || description;
+
+    if (
+      error.status === 402 ||
+      error.type === 'payment_required' ||
+      error.code === 'insufficient_credits' ||
+      error.code === 'no_subscription'
+    ) {
+      title = 'Payment required';
+    } else if (error.status === 401 || error.type === 'authentication_error') {
+      title = 'Authentication failed';
+    }
+  } else if (error instanceof Error && error.message) {
+    description = error.message;
+  }
+
+  return { title, description };
+}
+
 // Type guard for API error responses
 function isApiErrorResponse(response: unknown): response is ApiError {
   return typeof response === 'object' && response !== null && 'error' in response;
+}
+
+function normalizeApiError(
+  response: ApiError,
+  httpStatus?: number
+): {
+  message: string;
+  status?: number;
+  code?: string;
+  type?: string;
+  details?: ApiErrorDetails;
+} {
+  if (typeof response.error === 'string') {
+    return {
+      message: response.error,
+      status: response.status ?? httpStatus,
+    };
+  }
+
+  const details = response.error;
+  const fallbackMessage =
+    typeof response.status === 'number'
+      ? `HTTP error! status: ${response.status}`
+      : typeof httpStatus === 'number'
+        ? `HTTP error! status: ${httpStatus}`
+        : 'Unknown API error';
+
+  // Guard against null or non-object error details (e.g. {"error": null})
+  if (details == null || typeof details !== 'object') {
+    return {
+      message: fallbackMessage,
+      status:
+        typeof response.status === 'number'
+          ? response.status
+          : typeof httpStatus === 'number'
+            ? httpStatus
+            : undefined,
+    };
+  }
+
+  const message =
+    typeof details.message === 'string' && details.message.trim().length > 0
+      ? details.message
+      : typeof details.code === 'string' && details.code.trim().length > 0
+        ? details.code
+        : fallbackMessage;
+  const status =
+    typeof response.status === 'number'
+      ? response.status
+      : typeof details.status === 'number'
+        ? details.status
+        : typeof httpStatus === 'number'
+          ? httpStatus
+          : undefined;
+
+  return {
+    message,
+    status,
+    code: typeof details.code === 'string' ? details.code : undefined,
+    type: typeof details.type === 'string' ? details.type : undefined,
+    details,
+  };
 }
 
 /**
@@ -270,7 +377,8 @@ export class ApiClient {
     if (!response.ok) {
       // Try to extract error message from response body
       if (isApiErrorResponse(data)) {
-        throw new ApiClientError(data.error, response.status);
+        const apiError = normalizeApiError(data, response.status);
+        throw new ApiClientError(apiError.message, apiError.status, apiError);
       } else {
         throw new ApiClientError(`HTTP error! status: ${response.status}`, response.status);
       }
@@ -278,7 +386,8 @@ export class ApiClient {
 
     // Check if the response is an error (for successful HTTP status but API error)
     if (isApiErrorResponse(data)) {
-      throw new ApiClientError(data.error, data.status);
+      const apiError = normalizeApiError(data, response.status);
+      throw new ApiClientError(apiError.message, apiError.status, apiError);
     }
 
     return data as T;
@@ -998,10 +1107,11 @@ export class ApiClient {
 
     const data = await response.json();
     if (!response.ok) {
-      throw new ApiClientError(
-        isApiErrorResponse(data) ? data.error : `Upload failed: ${response.status}`,
-        response.status
-      );
+      if (isApiErrorResponse(data)) {
+        const apiError = normalizeApiError(data, response.status);
+        throw new ApiClientError(apiError.message, apiError.status, apiError);
+      }
+      throw new ApiClientError(`Upload failed: ${response.status}`, response.status);
     }
     return data;
   }

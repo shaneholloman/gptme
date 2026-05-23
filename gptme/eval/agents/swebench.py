@@ -1,8 +1,8 @@
 """
-Multi-stage SWE-bench agent from bjsi's original work (PR #424).
+Recovered multi-stage SWE-bench runner from bjsi's original work (PR #424).
 
-The understand/reproduce/fix sub-agents are not yet implemented — this is the
-orchestration skeleton that will drive them once they exist.
+The understand/reproduce/fix stages never landed. Keep the replay helpers and
+metadata plumbing, but fail fast until the staged execution path is real.
 """
 
 import logging
@@ -10,6 +10,7 @@ import os
 import time
 import uuid
 from pathlib import Path
+from typing import NoReturn
 
 from gptme.dirs import get_logs_dir
 from gptme.eval.swebench import SWEBenchInfo
@@ -18,8 +19,6 @@ from gptme.message import print_msg
 from gptme.tools import execute_msg, init_tools
 from gptme.util.auto_naming import generate_conversation_id
 
-from ..swe_extra.swe_bench_test_spec import instance_to_trajectory_info, make_test_spec
-
 try:
     from swebench.harness.constants import SWEbenchInstance
 except ImportError:
@@ -27,11 +26,35 @@ except ImportError:
 
 logger = logging.getLogger(__name__)
 
+MULTI_STAGE_RUNNER_UNAVAILABLE = (
+    "The recovered SWE-bench multi-stage runner from PR #424 is intentionally "
+    "disabled. The stage agents (Understand/Reproduce/Fix) were never "
+    "implemented, and the current eval chat path cannot write stage-specific "
+    "branch logs because GPTMe eval chats always persist to the main "
+    "conversation log. Use gptme.eval.swebench.main for single-agent runs "
+    "until branch-aware eval logging and concrete stage agents land."
+)
+
+
+def instance_to_trajectory_info(*args, **kwargs):
+    from ..swe_extra.swe_bench_test_spec import instance_to_trajectory_info as impl
+
+    return impl(*args, **kwargs)
+
+
+def make_test_spec(*args, **kwargs):
+    from ..swe_extra.swe_bench_test_spec import make_test_spec as impl
+
+    return impl(*args, **kwargs)
+
 
 class SWEBenchAgent:
     """Multi-stage SWE-bench agent that orchestrates understand/reproduce/fix phases."""
 
     stages = ["understand", "reproduce", "fix"]
+
+    def _raise_stage_runner_unavailable(self) -> NoReturn:
+        raise NotImplementedError(MULTI_STAGE_RUNNER_UNAVAILABLE)
 
     def act(
         self,
@@ -43,6 +66,8 @@ class SWEBenchAgent:
         start_stage: str = "understand",
         **kwargs,
     ):
+        self._raise_stage_runner_unavailable()
+
         # Initialize or load trajectory info
         trajectory_info = instance_to_trajectory_info(
             instance,
@@ -137,6 +162,8 @@ class SWEBenchAgent:
         resume_dir: Path | None = None,
         **kwargs,
     ):
+        self._raise_stage_runner_unavailable()
+
         instance_id = instance["instance_id"]
         problem_statement = instance["problem_statement"]
         info = SWEBenchInfo.load_from_log_dir(resume_dir) if resume_dir else None
@@ -189,6 +216,8 @@ class SWEBenchAgent:
             logger.info(
                 f"Evaluation completed for instance {instance_id}. Passed: {passed}"
             )
+        except NotImplementedError:
+            raise
         except Exception as e:
             import traceback
 

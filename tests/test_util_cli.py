@@ -164,6 +164,20 @@ def test_chats_send(tmp_path, monkeypatch):
     assert [record["content"] for record in records] == ["follow up"]
 
 
+def test_chats_send_help_mentions_queued_follow_up_flow():
+    """Test that chats send help explains the queued-follow-up workflow."""
+    import re
+
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["chats", "send", "--help"])
+
+    assert result.exit_code == 0
+    help_text = " ".join(result.output.lower().split())
+    assert re.search(r"queue.*prompt", help_text)
+    assert re.search(r"running conversation|gptme process.*busy", help_text)
+
+
 def test_tools_list():
     """Test the tools list command."""
     import json
@@ -319,6 +333,7 @@ def test_models_list_json_suppresses_provider_noise(mocker):
                 supports_vision=True,
                 supports_reasoning=True,
                 supports_parallel_tool_calls=True,
+                supports_responses_api=True,
                 price_input=None,
                 price_output=None,
                 knowledge_cutoff=None,
@@ -358,6 +373,7 @@ def test_models_list_json_available_keeps_plugin_models(mocker):
                 supports_vision=False,
                 supports_reasoning=False,
                 supports_parallel_tool_calls=False,
+                supports_responses_api=False,
                 price_input=0,
                 price_output=0,
                 knowledge_cutoff=None,
