@@ -216,6 +216,11 @@ class HybridLessonMatcher(LessonMatcher):
         )
         self._ts_posteriors = _load_effectiveness_scores(state_file)
 
+        # Cache of lesson embeddings keyed on the encoded lesson text. Lessons are
+        # matched on every turn but their text is static, so re-encoding the same
+        # candidates each turn is wasted compute. See _semantic_score.
+        self._lesson_embed_cache: dict[str, Any] = {}
+
     def match(
         self, lessons: list[Lesson], context: MatchContext, threshold: float = 0.0
     ) -> list[MatchResult]:
@@ -359,9 +364,22 @@ class HybridLessonMatcher(LessonMatcher):
 
         import numpy as np
 
-        # Generate lesson embedding from title and body
-        lesson_text = f"{lesson.title}\n{lesson.body[:500]}"  # Limit to first 500 chars
-        lesson_embed = self.embedder.encode(lesson_text, convert_to_numpy=True)
+        # Use description field for semantic matching — it encodes "when to use" in prose,
+        # which is more informative than raw body text for retrieval.
+        # Prefer explicit frontmatter description, fall back to extracted first-paragraph,
+        # then fall back to body[:500] so title-only embedding never silently degrades
+        # lessons that have no description field.
+        desc = lesson.metadata.description or lesson.description or lesson.body[:500]
+        lesson_text = f"{lesson.title}\n{desc}"
+
+        # Cache embeddings on the lesson text: matching runs every turn, but the
+        # text is static, so re-encoding the same candidates each turn is wasted
+        # compute. Keying on the text means an edited description naturally yields
+        # a fresh embedding — no stale-cache risk.
+        lesson_embed = self._lesson_embed_cache.get(lesson_text)
+        if lesson_embed is None:
+            lesson_embed = self.embedder.encode(lesson_text, convert_to_numpy=True)
+            self._lesson_embed_cache[lesson_text] = lesson_embed
 
         # Cosine similarity (guard against zero-norm embeddings)
         query_norm = np.linalg.norm(query_embed)

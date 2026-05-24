@@ -11,7 +11,7 @@ from gptme.tools import ToolUse
 logger = logging.getLogger(__name__)
 
 
-@pytest.mark.timeout(20)
+@pytest.mark.timeout(60)
 def test_tool_confirmation_flow(
     init_, setup_conversation, event_listener, mock_generation, wait_for_event
 ):
@@ -41,7 +41,12 @@ def test_tool_confirmation_flow(
     )
 
     # Start generation with mocked response
-    with unittest.mock.patch("gptme.server.session_step._stream", mock_stream):
+    with (
+        unittest.mock.patch("gptme.server.session_step._stream", mock_stream),
+        unittest.mock.patch(
+            "gptme.server.session_step._try_auto_name_and_notify", return_value=None
+        ),
+    ):
         # Request a step
         requests.post(
             f"http://localhost:{port}/api/v2/conversations/{conversation_id}/step",
@@ -65,8 +70,12 @@ def test_tool_confirmation_flow(
         assert wait_for_event(event_listener, "tool_executing")
         assert wait_for_event(event_listener, "message_added")
 
-        # Wait for assistant final response
+        # Wait for assistant final response and completion before leaving the
+        # mock context; otherwise the background continuation thread may fall
+        # through to the real LLM stream.
+        assert wait_for_event(event_listener, "generation_started")
         assert wait_for_event(event_listener, "message_added")
+        assert wait_for_event(event_listener, "generation_complete")
 
     # Verify conversation state
     resp = requests.get(
@@ -74,21 +83,33 @@ def test_tool_confirmation_flow(
     )
     assert resp.status_code == 200
 
-    # Check message sequence
-    # Note: Message order can vary depending on hook execution order
-    # Message count varies: 6 (CI, no lessons) or 7 (local, with lessons)
-    # Expect: system prompt, user message, TOKEN_BUDGET, possibly lessons, then assistant/system messages
-    # Temp fix: added 5 due to test flakiness
+    # Check message sequence.
+    # Hook-injected hidden context can legitimately add system messages here
+    # (token budget, lessons, active context, output-format hints, etc.), so
+    # assert the flow invariants instead of a brittle exact message count.
     messages = resp.json()["log"]
-    assert len(messages) in [5, 6, 7], f"Expected 6 or 7 messages, got {len(messages)}"
+    assert len(messages) >= 5, f"Expected at least 5 messages, got {len(messages)}"
 
     # Verify message content
     assert messages[0]["role"] == "system" and "testing" in messages[0]["content"]
 
-    # Find the user message (should be early in sequence)
-    user_msg_idx = next(i for i, m in enumerate(messages) if m["role"] == "user")
-    assert user_msg_idx <= 2, "User message should be within first 3 messages"
+    # Find the user message and verify the assistant/tool flow follows it.
+    user_msg_idx = next(
+        (i for i, m in enumerate(messages) if m["role"] == "user"), None
+    )
+    assert user_msg_idx is not None, "No user message found in conversation"
     assert "List files" in messages[user_msg_idx]["content"]
+
+    assistant_tool_idx = next(
+        (
+            i
+            for i, m in enumerate(messages)
+            if m["role"] == "assistant" and "ls -la" in m["content"]
+        ),
+        None,
+    )
+    assert assistant_tool_idx is not None, "No assistant tool message (ls -la) found"
+    assert user_msg_idx < assistant_tool_idx
 
     # Verify TOKEN_BUDGET message exists
     assert any(
@@ -99,9 +120,10 @@ def test_tool_confirmation_flow(
 
     # Verify final assistant message
     assert messages[-1]["role"] == "assistant"
+    assert "Done" in messages[-1]["content"]
 
 
-@pytest.mark.timeout(20)
+@pytest.mark.timeout(60)
 def test_tool_confirmation_without_session_id(
     init_, setup_conversation, event_listener, mock_generation, wait_for_event
 ):
@@ -130,7 +152,12 @@ def test_tool_confirmation_without_session_id(
     )
 
     # Start generation with mocked response
-    with unittest.mock.patch("gptme.server.session_step._stream", mock_stream):
+    with (
+        unittest.mock.patch("gptme.server.session_step._stream", mock_stream),
+        unittest.mock.patch(
+            "gptme.server.session_step._try_auto_name_and_notify", return_value=None
+        ),
+    ):
         # Request a step
         requests.post(
             f"http://localhost:{port}/api/v2/conversations/{conversation_id}/step",
@@ -155,6 +182,9 @@ def test_tool_confirmation_without_session_id(
         # Wait for tool execution
         assert wait_for_event(event_listener, "tool_executing")
         assert wait_for_event(event_listener, "message_added")
+        assert wait_for_event(event_listener, "generation_started")
+        assert wait_for_event(event_listener, "message_added")
+        assert wait_for_event(event_listener, "generation_complete")
 
 
 @pytest.mark.timeout(10)
