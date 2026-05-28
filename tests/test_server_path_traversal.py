@@ -25,9 +25,10 @@ from flask.testing import FlaskClient  # fmt: skip
 pytestmark = [pytest.mark.timeout(10)]
 
 
-# Payloads that bypass Flask's URL routing (no '/' so <string:> matches them)
-# Payloads with '/' are already blocked by Flask routing (<string:> doesn't match '/')
+# Payloads that bypass Flask's URL routing (no '/' so <string:> matches them).
+# Payloads with '/' are already blocked by Flask routing (<string:> doesn't match '/').
 TRAVERSAL_PAYLOADS = [
+    ".",
     "..",
     "test\\..\\..\\secret",
     "..\\..\\etc\\passwd",
@@ -495,6 +496,178 @@ class TestAgentCreationPathValidation:
         assert response.status_code == 400
         data = response.get_json()
         assert "alphanumeric" in data["error"].lower()
+
+
+class TestConversationIdLengthValidation:
+    """conversation_id values longer than NAME_MAX must return 400, not 500.
+
+    Linux filesystems (ext4, xfs) raise OSError ENAMETOOLONG for path components
+    longer than NAME_MAX (typically 255).  The server used to catch only
+    FileNotFoundError, so an over-long ID triggered an unhandled 500.
+    """
+
+    def test_too_long_id_returns_400_not_500(self, client: FlaskClient):
+        """A 256-char conversation_id must return 400, not 500 (OSError)."""
+        long_id = "a" * 256
+        response = client.get(f"/api/v2/conversations/{long_id}")
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert "too long" in data["error"]
+
+    def test_exactly_255_chars_is_accepted(self, client: FlaskClient):
+        """A 255-char ID is at the limit and must not be rejected by length check."""
+        ok_id = "a" * 255
+        response = client.get(f"/api/v2/conversations/{ok_id}")
+        # Must not crash (500) and must not be rejected for length
+        assert response.status_code != 500
+        if response.status_code == 400:
+            data = response.get_json()
+            assert data is None or "too long" not in data.get("error", "")
+
+    def test_very_long_id_unit(self):
+        """Unit test: _validate_conversation_id returns error for over-limit IDs."""
+        from gptme.server.api_v2_common import _validate_conversation_id
+        from gptme.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            result = _validate_conversation_id("a" * 256)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_255_char_id_passes_unit(self):
+        """Unit test: _validate_conversation_id accepts IDs up to 255 chars."""
+        from gptme.server.api_v2_common import _validate_conversation_id
+        from gptme.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            assert _validate_conversation_id("a" * 255) is None
+
+    def test_whitespace_only_id_rejected_unit(self):
+        """Whitespace-only conversation IDs must be rejected before hitting disk."""
+        from gptme.server.api_v2_common import _validate_conversation_id
+        from gptme.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            result = _validate_conversation_id("   ")
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    @pytest.mark.parametrize(
+        "bad_id", [" leading", "trailing ", "foo\tbar", "foo\nbar"]
+    )
+    def test_control_or_edge_whitespace_id_rejected_unit(self, bad_id: str):
+        """Control chars and edge whitespace should fail before filesystem access."""
+        from gptme.server.api_v2_common import _validate_conversation_id
+        from gptme.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            result = _validate_conversation_id(bad_id)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_multibyte_over_limit_rejected(self):
+        """Multi-byte chars counted by UTF-8 bytes, not code points.
+
+        255 CJK chars = 765 bytes > NAME_MAX and must be rejected even though
+        len() == 255 (code points).
+        """
+        from gptme.server.api_v2_common import _validate_conversation_id
+        from gptme.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            # Each CJK char is 3 UTF-8 bytes; 85 * 3 = 255 bytes (at limit, OK)
+            assert _validate_conversation_id("あ" * 85) is None
+            # 86 * 3 = 258 bytes (over limit, must reject)
+            result = _validate_conversation_id("あ" * 86)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+
+class TestBranchLengthValidation:
+    """Branch names longer than NAME_MAX must return 400, not 500."""
+
+    def test_too_long_branch_unit(self):
+        """Unit test: _validate_branch returns error for over-limit names.
+
+        Effective limit is NAME_MAX - len(".jsonl") = 249 bytes because the
+        on-disk filename is ``{branch}.jsonl``.
+        """
+        from gptme.server.api_v2_common import _validate_branch
+        from gptme.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            result = _validate_branch("b" * 250)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_249_char_branch_passes_unit(self):
+        """Unit test: _validate_branch accepts names up to 249 bytes.
+
+        249 bytes is the effective limit: NAME_MAX (255) minus the 6-byte
+        ``.jsonl`` suffix that is appended when the branch is stored on disk.
+        """
+        from gptme.server.api_v2_common import _validate_branch
+        from gptme.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            # 249 bytes: at the effective limit — must pass
+            assert _validate_branch("b" * 249) is None
+            # 250 bytes: one over the limit — must be rejected
+            result = _validate_branch("b" * 250)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_multibyte_branch_over_limit_rejected(self):
+        """Multi-byte branch names counted by UTF-8 bytes, not code points.
+
+        Effective limit is 249 bytes (NAME_MAX - len(".jsonl")).
+        Each CJK char is 3 UTF-8 bytes, so 83 chars = 249 bytes (OK),
+        84 chars = 252 bytes (over limit).
+        """
+        from gptme.server.api_v2_common import _validate_branch
+        from gptme.server.app import create_app
+
+        app = create_app()
+        with app.app_context():
+            # 83 CJK chars = 249 bytes (at effective limit, OK)
+            assert _validate_branch("あ" * 83) is None
+            # 84 CJK chars = 252 bytes (over effective limit, must reject)
+            result = _validate_branch("あ" * 84)
+            assert result is not None
+            _response, status_code = result
+            assert status_code == 400
+
+    def test_too_long_branch_via_endpoint(self, client: FlaskClient):
+        """Over-limit branch name in generate request must return 400.
+
+        Effective limit is 249 bytes; 250 bytes must be rejected.
+        """
+        response = client.post(
+            "/api/v2/conversations/test-conv",
+            json={
+                "role": "user",
+                "content": "hello",
+                "branch": "b" * 250,
+            },
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert "too long" in data["error"]
 
 
 class TestValidateBranchUnit:

@@ -7,6 +7,9 @@ Command groups are split into separate modules for maintainability:
 - cmd_hooks.py: Claude Code hook installation and execution
 - cmd_mcp.py: MCP server management (list, test, info, search)
 - cmd_skills.py: Skills and lessons (list, show, search, install, validate, etc.)
+
+Inline command groups (smaller, live in this file):
+- context: RAG index/retrieve plus workspace/git/journal context generation
 """
 
 # Filter requests' overly-strict version-compatibility warning before any
@@ -19,17 +22,24 @@ warnings.filterwarnings(
     message=r".*urllib3.*chardet.*charset_normalizer.*",
 )
 
+import glob
 import importlib
 import io
 import json
 import logging
 import os
+import subprocess
 import sys
 import time
 from contextlib import redirect_stderr, redirect_stdout
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 import click
+
+if TYPE_CHECKING:
+    from rich.tree import Tree as RichTree
 
 _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
     "agents": (".cmd_agents", "agents"),
@@ -247,7 +257,10 @@ def tokens():
 @click.argument("text", required=False)
 @click.option("-m", "--model", default="gpt-4", help="Model to use for token counting.")
 @click.option(
-    "-f", "--file", type=click.Path(exists=True), help="File to count tokens in."
+    "-f",
+    "--file",
+    type=click.Path(exists=True, dir_okay=False),
+    help="File to count tokens in.",
 )
 def tokens_count(text: str | None, model: str, file: str | None):
     """Count tokens in text or file."""
@@ -257,12 +270,15 @@ def tokens_count(text: str | None, model: str, file: str | None):
     if file:
         with open(file) as f:
             text = f.read()
-    elif not text and not sys.stdin.isatty():
+    elif text == "-":
         text = sys.stdin.read()
 
     if not text:
-        print("Error: No text provided. Use --file or pipe text to stdin.")
-        return
+        print(
+            "Error: No text provided. Use --file, a text argument, "
+            "or '-' to read from stdin."
+        )
+        sys.exit(1)
 
     # Validate model
     try:
@@ -322,6 +338,239 @@ def context_retrieve(query: str, full: bool):
     print(results)
 
 
+def _git_run(cmd: list[str], check: bool = True, timeout: int = 10) -> tuple[str, bool]:
+    """Run a git command and return (stdout, success)."""
+    try:
+        env = os.environ.copy()
+        env.update({"PAGER": "cat", "GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0"})
+        result = subprocess.run(
+            ["git"] + cmd,
+            capture_output=True,
+            text=True,
+            check=check,
+            env=env,
+            timeout=timeout,
+        )
+        if result.returncode != 0:
+            return (result.stderr or result.stdout).strip(), False
+        return result.stdout.strip(), True
+    except subprocess.TimeoutExpired:
+        return "", False
+    except subprocess.CalledProcessError as e:
+        return e.stderr.strip(), False
+
+
+def _codeblock(langtag: str, content: str) -> str:
+    return f"```{langtag}\n{content}\n```"
+
+
+def _read_gitignore(path: str) -> list[str]:
+    ignores: list[str] = []
+    for fp in [
+        os.path.join(path, ".gitignore"),
+        os.path.expanduser("~/.config/git/ignore"),
+    ]:
+        if os.path.exists(fp):
+            with open(fp) as f:
+                ignores += [
+                    line.strip()
+                    for line in f
+                    if line.strip() and not line.startswith("#")
+                ]
+    return ignores
+
+
+def _walk_directory(
+    directory: Path,
+    tree: "RichTree",
+    excludes: list[str],
+    max_depth: int | None,
+    depth: int = 1,
+) -> None:  # type: ignore[name-defined]
+    from rich.filesize import decimal
+    from rich.markup import escape
+    from rich.text import Text
+
+    if max_depth is not None and depth > max_depth:
+        return
+    try:
+        for path in sorted(
+            Path(directory).iterdir(), key=lambda p: (p.is_file(), p.name.lower())
+        ):
+            if any(path.match(e) for e in excludes):
+                continue
+            try:
+                if path.is_dir():
+                    style = "dim" if path.name.startswith("__") else ""
+                    branch = tree.add(
+                        f"[bold magenta][link file://{path}]{escape(path.name)}/",
+                        style=style,
+                        guide_style=style,
+                    )
+                    _walk_directory(path, branch, excludes, max_depth, depth + 1)
+                else:
+                    text = Text(path.name, "green")
+                    text.highlight_regex(r"\..*$", "bold red")
+                    text.stylize(f"link file://{path}")
+                    text.append(f" ({decimal(path.stat().st_size)})", "blue")
+                    tree.add(text)
+            except OSError as e:
+                tree.add(f"[red]{path.name} [Error: {e}]")
+    except (PermissionError, OSError) as e:
+        tree.add(f"[red][Error: {e}]")
+
+
+@context.command("git")
+def context_git():
+    """Summarise the current git repo: branch, recent commits, staged/unstaged changes."""
+    output, success = _git_run(["rev-parse", "--git-dir"])
+    if not success:
+        click.echo("Not a git repository", err=True)
+        raise SystemExit(1)
+
+    print("## Git\n")
+
+    log_out, ok = _git_run(
+        [
+            "log",
+            "--pretty=format:%h (%ad) %s",
+            "--date=format:%Y-%m-%d %H:%M",
+            "-n",
+            "5",
+        ]
+    )
+    if ok and log_out:
+        print("### Recent commits")
+        for line in log_out.split("\n"):
+            print(f"- {line}")
+        print()
+
+    status_out, ok = _git_run(["status", "-vv"])
+    if ok and status_out:
+        print(_codeblock("", status_out))
+
+
+@context.command("tree")
+@click.option(
+    "--path", type=click.Path(exists=True), default=".", help="Workspace root"
+)
+@click.option("--max-depth", type=int, default=1, help="Tree depth")
+def context_tree(path: str, max_depth: int):
+    """Print workspace directory tree (respects .gitignore)."""
+    from rich.console import Console
+    from rich.tree import Tree
+
+    excludes = _read_gitignore(path) + [".git"]
+    abs_path = os.path.abspath(path)
+    tree = Tree(abs_path, guide_style="bold bright_blue")
+    _walk_directory(Path(path), tree, excludes, max_depth)
+    buffer = io.StringIO()
+    console = Console(file=buffer, force_terminal=False, color_system=None)
+    console.print(tree)
+    print("## Workspace structure")
+    print(_codeblock("tree", buffer.getvalue().rstrip()))
+
+
+@context.command("files")
+@click.option(
+    "--config",
+    type=click.Path(exists=True),
+    default=None,
+    help="Path to gptme.toml (default: auto-discover from git root or cwd)",
+)
+def context_files(config: str | None):
+    """Print the contents of all files listed in gptme.toml [prompt] files.
+
+    Replaces ad-hoc context scripts in non-gptme harnesses (autonomous runs,
+    project-monitoring) that manually concatenate gptme.toml prompt files.
+    """
+    if sys.version_info >= (3, 11):
+        import tomllib
+    else:
+        import tomli as tomllib  # type: ignore[no-redef]
+
+    # Discover gptme.toml from cwd → git root
+    toml_path: Path | None
+    if config:
+        toml_path = Path(config)
+    else:
+        candidates = [Path.cwd() / "gptme.toml"]
+        root, ok = _git_run(["rev-parse", "--show-toplevel"])
+        if ok and root:
+            candidates.append(Path(root) / "gptme.toml")
+        toml_path = next((p for p in candidates if p.exists()), None)  # type: ignore[arg-type]
+
+    if not toml_path or not toml_path.exists():
+        click.echo("No gptme.toml found. Use --config to specify path.", err=True)
+        raise SystemExit(1)
+
+    with open(toml_path, "rb") as f:
+        cfg = tomllib.load(f)
+
+    files = cfg.get("prompt", {}).get("files", [])
+    if not files:
+        click.echo("No [prompt] files configured in gptme.toml.", err=True)
+        raise SystemExit(1)
+
+    workspace = toml_path.parent
+    for rel in files:
+        fpath = workspace / rel
+        if not fpath.exists():
+            click.echo(f"# FILE: {rel} (not found)\n", err=True)
+            continue
+        print(f"## FILE: {rel}\n")
+        print(fpath.read_text())
+        print("---\n")
+
+
+@context.command("journal")
+@click.option("--days", type=int, default=7, help="Days to look back")
+@click.option(
+    "--path",
+    type=click.Path(exists=True, file_okay=False),
+    help="Journal directory",
+)
+def context_journal(days: int, path: str | None):
+    """Print journal entries from the last N days."""
+    # Discover journal dir: prefer workspace-relative path first
+    candidates: list[str | None] = [path]
+    repo_root, ok = _git_run(["rev-parse", "--show-toplevel"])
+    if ok and repo_root:
+        candidates.append(os.path.join(repo_root, "journal"))
+    candidates += [
+        os.path.expanduser("~/journal"),
+        os.path.expanduser("~/Documents/journal"),
+        os.path.expanduser("~/notes"),
+    ]
+
+    journal_dir: str | None = None
+    for loc in candidates:
+        if loc and os.path.isdir(loc):
+            journal_dir = loc
+            break
+
+    if not journal_dir:
+        click.echo("No journal directory found. Use --path to specify one.", err=True)
+        raise SystemExit(1)
+
+    today = datetime.now(tz=timezone.utc).astimezone().date()
+    dates = [(today - timedelta(days=i)).strftime("%Y-%m-%d") for i in range(days)]
+    entries: list[str] = []
+    for date in dates:
+        # Support both flat (YYYY-MM-DD-topic.md) and subdirectory (YYYY-MM-DD/topic.md) layouts
+        flat_files = glob.glob(os.path.join(journal_dir, f"*{date}*.md"))
+        subdir_files = glob.glob(os.path.join(journal_dir, date, "*.md"))
+        for file in flat_files + subdir_files:
+            with open(file) as f:
+                entries.append(f"\n# {date} — {os.path.basename(file)}\n{f.read()}")
+
+    if entries:
+        print(f"Journal entries from the last {days} days:\n")
+        print("\n".join(entries))
+    else:
+        print(f"No journal entries found for the last {days} days")
+
+
 @main.group()
 def llm():
     """LLM-related utilities."""
@@ -335,7 +584,16 @@ def llm():
     help="Model to use (e.g. openai/gpt-4o, anthropic/claude-sonnet-4-6)",
 )
 @click.option("--stream/--no-stream", default=False, help="Stream the response")
-def llm_generate(prompt: str | None, model: str | None, stream: bool):
+@click.option(
+    "--system",
+    "system_prompt",
+    default="You are a helpful assistant.",
+    show_default=True,
+    help="System message to prepend.",
+)
+def llm_generate(
+    prompt: str | None, model: str | None, stream: bool, system_prompt: str
+):
     """Generate a response from an LLM without any formatting."""
 
     # Suppress all logging output to get clean response
@@ -374,17 +632,18 @@ def llm_generate(prompt: str | None, model: str | None, stream: bool):
         console.quiet = True
 
         # Initialize with minimal setup - no tools needed for simple generation
-        init(model, interactive=False, tool_allowlist=[], tool_format="markdown")
+        try:
+            init(model, interactive=False, tool_allowlist=[], tool_format="markdown")
+        except ValueError as e:
+            raise click.UsageError(str(e)) from e
 
         # Get model or use default
         if not model:
             default_model = get_default_model()
             if not default_model:
-                print(
-                    "Error: No model specified and no default model available.",
-                    file=sys.stderr,
+                raise click.UsageError(
+                    "No model specified and no default model available."
                 )
-                sys.exit(1)
             model = default_model.full
 
         # Ensure provider is initialized
@@ -392,11 +651,10 @@ def llm_generate(prompt: str | None, model: str | None, stream: bool):
             provider = get_provider_from_model(model)
             init_llm(provider)
         except ValueError as e:
-            print(f"Error: {e}", file=sys.stderr)
-            sys.exit(1)
+            raise click.UsageError(str(e)) from e
 
-    # Create message
-    messages = [Message("user", prompt)]
+    # Anthropic requires the first message to be a system message
+    messages = [Message("system", system_prompt), Message("user", prompt)]
 
     try:
         if stream:
@@ -406,7 +664,7 @@ def llm_generate(prompt: str | None, model: str | None, stream: bool):
             print()  # Final newline
         else:
             # Get complete response and print it
-            response = _chat_complete(messages, model, None)
+            response, _ = _chat_complete(messages, model, None)
             print(response)
     except Exception as e:
         print(f"Error generating response: {e}", file=sys.stderr)
@@ -495,9 +753,21 @@ def tools_info(
         if tool_name in available_dict:
             tool = available_dict[tool_name]
         else:
-            print(f"Tool '{tool_name}' not found. Available tools:")
-            for name in sorted(available_dict.keys()):
-                print(f"  - {name}")
+            if as_json:
+                click.echo(
+                    json.dumps(
+                        {
+                            "tool": tool_name,
+                            "error": f"Tool '{tool_name}' not found",
+                            "available_tools": sorted(available_dict.keys()),
+                        },
+                        indent=2,
+                    )
+                )
+            else:
+                print(f"Tool '{tool_name}' not found. Available tools:")
+                for name in sorted(available_dict.keys()):
+                    print(f"  - {name}")
             sys.exit(1)
 
     if as_json:
@@ -530,15 +800,32 @@ def tools_info(
 )
 def tools_call(tool_name: str, function_name: str, arg: list[str]):
     """Call a tool with the given arguments."""
-    from ..tools import get_tool, get_tools, init_tools  # fmt: skip
+    from ..tools import get_available_tools, get_tool, init_tools  # fmt: skip
 
-    # Initialize tools
-    init_tools()
+    # Load the requested tool even if it is not part of the default toolchain.
+    # Some tools (e.g. computer, rag, subagent) expose callable functions but
+    # are not loaded by default, so a bare init_tools() would leave them
+    # uncallable. init_tools raises ValueError for two distinct reasons:
+    #   (1) tool name is genuinely unknown — safe to fall back to default init
+    #       so the not-found branch can enumerate the full tool list.
+    #   (2) tool matched get_available_tools() but was inexplicably absent from
+    #       loaded_tools after init — internal consistency failure, must not be
+    #       swallowed.
+    # Pre-flighting against get_available_tools() separates the two cases
+    # without needing to parse error message text. Only route to targeted init
+    # when the tool is available (has its runtime deps installed); tools that
+    # are discovered but unavailable (is_available=False) fall through to the
+    # default init so get_toolchain's strict-mode dep check is never hit.
+    available_names = {t.name for t in get_available_tools() if t.is_available}
+    if tool_name in available_names:
+        init_tools(allowlist=[tool_name])
+    else:
+        init_tools()
 
     tool = get_tool(tool_name)
     if not tool:
         print(f"Tool '{tool_name}' not found. Available tools:")
-        for t in get_tools():
+        for t in sorted(get_available_tools(), key=lambda t: t.name):
             print(f"- {t.name}")
         sys.exit(1)
 
@@ -598,7 +885,14 @@ def prompts_expand(prompt: tuple[str, ...]):
     from ..util.context import include_paths  # fmt: skip
 
     original_msg = Message("user", full_prompt)
-    expanded_msg = include_paths(original_msg, workspace=Path.cwd())
+    # This utility is for inspecting path expansion itself, so it must ignore
+    # the ambient GPTME_DISABLE_PATH_INCLUDE setting used by automation.
+    disabled_path_include = os.environ.pop("GPTME_DISABLE_PATH_INCLUDE", None)
+    try:
+        expanded_msg = include_paths(original_msg, workspace=Path.cwd())
+    finally:
+        if disabled_path_include is not None:
+            os.environ["GPTME_DISABLE_PATH_INCLUDE"] = disabled_path_include
 
     # Print the expanded content exactly as it would be sent to the LLM
     print(expanded_msg.content)
@@ -692,6 +986,25 @@ def models_info(model_name: str, as_json: bool):
     except Exception as e:
         print(f"Error getting model info: {e}")
         sys.exit(1)
+
+    # Warn (on stderr, so it never corrupts stdout/JSON) when the provider
+    # prefix isn't recognized — get_model() returns generic fallback metadata
+    # for unknown providers, so a typo like 'anthropc/...' silently shows fake
+    # values. Mirror the provider check that `models test` performs. Only
+    # applies to fully-qualified 'provider/model' names; bare names and known
+    # custom providers (e.g. lmstudio/...) don't trigger the warning.
+    if "/" in model_name:
+        from ..llm import get_provider_from_model  # fmt: skip
+
+        try:
+            get_provider_from_model(model_name)
+        except ValueError:
+            click.echo(
+                f"⚠️  Unrecognized provider in '{model_name}'; showing generic "
+                "fallback metadata. Run 'gptme-util models list --available' "
+                "to see known models.",
+                err=True,
+            )
 
     if as_json:
         print(json.dumps(model_to_dict(model), indent=2))

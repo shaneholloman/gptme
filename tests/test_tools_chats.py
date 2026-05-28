@@ -1,4 +1,5 @@
 import json
+import sys
 
 from gptme.tools import init_tools
 from gptme.tools.chats import _format_message_with_context, list_chats, search_chats
@@ -41,8 +42,9 @@ def test_chats(tmp_path, monkeypatch, capsys):
     assert "Search results" in captured.out
 
 
-def test_format_message_basic():
+def test_format_message_basic(monkeypatch):
     """Test basic match highlighting."""
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     result = _format_message_with_context("hello world", "world")
     assert "world" in result
     # Should contain ANSI bold red escape codes
@@ -71,10 +73,80 @@ def test_format_message_no_repr_quotes():
     assert "'world'" not in result
 
 
-def test_format_message_case_insensitive_highlight():
+def test_format_message_case_insensitive_highlight(monkeypatch):
     """Test that highlighting works case-insensitively and preserves original casing."""
+    monkeypatch.setattr(sys.stdout, "isatty", lambda: True)
     result = _format_message_with_context("Hello WORLD", "world")
     # The ANSI highlight should be present
     assert "\033[1;31m" in result
     # Original casing must be preserved inside the highlight (not lowercased)
     assert "WORLD" in result
+
+
+def test_search_chats_handles_non_string_content(tmp_path, monkeypatch, capsys):
+    """Test that search_chats doesn't crash when messages have non-string content."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path))
+
+    conv_dir = tmp_path / "2026-01-01-int-content-demo"
+    conv_dir.mkdir()
+    # Simulate a conversation JSONL with mixed string and int content
+    (conv_dir / "conversation.jsonl").write_text(
+        json.dumps(
+            {
+                "role": "system",
+                "content": "system message",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "role": "user",
+                "content": 12345,  # int content - the actual crash case
+                "timestamp": "2026-01-01T00:00:01+00:00",
+            }
+        )
+        + "\n"
+        + json.dumps(
+            {
+                "role": "assistant",
+                "content": "hello world",
+                "timestamp": "2026-01-01T00:00:02+00:00",
+            }
+        )
+        + "\n"
+    )
+
+    # Should not crash on int content
+    search_chats("hello", system=False)
+    captured = capsys.readouterr()
+    assert "Search results" in captured.out
+
+
+def test_format_message_with_non_string_content():
+    """Test _format_message_with_context gracefully handles non-string content."""
+    result = _format_message_with_context(12345, "test")
+    assert result == "[non-string content]"
+
+
+def test_search_chats_with_empty_after_strip(tmp_path, monkeypatch, capsys):
+    """Test that search_chats with whitespace-only query fails early."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path))
+
+    conv_dir = tmp_path / "2026-01-01-demo"
+    conv_dir.mkdir()
+    (conv_dir / "conversation.jsonl").write_text(
+        json.dumps(
+            {
+                "role": "user",
+                "content": "hello world",
+                "timestamp": "2026-01-01T00:00:00+00:00",
+            }
+        )
+        + "\n"
+    )
+
+    search_chats("   ", system=False)
+    captured = capsys.readouterr()
+    # Should exit early with an error message, not crash
+    assert "search query cannot be empty" in captured.err

@@ -15,7 +15,7 @@ import pytest
 import requests
 
 import gptme.init as _gptme_init
-from gptme.config import get_config
+from gptme.config import get_config, set_config
 from gptme.init import init
 from gptme.tools import clear_tools
 from gptme.tools import shell as shell_module
@@ -210,6 +210,15 @@ def clear_tools_before():
     # Without this, the _init_done guard prevents init_tools() from re-running
     # after clear_tools(), leaving get_tool() returning None for all tools.
     _gptme_init._init_done = False
+    # Reset config.chat to prevent stale tool allowlists from tests that call
+    # setup_config_from_cli() (e.g. test_custom_tool_file_mixed_allowlist).
+    # Without this, init_tools(allowlist=None) picks up the previous test's
+    # chat.tools and loads only those tools, skipping standard tools like 'save'.
+    from dataclasses import replace
+
+    config = get_config()
+    if config.chat is not None:
+        set_config(replace(config, chat=None))
 
 
 @pytest.fixture(autouse=True)
@@ -428,9 +437,9 @@ def event_listener(setup_conversation):
         try:
             for line in resp.iter_lines():
                 if line:
-                    line = line.decode("utf-8")
-                    if line.startswith("data: "):
-                        event_data = json.loads(line[6:])
+                    line_str = line.decode("utf-8")
+                    if line_str.startswith("data: "):
+                        event_data = json.loads(line_str[6:])
                         events.put(event_data)
 
                         # Track event types

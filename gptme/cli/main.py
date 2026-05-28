@@ -4,6 +4,9 @@ import importlib
 import logging
 import os
 import pstats
+import select
+import shlex
+import shutil
 import signal
 import sys
 import traceback
@@ -28,9 +31,14 @@ from ..config import setup_config_from_cli
 from ..constants import MULTIPROMPT_SEPARATOR
 from ..dirs import get_logs_dir
 from ..init import init_logging
+from ..llm import get_provider_from_model
 from ..llm import reply as llm_reply
 from ..llm.models import get_recommended_model
-from ..logmanager import ConversationMeta, get_user_conversations
+from ..logmanager import (
+    ConversationMeta,
+    conversation_name_error,
+    get_user_conversations,
+)
 from ..message import Message
 from ..profiles import get_profile
 from ..prompts import ContextMode, get_prompt
@@ -46,6 +54,7 @@ logger = logging.getLogger(__name__)
 
 
 script_path = Path(os.path.realpath(__file__))
+_STDIN_PIPE_GRACE_PERIOD = 1.0
 
 
 class CommaSeparatedChoice(click.ParamType):
@@ -58,9 +67,11 @@ class CommaSeparatedChoice(click.ParamType):
         choices: list[str],
         allow_prefix: str | None = None,
         allow_prefixes: list[str] | None = None,
+        extra_choices_for_prefix: dict[str, list[str]] | None = None,
         metavar: str | None = None,
     ):
         self.choices = choices
+        self._choice_set = set(choices)
         # Support both single prefix and multiple prefixes
         if allow_prefixes:
             self.allow_prefixes = allow_prefixes
@@ -68,20 +79,36 @@ class CommaSeparatedChoice(click.ParamType):
             self.allow_prefixes = [allow_prefix]
         else:
             self.allow_prefixes = []
+        self.extra_choices_for_prefix = {
+            prefix: set(prefix_choices)
+            for prefix, prefix_choices in (extra_choices_for_prefix or {}).items()
+        }
         self._metavar = metavar
 
     def convert(self, value, param, ctx):
+        # Click keeps the leading "=" for short options passed as `-x=value`.
+        # Normalize that form so documented examples like `-t=-browser` work.
+        value = value.removeprefix("=")
         parts = [v.strip() for v in value.split(",") if v.strip()]
+        if not parts:
+            self.fail("value cannot be empty.", param, ctx)
         for part in parts:
             check = part
+            matched_prefix = None
             for prefix in self.allow_prefixes:
                 if check.startswith(prefix):
                     check = check[len(prefix) :]
+                    matched_prefix = prefix
                     break
             # Allow file paths (e.g. path/to/tool.py) to pass through
             if check.endswith(".py") or "/" in check or "\\" in check:
                 continue
-            if check not in self.choices:
+            extra_choices = (
+                self.extra_choices_for_prefix.get(matched_prefix, set())
+                if matched_prefix is not None
+                else set()
+            )
+            if check not in self._choice_set and check not in extra_choices:
                 self.fail(
                     f"invalid choice: {part}. (choose from {', '.join(self.choices)})",
                     param,
@@ -105,7 +132,7 @@ class WorkspacePath(click.ParamType):
     def convert(self, value, param, ctx):
         if value == "@log":
             return value
-        path = Path(value)
+        path = Path(value).expanduser()
         if not path.exists():
             self.fail(f"directory '{value}' does not exist.", param, ctx)
         if not path.is_dir():
@@ -113,10 +140,95 @@ class WorkspacePath(click.ParamType):
         return str(path.resolve())
 
 
+class ConversationName(click.ParamType):
+    """Click type for conversation names stored under the logs directory."""
+
+    name = "TEXT"
+
+    def convert(self, value, param, ctx):
+        if value == "random":
+            return value
+        if error := conversation_name_error(value):
+            self.fail(error, param, ctx)
+        return value
+
+
+def _looks_like_tool_file_path(value: str) -> bool:
+    return (
+        value.endswith(".py")
+        or value.startswith(("/", "./", "../", "~"))
+        or (len(value) > 2 and value[1] == ":" and value[2] in "/\\")
+    )
+
+
+def _validate_custom_tool_paths(tool_allowlist: str | None) -> None:
+    """Fail fast on missing custom tool files before config/logging init."""
+    if not tool_allowlist:
+        return
+
+    for raw_item in tool_allowlist.split(","):
+        item = raw_item.strip().removeprefix("+").removeprefix("-")
+        if not item or not _looks_like_tool_file_path(item):
+            continue
+
+        path = Path(item).expanduser()
+        if path.suffix != ".py":
+            raise click.UsageError(f"Tool file must be a .py file: {item}")
+        if not path.exists():
+            raise click.UsageError(f"Tool file does not exist: {item}")
+        if not path.is_file():
+            raise click.UsageError(f"Tool path is not a file: {item}")
+
+
+def _extract_missing_explicit_local_path(prompt: str) -> str | None:
+    """Return an explicit local-path prompt that is missing on disk.
+
+    Only catches unambiguous local path forms so ordinary text prompts and
+    repo/host-style strings like ``github.com/org/repo`` keep working.
+    """
+    from ..util.content import is_message_command
+
+    stripped = prompt.strip()
+    if not stripped or any(ch.isspace() for ch in stripped):
+        return None
+    if is_message_command(stripped):
+        return None
+
+    candidate = stripped.removeprefix("@")
+    explicit_local = candidate.startswith(("/", "~/", "./", "../")) or (
+        len(candidate) >= 3
+        and candidate[1] == ":"
+        and candidate[2] in ("/", "\\")
+        and candidate[0].isalpha()
+    )
+    if not explicit_local:
+        return None
+
+    try:
+        if Path(candidate).expanduser().exists():
+            return None
+    except OSError:
+        return None
+    return candidate
+
+
+def _find_missing_explicit_local_path(prompts: list[str]) -> str | None:
+    """Return the first missing explicit local-path prompt in raw CLI argv order.
+
+    This catches mixed positional argv like ``gptme missing.py "fix it"`` before
+    prompt arguments are merged into a single message, where the path would
+    otherwise be masked by surrounding text.
+    """
+    for prompt in prompts:
+        if missing := _extract_missing_explicit_local_path(prompt):
+            return missing
+    return None
+
+
 commands_help = "\n".join(_gen_help(incl_langtags=False))
-_available_tools = sorted(
-    tool.name for tool in get_available_tools(include_mcp=False) if tool.is_available
-)
+_builtin_tools = get_available_tools(include_mcp=False)
+_known_tool_names = sorted(tool.name for tool in _builtin_tools)
+_available_tools = sorted(tool.name for tool in _builtin_tools if tool.is_available)
 available_tool_names = ", ".join(_available_tools)
 
 
@@ -169,6 +281,7 @@ Run 'gptme-util --help' for all utility commands."""
 @click.option(
     "--name",
     default="random",
+    type=ConversationName(),
     help="Conversation ID (used to resume). Defaults to a random name.",
 )
 @click.option(
@@ -231,7 +344,10 @@ Run 'gptme-util --help' for all utility commands."""
     default=None,
     multiple=True,
     type=CommaSeparatedChoice(
-        _available_tools + ["none"], allow_prefixes=["+", "-"], metavar="TOOL"
+        _available_tools + ["none"],
+        allow_prefixes=["+", "-"],
+        extra_choices_for_prefix={"-": _known_tool_names},
+        metavar="TOOL",
     ),
     help=f"Tools to allow. Comma-separated or repeated. Use '+tool' to add to defaults (e.g., '-t +subagent'). Use '-tool' to exclude from defaults (e.g., '-t=-browser'). Use 'none' to disable all tools. Supports .py file paths for custom tools (e.g., '-t path/to/tool.py'). Available: {available_tool_names}.",
 )
@@ -371,9 +487,12 @@ def main(
     if agent_profile:
         selected_profile = get_profile(agent_profile)
         if not selected_profile:
-            print(f"Unknown profile: {agent_profile}")
-            print("Use 'gptme-util profile list' to see available profiles.")
-            sys.exit(1)
+            raise click.BadParameter(
+                f"unknown profile '{agent_profile}'. "
+                "Use 'gptme-util profile list' to see available profiles.",
+                ctx=ctx,
+                param_hint="'--agent-profile'",
+            )
 
         logger.info(f"Using agent profile: {selected_profile.name}")
 
@@ -468,6 +587,8 @@ def main(
         # User explicitly provided empty list (e.g., no -t flags with multiple=True)
         tool_allowlist_str = None
 
+    _validate_custom_tool_paths(tool_allowlist_str)
+
     if profile:
         print("Profiling enabled...")
         pr = cProfile.Profile()
@@ -495,6 +616,7 @@ def main(
         atexit.register(save_profile)
 
     interactive = not non_interactive
+    auto_switched_noninteractive = False
     if version or version_json:
         from ..info import format_version_info
 
@@ -539,6 +661,7 @@ def main(
                 )
                 interactive = False
                 no_confirm = True
+                auto_switched_noninteractive = True
 
     # add prompts to prompt-toolkit history
     for prompt in prompts:
@@ -549,7 +672,37 @@ def main(
 
     # join prompts, grouped by `-` if present, since that's the separator for "chained"/multiple-round prompts
     sep = "\n\n" + MULTIPROMPT_SEPARATOR
-    prompts = [p.strip() for p in "\n\n".join(prompts).split(sep) if p]
+
+    if missing_path := _find_missing_explicit_local_path(prompts):
+        raise click.UsageError(
+            "Prompt looks like an explicit local path, but it does not exist: "
+            f"{missing_path}"
+        )
+
+    # Validate and resolve --output-schema early (format: "module:ClassName"),
+    # before creating a logdir or running setup. An explicit but malformed or
+    # unloadable schema is a usage error, not something to silently ignore — the
+    # user explicitly asked for structured output.
+    output_schema_type: type | None = None
+    if output_schema:
+        if ":" not in output_schema:
+            raise click.UsageError(
+                f"Invalid --output-schema format: '{output_schema}'. "
+                "Expected 'module:ClassName' (e.g. 'mymodule:MyModel')."
+            )
+        module_name, class_name = output_schema.rsplit(":", 1)
+        try:
+            module = importlib.import_module(module_name)
+            output_schema_type = getattr(module, class_name)
+        except (ImportError, AttributeError, ValueError) as e:
+            raise click.UsageError(
+                f"Could not load --output-schema '{output_schema}': {e}. "
+                "Verify the module is installed and the class name is correct."
+            ) from e
+
+    prompts = [
+        stripped for p in "\n\n".join(prompts).split(sep) if (stripped := p.strip())
+    ]
     # File paths in multiprompts are expanded at runtime by include_paths() in
     # _run_chat_loop (gptme/chat.py:194), not at parse time. Each prompt from the
     # queue goes through include_paths when popped, ensuring fresh content.
@@ -568,8 +721,19 @@ def main(
             )
         return prompt_msgs
 
+    logdir_preexisting = True
+
     if resume:
-        logdir = get_logdir_resume()
+        if workspace == "@log":
+            resume_workspace_filter: Path | None = None
+        elif workspace is None:
+            resume_workspace_filter = Path.cwd()
+        else:
+            resume_workspace_filter = Path(workspace)
+        try:
+            logdir = get_logdir_resume(name, workspace=resume_workspace_filter)
+        except ValueError as e:
+            raise click.UsageError(str(e)) from e
         prompt_msgs = inject_stdin(prompt_msgs, piped_input)
     # don't run pick in tests/non-interactive mode, or if the user specifies a name
     elif (
@@ -581,15 +745,29 @@ def main(
     ):
         logdir = pick_log()
     else:
+        logdir_preexisting = name != "random" and (get_logs_dir() / name).exists()
         logdir = get_logdir(name)
         prompt_msgs = inject_stdin(prompt_msgs, piped_input)
 
+    show_resume_hint_on_exit = False
+
     # Register atexit handler to show conversation ID on exit
     def goodbye_handler():
-        if output_format != "json":
-            print(f"\nGoodbye! (resume with: gptme --name {logdir.name})")
+        if show_resume_hint_on_exit and _should_print_resume_hint(
+            logdir, output_format
+        ):
+            print(f"\nGoodbye! (resume with: {_format_resume_hint(logdir.name)})")
 
     atexit.register(goodbye_handler)
+
+    for prompt_msg in prompt_msgs:
+        missing_path = _extract_missing_explicit_local_path(prompt_msg.content)
+        if missing_path:
+            _cleanup_aborted_new_logdir(logdir, preexisting=logdir_preexisting)
+            raise click.UsageError(
+                "Prompt looks like an explicit local path, but it does not exist: "
+                f"{missing_path}"
+            )
 
     if workspace == "@log":
         workspace_path: Path | None = logdir / "workspace"
@@ -599,16 +777,19 @@ def main(
         workspace_path = Path(workspace) if workspace else Path.cwd()
 
     # Setup complete configuration from CLI arguments and workspace
-    config = setup_config_from_cli(
-        workspace=workspace_path,
-        logdir=logdir,
-        model=model,
-        tool_allowlist=tool_allowlist_str,
-        tool_format=tool_format,
-        stream=stream,
-        interactive=interactive,
-        agent_path=Path(agent_path) if agent_path else None,
-    )
+    try:
+        config = setup_config_from_cli(
+            workspace=workspace_path,
+            logdir=logdir,
+            model=model,
+            tool_allowlist=tool_allowlist_str,
+            tool_format=tool_format,
+            stream=stream,
+            interactive=interactive,
+            agent_path=Path(agent_path) if agent_path else None,
+        )
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
     assert config.chat and config.chat.tool_format
 
     # init telemetry with agent name and interactive mode
@@ -635,11 +816,15 @@ def main(
     # Validate --output-format json and --non-interactive requirements early,
     # before the expensive get_prompt() call (which can take 10+ seconds).
     # This avoids CI timeouts when the CLI will just exit with usage error.
-    if output_format == "json" and not non_interactive:
+    if output_format == "json" and not (
+        non_interactive or auto_switched_noninteractive
+    ):
+        _cleanup_aborted_new_logdir(logdir, preexisting=logdir_preexisting)
         logger.error("--output-format json is only allowed with --non-interactive.")
         sys.exit(1)
 
     if not interactive and not prompt_msgs and not is_existing_conversation:
+        _cleanup_aborted_new_logdir(logdir, preexisting=logdir_preexisting)
         logger.error(
             "Non-interactive mode requires a prompt. Provide a prompt as an argument, "
             "use --resume to continue an existing conversation, or pipe input via stdin.\n\n"
@@ -686,26 +871,6 @@ def main(
     set_interruptible()  # prepare, user should be able to Ctrl+C until user prompt ready
     signal.signal(signal.SIGINT, handle_keyboard_interrupt)
 
-    # Parse output_schema if provided (format: "module:ClassName")
-    output_schema_type: type | None = None
-    if output_schema:
-        try:
-            if ":" in output_schema:
-                module_name, class_name = output_schema.rsplit(":", 1)
-
-                module = importlib.import_module(module_name)
-                output_schema_type = getattr(module, class_name)
-            else:
-                logger.warning(
-                    f"Invalid output_schema format: '{output_schema}'. "
-                    "Expected 'module:ClassName' (e.g. 'mymodule:MyModel')"
-                )
-        except (ImportError, AttributeError) as e:
-            logger.warning(
-                f"Could not load output_schema '{output_schema}': {e}. "
-                "Verify the module is installed and the class name is correct."
-            )
-
     # Architect/editor split: if enabled via CLI flag OR via TOML config
     _toml_architect_enabled = bool(
         config.project and config.project.architect and config.project.architect.enabled
@@ -736,6 +901,20 @@ def main(
         # Use the architect model for the planning turn, or fall back
         _arch_model = _arch_model or config.chat.model
         assert _arch_model, "Architect mode requires a model to be configured"
+
+        # Validate architect/editor model names up front so a malformed value
+        # (e.g. missing provider prefix) surfaces as a clean usage error rather
+        # than a raw traceback from llm_reply mid-planning. Mirrors the main
+        # --model path, which validates inside setup_config_from_cli above.
+        for _flag, _value in (
+            ("--architect-model", _arch_model),
+            ("--editor-model", _editor_model),
+        ):
+            if _value:
+                try:
+                    get_provider_from_model(_value)
+                except ValueError as e:
+                    raise click.UsageError(f"{_flag}: {e}") from e
 
         # Construct architect messages from first user prompt
         from ..prompts.architect import (
@@ -815,6 +994,7 @@ def main(
             output_schema_type,
             output_format,
         )
+        show_resume_hint_on_exit = True
     except (RuntimeError, Exception) as e:
         logger.error("Fatal error occurred")
         if verbose:
@@ -898,19 +1078,88 @@ def get_logdir(logdir: Path | str | Literal["random"]) -> Path:
     if logdir == "random":
         logdir = logs_dir / generate_conversation_id(name="random", logs_dir=logs_dir)
     elif isinstance(logdir, str):
+        error = conversation_name_error(logdir)
+        if error:
+            raise ValueError(error)
         logdir = logs_dir / logdir
 
     logdir.mkdir(parents=True, exist_ok=True)
     return logdir
 
 
-def get_logdir_resume() -> Path:
-    if conv := next(get_user_conversations(), None):
+def get_logdir_resume(name: str = "random", workspace: Path | None = None) -> Path:
+    if name != "random":
+        logdir = get_logs_dir() / name
+        if (logdir / "conversation.jsonl").exists():
+            return logdir
+        raise ValueError(f"No conversation named '{name}' to resume")
+
+    conversations = get_user_conversations(detail=False)
+    if workspace is not None:
+        workspace = workspace.resolve()
+        conversations = (
+            conv
+            for conv in conversations
+            if Path(conv.workspace).resolve() == workspace
+        )
+
+    if conv := next(conversations, None):
         return Path(conv.path).parent
+
+    if workspace is not None:
+        raise ValueError(
+            f"No previous conversations to resume for workspace '{workspace}'"
+        )
     raise ValueError("No previous conversations to resume")
 
 
+def _should_print_resume_hint(logdir: Path, output_format: str) -> bool:
+    if output_format == "json":
+        return False
+
+    log_file = logdir / "conversation.jsonl"
+    try:
+        return log_file.stat().st_size > 0
+    except OSError:
+        return False
+
+
+def _format_resume_hint(name: str) -> str:
+    return f"gptme --name {shlex.quote(name)}"
+
+
+def _cleanup_aborted_new_logdir(logdir: Path, *, preexisting: bool) -> None:
+    """Remove logdirs created for a conversation that never actually started."""
+    if preexisting:
+        return
+
+    log_file = logdir / "conversation.jsonl"
+    try:
+        if log_file.exists() and log_file.stat().st_size > 0:
+            return
+    except OSError:
+        return
+
+    try:
+        shutil.rmtree(logdir)
+    except OSError:
+        pass
+
+
 def _read_stdin() -> str:
+    # In automation, stdin is often an open pipe with no bytes pending yet.
+    # Wait briefly for readability so we don't block forever on read-until-EOF,
+    # while still giving moderately slow pipeline producers time to write.
+    try:
+        readable, _, _ = select.select(
+            [sys.stdin.fileno()], [], [], _STDIN_PIPE_GRACE_PERIOD
+        )
+    except (AttributeError, OSError, ValueError):
+        readable = [True]
+
+    if not readable:
+        return ""
+
     chunk_size = 1024  # 1 KB
     all_data = ""
 

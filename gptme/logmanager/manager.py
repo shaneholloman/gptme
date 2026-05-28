@@ -26,7 +26,7 @@ if os.name == "nt":
         pass
 from collections.abc import Generator, Iterator
 from contextvars import ContextVar
-from dataclasses import dataclass, field, replace
+from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from itertools import islice, zip_longest
 from pathlib import Path
@@ -45,6 +45,7 @@ from ..dirs import get_logs_dir
 from ..message import Message, _migrate_metadata, len_tokens, print_msg
 from ..tools import ToolUse
 from ..util.context import enrich_messages_with_context
+from ..util.conversation_ids import conversation_id_error, validate_conversation_id
 from ..util.reduce import limit_log, reduce_log
 from ..util.uri import URI
 
@@ -53,6 +54,15 @@ PathLike: TypeAlias = str | Path
 logger = logging.getLogger(__name__)
 
 RoleLiteral = Literal["user", "assistant", "system"]
+
+# Field names accepted by Message.__init__, used to drop unknown keys when
+# reading stored logs (forward-compatibility with logs from newer versions).
+_MESSAGE_FIELD_NAMES = frozenset(f.name for f in fields(Message))
+
+
+def conversation_name_error(value: str) -> str | None:
+    """Return a validation error for unsafe conversation names, if any."""
+    return conversation_id_error(value)
 
 
 @dataclass(frozen=True, repr=False)
@@ -652,6 +662,7 @@ class LogManager:
         """
         Copy the conversation folder to a new name.
         """
+        validate_conversation_id(name)
         self.write()
         logsdir = get_logs_dir()
         shutil.copytree(self.logfile.parent, logsdir / name, symlinks=True)
@@ -850,4 +861,14 @@ def _gen_read_jsonl(path: PathLike) -> Generator[Message, None, None]:
             # Migrate flat metadata format to nested usage format
             if json_data.get("metadata"):
                 json_data["metadata"] = _migrate_metadata(json_data["metadata"])
+            # Drop unknown keys so logs written by a newer gptme version (with
+            # message fields this version doesn't know about) stay readable
+            # instead of crashing the whole read with a TypeError.
+            unknown = set(json_data) - _MESSAGE_FIELD_NAMES
+            if unknown:
+                logger.warning(
+                    f"Ignoring unknown message field(s) {sorted(unknown)} in {path}"
+                )
+                for key in unknown:
+                    del json_data[key]
             yield Message(**json_data, files=files, file_hashes=file_hashes)

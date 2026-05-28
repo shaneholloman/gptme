@@ -86,6 +86,12 @@ logger = logging.getLogger(__name__)
 # SVG excluded: can embed <script> tags (XSS via crafted SVG).
 _ALLOWED_AVATAR_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".ico"}
 
+# Commands that must not run in server mode:
+# - exit/restart: terminate or restart the server process
+# - edit: launches an interactive $EDITOR subprocess, blocking the worker thread
+# - delete (without --force): calls input() waiting for stdin that never arrives
+_SERVER_BLOCKED_COMMANDS = {"exit", "restart", "edit", "delete"}
+
 
 def _is_valid_image_content(path: "Path") -> bool:
     """Validate file content is a recognised image format using Pillow.
@@ -125,6 +131,18 @@ def _validate_model_input(model: str, expected_provider: str | None = None) -> s
             f"Model {trimmed_model} does not match provider {expected_provider}"
         )
     return trimmed_model
+
+
+def _get_optional_string_list_field(
+    req_json: dict, field: str
+) -> list[str] | None | tuple[flask.Response, int]:
+    """Return an optional list[str] field or a 400 response."""
+    value = req_json.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, list) or not all(isinstance(item, str) for item in value):
+        return flask.jsonify({"error": f"{field} must be a list of strings"}), 400
+    return value
 
 
 def _persist_default_model(model: str) -> bool:
@@ -456,7 +474,13 @@ def api_conversation_put(conversation_id: str):
 
     logdir = get_logs_dir() / conversation_id
 
-    req_json = flask.request.json or {}
+    req_json = request.get_json(silent=True)
+    if req_json is None:
+        if request.get_data(cache=True):
+            return flask.jsonify({"error": "Malformed JSON in request body"}), 400
+        req_json = {}
+    if not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
 
     # Validate auto_confirm type before any side effects (CWE-20: truthy coercion).
     # "false" (string) is truthy in Python — must reject non-bool/int values.
@@ -476,10 +500,15 @@ def api_conversation_put(conversation_id: str):
     # Validate all messages before creating any side effects (directories).
     # This prevents orphaned directories when validation fails: if logdir.mkdir()
     # runs before a 400 is returned, the same conversation_id gets a 409 on retry.
+    messages_raw = req_json.get("messages", [])
+    if not isinstance(messages_raw, list):
+        return flask.jsonify({"error": "'messages' must be a list"}), 400
     _RoleType = Literal["system", "user", "assistant"]
     valid_roles = ("system", "user", "assistant")
     validated_msgs: list[tuple[_RoleType, str, datetime]] = []
-    for msg in req_json.get("messages", []):
+    for msg in messages_raw:
+        if not isinstance(msg, dict):
+            return flask.jsonify({"error": "Each message must be an object"}), 400
         if msg.get("role") not in valid_roles:
             return (
                 flask.jsonify(
@@ -493,6 +522,8 @@ def api_conversation_put(conversation_id: str):
             return flask.jsonify(
                 {"error": "Message missing required 'content' field"}
             ), 400
+        if not isinstance(msg["content"], str):
+            return flask.jsonify({"error": "Message 'content' must be a string"}), 400
         if "timestamp" in msg:
             try:
                 ts: datetime = isoparse(msg["timestamp"])
@@ -504,6 +535,21 @@ def api_conversation_put(conversation_id: str):
             ts = datetime.now(tz=timezone.utc)
         validated_msgs.append((cast(_RoleType, msg["role"]), msg["content"], ts))
 
+    config_raw = req_json.get("config", {})
+    if not isinstance(config_raw, dict):
+        return flask.jsonify({"error": "'config' must be an object"}), 400
+    prompt = req_json.get("prompt", "full")
+    if not isinstance(prompt, str):
+        return flask.jsonify({"error": "'prompt' must be a string"}), 400
+
+    # Load or create the chat config, overriding values from request config if provided
+    config_dict = dict(config_raw)
+    config_dict["_logdir"] = logdir  # Pass logdir for "@log" workspace resolution
+    try:
+        request_config = ChatConfig.from_dict(config_dict, create_workspace=False)
+    except ValueError as exc:
+        return flask.jsonify({"error": str(exc)}), 400
+
     # Create the log directory atomically to avoid TOCTOU race
     try:
         logdir.mkdir(parents=True)
@@ -513,12 +559,7 @@ def api_conversation_put(conversation_id: str):
             409,
         )
 
-    # Load or create the chat config, overriding values from request config if provided
-    config_dict = req_json.get("config", {})
-    config_dict["_logdir"] = logdir  # Pass logdir for "@log" workspace resolution
-    request_config = ChatConfig.from_dict(config_dict)
     chat_config = ChatConfig.load_or_create(logdir, request_config)
-    prompt = req_json.get("prompt", "full")
 
     msgs = get_prompt(
         tools=list(get_toolchain(chat_config.tools, strict=False)),
@@ -596,9 +637,11 @@ def api_conversation_post(conversation_id: str):
     if error := _validate_conversation_id(conversation_id):
         return error
 
-    req_json = flask.request.json
-    if not req_json:
+    req_json = request.get_json(silent=True)
+    if req_json is None:
         return flask.jsonify({"error": "No JSON data provided"}), 400
+    if not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
 
     if "role" not in req_json or "content" not in req_json:
         return flask.jsonify({"error": "Missing required fields (role, content)"}), 400
@@ -622,25 +665,37 @@ def api_conversation_post(conversation_id: str):
     branch = req_json.get("branch", "main")
     if error := _validate_branch(branch):
         return error
-    tool_allowlist = req_json.get("tools", None)
-
-    init_tools(tool_allowlist)
+    tool_allowlist = _get_optional_string_list_field(req_json, "tools")
+    if isinstance(tool_allowlist, tuple):
+        return tool_allowlist
 
     try:
-        log = LogManager.load(conversation_id, branch=branch)
-    except FileNotFoundError:
+        init_tools(tool_allowlist)
+    except ValueError as exc:
+        return flask.jsonify({"error": str(exc)}), 400
+    except Exception as exc:
+        return flask.jsonify({"error": f"Failed to load tool: {exc}"}), 400
+
+    # Check conversation existence before branch to return accurate error messages.
+    logdir = get_logs_dir() / conversation_id
+    if not logdir.exists():
         return (
             flask.jsonify({"error": f"Conversation not found: {conversation_id}"}),
             404,
         )
+    try:
+        log = LogManager.load(conversation_id, branch=branch)
+    except FileNotFoundError:
+        return (
+            flask.jsonify({"error": f"Branch not found: {branch}"}),
+            404,
+        )
 
     # Validate and convert file paths from JSON strings to Path objects
-    files_raw = req_json.get("files", [])
-    if not isinstance(files_raw, list) or not all(
-        isinstance(f, str) for f in files_raw
-    ):
-        return flask.jsonify({"error": "files must be a list of strings"}), 400
-    file_paths = [Path(f) for f in files_raw]
+    files_result = _get_optional_string_list_field(req_json, "files")
+    if isinstance(files_result, tuple):
+        return files_result
+    file_paths = [Path(f) for f in files_result] if files_result is not None else []
     msg = Message(
         req_json["role"],
         req_json["content"],
@@ -649,11 +704,10 @@ def api_conversation_post(conversation_id: str):
 
     # Check if the message is a slash command (e.g. /help, /model, /tools)
     if msg.role == "user" and is_message_command(msg.content):
-        # Block commands that are unsafe in server context (would crash or block server)
+        # Block commands that are unsafe in server context (see _SERVER_BLOCKED_COMMANDS)
         parts = msg.content.lstrip("/").split()
         cmd_name = parts[0] if parts else ""
-        server_blocked_commands = {"exit", "restart"}
-        if cmd_name in server_blocked_commands:
+        if cmd_name in _SERVER_BLOCKED_COMMANDS:
             return flask.jsonify(
                 {"error": f"Command /{cmd_name} is not available in server mode"}
             ), 400
@@ -757,6 +811,8 @@ def api_conversation_edit_message(conversation_id: str, index: int):
 
     req_json = request.get_json(silent=True)
     if req_json is None:
+        if request.get_data(cache=True):
+            return flask.jsonify({"error": "Malformed JSON in request body"}), 400
         req_json = {}
     elif not isinstance(req_json, dict):
         return flask.jsonify({"error": "JSON body must be an object"}), 400
@@ -1122,6 +1178,17 @@ def api_conversation_config_patch(conversation_id: str):
     if not isinstance(req_json, dict):
         return flask.jsonify({"error": "JSON body must be an object"}), 400
 
+    # Extract tool allowlist early for type-checking (no side effects).
+    # init_tools validation is deferred to after the 404/409 guards because it
+    # mutates process-wide state (loaded_tools, _tools_init_lock).
+    tool_allowlist: list[str] | None = None
+    chat_patch = req_json.get("chat")
+    if isinstance(chat_patch, dict) and "tools" in chat_patch:
+        raw_allowlist = _get_optional_string_list_field(chat_patch, "tools")
+        if isinstance(raw_allowlist, tuple):
+            return raw_allowlist  # 400: bad type, no side effects
+        tool_allowlist = raw_allowlist  # narrowed to list[str] | None
+
     logdir = get_logs_dir() / conversation_id
 
     # Guard: check conversation exists before any side-effecting operations.
@@ -1156,10 +1223,23 @@ def api_conversation_config_patch(conversation_id: str):
                 409,
             )
 
+    # Validate tool allowlist now that 404/409 guards have passed.
+    # init_tools mutates process-wide state; must run AFTER guards, not before.
+    if tool_allowlist is not None:
+        try:
+            init_tools(tool_allowlist)
+        except ValueError as exc:
+            return flask.jsonify({"error": str(exc)}), 400
+        except Exception as exc:
+            return flask.jsonify({"error": f"Failed to load tool: {exc}"}), 400
+
     # Create and set config
     req_json["_logdir"] = logdir  # Pass logdir for "@log" workspace resolution
-    request_config = ChatConfig.from_dict(req_json)
-    chat_config = ChatConfig.load_or_create(logdir, request_config).save()
+    try:
+        request_config = ChatConfig.from_dict(req_json)
+        chat_config = ChatConfig.load_or_create(logdir, request_config).save()
+    except ValueError as exc:
+        return flask.jsonify({"error": str(exc)}), 400
     config = Config.from_workspace(workspace=chat_config.workspace)
     config.chat = chat_config
     set_config(config)
@@ -1409,9 +1489,11 @@ def api_user():
 )
 def api_user_api_key():
     """Persist a provider API key into user config."""
-    req_json = flask.request.json
-    if not req_json:
+    req_json = request.get_json(silent=True)
+    if req_json is None:
         return flask.jsonify({"error": "No JSON data provided"}), 400
+    if not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
 
     provider = req_json.get("provider")
     api_key = req_json.get("api_key")
@@ -1474,9 +1556,11 @@ def api_user_api_key():
 )
 def api_user_default_model():
     """Persist the default model into user config."""
-    req_json = flask.request.json
-    if not req_json:
+    req_json = request.get_json(silent=True)
+    if req_json is None:
         return flask.jsonify({"error": "No JSON data provided"}), 400
+    if not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
 
     model = req_json.get("model")
     if not isinstance(model, str):

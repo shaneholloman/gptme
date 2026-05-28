@@ -4,7 +4,9 @@ Flask application factory for gptme server.
 
 import atexit
 import logging
+import os
 from importlib import resources
+from pathlib import Path
 
 import flask
 from flask_cors import CORS
@@ -19,7 +21,29 @@ media_path = _root_path.parent / "media"
 atexit.register(_gptme_path_ctx.__exit__, None, None, None)
 
 
-def create_app(cors_origin: str | None = None, host: str = "127.0.0.1") -> flask.Flask:
+def _resolve_static_folder(webui_dir: str | Path | None = None) -> Path:
+    """Resolve which directory the web UI is served from.
+
+    Precedence: explicit ``webui_dir`` argument > ``GPTME_WEBUI_DIR`` env var >
+    the embedded legacy static bundle. A configured directory must exist so
+    that a typo fails loudly at startup instead of silently serving 404s.
+    """
+    candidate = webui_dir or os.environ.get("GPTME_WEBUI_DIR")
+    if not candidate:
+        return static_path
+    path = Path(candidate).expanduser()
+    if not path.is_dir():
+        raise FileNotFoundError(
+            f"webui_dir does not exist or is not a directory: {path}"
+        )
+    return path
+
+
+def create_app(
+    cors_origin: str | None = None,
+    host: str = "127.0.0.1",
+    webui_dir: str | Path | None = None,
+) -> flask.Flask:
     """Create the Flask app.
 
     Args:
@@ -27,8 +51,13 @@ def create_app(cors_origin: str | None = None, host: str = "127.0.0.1") -> flask
             A comma-separated string allows multiple origins, e.g.
             "tauri://localhost,http://tauri.localhost". Whitespace around
             entries is ignored.
+        webui_dir: Optional directory containing a web UI build (e.g. the
+            modern React webui's ``dist/``) to serve instead of the bundled
+            legacy UI. Falls back to the ``GPTME_WEBUI_DIR`` environment
+            variable, then to the embedded legacy static bundle.
     """
-    app = flask.Flask(__name__, static_folder=static_path)
+    static_folder = _resolve_static_folder(webui_dir)
+    app = flask.Flask(__name__, static_folder=static_folder)
 
     # Capture the server's default model from the startup context
     # This is needed because ContextVar doesn't propagate across request contexts
@@ -89,6 +118,10 @@ def create_app(cors_origin: str | None = None, host: str = "127.0.0.1") -> flask
 
     init_auth(host=host, display=False)
 
+    # Track whether we're serving a custom webui build (not the legacy bundle).
+    # Used below to gate SPA-specific route behaviour.
+    is_custom_webui = static_folder != static_path
+
     # Register static file routes directly on the app
     @app.route("/")
     def root():
@@ -96,6 +129,10 @@ def create_app(cors_origin: str | None = None, host: str = "127.0.0.1") -> flask
 
     @app.route("/computer")
     def computer():
+        # Legacy bundle ships computer.html; a custom React build does not —
+        # fall back to index.html and let client-side routing take over.
+        if is_custom_webui or not (static_folder / "computer.html").exists():
+            return app.send_static_file("index.html")
         return app.send_static_file("computer.html")
 
     @app.route("/chat")
@@ -105,6 +142,18 @@ def create_app(cors_origin: str | None = None, host: str = "127.0.0.1") -> flask
     @app.route("/favicon.png")
     def favicon():
         return flask.send_from_directory(media_path, "logo.png")
+
+    if is_custom_webui:
+        # SPA catch-all: serve any unknown path as index.html so that React
+        # Router deep-links (/settings, /conversations/xyz, …) work correctly.
+        # Actual static assets (JS/CSS/images) are served first because their
+        # paths exist in static_folder; only truly unknown paths fall through.
+        @app.route("/<path:path>")
+        def spa_fallback(path: str):
+            asset = static_folder / path
+            if asset.is_file():
+                return app.send_static_file(path)
+            return app.send_static_file("index.html")
 
     # Server confirmation hook is now registered via init_hooks(server=True)
     # in server/cli.py

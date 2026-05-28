@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import shutil
+import sys
 from collections.abc import Generator
 from dataclasses import dataclass
 from datetime import datetime, timezone
@@ -30,6 +31,11 @@ def _conversation_files() -> list[Path]:
     return sorted(
         logsdir.glob("*/conversation.jsonl"), key=lambda f: -f.stat().st_mtime
     )
+
+
+def _is_test_conversation_id(conv_id: str) -> bool:
+    """Return True when a conversation ID belongs to test/eval output."""
+    return conv_id.startswith(("tmp", "test-")) or "gptme-evals-" in conv_id
 
 
 @dataclass(frozen=True)
@@ -212,17 +218,24 @@ def _full_scan(
 
 
 def get_conversations(
-    *, detail: bool = True
+    *, detail: bool = True, include_test: bool = True
 ) -> Generator[ConversationMeta, None, None]:
-    """Returns all conversations, excluding ones used for testing, evals, etc.
+    """Returns all conversations.
 
     Args:
         detail: If True (default), performs a full JSONL scan to compute exact
             costs, token counts, and model info. If False, reads only the tail
             of each file for a faster scan — suitable for list/search endpoints
             where cost/token aggregates are not displayed.
+        include_test: If True (default), includes test/eval conversations.
+            If False, skips them before scanning any files or loading
+            per-conversation config.
     """
     for conv_fn in _conversation_files():
+        conv_id = conv_fn.parent.name
+        if not include_test and _is_test_conversation_id(conv_id):
+            continue
+
         log = Log.read_jsonl(conv_fn, limit=1)
 
         file_size = conv_fn.stat().st_size
@@ -254,7 +267,6 @@ def get_conversations(
         modified = conv_fn.stat().st_mtime
         first_timestamp = log[0].timestamp.timestamp() if log else modified
         # Try to get display name from ChatConfig, fallback to folder name
-        conv_id = conv_fn.parent.name
         chat_config = ChatConfig.from_logdir(conv_fn.parent)
         display_name = chat_config.name or conv_id
 
@@ -305,12 +317,7 @@ def get_user_conversations(
     *, detail: bool = True
 ) -> Generator[ConversationMeta, None, None]:
     """Returns all user conversations, excluding ones used for testing, evals, etc."""
-    for conv in get_conversations(detail=detail):
-        if any(conv.id.startswith(prefix) for prefix in ["tmp", "test-"]) or any(
-            substr in conv.id for substr in ["gptme-evals-"]
-        ):
-            continue
-        yield conv
+    yield from get_conversations(detail=detail, include_test=False)
 
 
 def list_conversations(
@@ -328,15 +335,19 @@ def list_conversations(
         detail: If True, performs full JSONL scan for costs/tokens.
             If False, uses fast tail-only scan.
     """
-    conversation_iter = (
-        get_conversations(detail=detail)
-        if include_test
-        else get_user_conversations(detail=detail)
-    )
-    return list(islice(conversation_iter, limit))
+    conversation_iter = get_conversations(detail=detail, include_test=include_test)
+    # islice() raises ValueError when the stop value is negative OR greater than
+    # sys.maxsize, so clamp into the valid [0, sys.maxsize] range. A negative
+    # limit yields an empty result, and an over-large limit (e.g. ?limit=10**30
+    # or `chats list --limit 999...`) returns everything instead of crashing.
+    # The CLI rejects negatives earlier, but this also guards non-CLI callers
+    # (webui/server) and over-large values that pass the CLI's IntRange(min=1).
+    return list(islice(conversation_iter, min(max(limit, 0), sys.maxsize)))
 
 
-def get_conversation_by_id(conv_id: str) -> ConversationMeta | None:
+def get_conversation_by_id(
+    conv_id: str, *, detail: bool = True
+) -> ConversationMeta | None:
     """
     Get a conversation by its ID.
 
@@ -346,7 +357,7 @@ def get_conversation_by_id(conv_id: str) -> ConversationMeta | None:
     Returns:
         ConversationMeta if found, None otherwise
     """
-    for conv in get_conversations():
+    for conv in get_conversations(detail=detail):
         if conv.id == conv_id:
             return conv
     return None

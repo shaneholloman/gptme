@@ -22,6 +22,8 @@ import {
   DropdownMenuItem,
   DropdownMenuTrigger,
 } from '@/components/ui/dropdown-menu';
+import { withLocalAddressSpace } from '@/utils/addressSpace';
+import { isLikelyChromeCorsPna } from '@/utils/api';
 
 const DEFAULT_LOCAL_SERVER_URLS = new Set(['http://127.0.0.1:5700', 'http://localhost:5700']);
 
@@ -29,6 +31,7 @@ export const WelcomeView = () => {
   const [inputValue, setInputValue] = useState(
     () => (typeof window !== 'undefined' ? localStorage.getItem('gptme-draft-new') : null) || ''
   );
+  const [hostedLoopbackReachable, setHostedLoopbackReachable] = useState(false);
   // Persist new-chat draft to localStorage
   useEffect(() => {
     if (typeof window === 'undefined') return;
@@ -46,6 +49,7 @@ export const WelcomeView = () => {
   const { api, isConnected$, connectionConfig, switchServer, connect } = useApi();
   const queryClient = useQueryClient();
   const isConnected = use$(isConnected$);
+  const lastConnectionResult = use$(api.lastConnectionResult$);
   const providerStatusVersion = use$(setupWizard$.providerStatusVersion);
   const registry = use$(serverRegistry$);
   const connectedServers = getConnectedServers();
@@ -57,7 +61,19 @@ export const WelcomeView = () => {
     ''
   );
   const isDefaultLocalServer = DEFAULT_LOCAL_SERVER_URLS.has(activeServerBaseUrl);
+  const installCommand = `pipx install 'gptme[server]'`;
   const serverCommand = `gptme-server --cors-origin='${window.location.origin}'`;
+  // Chrome 142+ Local Network Access only gates requests from a non-local page
+  // origin to a loopback/local server, so the permission hint below is only
+  // relevant when the web UI itself is served from a hosted (non-local) origin.
+  const isHostedOrigin = !/^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:/]|$)/.test(
+    window.location.origin
+  );
+  // True when the configured server URL points at a loopback address (any port),
+  // not just the two well-known defaults — used to show the LNA hint for custom ports.
+  const isActiveServerLoopback = /^https?:\/\/(localhost|127\.0\.0\.1|\[::1\])([:/]|$)/.test(
+    activeServerBaseUrl
+  );
 
   // Create observables that ChatInput expects
   const autoFocus$ = observable(true);
@@ -151,6 +167,102 @@ export const WelcomeView = () => {
   }, [api.authHeader, connectionConfig.baseUrl, isConnected, providerStatusVersion]);
 
   const { settings } = useSettings();
+  // First-time users on the default local server (typically chat.gptme.org) get a
+  // guided "Get started" CTA into the setup wizard instead of the raw install/
+  // settings path. Users on a custom server have already chosen their setup, so
+  // their disconnected banner is left unchanged.
+  const isFirstVisit = !settings.hasCompletedSetup;
+  const showGuidedSetup = isDefaultLocalServer && isFirstVisit;
+
+  // Classify the last connection failure into actionable buckets for targeted guidance.
+  const errorBucket = (() => {
+    if (!lastConnectionResult || lastConnectionResult.ok) return 'unknown';
+    const { reason, url } = lastConnectionResult;
+    if (reason === 'cors') return isLikelyChromeCorsPna(url) ? 'pna' : 'cors';
+    return reason; // 'network' | 'timeout' | 'http_error' | 'parse_error'
+  })();
+  const showHostedLoopbackCorsHint =
+    errorBucket === 'unknown' && isDefaultLocalServer && isHostedOrigin && hostedLoopbackReachable;
+
+  useEffect(() => {
+    if (isConnected || !isDefaultLocalServer || !isHostedOrigin || errorBucket !== 'unknown') {
+      setHostedLoopbackReachable(false);
+      return;
+    }
+
+    const probeUrl = `${activeServerBaseUrl}/api/v2`;
+    const controller = new AbortController();
+    const timeoutId = window.setTimeout(() => controller.abort(), 2500);
+    let cancelled = false;
+
+    const runProbe = async () => {
+      try {
+        // First try a regular CORS fetch. If it succeeds, CORS is already configured
+        // and the hint would be a false positive — connect directly instead.
+        try {
+          await fetch(probeUrl, { cache: 'no-store', signal: controller.signal });
+          if (!cancelled) void connect(); // CORS is already configured; auto-connect
+          return;
+        } catch {
+          if (controller.signal.aborted || cancelled) return;
+        }
+        // CORS fetch failed; probe with no-cors to confirm the server is running at all.
+        // If this succeeds the server is up but not yet allowing cross-origin requests.
+        await fetch(
+          probeUrl,
+          withLocalAddressSpace(probeUrl, {
+            mode: 'no-cors',
+            cache: 'no-store',
+            signal: controller.signal,
+          })
+        );
+        if (!cancelled) setHostedLoopbackReachable(true);
+      } catch {
+        if (!cancelled) setHostedLoopbackReachable(false);
+      } finally {
+        window.clearTimeout(timeoutId);
+      }
+    };
+
+    runProbe();
+
+    return () => {
+      cancelled = true;
+      window.clearTimeout(timeoutId);
+      controller.abort();
+    };
+  }, [
+    activeServerBaseUrl,
+    connect,
+    errorBucket,
+    isConnected,
+    isDefaultLocalServer,
+    isHostedOrigin,
+  ]);
+
+  const disconnectedDesc = (() => {
+    if (errorBucket === 'network') {
+      return isDefaultLocalServer
+        ? 'The gptme server is not running. Start one with the command below.'
+        : 'Connection refused — check that the server is running and the URL is correct.';
+    }
+    if (errorBucket === 'pna') {
+      return `Chrome blocked this connection (Local Network Access). Click Allow if a permission prompt appeared, then retry. If no prompt appeared, try opening ${activeServerBaseUrl} directly in your browser first.`;
+    }
+    if (errorBucket === 'cors') {
+      return `The server rejected cross-origin requests from ${window.location.origin}. Restart it with --cors-origin to allow this page.`;
+    }
+    if (errorBucket === 'timeout') {
+      return 'The connection timed out — the server may be starting up or unreachable. Retry in a moment.';
+    }
+    if (showHostedLoopbackCorsHint) {
+      return `The local gptme server appears to be running, but it is not allowing requests from ${window.location.origin} yet. Restart it with --cors-origin to allow this page.`;
+    }
+    return isDefaultLocalServer
+      ? 'Start a local gptme server or point the app at another server before starting a chat.'
+      : 'Check the server URL and auth token, then retry the connection.';
+  })();
+
   const bg = settings.welcomeBackground;
   // Determine if the background is an image URL or a CSS gradient/color
   const isImageBg = bg && (bg.startsWith('http') || bg.startsWith('/') || bg.startsWith('data:'));
@@ -188,22 +300,76 @@ export const WelcomeView = () => {
               <Alert className="mx-auto w-full max-w-2xl border-amber-500/30 bg-amber-500/10 text-left">
                 <Server className="h-4 w-4 text-amber-700 dark:text-amber-300" />
                 <AlertTitle>
-                  {isDefaultLocalServer
-                    ? 'No gptme server connected'
-                    : `Cannot reach ${activeServer?.name || 'the configured server'}`}
+                  {showHostedLoopbackCorsHint || (isDefaultLocalServer && errorBucket === 'cors')
+                    ? 'Local gptme server needs browser access'
+                    : isDefaultLocalServer
+                      ? 'No gptme server connected'
+                      : `Cannot reach ${activeServer?.name || 'the configured server'}`}
                 </AlertTitle>
                 <AlertDescription className="space-y-3">
-                  <p>
-                    {isDefaultLocalServer
-                      ? 'Start a local gptme server or point the app at another server before starting a chat.'
-                      : 'Check the server URL and auth token, then retry the connection.'}
-                  </p>
-                  {isDefaultLocalServer && (
+                  <p>{disconnectedDesc}</p>
+                  {(errorBucket === 'cors' || showHostedLoopbackCorsHint) && (
                     <code className="block rounded-md border border-amber-500/20 bg-background/80 px-3 py-2 font-mono text-xs">
                       {serverCommand}
                     </code>
                   )}
+                  {errorBucket !== 'pna' &&
+                    !isDefaultLocalServer &&
+                    isHostedOrigin &&
+                    isActiveServerLoopback && (
+                      <p className="text-xs text-muted-foreground">
+                        On Chrome 142+ (and other Chromium browsers), connecting from a hosted page
+                        to a local server triggers a{' '}
+                        <span className="font-medium">Local Network Access</span> permission prompt
+                        — click <span className="font-medium">Allow</span> if you see one. The{' '}
+                        <code>--cors-origin</code> flag alone is not enough.
+                      </p>
+                    )}
+                  {showGuidedSetup && (
+                    <p className="text-sm text-muted-foreground">
+                      New to gptme? The setup guide walks you through installing a local server or
+                      using the managed gptme.ai option — no copy-pasting required.
+                    </p>
+                  )}
+                  {isDefaultLocalServer &&
+                    !isFirstVisit &&
+                    errorBucket !== 'cors' &&
+                    !showHostedLoopbackCorsHint && (
+                      <div className="space-y-2">
+                        <p className="text-xs text-muted-foreground">
+                          New to gptme? Install it, then start a server:
+                        </p>
+                        <code className="block rounded-md border border-amber-500/20 bg-background/80 px-3 py-2 font-mono text-xs">
+                          {installCommand}
+                        </code>
+                        <code className="block rounded-md border border-amber-500/20 bg-background/80 px-3 py-2 font-mono text-xs">
+                          {serverCommand}
+                        </code>
+                        {errorBucket !== 'pna' && isHostedOrigin && (
+                          <p className="text-xs text-muted-foreground">
+                            On Chrome 142+ (and other Chromium browsers), the first connection to a
+                            local server also triggers a{' '}
+                            <span className="font-medium">Local Network Access</span> permission
+                            prompt. Click <span className="font-medium">Allow</span> so this page
+                            can reach <code>localhost</code> — the <code>--cors-origin</code> flag
+                            alone is not enough.
+                          </p>
+                        )}
+                      </div>
+                    )}
                   <div className="flex flex-wrap gap-2">
+                    {showGuidedSetup && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => {
+                          setupWizard$.step.set('welcome');
+                          setupWizard$.open.set(true);
+                        }}
+                      >
+                        Get started
+                      </Button>
+                    )}
                     <Button
                       type="button"
                       size="sm"
@@ -214,7 +380,7 @@ export const WelcomeView = () => {
                       <RotateCcw className="mr-2 h-4 w-4" />
                       {isRetryingConnection ? 'Retrying...' : 'Retry connection'}
                     </Button>
-                    {isDefaultLocalServer && (
+                    {isDefaultLocalServer && !isFirstVisit && (
                       <Button
                         type="button"
                         size="sm"
@@ -225,15 +391,47 @@ export const WelcomeView = () => {
                         Copy start command
                       </Button>
                     )}
-                    <Button
-                      type="button"
-                      size="sm"
-                      variant="outline"
-                      onClick={() => settingsModal$.set({ open: true, category: 'servers' })}
-                    >
-                      Server settings
-                    </Button>
+                    {!showGuidedSetup && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        variant="outline"
+                        onClick={() => settingsModal$.set({ open: true, category: 'servers' })}
+                      >
+                        Server settings
+                      </Button>
+                    )}
                   </div>
+                  {isDefaultLocalServer && !isFirstVisit && (
+                    <p className="text-sm text-muted-foreground">
+                      Prefer not to run a local server?{' '}
+                      <Button
+                        type="button"
+                        variant="link"
+                        size="sm"
+                        className="h-auto p-0 text-sm"
+                        onClick={() => {
+                          setupWizard$.step.set('cloud');
+                          setupWizard$.open.set(true);
+                        }}
+                      >
+                        Use gptme.ai
+                      </Button>{' '}
+                      for a managed option — no install required.
+                    </p>
+                  )}
+                  <p className="text-xs text-muted-foreground">
+                    Need help connecting?{' '}
+                    <a
+                      href="https://gptme.org/docs/server.html"
+                      target="_blank"
+                      rel="noopener noreferrer"
+                      className="font-medium underline underline-offset-2 hover:text-foreground"
+                    >
+                      Read the server setup guide
+                    </a>
+                    .
+                  </p>
                 </AlertDescription>
               </Alert>
             )}

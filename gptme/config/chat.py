@@ -6,6 +6,7 @@ tool configuration, workspace paths, and agent settings.
 
 import logging
 import os
+import sys
 import tempfile
 from dataclasses import asdict, dataclass, field, replace
 from pathlib import Path
@@ -15,6 +16,15 @@ import tomlkit
 from tomlkit.exceptions import TOMLKitError
 from typing_extensions import Self
 
+if sys.version_info >= (3, 11):
+    import tomllib
+
+    _CHAT_CONFIG_LOAD_ERRORS = (OSError, tomllib.TOMLDecodeError)
+else:
+    tomllib = None
+
+    _CHAT_CONFIG_LOAD_ERRORS = (OSError, TOMLKitError)
+
 from ..util import path_with_tilde
 from .models import AgentConfig, MCPConfig
 from .project import get_project_config
@@ -23,6 +33,13 @@ if TYPE_CHECKING:
     from ..tools.base import ToolFormat
 
 logger = logging.getLogger(__name__)
+
+
+def _coerce_config_path(value: object, field_name: str) -> Path:
+    """Convert a JSON-provided path value to a resolved Path."""
+    if not isinstance(value, str | os.PathLike):
+        raise ValueError(f"chat.{field_name} must be a string path")
+    return Path(value).expanduser().resolve()
 
 
 @dataclass
@@ -57,12 +74,14 @@ class ChatConfig:
         return None
 
     @classmethod
-    def from_dict(cls, config_data: dict) -> Self:
+    def from_dict(cls, config_data: dict, *, create_workspace: bool = True) -> Self:
         """Create a ChatConfig instance from a dictionary. Warns about unknown keys."""
         _logdir = config_data.pop("_logdir", None)
 
         # Extract chat settings
         chat_data = config_data.pop("chat", {})
+        if not isinstance(chat_data, dict):
+            raise ValueError("chat must be an object")
 
         # Convert workspace to Path if present and resolve to absolute path
         if "workspace" in chat_data:
@@ -72,24 +91,31 @@ class ChatConfig:
                 if not _logdir:
                     raise ValueError("Cannot use '@log' workspace without logdir")
                 chat_data["workspace"] = (_logdir / "workspace").resolve()
-                # Ensure the workspace directory exists
-                chat_data["workspace"].mkdir(parents=True, exist_ok=True)
+                if create_workspace:
+                    chat_data["workspace"].mkdir(parents=True, exist_ok=True)
             else:
-                chat_data["workspace"] = Path(workspace_value).expanduser().resolve()
+                chat_data["workspace"] = _coerce_config_path(
+                    workspace_value, "workspace"
+                )
         # For old-style config, check if workspace is in the logdir
         elif _logdir and (_logdir / "workspace").exists():
             chat_data["workspace"] = (_logdir / "workspace").resolve()
 
         # Extract agent
-        agent_path = chat_data.pop("agent", None)
-        agent = Path(agent_path).expanduser().resolve() if agent_path else None
+        _missing = object()
+        agent_path = chat_data.pop("agent", _missing)
+        if agent_path is _missing or agent_path is None or agent_path == "":
+            agent = None
+        else:
+            agent = _coerce_config_path(agent_path, "agent")
 
         env = config_data.pop("env", {})
-        mcp = (
-            MCPConfig.from_dict(config_data.pop("mcp", {}))
-            if "mcp" in config_data
-            else None
-        )
+        if not isinstance(env, dict):
+            raise ValueError("env must be an object")
+        mcp_data = config_data.pop("mcp", None)
+        if mcp_data is not None and not isinstance(mcp_data, dict):
+            raise ValueError("mcp must be an object")
+        mcp = MCPConfig.from_dict(mcp_data) if mcp_data is not None else None
 
         # Check for unknown keys
         if config_data:
@@ -116,11 +142,15 @@ class ChatConfig:
             workspace.mkdir(parents=True, exist_ok=True)
             return cls(_logdir=path, workspace=workspace.resolve())
         try:
-            with open(chat_config_path) as f:
-                config_data = tomlkit.load(f).unwrap()
+            if tomllib is not None:
+                with open(chat_config_path, "rb") as f:
+                    config_data = tomllib.load(f)
+            else:
+                with open(chat_config_path) as f:
+                    config_data = tomlkit.load(f).unwrap()
             config_data["_logdir"] = path
             return cls.from_dict(config_data)
-        except (OSError, TOMLKitError) as e:
+        except _CHAT_CONFIG_LOAD_ERRORS as e:
             logger.warning(f"Failed to load chat config from {chat_config_path}: {e}")
             return cls()
 

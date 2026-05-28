@@ -12,9 +12,15 @@ from rich import print as rprint
 
 from ..config import Config, get_config
 from ..constants import prompt_assistant
-from ..message import Message, MessageMetadata, format_msgs, len_tokens
+from ..message import (
+    Message,
+    MessageMetadata,
+    format_msgs,
+    is_output_json,
+    len_tokens,
+)
 from ..telemetry import trace_function
-from ..tools import ToolSpec, ToolUse
+from ..tools import ToolSpec, ToolUse, get_tool_format
 from ..util import console
 from .models import (
     MODELS,
@@ -34,6 +40,18 @@ from .provider_plugins import (
 
 logger = logging.getLogger(__name__)
 _max_tokens_env_warned = False
+
+
+def _tooluse_break_check_char(char: str) -> bool:
+    """Return whether this character can complete a runnable tool call."""
+    current_format = get_tool_format()
+    if current_format == "markdown":
+        return char == "\n"
+    if current_format == "tool":
+        return char in {"}", "\n"}
+    if current_format == "xml":
+        return char in {">", "\n"}
+    return char == "\n"
 
 
 # Cheap/fast default model per provider for first-run / fallback scenarios.
@@ -249,7 +267,9 @@ def reply(
             on_token=on_token,
             max_tokens=max_tokens,
         )
-    rprint(f"{prompt_assistant(agent_name)}: Thinking...", end="\r")
+    json_mode = is_output_json()
+    if not json_mode:
+        rprint(f"{prompt_assistant(agent_name)}: Thinking...", end="\r")
     response, metadata = _chat_complete(
         generation_msgs,
         model,
@@ -257,8 +277,9 @@ def reply(
         output_schema=output_schema,
         max_tokens=max_tokens,
     )
-    rprint(" " * shutil.get_terminal_size().columns, end="\r")
-    rprint(f"{prompt_assistant(agent_name)}: {response}")
+    if not json_mode:
+        rprint(" " * shutil.get_terminal_size().columns, end="\r")
+        rprint(f"{prompt_assistant(agent_name)}: {response}")
     return Message("assistant", response, metadata=metadata)
 
 
@@ -429,9 +450,13 @@ def _reply_stream(
     on_token: Callable[[str], None] | None = None,
     max_tokens: int | None = None,
 ) -> Message:
-    rprint(f"{prompt_assistant(agent_name)}: Thinking...", end="\r")
+    json_mode = is_output_json()
+    if not json_mode:
+        rprint(f"{prompt_assistant(agent_name)}: Thinking...", end="\r")
 
     def print_clear(length: int = 0):
+        if json_mode:
+            return
         length = length or shutil.get_terminal_size().columns
         rprint("\r" + " " * length, end="\r")
 
@@ -457,7 +482,8 @@ def _reply_stream(
             if not output:  # first character
                 first_token_time = time.time()
                 print_clear()
-                rprint(f"{prompt_assistant(agent_name)}: \n", end="")
+                if not json_mode:
+                    rprint(f"{prompt_assistant(agent_name)}: \n", end="")
 
             # Capture thinking state before the tag-detection update below so
             # we can tell whether a transition happened at this newline.
@@ -475,24 +501,28 @@ def _reply_stream(
                     # Print spaces to clear the line
                     print_clear(len(last_line))
                     # Print styled version
-                    rprint(f"[dim]{last_line}[/dim]", end="")
+                    if not json_mode:
+                        rprint(f"[dim]{last_line}[/dim]", end="")
                     are_thinking = True
                 # Check for closing tag
                 elif last_line == "</think>" or last_line == "</thinking>":
                     print_clear(len(last_line))
                     # Print styled version
-                    rprint(f"[dim]{last_line}[/dim]", end="")
+                    if not json_mode:
+                        rprint(f"[dim]{last_line}[/dim]", end="")
                     are_thinking = False
                     just_closed_thinking = True
 
                 # Now print the newline
-                rprint(char, end="")
+                if not json_mode:
+                    rprint(char, end="")
             else:
                 # Print normal characters
-                if are_thinking:
-                    rprint(f"[dim]{char}[/dim]", end="")
-                else:
-                    rprint(char, end="")
+                if not json_mode:
+                    if are_thinking:
+                        rprint(f"[dim]{char}[/dim]", end="")
+                    else:
+                        rprint(char, end="")
 
             assert len(char) == 1
             output += char
@@ -533,11 +563,14 @@ def _reply_stream(
                 # else: are_thinking is True — skip thinking content
 
             # need to flush stdout to get the print to show up
-            sys.stdout.flush()
+            if not json_mode:
+                sys.stdout.flush()
 
-            # Trigger the tool detection only if the line is finished.
-            # Helps to detect nested start code blocks.
-            if break_on_tooluse and char == "\n":
+            # Trigger tool detection at cheap format-specific breakpoints.
+            # Markdown tools need line completion; XML/tool formats can finish
+            # before a trailing newline, so waiting only for "\n" can leak
+            # extra assistant text past the breakpoint.
+            if break_on_tooluse and _tooluse_break_check_char(char):
                 # TODO: make this more robust/general, maybe with a callback that runs on each char/chunk
                 # pause inference on finished code-block, letting user run the command before continuing
                 # Use streaming=True to require blank line after code blocks during streaming
@@ -704,7 +737,8 @@ def guess_provider_from_config() -> Provider | None:
     available = list_available_providers()
     if available:
         provider, _ = available[0]  # Return first available provider
-        console.log(f"Found {provider} API key, using {provider} provider")
+        if not is_output_json():
+            console.log(f"Found {provider} API key, using {provider} provider")
         return provider
     return None
 
@@ -740,7 +774,7 @@ def get_available_models(provider: Provider) -> list[ModelMeta]:
         ValueError: If provider doesn't support listing models
         Exception: If API request fails
     """
-    if provider in ("openrouter", "local") or is_custom_provider(provider):
+    if provider in ("openrouter", "local", "gptme") or is_custom_provider(provider):
         from .llm_openai import get_available_models as get_openai_models
 
         return get_openai_models(provider)

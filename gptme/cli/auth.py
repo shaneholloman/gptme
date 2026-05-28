@@ -34,7 +34,16 @@ def main():
     "--url",
     default="https://fleet.gptme.ai",
     show_default=True,
-    help="gptme service URL to authenticate with.",
+    help="gptme service URL (used for LLM API and token storage).",
+)
+@click.option(
+    "--auth-url",
+    default=None,
+    show_default=False,
+    help=(
+        "Override the device-auth endpoint base URL. "
+        "Defaults to the Supabase edge function used by gptme.ai."
+    ),
 )
 @click.option(
     "--no-browser",
@@ -42,7 +51,7 @@ def main():
     default=False,
     help="Don't open the browser automatically.",
 )
-def auth_login(url: str, no_browser: bool):
+def auth_login(url: str, auth_url: str | None, no_browser: bool):
     """Login to gptme cloud using RFC 8628 Device Flow.
 
     Initiates an OAuth Device Authorization Grant flow:
@@ -55,24 +64,26 @@ def auth_login(url: str, no_browser: bool):
 
     Works great for SSH sessions and headless environments.
     """
+    from ..llm.llm_gptme import DEFAULT_DEVICE_AUTH_URL
+
     base_url = url.rstrip("/")
-    authorize_url = f"{base_url}/api/v1/auth/device/authorize"
-    token_url = f"{base_url}/api/v1/auth/device/token"
+    auth_base = (auth_url or DEFAULT_DEVICE_AUTH_URL).rstrip("/")
+    authorize_url = f"{auth_base}/authorize"
+    token_url = f"{auth_base}/token"
 
     console.print(f"\n[bold]Logging in to {base_url}[/bold]\n")
 
     # Step 1: Request device authorization
     try:
-        resp = requests.post(authorize_url, timeout=15)
+        resp = requests.post(authorize_url, json={"client_id": "gptme-cli"}, timeout=15)
         resp.raise_for_status()
     except requests.exceptions.ConnectionError:
-        console.print(f"[red]✗ Could not connect to {base_url}[/red]")
-        console.print("  Is the service running? Check your --url argument.")
+        console.print(f"[red]✗ Could not connect to {auth_base}[/red]")
+        console.print("  Check your --auth-url argument.")
         sys.exit(1)
     except requests.exceptions.HTTPError as e:
-        console.print(
-            f"[red]✗ Authorization request failed: {e.response.status_code}[/red]"
-        )
+        status = e.response.status_code if e.response is not None else "unknown"
+        console.print(f"[red]✗ Authorization request failed: {status}[/red]")
         sys.exit(1)
 
     try:
@@ -118,6 +129,7 @@ def auth_login(url: str, no_browser: bool):
             poll_resp = requests.post(
                 token_url,
                 json={
+                    "client_id": "gptme-cli",
                     "device_code": device_code,
                     "grant_type": "urn:ietf:params:oauth:grant-type:device_code",
                 },

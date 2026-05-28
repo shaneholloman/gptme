@@ -10,39 +10,49 @@ import flask
 from typing_extensions import NotRequired
 
 from ..message import Message
+from ..util.conversation_ids import conversation_id_error
 from ..util.uri import URI, is_uri
+
+_MAX_ID_LENGTH = 255  # Linux NAME_MAX: 255 UTF-8 bytes for a single path component
+_BRANCH_SUFFIX_LEN = len(
+    ".jsonl"
+)  # branches/{name}.jsonl on disk — suffix counts against NAME_MAX
 
 
 def _validate_conversation_id(
     conversation_id: str,
 ) -> tuple[flask.Response, int] | None:
-    """Validate conversation_id to prevent path traversal attacks.
+    """Validate conversation_id to prevent path traversal attacks and OS errors.
 
     Returns None if valid, or (error_response, status_code) if invalid.
 
-    The ``..`` check is intentionally conservative: it rejects any ID containing
-    two consecutive dots, including names like ``my..project`` that aren't true
-    traversals. Since ``/`` and ``\\`` are already blocked, the only dangerous
-    single-component form is a bare ``..``, but substring matching is simpler
-    and the false-positive risk (rejecting ``..`` in a real conversation name)
-    is negligible in practice.
+    The shared validator owns the exact filesystem-safety rules. This wrapper
+    keeps the server API's historical response strings stable.
     """
-    if "/" in conversation_id or ".." in conversation_id or "\\" in conversation_id:
+    if error := conversation_id_error(conversation_id):
+        if "too long" in error:
+            return flask.jsonify({"error": "conversation_id too long"}), 400
         return flask.jsonify({"error": "Invalid conversation_id"}), 400
     return None
 
 
 def _validate_branch(branch: object) -> tuple[flask.Response, int] | None:
-    """Validate branch name to prevent path traversal attacks (CWE-22).
+    """Validate branch name to prevent path traversal attacks and OS errors.
 
     Branch names are used to construct file paths like ``branches/{branch}.jsonl``,
     so they must not contain path separators or traversal sequences.
+
+    The effective byte limit is ``NAME_MAX - len(".jsonl")`` because the on-disk
+    filename is ``{branch}.jsonl``; a branch name filling all 255 bytes would
+    produce a 261-byte filename, still triggering ``OSError: [Errno 36]``.
 
     Returns None if valid, or (error_response, status_code) if invalid.
     """
     if not isinstance(branch, str):
         return flask.jsonify({"error": "Invalid branch name"}), 400
-    if "/" in branch or ".." in branch or "\\" in branch:
+    if len(branch.encode()) > _MAX_ID_LENGTH - _BRANCH_SUFFIX_LEN:
+        return flask.jsonify({"error": "branch name too long"}), 400
+    if "/" in branch or ".." in branch or "\\" in branch or "\x00" in branch:
         return flask.jsonify({"error": "Invalid branch name"}), 400
     return None
 

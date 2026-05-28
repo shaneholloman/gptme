@@ -1,6 +1,7 @@
 """Tests for the gptme-util CLI."""
 
 import json
+import os
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -37,25 +38,45 @@ def test_tokens_count(tmp_path):
     assert result.exit_code == 0
     assert "Token count" in result.output
 
+    # Test no input: should exit nonzero (error), not silently succeed
+    result = runner.invoke(main, ["tokens", "count"], input="")
+    assert result.exit_code != 0
+    assert "No text provided" in result.output
+
+    # Test stdin via "-" argument (Unix convention: "-" means read from stdin)
+    result = runner.invoke(main, ["tokens", "count", "-"], input="Hello, world!")
+    assert result.exit_code == 0
+    assert "Token count" in result.output
+    # Should count actual tokens, not 1 (the dash character)
+    count = int(result.output.split(": ", 1)[1].strip())
+    assert count > 1
+
+    # Test directory passed to --file: should fail cleanly, not raise
+    # IsADirectoryError as an uncaught traceback.
+    result = runner.invoke(main, ["tokens", "count", "-f", str(tmp_path)])
+    assert result.exit_code == 2
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    assert "is a directory" in result.output.lower()
+
 
 def test_chats_list(tmp_path, mocker):
     """Test the chats list command."""
     runner = CliRunner()
 
+    mocker.patch("gptme.tools.browser.browser", "playwright")
+
     # Create test conversations
     logs_dir = tmp_path / "logs"
     logs_dir.mkdir()
 
-    # Mock both the logs directory and the conversation listing
-    mocker.patch("gptme.dirs.get_logs_dir", return_value=str(logs_dir))
-    mocker.patch(
-        "gptme.logmanager.conversations.get_user_conversations", return_value=[]
-    )
+    # Mock list_conversations at the package level (picked up by lazy imports in tools/chats.py)
+    mocker.patch("gptme.logmanager.list_conversations", return_value=[])
 
-    # Test empty list (should work now since we're using our empty logs_dir)
+    # Test empty list
     result = runner.invoke(main, ["chats", "list"])
     assert result.exit_code == 0
     assert "No conversations found" in result.output
+    assert "Using browser tool with" not in result.output
 
     # Create test conversation files with names that won't be filtered
     conv1_dir = logs_dir / "2024-01-01-chat-one"
@@ -95,20 +116,161 @@ def test_chats_list(tmp_path, mocker):
     )
 
     # Update the mock to return our test conversations
-    mocker.patch(
-        "gptme.logmanager.conversations.get_user_conversations",
-        return_value=[conv1, conv2],
-    )
+    mocker.patch("gptme.logmanager.list_conversations", return_value=[conv1, conv2])
 
     # Test with conversations
     result = runner.invoke(main, ["chats", "list"])
     assert result.exit_code == 0
     assert "Chat One" in result.output
     assert "Chat Two" in result.output
-    assert "2024-01-01-chat-one" in result.output
-    assert "2024-01-01-chat-two" in result.output
-    assert "Messages: 1" in result.output  # First chat has 1 message
-    assert "Messages: 2" in result.output  # Second chat has 2 messages
+    assert "(1 msgs)" in result.output  # First chat has 1 message
+    assert "(2 msgs)" in result.output  # Second chat has 2 messages
+    assert "Using browser tool with" not in result.output
+
+
+def test_chats_list_negative_limit():
+    """A negative --limit should be rejected cleanly, not crash islice()."""
+    runner = CliRunner()
+
+    # Both plain and --json paths funnel through list_conversations(limit),
+    # which previously passed a negative limit straight to islice() (ValueError).
+    for extra in ([], ["--json"]):
+        result = runner.invoke(main, ["chats", "list", "--limit", "-5", *extra])
+        assert result.exit_code != 0
+        assert "Traceback" not in result.output
+        # click.IntRange emits a clear range-violation message
+        assert "-5" in result.output
+
+
+def test_chats_read_nonexistent_exits_nonzero(tmp_path, monkeypatch):
+    """Reading a missing conversation should fail (exit!=0), like rename/send/export.
+
+    Previously `chats read` delegated to read_chat() which only printed
+    "not found" and returned, so the CLI exited 0 on an error.
+    """
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path))
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["chats", "read", "no-such-conversation"])
+    assert result.exit_code != 0
+    assert "not found" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_chats_read_too_long_id_exits_cleanly(tmp_path, monkeypatch):
+    """``chats read`` with a >255-byte ID must exit non-zero without an OSError traceback.
+
+    Passing a 300-character ID previously caused ``OSError: [Errno 36] File name too long``
+    to bubble up unhandled from ``Path.exists()`` inside the command.
+    """
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path))
+    runner = CliRunner()
+
+    long_id = "a" * 300
+    result = runner.invoke(main, ["chats", "read", long_id])
+    assert result.exit_code != 0
+    assert "not found" in result.output
+    assert "Traceback" not in result.output
+    assert "OSError" not in result.output
+
+
+def test_chats_read_dot_id_exits_cleanly(tmp_path, monkeypatch):
+    """``chats read .`` must exit non-zero without accessing the logs root directory.
+
+    A single-dot ID resolves to the logs root directory itself, which can exist and
+    cause ``chats_send``/``chats_export`` to operate on the whole log tree.
+    """
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path))
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["chats", "read", "."])
+    assert result.exit_code != 0
+    assert "not found" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_chats_read_finds_conversation_beyond_recent_limit(tmp_path, monkeypatch):
+    """`chats read` must find any conversation, not just the 20 most recent.
+
+    read_chat() used list_conversations() (default limit 20), so reading an
+    older conversation by id reported it as "not found" even though it existed.
+    """
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path))
+    runner = CliRunner()
+
+    # Create 25 conversations with strictly increasing mtimes so recency order
+    # is deterministic; the oldest sits well outside the old 20-conversation window.
+    target_id = "0000-01-01-oldest-chat"
+    base = time.time() - 10_000
+    for i in range(25):
+        conv_id = "0000-01-01-oldest-chat" if i == 0 else f"2026-01-01-chat-{i:02d}"
+        conv_dir = tmp_path / conv_id
+        conv_dir.mkdir()
+        jsonl = conv_dir / "conversation.jsonl"
+        jsonl.write_text(
+            '{"role": "user", "content": "hello", "timestamp": "2026-01-01T00:00:00+00:00"}\n'
+        )
+        # i=0 (target) is the oldest, i=24 the newest.
+        os.utime(jsonl, (base + i, base + i))
+
+    result = runner.invoke(main, ["chats", "read", target_id])
+    assert result.exit_code == 0, result.output
+    assert "not found" not in result.output
+    assert target_id in result.output
+
+
+def test_chats_search_matches_and_context_options(tmp_path, monkeypatch, mocker):
+    """`chats search` should honor --matches and line-based --context."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path))
+    mocker.patch("gptme.cli.cmd_chats.get_tools", return_value=[SimpleNamespace()])
+    runner = CliRunner()
+
+    conv_dir = tmp_path / "2026-01-01-demo"
+    conv_dir.mkdir()
+    (conv_dir / "conversation.jsonl").write_text(
+        '{"role": "user", "content": "before\\nneedle first\\nafter", "timestamp": "2026-01-01T00:00:00+00:00"}\n'
+        '{"role": "assistant", "content": "one\\nneedle second\\ntwo", "timestamp": "2026-01-01T00:00:01+00:00"}\n'
+    )
+
+    result = runner.invoke(
+        main,
+        ["chats", "search", "needle", "--matches", "2", "--context", "1"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "Match 1 (message 0, user):" in result.output
+    assert "Match 2 (message 1, assistant):" in result.output
+    assert "1| before" in result.output
+    assert "2| **needle** first" in result.output
+    assert "1| one" in result.output
+    assert "2| **needle** second" in result.output
+
+
+def test_chats_read_start_and_context_options(tmp_path, monkeypatch, mocker):
+    """`chats read` should include prior messages when --context is requested."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path))
+    mocker.patch("gptme.cli.cmd_chats.get_tools", return_value=[SimpleNamespace()])
+    runner = CliRunner()
+
+    conv_id = "2026-01-01-demo"
+    conv_dir = tmp_path / conv_id
+    conv_dir.mkdir()
+    (conv_dir / "conversation.jsonl").write_text(
+        '{"role": "user", "content": "first line", "timestamp": "2026-01-01T00:00:00+00:00"}\n'
+        '{"role": "assistant", "content": "second line", "timestamp": "2026-01-01T00:00:01+00:00"}\n'
+        '{"role": "user", "content": "third line", "timestamp": "2026-01-01T00:00:02+00:00"}\n'
+    )
+
+    result = runner.invoke(
+        main,
+        ["chats", "read", conv_id, "--start", "2", "--context", "1", "--limit", "2"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert f"Reading conversation: {conv_id} ({conv_id})" in result.output
+    assert "1. User: first line..." in result.output
+    assert "2. Assistant: second line..." in result.output
+    assert "3. User: third line..." not in result.output
 
 
 def test_context_index_and_retrieve(tmp_path):
@@ -142,6 +304,26 @@ def test_context_index_and_retrieve(tmp_path):
     assert result.exit_code == 0
     assert result.output.count("Hello, world!") > 0
     # assert result.output.count("Hello, world!") == 1
+
+
+def test_prompts_expand_ignores_disable_path_include(tmp_path, monkeypatch):
+    """`prompts expand` should still show path expansion under disabled include env.
+
+    The command is an inspection/debugging surface for path expansion itself, so
+    it must not inherit the ambient automation env that disables expansion in
+    normal chat prompts.
+    """
+    runner = CliRunner()
+    test_file = tmp_path / "hello.txt"
+    test_file.write_text("hello\n")
+
+    monkeypatch.setenv("GPTME_DISABLE_PATH_INCLUDE", "1")
+    result = runner.invoke(main, ["prompts", "expand", str(test_file)])
+
+    assert result.exit_code == 0
+    assert "hello" in result.output
+    assert str(test_file) in result.output
+    assert os.environ["GPTME_DISABLE_PATH_INCLUDE"] == "1"
 
 
 def test_chats_send(tmp_path, monkeypatch):
@@ -178,16 +360,19 @@ def test_chats_send_help_mentions_queued_follow_up_flow():
     assert re.search(r"running conversation|gptme process.*busy", help_text)
 
 
-def test_tools_list():
+def test_tools_list(mocker):
     """Test the tools list command."""
     import json
 
     runner = CliRunner()
 
+    mocker.patch("gptme.tools.browser.browser", "playwright")
+
     # Test basic list
     result = runner.invoke(main, ["tools", "list"])
     assert "Available tools" in result.output
     assert result.exit_code == 0
+    assert "Using browser tool with" not in result.output
 
     # Test langtags
     result = runner.invoke(main, ["tools", "list", "--langtags"])
@@ -256,6 +441,52 @@ def test_tools_info():
     assert isinstance(data["examples"], str)
     assert "is_mcp" in data
     assert isinstance(data["is_mcp"], bool)
+
+
+def test_tools_info_json_invalid_tool_stays_machine_readable():
+    """tools info --json should return a JSON error payload for missing tools."""
+    import json
+
+    runner = CliRunner()
+
+    result = runner.invoke(main, ["tools", "info", "nonexistent-tool", "--json"])
+
+    assert result.exit_code == 1
+    data = json.loads(result.output)
+    assert data["tool"] == "nonexistent-tool"
+    assert "not found" in data["error"]
+    assert "shell" in data["available_tools"]
+
+
+def test_tools_call_non_default_tool():
+    """Non-default tools that expose functions must be callable.
+
+    Tools like ``subagent`` are not loaded by default, but they expose
+    callable functions and ``tools call`` should still reach them instead of
+    reporting the tool as missing. Regression test for the bare ``init_tools()``
+    that left non-default tools uncallable.
+    """
+    runner = CliRunner()
+
+    # subagent is not in the default toolchain but exposes functions.
+    # Calling without the required arg should reach the function (and fail on
+    # the missing argument), NOT report the tool as not found.
+    result = runner.invoke(main, ["tools", "call", "subagent", "subagent_status"])
+    assert result.exit_code != 0
+    assert "Tool 'subagent' not found" not in result.output
+    assert "Error calling function" in result.output
+
+    # Unknown function on a loaded non-default tool lists its functions.
+    result = runner.invoke(main, ["tools", "call", "subagent", "nosuchfn"])
+    assert result.exit_code != 0
+    assert "not found in tool 'subagent'" in result.output
+    assert "Available functions" in result.output
+
+    # Genuinely unknown tool still errors and lists available tools.
+    result = runner.invoke(main, ["tools", "call", "definitely-not-a-tool", "fn"])
+    assert result.exit_code != 0
+    assert "not found" in result.output
+    assert "Available tools" in result.output
 
 
 def test_models_list():
@@ -613,3 +844,255 @@ def test_agents_scan_workspace_passes_through(mocker, tmp_path):
     runner = CliRunner()
     runner.invoke(main, ["agents", "scan", "--workspace", str(tmp_path)])
     mock_scan.assert_called_once_with(workspace=str(tmp_path))
+
+
+def test_llm_generate_unknown_model():
+    """gptme-util llm generate --model unknown/model should fail cleanly, not crash."""
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["llm", "generate", "--model", "notareal/model", "hello"]
+    )
+    assert result.exit_code != 0
+    # Should show clean error, not a raw ValueError traceback
+    assert result.exception is None or isinstance(result.exception, SystemExit)
+    # Error mentions the unknown provider/model — exact message varies by code path
+    assert "notareal" in result.output or "Unknown" in result.output
+
+
+def test_llm_generate_prepends_system_message(monkeypatch):
+    """llm generate must prepend a system message so Anthropic-compatible providers don't reject it."""
+    import unittest.mock as mock
+
+    captured: list = []
+
+    def fake_chat_complete(messages, model, tools):
+        captured.extend(messages)
+        return ("ok", None)
+
+    # Patch at source — _chat_complete is lazily imported inside llm_generate
+    monkeypatch.setattr("gptme.llm._chat_complete", fake_chat_complete)
+    monkeypatch.setattr("gptme.init.init", lambda *a, **kw: None)
+    monkeypatch.setattr("gptme.llm.get_provider_from_model", lambda m: mock.MagicMock())
+    monkeypatch.setattr("gptme.llm.init_llm", lambda *a, **kw: None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main, ["llm", "generate", "--model", "anthropic/claude-sonnet-4-6", "hello"]
+    )
+    assert result.exit_code == 0, result.output
+    assert result.output.strip() == "ok", (
+        f"Expected plain response text, got: {result.output!r}"
+    )
+    assert captured, "No messages were passed to _chat_complete"
+    assert captured[0].role == "system", (
+        f"First message must be system, got {captured[0].role!r}; "
+        f"Anthropic rejects conversations without a leading system message"
+    )
+
+
+def test_llm_generate_prepends_system_message_stream(monkeypatch):
+    """--stream path must also prepend a system message (same message list is used for both paths)."""
+    import unittest.mock as mock
+
+    captured: list = []
+
+    def fake_stream(messages, model, tools):
+        captured.extend(messages)
+        yield "ok"
+
+    monkeypatch.setattr("gptme.llm._stream", fake_stream)
+    monkeypatch.setattr("gptme.init.init", lambda *a, **kw: None)
+    monkeypatch.setattr("gptme.llm.get_provider_from_model", lambda m: mock.MagicMock())
+    monkeypatch.setattr("gptme.llm.init_llm", lambda *a, **kw: None)
+
+    runner = CliRunner()
+    result = runner.invoke(
+        main,
+        [
+            "llm",
+            "generate",
+            "--stream",
+            "--model",
+            "anthropic/claude-sonnet-4-6",
+            "hello",
+        ],
+    )
+    assert result.exit_code == 0, result.output
+    assert captured, "No messages were passed to _stream"
+    assert captured[0].role == "system", (
+        f"First message must be system, got {captured[0].role!r}"
+    )
+
+
+def test_context_git_in_repo(tmp_path):
+    """context git outputs branch/commit info inside a git repo."""
+    import subprocess
+
+    runner = CliRunner()
+    # Minimal git env so global hooks/signing/gpg don't interfere
+    git_env = {
+        "HOME": str(tmp_path),
+        "GIT_CONFIG_NOSYSTEM": "1",
+        "GIT_AUTHOR_NAME": "Test",
+        "GIT_AUTHOR_EMAIL": "test@test.com",
+        "GIT_COMMITTER_NAME": "Test",
+        "GIT_COMMITTER_EMAIL": "test@test.com",
+        "PATH": os.environ.get("PATH", "/usr/bin:/bin"),
+    }
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        subprocess.run(["git", "init"], check=True, capture_output=True, env=git_env)
+        subprocess.run(
+            ["git", "config", "user.email", "test@test.com"],
+            check=True,
+            capture_output=True,
+            env=git_env,
+        )
+        subprocess.run(
+            ["git", "config", "user.name", "Test"],
+            check=True,
+            capture_output=True,
+            env=git_env,
+        )
+        subprocess.run(
+            ["git", "config", "commit.gpgsign", "false"],
+            check=True,
+            capture_output=True,
+            env=git_env,
+        )
+        Path("readme.txt").write_text("hello")
+        subprocess.run(
+            ["git", "add", "."], check=True, capture_output=True, env=git_env
+        )
+        subprocess.run(
+            ["git", "commit", "-m", "initial commit", "--no-verify"],
+            check=True,
+            capture_output=True,
+            env=git_env,
+        )
+        result = runner.invoke(main, ["context", "git"])
+    assert result.exit_code == 0, result.output
+    assert "## Git" in result.output
+
+
+def test_context_git_not_in_repo(tmp_path):
+    """context git exits nonzero outside a git repo."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(main, ["context", "git"])
+    assert result.exit_code != 0
+
+
+def test_context_tree(tmp_path):
+    """context tree prints a workspace tree."""
+    runner = CliRunner()
+    (tmp_path / "file.txt").write_text("content")
+    (tmp_path / "subdir").mkdir()
+    result = runner.invoke(main, ["context", "tree", "--path", str(tmp_path)])
+    assert result.exit_code == 0, result.output
+    assert "Workspace structure" in result.output
+    assert "\x1b[" not in result.output
+
+
+def test_context_files(tmp_path):
+    """context files reads gptme.toml [prompt] files and prints them."""
+    runner = CliRunner()
+    prompt_file = tmp_path / "notes.md"
+    prompt_file.write_text("hello notes")
+    toml = tmp_path / "gptme.toml"
+    toml.write_text('[prompt]\nfiles = ["notes.md"]\n')
+    result = runner.invoke(main, ["context", "files", "--config", str(toml)])
+    assert result.exit_code == 0, result.output
+    assert "notes.md" in result.output
+    assert "hello notes" in result.output
+
+
+def test_context_files_missing_toml(tmp_path):
+    """context files exits nonzero when no gptme.toml is found."""
+    runner = CliRunner()
+    with runner.isolated_filesystem(temp_dir=tmp_path):
+        result = runner.invoke(main, ["context", "files"])
+    assert result.exit_code != 0
+
+
+def test_context_journal(tmp_path):
+    """context journal finds and prints journal entries."""
+    from datetime import datetime, timezone
+
+    runner = CliRunner()
+    today = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d")
+    journal_dir = tmp_path / "journal"
+    journal_dir.mkdir()
+    # flat layout: YYYY-MM-DD-topic.md
+    (journal_dir / f"{today}-test.md").write_text("# Today\nsome notes")
+    result = runner.invoke(
+        main, ["context", "journal", "--path", str(journal_dir), "--days", "1"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "some notes" in result.output
+
+
+def test_context_journal_subdirectory_layout(tmp_path):
+    """context journal handles subdirectory-per-day journal layout."""
+    from datetime import datetime, timezone
+
+    runner = CliRunner()
+    today = datetime.now(tz=timezone.utc).astimezone().strftime("%Y-%m-%d")
+    journal_dir = tmp_path / "journal"
+    day_dir = journal_dir / today
+    day_dir.mkdir(parents=True)
+    (day_dir / "session.md").write_text("# Session\nsubdir notes")
+    result = runner.invoke(
+        main, ["context", "journal", "--path", str(journal_dir), "--days", "1"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "subdir notes" in result.output
+
+
+def test_context_journal_uses_local_date_not_utc(tmp_path, monkeypatch):
+    """context journal should use the local calendar date when choosing entries."""
+    from datetime import datetime, timedelta, timezone
+
+    class FakeDateTime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return cls(2026, 1, 1, 23, 0, tzinfo=tz)
+
+        def astimezone(self, tz=None):
+            return type(self)(2026, 1, 2, 8, 0, tzinfo=timezone(timedelta(hours=9)))
+
+    monkeypatch.setattr("gptme.cli.util.datetime", FakeDateTime)
+
+    runner = CliRunner()
+    journal_dir = tmp_path / "journal"
+    journal_dir.mkdir()
+    (journal_dir / "2026-01-02-local.md").write_text(
+        "# Local day\nfound via local date"
+    )
+
+    result = runner.invoke(
+        main, ["context", "journal", "--path", str(journal_dir), "--days", "1"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "found via local date" in result.output
+
+
+def test_context_journal_no_entries(tmp_path):
+    """context journal reports nothing found gracefully."""
+    runner = CliRunner()
+    journal_dir = tmp_path / "journal"
+    journal_dir.mkdir()
+    result = runner.invoke(
+        main, ["context", "journal", "--path", str(journal_dir), "--days", "1"]
+    )
+    assert result.exit_code == 0, result.output
+    assert "No journal entries" in result.output
+
+
+def test_context_journal_rejects_file_path(tmp_path):
+    """context journal should reject a file passed to --path."""
+    runner = CliRunner()
+    journal_file = tmp_path / "journal.md"
+    journal_file.write_text("# Not a directory\n")
+    result = runner.invoke(main, ["context", "journal", "--path", str(journal_file)])
+    assert result.exit_code != 0
+    assert "Directory" in result.output

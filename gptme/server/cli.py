@@ -121,7 +121,20 @@ def main():
     help=(
         "CORS origin(s) to allow. Use '*' to allow all origins. Pass a "
         "comma-separated list to allow multiple origins, e.g. "
-        "'tauri://localhost,http://tauri.localhost'."
+        "'https://chat.gptme.org,tauri://localhost,http://tauri.localhost'. "
+        "Set this to the origin of the web UI you load (for the hosted UI, "
+        "'https://chat.gptme.org')."
+    ),
+)
+@click.option(
+    "--webui-dir",
+    type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
+    default=None,
+    envvar="GPTME_WEBUI_DIR",
+    help=(
+        "Directory containing a web UI build (e.g. the modern React webui's "
+        "dist/) to serve instead of the bundled legacy UI. Can also be set "
+        "via the GPTME_WEBUI_DIR environment variable."
     ),
 )
 @click.option(
@@ -152,6 +165,7 @@ def serve(
     port: int,
     tools: str | None,
     cors_origin: str | None,
+    webui_dir: Path | None,
     exit_on_parent_death: bool,
     watch_pid: int | None,
 ):  # pragma: no cover
@@ -219,7 +233,7 @@ def serve(
     # Initialize authentication and display token
     init_auth(host=host, display=True)
 
-    app = create_app(cors_origin=cors_origin, host=host)
+    app = create_app(cors_origin=cors_origin, host=host, webui_dir=webui_dir)
 
     try:
         app.run(debug=debug, host=host, port=port)

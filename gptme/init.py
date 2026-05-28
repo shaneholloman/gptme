@@ -5,21 +5,25 @@ from dataclasses import replace
 from typing import cast
 
 from dotenv import load_dotenv
+from rich.console import Console
 from rich.logging import RichHandler
 
 from .cli.setup import ask_for_api_key
 from .commands import init_commands
-from .config import get_config
+from .config import Config, get_config
 from .hooks import init_hooks
 from .llm import guess_provider_from_config, init_llm, is_custom_provider
+from .llm.llm_gptme import GptmeAuthError
 from .llm.models import (
     PROVIDERS,
     CustomProvider,
+    ModelMeta,
     Provider,
     get_model,
     get_recommended_model,
     set_default_model,
 )
+from .message import is_output_json
 from .tools import ToolFormat, init_tools, set_tool_format
 from .util import console
 
@@ -116,7 +120,7 @@ def init_model(
     if not model:  # pragma: no cover
         # auto-detect depending on if OPENAI_API_KEY or ANTHROPIC_API_KEY is set
         model = guess_provider_from_config()
-        if not model:
+        if not model and not is_output_json():
             console.print("[yellow]No API keys set, no provider available.[/yellow]")
 
     # ask user for API key
@@ -136,6 +140,10 @@ def init_model(
             "Full guide: https://gptme.org/docs/getting-started.html"
         )
 
+    # Holds a pre-resolved ModelMeta when the resolution step already fetched it,
+    # so the final get_model(model_full) call below can be skipped.
+    _resolved_meta: ModelMeta | None = None
+
     # Check if model has provider/model format
     if "/" in model:
         provider_part = model.split("/")[0]
@@ -147,8 +155,21 @@ def init_model(
             provider = CustomProvider(provider_part)
             model_name = "/".join(model.split("/")[1:])  # Rest after provider
         else:
-            # Unknown provider format, treat as provider only
-            provider, model_name = cast(tuple[Provider, str], (model, None))
+            # Unrecognized provider prefix. Delegate to get_model(), which can
+            # still resolve provider-less model names (e.g. OpenRouter's
+            # "meta-llama/llama-3.1-405b-instruct") via dynamic lookup.
+            # Previously this mistook the whole "a/b" string for a provider name
+            # and crashed in get_recommended_model() with a misleading message.
+            resolved = get_model(model)
+            if resolved.provider == "unknown":
+                raise ValueError(
+                    f"Unknown model {model!r}. Use 'provider/model' with a known "
+                    f"provider (e.g. 'openrouter/{model}'), or configure a custom "
+                    f"provider. Run 'gptme-util models list' to see available models."
+                )
+            provider = resolved.provider
+            model_name = resolved.model
+            _resolved_meta = resolved  # reuse below; avoids a redundant second lookup
     else:
         # No slash - check if it's a custom provider with default model
         if is_custom_provider(model):
@@ -165,10 +186,16 @@ def init_model(
     if model_name is None:
         model_name = get_recommended_model(provider)
     model_full = f"{provider}/{model_name}"
-    console.log(f"Using model: [green]{model_full}[/green]")
-    init_llm(provider)
+    if not is_output_json():
+        console.log(f"Using model: [green]{model_full}[/green]")
+    try:
+        init_llm(provider)
+    except GptmeAuthError:
+        if not _maybe_authenticate_gptme_interactively(provider, interactive, config):
+            raise
+        init_llm(provider)
 
-    model_meta = get_model(model_full)
+    model_meta = _resolved_meta or get_model(model_full)
 
     # Apply GPTME_CONTEXT_LENGTH override (useful for local models with non-standard context)
     context_length_str = os.environ.get("GPTME_CONTEXT_LENGTH")
@@ -186,8 +213,33 @@ def init_model(
     set_default_model(model_meta)
 
 
-def init_logging(verbose):
-    handler = RichHandler()  # show_time=False
+def _maybe_authenticate_gptme_interactively(
+    provider: Provider,
+    interactive: bool,
+    config: Config,
+) -> bool:
+    """Offer inline gptme.ai device-flow auth and return True if it completed."""
+    if provider != "gptme" or not interactive or is_output_json():
+        return False
+
+    response = console.input(
+        "[yellow]No gptme.ai login found.[/yellow] Start device-flow login now? [Y/n] "
+    ).strip()
+    if response and response.lower() not in {"y", "yes"}:
+        return False
+
+    from .llm.llm_gptme import DEFAULT_SERVICE_URL, device_flow_authenticate
+
+    service_url = config.get_env("GPTME_CLOUD_BASE_URL") or DEFAULT_SERVICE_URL
+    service_url = service_url.rstrip("/").removesuffix("/v1")
+    device_flow_authenticate(server_url=service_url)
+    return True
+
+
+def init_logging(verbose, *, stderr: bool = True):
+    handler = RichHandler(
+        console=Console(stderr=stderr, log_path=False)
+    )  # show_time=False
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(message)s",

@@ -66,14 +66,44 @@ def _get_request_json_object() -> dict | tuple[flask.Response, int]:
     """Return request JSON as an object or a 400 error response.
 
     Session endpoints expect JSON objects. Arrays/strings/numbers would make
-    later `.get()` access crash with AttributeError and return 500s.
+    later `.get()` access crash with AttributeError and return 500s. When the
+    client sends a non-empty malformed JSON body, surface a structured 400 here
+    instead of falling through to misleading "field is required" errors.
     """
     req_json = request.get_json(silent=True)
     if req_json is None:
+        if request.get_data(cache=True):
+            return flask.jsonify({"error": "Malformed JSON in request body"}), 400
         return {}
     if not isinstance(req_json, dict):
         return flask.jsonify({"error": "JSON body must be an object"}), 400
     return req_json
+
+
+def _get_required_string_field(
+    req_json: dict, field: str
+) -> str | tuple[flask.Response, int]:
+    """Return a required non-empty string field or a 400 response."""
+    value = req_json.get(field)
+    if value is None:
+        return flask.jsonify({"error": f"{field} is required"}), 400
+    if not isinstance(value, str):
+        return flask.jsonify({"error": f"{field} must be a string"}), 400
+    if not value:
+        return flask.jsonify({"error": f"{field} is required"}), 400
+    return value
+
+
+def _get_optional_string_field(
+    req_json: dict, field: str
+) -> str | None | tuple[flask.Response, int]:
+    """Return an optional string field or a 400 response."""
+    value = req_json.get(field)
+    if value is None:
+        return None
+    if not isinstance(value, str):
+        return flask.jsonify({"error": f"{field} must be a string"}), 400
+    return value
 
 
 # Re-export step-level symbols that other modules may import from here.
@@ -128,6 +158,13 @@ def api_conversation_events(conversation_id: str):
     """Subscribe to conversation events."""
     if error := _validate_conversation_id(conversation_id):
         return error
+    # Validate conversation exists before creating a session
+    try:
+        LogManager.load(conversation_id, lock=False)
+    except FileNotFoundError:
+        return flask.jsonify(
+            {"error": f"Conversation not found: {conversation_id}"}
+        ), 404
     session_id = request.args.get("session_id")
     if not session_id:
         # Create a new session if none provided
@@ -137,6 +174,12 @@ def api_conversation_events(conversation_id: str):
         session_obj = SessionManager.get_session(session_id)
         if session_obj is None:
             return flask.jsonify({"error": f"Session not found: {session_id}"}), 404
+        if session_obj.conversation_id != conversation_id:
+            return flask.jsonify(
+                {
+                    "error": f"Session {session_id} does not belong to conversation {conversation_id}"
+                }
+            ), 403
         session = session_obj
 
     # Generate event stream
@@ -250,19 +293,50 @@ def api_conversation_step(conversation_id: str):
     req_json = _get_request_json_object()
     if not isinstance(req_json, dict):
         return req_json
-    session_id = req_json.get("session_id")
-
-    if not session_id:
-        return flask.jsonify({"error": "session_id is required"}), 400
+    session_id = _get_required_string_field(req_json, "session_id")
+    if not isinstance(session_id, str):
+        return session_id
 
     session = SessionManager.get_session(session_id)
     if session is None:
         return flask.jsonify({"error": f"Session not found: {session_id}"}), 404
+    # Validate conversation exists before checking ownership: a nonexistent URL
+    # conversation should return 404, not 403 (mismatch is ambiguous until we
+    # know both sides exist).
+    try:
+        LogManager.load(conversation_id, lock=False)
+    except FileNotFoundError:
+        return flask.jsonify(
+            {"error": f"Conversation not found: {conversation_id}"}
+        ), 404
+    if session.conversation_id != conversation_id:
+        return flask.jsonify(
+            {
+                "error": f"Session {session_id} does not belong to conversation {conversation_id}"
+            }
+        ), 403
 
     logdir = get_logs_dir() / conversation_id
     chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
 
-    stream = req_json.get("stream", chat_config.stream)
+    model = req_json.get("model")
+    if model is not None and not isinstance(model, str):
+        return flask.jsonify({"error": "model must be a string"}), 400
+
+    if "stream" in req_json:
+        stream = req_json["stream"]
+        if not isinstance(stream, bool):
+            return (
+                flask.jsonify(
+                    {
+                        "error": "Invalid 'stream' value",
+                        "message": "'stream' must be a boolean",
+                    }
+                ),
+                400,
+            )
+    else:
+        stream = chat_config.stream
 
     # ACP opt-in: sticky once enabled for a session.
     # Default can be set server-wide via GPTME_USE_ACP_DEFAULT=true env var.
@@ -343,7 +417,6 @@ def api_conversation_step(conversation_id: str):
         # Get model from request, config, or default (in that order).
         # The frontend only sends model when the user explicitly selected one
         # (hasExplicitModelSelection), so any value here is a genuine choice.
-        model = req_json.get("model")
         if model and model != chat_config.model:
             chat_config.model = model
             chat_config.save()
@@ -493,15 +566,17 @@ def api_conversation_tool_confirm(conversation_id: str):
     req_json = _get_request_json_object()
     if not isinstance(req_json, dict):
         return req_json
-    session_id = req_json.get("session_id")
-    tool_id = req_json.get("tool_id")
-    action = req_json.get("action")
-
-    if not tool_id or not action:
-        return (
-            flask.jsonify({"error": "tool_id and action are required"}),
-            400,
-        )
+    session_id = _get_optional_string_field(req_json, "session_id")
+    if isinstance(session_id, tuple):
+        return session_id
+    tool_id = _get_required_string_field(req_json, "tool_id")
+    if not isinstance(tool_id, str):
+        return tool_id
+    action = _get_required_string_field(req_json, "action")
+    if not isinstance(action, str):
+        return action
+    if action not in {"confirm", "edit", "skip", "auto"}:
+        return flask.jsonify({"error": f"Unknown action: {action}"}), 400
 
     session: ConversationSession | None = None
 
@@ -510,6 +585,19 @@ def api_conversation_tool_confirm(conversation_id: str):
         session = SessionManager.get_session(session_id)
         if session is None:
             return flask.jsonify({"error": f"Session not found: {session_id}"}), 404
+        # Validate conversation exists before checking ownership (same as step).
+        try:
+            LogManager.load(conversation_id, lock=False)
+        except FileNotFoundError:
+            return flask.jsonify(
+                {"error": f"Conversation not found: {conversation_id}"}
+            ), 404
+        if session.conversation_id != conversation_id:
+            return flask.jsonify(
+                {
+                    "error": f"Session {session_id} does not belong to conversation {conversation_id}"
+                }
+            ), 403
         if tool_id not in session.pending_tools:
             return flask.jsonify({"error": f"Tool not found: {tool_id}"}), 404
     else:
@@ -612,8 +700,6 @@ def api_conversation_tool_confirm(conversation_id: str):
         start_tool_execution(
             conversation_id, session, tool_id, tool_exec.tooluse, model, chat_config
         )
-    else:
-        return flask.jsonify({"error": f"Unknown action: {action}"}), 400
 
     return flask.jsonify({"status": "ok", "message": f"Tool {action}ed"})
 
@@ -644,14 +730,26 @@ def api_conversation_rerun(conversation_id: str):
     req_json = _get_request_json_object()
     if not isinstance(req_json, dict):
         return req_json
-    session_id = req_json.get("session_id")
-
-    if not session_id:
-        return flask.jsonify({"error": "session_id is required"}), 400
+    session_id = _get_required_string_field(req_json, "session_id")
+    if not isinstance(session_id, str):
+        return session_id
 
     session = SessionManager.get_session(session_id)
     if not session:
         return flask.jsonify({"error": f"Session not found: {session_id}"}), 404
+    # Validate conversation exists before checking ownership (same as step).
+    try:
+        LogManager.load(conversation_id, lock=False)
+    except FileNotFoundError:
+        return flask.jsonify(
+            {"error": f"Conversation not found: {conversation_id}"}
+        ), 404
+    if session.conversation_id != conversation_id:
+        return flask.jsonify(
+            {
+                "error": f"Session {session_id} does not belong to conversation {conversation_id}"
+            }
+        ), 403
 
     if session.generating:
         return flask.jsonify(
@@ -772,7 +870,14 @@ def api_conversation_elicit_respond(conversation_id: str):
     elicit_id = req_json.get("elicit_id")
     action = req_json.get("action")
 
-    if not elicit_id or not action:
+    if elicit_id is None or not action:
+        return (
+            flask.jsonify({"error": "elicit_id and action are required"}),
+            400,
+        )
+    if not isinstance(elicit_id, str):
+        return flask.jsonify({"error": "elicit_id must be a string"}), 400
+    if not elicit_id:
         return (
             flask.jsonify({"error": "elicit_id and action are required"}),
             400,
@@ -832,12 +937,17 @@ def api_conversation_transcript(conversation_id: str):
     for i, turn in enumerate(turns):
         if not isinstance(turn, dict):
             return flask.jsonify({"error": f"turns[{i}] must be an object"}), 400
+        text = turn.get("text")
+        if text is not None and not isinstance(text, str):
+            return flask.jsonify({"error": f"turns[{i}].text must be a string"}), 400
     if not call_metadata or not isinstance(call_metadata, dict):
         return flask.jsonify({"error": "call_metadata (object) is required"}), 400
 
     call_sid = call_metadata.get("call_sid")
-    if not call_sid:
+    if call_sid is None or call_sid == "":
         return flask.jsonify({"error": "call_metadata.call_sid is required"}), 400
+    if not isinstance(call_sid, str):
+        return flask.jsonify({"error": "call_metadata.call_sid must be a string"}), 400
 
     with LogManager.load(conversation_id, lock=True, create=True) as manager:
         # Idempotency check: scan existing messages for this call_sid in metadata
@@ -857,7 +967,7 @@ def api_conversation_transcript(conversation_id: str):
         # Append each turn as a Message
         for turn in turns:
             role = turn.get("role")
-            text = turn.get("text", "").strip()
+            text = (turn.get("text") or "").strip()
 
             # Skip empty/whitespace-only turns
             if not text:
@@ -901,14 +1011,26 @@ def api_conversation_interrupt(conversation_id: str):
     req_json = _get_request_json_object()
     if not isinstance(req_json, dict):
         return req_json
-    session_id = req_json.get("session_id")
-
-    if not session_id:
-        return flask.jsonify({"error": "session_id is required"}), 400
+    session_id = _get_required_string_field(req_json, "session_id")
+    if not isinstance(session_id, str):
+        return session_id
 
     session = SessionManager.get_session(session_id)
     if session is None:
         return flask.jsonify({"error": f"Session not found: {session_id}"}), 404
+    # Validate conversation exists before checking ownership (same as step).
+    try:
+        LogManager.load(conversation_id, lock=False)
+    except FileNotFoundError:
+        return flask.jsonify(
+            {"error": f"Conversation not found: {conversation_id}"}
+        ), 404
+    if session.conversation_id != conversation_id:
+        return flask.jsonify(
+            {
+                "error": f"Session {session_id} does not belong to conversation {conversation_id}"
+            }
+        ), 403
 
     if not session.generating and not session.pending_tools:
         # Idempotent: if nothing is generating, treat as already interrupted

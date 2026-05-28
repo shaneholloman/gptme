@@ -23,6 +23,15 @@ Playwright backend:
        PW_VERSION=$(pipx runpip gptme show playwright | grep Version | cut -d' ' -f2)
        pipx run playwright==$PW_VERSION install chromium-headless-shell
 
+ - To use an existing Chromium-compatible browser over Chrome DevTools Protocol
+   instead of launching Playwright's bundled Chromium, start it with remote
+   debugging enabled and set GPTME_BROWSER_CDP_URL:
+
+   .. code-block:: bash
+
+       chromium --remote-debugging-port=9222
+       export GPTME_BROWSER_CDP_URL=http://127.0.0.1:9222
+
 Lynx backend:
  - Text-only browser for basic page reading and searching
  - No screenshot support
@@ -70,7 +79,6 @@ from typing import Literal
 
 import requests
 
-from ..util import console
 from ..util.context import md_codeblock
 from ..util.gh import (
     get_github_issue_content,
@@ -566,10 +574,6 @@ def _tool_instructions() -> str:
 
 
 def init() -> ToolSpec:
-    if browser == "playwright":
-        console.log("Using browser tool with playwright")
-    elif browser == "lynx":
-        console.log("Using browser tool with lynx")
     # Note: _tool_instructions() is evaluated once at init time, so the
     # "available now:" list reflects backend availability at startup.
     # search() itself always re-evaluates _available_search_engines() at call time.

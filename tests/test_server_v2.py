@@ -255,6 +255,20 @@ def test_v2_user_default_model_rejects_unqualified_model(client: FlaskClient):
     assert data == {"error": "model must be fully qualified as provider/model"}
 
 
+@pytest.mark.parametrize(
+    "endpoint", ["/api/v2/user/api-key", "/api/v2/user/default-model"]
+)
+@pytest.mark.parametrize("body", [[], [1, 2, 3], "string", 42])
+def test_v2_user_endpoints_reject_non_object_json(
+    client: FlaskClient, endpoint: str, body: object
+):
+    """User-setting endpoints should reject non-object JSON bodies with 400."""
+    response = client.post(endpoint, json=body)
+
+    assert response.status_code == 400
+    assert "object" in response.get_json()["error"].lower()
+
+
 class _FakeExternalSessionItem:
     def __init__(self):
         self.id = "abc123"
@@ -1040,6 +1054,39 @@ def test_v2_create_conversation_webui_html_hint_disabled(
     )
 
 
+def test_v2_create_conversation_rejects_non_object_config_without_side_effects(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    logs_dir = tmp_path / "logs"
+    conversation_id = "test-server-v2-bad-config"
+    monkeypatch.setattr("gptme.server.api_v2.get_logs_dir", lambda: logs_dir)
+
+    response = client.put(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"config": []},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "'config' must be an object"}
+    assert not (logs_dir / conversation_id).exists()
+
+
+def test_v2_create_conversation_accepts_log_workspace(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    logs_dir = tmp_path / "logs"
+    conversation_id = "test-server-v2-log-workspace"
+    monkeypatch.setattr("gptme.server.api_v2.get_logs_dir", lambda: logs_dir)
+
+    response = client.put(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"prompt": "none", "config": {"chat": {"workspace": "@log"}}},
+    )
+
+    assert response.status_code == 200
+    assert (logs_dir / conversation_id / "workspace").is_dir()
+
+
 def test_v2_conversation_post(v2_conv, client: FlaskClient):
     """Test posting a message to a V2 conversation."""
     conversation_id = v2_conv["conversation_id"]
@@ -1062,6 +1109,52 @@ def test_v2_conversation_post(v2_conv, client: FlaskClient):
     # Last message should be the user message we added
     assert data["log"][-1]["role"] == "user"
     assert data["log"][-1]["content"] == "Hello, this is a test message."
+
+
+def test_v2_conversation_post_nonexistent_branch_returns_404(
+    v2_conv, client: FlaskClient
+):
+    """POST to an existing conversation with a non-existent branch returns 404 with
+    a 'Branch not found' error — not the misleading 'Conversation not found' message
+    that would fire when the conversation itself is absent.
+    """
+    conversation_id = v2_conv["conversation_id"]
+
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "user", "content": "hello", "branch": "no-such-branch"},
+    )
+
+    assert response.status_code == 404
+    data = response.get_json()
+    assert data is not None
+    # Must say "Branch not found", not "Conversation not found"
+    assert "branch" in data["error"].lower()
+    assert "no-such-branch" in data["error"]
+
+
+@pytest.mark.parametrize("cmd", ["exit", "restart", "edit", "delete"])
+def test_v2_conversation_post_blocks_unsafe_commands(
+    v2_conv, client: FlaskClient, cmd: str
+):
+    """Commands that would crash or block the server are rejected with a clean 400.
+
+    /exit and /restart terminate/restart the server process; /edit launches an
+    interactive $EDITOR subprocess on the server host; /delete without --force
+    calls input() waiting for stdin that never arrives in server mode.
+    None should be dispatched to handle_cmd in server mode.
+    """
+    conversation_id = v2_conv["conversation_id"]
+
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "user", "content": f"/{cmd}"},
+    )
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "not available in server mode" in data["error"]
 
 
 @pytest.mark.slow
@@ -1349,6 +1442,47 @@ def test_v2_chat_config_patch_rejects_non_object_json(
     assert response.get_json() == {"error": "JSON body must be an object"}
 
 
+@pytest.mark.parametrize("bad_workspace", [[], 42, {"path": "~/tmp"}])
+def test_v2_chat_config_patch_rejects_invalid_workspace_type(
+    client: FlaskClient, bad_workspace: object
+):
+    """Config PATCH should reject non-string workspace paths with 400."""
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+
+    response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/config",
+        json={"chat": {"workspace": bad_workspace}},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "chat.workspace must be a string path"}
+
+
+@pytest.mark.parametrize(
+    ("tools_payload", "expected_error"),
+    [
+        ("shell", "tools must be a list of strings"),
+        (["definitely-not-a-tool"], "Tool 'definitely-not-a-tool' not found"),
+    ],
+)
+def test_v2_chat_config_patch_validates_tools_before_init(
+    client: FlaskClient, tools_payload: object, expected_error: str
+):
+    """Config PATCH should reject malformed tool allowlists with 400."""
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+
+    response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/config",
+        json={"chat": {"tools": tools_payload}},
+    )
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert expected_error in data["error"]
+
+
 def test_v2_chat_config_patch_rejected_during_generation(client: FlaskClient):
     """Config PATCH should return 409 when a session is actively generating."""
     conv = create_conversation(client)
@@ -1426,6 +1560,58 @@ def test_v2_post_message_rejects_invalid_files_payload(
     )
     assert response.status_code == 400
     assert response.get_json() == {"error": "files must be a list of strings"}
+
+
+@pytest.mark.parametrize(
+    "tools_payload",
+    [
+        "bash",
+        ["shell", 123],
+        {"name": "shell"},
+    ],
+)
+def test_v2_post_message_rejects_invalid_tools_payload(
+    client: FlaskClient, tools_payload: object
+):
+    """POST message should reject malformed tool allowlists with 400."""
+    conversation_id = create_conversation(client)["conversation_id"]
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "user", "content": "Test message", "tools": tools_payload},
+    )
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "tools must be a list of strings"}
+
+
+def test_v2_post_message_rejects_unknown_tool_name(client: FlaskClient):
+    """POST message should surface unknown tool names as a 400, not a 500."""
+    conversation_id = create_conversation(client)["conversation_id"]
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={
+            "role": "user",
+            "content": "Test message",
+            "tools": ["definitely-not-a-real-tool"],
+        },
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "Tool 'definitely-not-a-real-tool' not found" in data["error"]
+
+
+@pytest.mark.parametrize("body", [[], [1, 2, 3], "string", 42])
+def test_v2_post_message_rejects_non_object_json(client: FlaskClient, body: object):
+    """POST /conversations/<id> should reject non-object JSON bodies with 400."""
+    conversation_id = create_conversation(client)["conversation_id"]
+
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json=body,
+    )
+
+    assert response.status_code == 400
+    assert "object" in response.get_json()["error"].lower()
 
 
 def test_v2_edit_message_preserves_uri_files(client: FlaskClient):
@@ -1654,6 +1840,26 @@ def test_v2_create_conversation_missing_content(client: FlaskClient):
     assert "content" in data["error"].lower()
 
 
+@pytest.mark.parametrize("bad_content", [12345, None, True])
+def test_v2_create_conversation_non_string_content(
+    client: FlaskClient, bad_content: object
+):
+    """Creating a conversation with non-string message content returns 400 (not 500)."""
+    import uuid
+
+    conv_id = f"test-non-str-content-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={
+            "messages": [{"role": "user", "content": bad_content}],
+        },
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "content" in data["error"].lower()
+
+
 def test_v2_create_conversation_invalid_timestamp(client: FlaskClient):
     """Creating a conversation with an invalid timestamp returns 400."""
     import uuid
@@ -1688,6 +1894,162 @@ def test_v2_create_conversation_non_string_timestamp(client: FlaskClient):
     data = response.get_json()
     assert data is not None
     assert "timestamp" in data["error"].lower()
+
+
+@pytest.mark.parametrize("body", [[], [1, 2, 3], "string", 42])
+def test_v2_create_conversation_non_object_body(client: FlaskClient, body: object):
+    """PUT /conversations/<id> with a non-object JSON body returns 400 (not 500)."""
+    import uuid
+
+    conv_id = f"test-non-object-body-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json=body,
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "object" in data["error"].lower()
+
+
+def test_v2_create_conversation_empty_body_defaults(client: FlaskClient):
+    """PUT /conversations/<id> with no body creates a default conversation."""
+    import uuid
+
+    conv_id = f"test-empty-body-{uuid.uuid4().hex[:8]}"
+    response = client.put(f"/api/v2/conversations/{conv_id}")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["conversation_id"] == conv_id
+    assert "session_id" in data
+
+
+def test_v2_create_conversation_malformed_json_body(client: FlaskClient):
+    """PUT /conversations/<id> with malformed JSON returns 400 (not Werkzeug 400).
+
+    When get_json(silent=True) encounters malformed JSON (e.g. {bad:),
+    it returns None rather than raising BadRequest.  The endpoint should
+    surface a structured "Malformed JSON in request body" error instead of the
+    raw Werkzeug 400 that flask.request.json would have produced.
+    """
+    import uuid
+
+    conv_id = f"test-malformed-json-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        data="{bad:",  # malformed JSON: unclosed brace
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert data == {"error": "Malformed JSON in request body"}
+
+
+def test_v2_edit_message_malformed_json_body(client: FlaskClient):
+    """PATCH /messages/<index> with malformed JSON should return a JSON 400."""
+    conversation_id = create_conversation(client)["conversation_id"]
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "user", "content": "Original message"},
+    )
+    assert response.status_code == 200
+
+    conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    assert conversation is not None
+    user_index = len(conversation["log"]) - 1
+
+    response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/messages/{user_index}",
+        data="{bad:",
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert data == {"error": "Malformed JSON in request body"}
+
+
+@pytest.mark.parametrize("messages", ["not-a-list", 42, {"key": "val"}])
+def test_v2_create_conversation_messages_not_list(
+    client: FlaskClient, messages: object
+):
+    """PUT /conversations/<id> with non-list 'messages' returns 400 (not 500)."""
+    import uuid
+
+    conv_id = f"test-msgs-not-list-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={"messages": messages},
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "messages" in data["error"].lower()
+
+
+@pytest.mark.parametrize("bad_prompt", [None, [], 42, {"mode": "full"}])
+def test_v2_create_conversation_rejects_non_string_prompt(
+    client: FlaskClient, tmp_path, monkeypatch, bad_prompt: object
+):
+    """PUT /conversations/<id> should reject non-string prompt values before side effects."""
+    import uuid
+
+    logs_dir = tmp_path / "logs"
+    monkeypatch.setattr("gptme.server.api_v2.get_logs_dir", lambda: logs_dir)
+    conv_id = f"test-bad-prompt-{uuid.uuid4().hex[:8]}"
+
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={"prompt": bad_prompt},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "'prompt' must be a string"}
+    assert not (logs_dir / conv_id).exists()
+
+    retry = client.put(f"/api/v2/conversations/{conv_id}", json={"prompt": "none"})
+    assert retry.status_code == 200
+
+
+@pytest.mark.parametrize("bad_agent", [[], 42, {"path": "~/agent"}])
+def test_v2_create_conversation_rejects_invalid_agent_type(
+    client: FlaskClient, tmp_path, monkeypatch, bad_agent: object
+):
+    """PUT /conversations/<id> should reject non-string config.chat.agent values."""
+    import uuid
+
+    logs_dir = tmp_path / "logs"
+    monkeypatch.setattr("gptme.server.api_v2.get_logs_dir", lambda: logs_dir)
+    conv_id = f"test-bad-agent-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={"config": {"chat": {"agent": bad_agent}}},
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "chat.agent must be a string path"}
+    assert not (logs_dir / conv_id).exists()
+
+    retry = client.put(f"/api/v2/conversations/{conv_id}", json={"prompt": "none"})
+    assert retry.status_code == 200
+
+
+def test_v2_create_conversation_message_not_object(client: FlaskClient):
+    """PUT /conversations/<id> with a non-object message item returns 400 (not 500)."""
+    import uuid
+
+    conv_id = f"test-msg-not-obj-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={"messages": [1, 2, 3]},
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "object" in data["error"].lower()
 
 
 @pytest.mark.parametrize("body", [[], [1, 2, 3], "string", 42])
@@ -1924,3 +2286,347 @@ def test_v2_conversation_transcript_rejects_non_dict_turns(client: FlaskClient):
         assert response.status_code == 400
         data = response.get_json()
         assert "turns[" in data["error"] and "must be an object" in data["error"]
+
+
+# --- Tasks and Agents malformed-JSON regression tests ---
+
+
+@pytest.mark.parametrize("body", [[1, 2, 3], "string", 42])
+def test_v2_tasks_post_rejects_non_object_json(client: FlaskClient, body: object):
+    """Task POST should reject non-object JSON bodies with 400."""
+    response = client.post("/api/v2/tasks", json=body)
+    assert response.status_code == 400
+    assert "object" in response.get_json()["error"].lower()
+
+
+def test_v2_tasks_post_rejects_malformed_json(client: FlaskClient):
+    """Task POST should return 400 (not 400 Werkzeug HTML) on truly malformed JSON."""
+    response = client.post(
+        "/api/v2/tasks",
+        data=b"{bad:",
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None, (
+        "Response must be valid JSON, not a raw Werkzeug error page"
+    )
+    assert "error" in data
+
+
+def test_v2_tasks_put_rejects_malformed_json(client: FlaskClient):
+    """Task PUT should return clean JSON 400 on truly malformed JSON body."""
+    create_resp = client.post(
+        "/api/v2/tasks", json={"content": "task for put malformed"}
+    )
+    assert create_resp.status_code == 201
+    task_id = create_resp.get_json()["id"]
+
+    response = client.put(
+        f"/api/v2/tasks/{task_id}",
+        data=b"{bad:",
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None, (
+        "Response must be valid JSON, not a raw Werkzeug error page"
+    )
+    assert "error" in data
+
+
+@pytest.mark.parametrize("body", [[1, 2, 3], "string", 42])
+def test_v2_agents_put_rejects_non_object_json(client: FlaskClient, body: object):
+    """Agents PUT should reject non-object JSON bodies with 400."""
+    response = client.put("/api/v2/agents", json=body)
+    assert response.status_code == 400
+    assert "object" in response.get_json()["error"].lower()
+
+
+def test_v2_agents_put_rejects_malformed_json(client: FlaskClient):
+    """Agents PUT should return clean JSON 400 on truly malformed JSON body."""
+    response = client.put(
+        "/api/v2/agents",
+        data=b"{bad:",
+        content_type="application/json",
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None, (
+        "Response must be valid JSON, not a raw Werkzeug error page"
+    )
+    assert "error" in data
+
+
+@pytest.mark.parametrize(
+    ("body", "expected_error"),
+    [
+        (
+            {
+                "name": ["bob"],
+                "template_repo": "https://example.com/repo.git",
+                "template_branch": "master",
+                "fork_command": "echo ok",
+            },
+            "name must be a string",
+        ),
+        (
+            {
+                "name": False,
+                "template_repo": "https://example.com/repo.git",
+                "template_branch": "master",
+                "fork_command": "echo ok",
+            },
+            "name must be a string",
+        ),
+        (
+            {
+                "name": "bob2",
+                "template_repo": 123,
+                "template_branch": "master",
+                "fork_command": "echo ok",
+            },
+            "template_repo must be a string",
+        ),
+        (
+            {
+                "name": "bob2",
+                "template_repo": 0,
+                "template_branch": "master",
+                "fork_command": "echo ok",
+            },
+            "template_repo must be a string",
+        ),
+        (
+            {
+                "name": "bob2",
+                "template_repo": "https://example.com/repo.git",
+                "template_branch": ["master"],
+                "fork_command": "echo ok",
+            },
+            "template_branch must be a string",
+        ),
+        (
+            {
+                "name": "bob2",
+                "template_repo": "https://example.com/repo.git",
+                "template_branch": [],
+                "fork_command": "echo ok",
+            },
+            "template_branch must be a string",
+        ),
+        (
+            {
+                "name": "bob2",
+                "template_repo": "https://example.com/repo.git",
+                "template_branch": "master",
+                "fork_command": {"cmd": "echo ok"},
+            },
+            "fork_command must be a string",
+        ),
+        (
+            {
+                "name": "bob2",
+                "template_repo": "https://example.com/repo.git",
+                "template_branch": "master",
+                "fork_command": False,
+            },
+            "fork_command must be a string",
+        ),
+        (
+            {
+                "name": "bob2",
+                "template_repo": "https://example.com/repo.git",
+                "template_branch": "master",
+                "fork_command": "echo ok",
+                "path": 123,
+            },
+            "path must be a string",
+        ),
+        (
+            {
+                "name": "bob2",
+                "template_repo": "https://example.com/repo.git",
+                "template_branch": "master",
+                "fork_command": "echo ok",
+                "project_config": "bad",
+            },
+            "project_config must be an object",
+        ),
+    ],
+)
+def test_v2_agents_put_rejects_invalid_field_types(
+    client: FlaskClient,
+    monkeypatch: pytest.MonkeyPatch,
+    body: dict,
+    expected_error: str,
+):
+    """Agents PUT should reject invalid field types before any side effects start."""
+
+    def fail_workspace(*args, **kwargs):
+        pytest.fail("create_workspace_from_template should not run for invalid input")
+
+    def fail_project_config(*args, **kwargs):
+        pytest.fail("ProjectConfig.from_dict should not run for invalid input")
+
+    monkeypatch.setattr(
+        "gptme.server.api_v2_agents.create_workspace_from_template", fail_workspace
+    )
+    monkeypatch.setattr(
+        "gptme.server.api_v2_agents.ProjectConfig.from_dict", fail_project_config
+    )
+
+    response = client.put("/api/v2/agents", json=body)
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert data["error"] == expected_error
+
+
+def test_v2_agents_put_parses_project_config_object(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Agents PUT should parse a valid project_config object before workspace creation."""
+
+    parsed_project_config = object()
+    called: dict[str, Any] = {}
+
+    def fake_project_config_from_dict(raw_config: dict[str, Any], workspace: Path):
+        called["project_config_raw"] = raw_config
+        called["project_config_workspace"] = workspace
+        return parsed_project_config
+
+    def fake_create_workspace_from_template(**kwargs):
+        called["workspace_kwargs"] = kwargs
+
+    def fake_init_conversation(workspace: Path):
+        called["conversation_workspace"] = workspace
+        return "conv-test"
+
+    monkeypatch.setattr(
+        "gptme.server.api_v2_agents.ProjectConfig.from_dict",
+        fake_project_config_from_dict,
+    )
+    monkeypatch.setattr(
+        "gptme.server.api_v2_agents.create_workspace_from_template",
+        fake_create_workspace_from_template,
+    )
+    monkeypatch.setattr(
+        "gptme.server.api_v2_agents.init_conversation", fake_init_conversation
+    )
+
+    body = {
+        "name": "bob2",
+        "template_repo": "https://example.com/repo.git",
+        "template_branch": "master",
+        "fork_command": "echo ok",
+        "project_config": {"models": {"default": "openai/gpt-4o-mini"}},
+    }
+
+    response = client.put("/api/v2/agents", json=body)
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["status"] == "ok"
+    assert data["initial_conversation_id"] == "conv-test"
+    assert called["project_config_raw"] == body["project_config"]
+    assert called["project_config_workspace"] == called["workspace_kwargs"]["path"]
+    assert called["workspace_kwargs"]["project_config"] is parsed_project_config
+    assert called["conversation_workspace"] == called["workspace_kwargs"]["path"]
+
+
+def test_v2_agents_put_rejects_invalid_nested_project_config(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Agents PUT should return 400 when nested project_config sections are malformed."""
+
+    def fail_workspace(*args, **kwargs):
+        pytest.fail(
+            "create_workspace_from_template should not run for invalid project_config"
+        )
+
+    monkeypatch.setattr(
+        "gptme.server.api_v2_agents.create_workspace_from_template", fail_workspace
+    )
+
+    response = client.put(
+        "/api/v2/agents",
+        json={
+            "name": "bob2",
+            "template_repo": "https://example.com/repo.git",
+            "template_branch": "master",
+            "fork_command": "echo ok",
+            "project_config": {"rag": "boom"},
+        },
+    )
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert data["error"] == "Invalid project_config: rag must be an object"
+
+
+def test_v2_agents_put_rejects_non_list_mcp_servers(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Agents PUT should return 400 when MCP servers is not a list."""
+
+    def fail_workspace(*args, **kwargs):
+        pytest.fail(
+            "create_workspace_from_template should not run for invalid project_config"
+        )
+
+    monkeypatch.setattr(
+        "gptme.server.api_v2_agents.create_workspace_from_template", fail_workspace
+    )
+
+    response = client.put(
+        "/api/v2/agents",
+        json={
+            "name": "bob2",
+            "template_repo": "https://example.com/repo.git",
+            "template_branch": "master",
+            "fork_command": "echo ok",
+            "project_config": {"mcp": {"servers": "not_a_list"}},
+        },
+    )
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert data["error"] == "Invalid project_config: mcp.servers must be a list"
+
+
+def test_v2_agents_put_rejects_non_object_mcp_server_entries(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Agents PUT should return 400 when an MCP server entry is not a dict."""
+
+    def fail_workspace(*args, **kwargs):
+        pytest.fail(
+            "create_workspace_from_template should not run for invalid project_config"
+        )
+
+    monkeypatch.setattr(
+        "gptme.server.api_v2_agents.create_workspace_from_template", fail_workspace
+    )
+
+    response = client.put(
+        "/api/v2/agents",
+        json={
+            "name": "bob2",
+            "template_repo": "https://example.com/repo.git",
+            "template_branch": "master",
+            "fork_command": "echo ok",
+            "project_config": {"mcp": {"servers": ["not_an_object"]}},
+        },
+    )
+
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert (
+        data["error"] == "Invalid project_config: mcp.servers entries must be objects"
+    )

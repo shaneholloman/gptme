@@ -3,13 +3,19 @@
 import io
 import json
 import sys
+from contextlib import redirect_stdout
 from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from typing import Any
 from unittest.mock import patch
 
 import pytest
 from click.testing import CliRunner
 
 import gptme.cli.main as cli
+import gptme.init as gptme_init
+import gptme.llm as llm
 from gptme.message import Message, get_output_format, print_msg, set_output_format
 
 
@@ -20,14 +26,61 @@ def reset_output_format():
     set_output_format("text")
 
 
+def _invoke_cli_with_captured_goodbye(monkeypatch, tmp_path: Path, args: list[str]):
+    """Run the CLI while capturing the registered goodbye handler."""
+    handlers: list[Any] = []
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+    monkeypatch.setattr(cli.atexit, "register", handlers.append)
+
+    # Pre-chat mocks to make tests environment-independent.
+    # Without these the full setup_config_from_cli → init_tools → get_prompt
+    # pipeline runs in a bare tmp_path with no model configured, so the CLI
+    # exits through UsageError before reaching chat().
+    fake_config = SimpleNamespace(
+        chat=SimpleNamespace(
+            agent_config=None,
+            tools=[],
+            interactive=False,
+            tool_format="markdown",
+            model="local/test",
+            workspace=tmp_path,
+            stream=False,
+            agent=None,
+        ),
+        project=None,
+    )
+    monkeypatch.setattr(cli, "setup_config_from_cli", lambda **_: fake_config)
+    monkeypatch.setattr(cli, "init_tools", lambda _: [])
+    monkeypatch.setattr(cli, "get_prompt", lambda **_: [])
+    monkeypatch.setattr(cli, "init_telemetry", lambda **_: None)
+    monkeypatch.setattr(cli, "set_interruptible", lambda: None)
+    monkeypatch.setattr(cli.signal, "signal", lambda *args, **kwargs: None)
+
+    runner = CliRunner()
+    result = runner.invoke(cli.main, args, input="")
+    goodbye_handler = next(
+        handler
+        for handler in handlers
+        if getattr(handler, "__name__", "") == "goodbye_handler"
+    )
+    return result, goodbye_handler
+
+
 class TestOutputFormatValidation:
     """Tests for CLI flag validation."""
 
-    def test_json_requires_noninteractive(self):
+    def test_json_requires_noninteractive(self, monkeypatch):
         """--output-format json should error without --non-interactive."""
         runner = CliRunner()
-        # Simulate an interactive TTY so the auto-switch doesn't trigger
-        with runner.isolated_filesystem():
+        monkeypatch.delenv("PYTEST_CURRENT_TEST", raising=False)
+        # Simulate a real interactive TTY so the auto-switch path stays off.
+        with (
+            patch("click.testing._NamedTextIOWrapper.isatty", return_value=True),
+            runner.isolated_filesystem(),
+        ):
             result = runner.invoke(
                 cli.main,
                 ["--output-format", "json", "/exit"],
@@ -56,12 +109,336 @@ class TestOutputFormatValidation:
             f"Unexpected output-format error in exception: {result.exception}"
         )
 
+    def test_json_auto_switched_headless_prompt_is_allowed(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """A prompt on non-TTY stdin auto-switches to headless mode and should allow JSON."""
+        received: list[tuple[bool, str]] = []
+
+        fake_config = SimpleNamespace(
+            chat=SimpleNamespace(
+                agent_config=None,
+                tools=[],
+                interactive=False,
+                tool_format="markdown",
+                model="local/test",
+                workspace=tmp_path,
+                stream=False,
+                agent=None,
+            ),
+            project=None,
+        )
+
+        def fake_chat(
+            prompt_msgs,
+            initial_msgs,
+            logdir,
+            workspace,
+            model,
+            stream=True,
+            no_confirm=False,
+            interactive=True,
+            show_hidden=False,
+            tool_allowlist=None,
+            tool_format=None,
+            output_schema=None,
+            output_format="text",
+        ):
+            received.append((interactive, output_format))
+
+        monkeypatch.chdir(tmp_path)
+        monkeypatch.setenv("HOME", str(tmp_path))
+        monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+        monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+        monkeypatch.setattr(cli, "setup_config_from_cli", lambda **_: fake_config)
+        monkeypatch.setattr(cli, "init_tools", lambda _: [])
+        monkeypatch.setattr(cli, "get_prompt", lambda **_: [])
+        monkeypatch.setattr(cli, "init_telemetry", lambda **_: None)
+        monkeypatch.setattr(cli, "set_interruptible", lambda: None)
+        monkeypatch.setattr(cli.signal, "signal", lambda *args, **kwargs: None)
+
+        runner = CliRunner()
+        with patch("gptme.cli.main.chat", new=fake_chat):
+            result = runner.invoke(
+                cli.main,
+                ["--output-format", "json", "hello"],
+                catch_exceptions=False,
+            )
+
+        assert result.exit_code == 0
+        assert received == [(False, "json")]
+
+    def test_json_resume_error_keeps_stdout_clean(self, monkeypatch, tmp_path):
+        """JSON mode must not leak Rich logs onto stdout on early resume errors."""
+        runner_cls: Any = CliRunner
+        try:
+            runner = runner_cls(mix_stderr=False)
+        except TypeError:
+            runner = runner_cls()
+        result = runner.invoke(
+            cli.main,
+            ["--output-format", "json", "--non-interactive", "--resume"],
+            env={
+                "HOME": str(tmp_path),
+                "XDG_DATA_HOME": str(tmp_path),
+                "XDG_STATE_HOME": str(tmp_path / "state"),
+            },
+        )
+
+        assert result.exit_code == 2
+        assert result.stdout.strip() == "", (
+            "stdout must stay empty on early JSON-mode errors so supervisors don't "
+            "see non-JSON bytes before the process exits"
+        )
+        assert "No previous conversations to resume" in result.stderr
+
+    def test_json_missing_explicit_path_prompt_keeps_stdout_clean(self, tmp_path):
+        """A missing explicit path prompt must fail before any JSON-mode stdout output."""
+        runner_cls: Any = CliRunner
+        try:
+            runner = runner_cls(mix_stderr=False)
+        except TypeError:
+            runner = runner_cls()
+        missing_path = tmp_path / "missing-prompt.txt"
+        result = runner.invoke(
+            cli.main,
+            ["--output-format", "json", "--non-interactive", str(missing_path)],
+            env={
+                "HOME": str(tmp_path),
+                "XDG_DATA_HOME": str(tmp_path),
+                "XDG_STATE_HOME": str(tmp_path / "state"),
+            },
+        )
+
+        assert result.exit_code == 2
+        assert result.stdout.strip() == "", (
+            "stdout must stay empty on early JSON-mode prompt validation errors"
+        )
+        assert "explicit local path" in result.stderr
+        assert str(missing_path) in result.stderr
+
+    def test_json_missing_explicit_path_with_other_prompt_keeps_stdout_clean(
+        self, tmp_path
+    ):
+        """Mixed prompt/path argv should still fail before any JSON stdout output."""
+        runner_cls: Any = CliRunner
+        try:
+            runner = runner_cls(mix_stderr=False)
+        except TypeError:
+            runner = runner_cls()
+        missing_path = tmp_path / "missing-prompt.txt"
+        result = runner.invoke(
+            cli.main,
+            [
+                "--output-format",
+                "json",
+                "--non-interactive",
+                str(missing_path),
+                "hello",
+            ],
+            env={
+                "HOME": str(tmp_path),
+                "XDG_DATA_HOME": str(tmp_path),
+                "XDG_STATE_HOME": str(tmp_path / "state"),
+            },
+        )
+
+        assert result.exit_code == 2
+        assert result.stdout.strip() == "", (
+            "stdout must stay empty on early JSON-mode prompt validation errors"
+        )
+        assert "explicit local path" in result.stderr
+        assert str(missing_path) in result.stderr
+
+    def test_noninteractive_missing_prompt_has_no_fake_resume_hint(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """A validation error before chat start must not print a bogus resume hint."""
+        result, goodbye_handler = _invoke_cli_with_captured_goodbye(
+            monkeypatch, tmp_path, ["--non-interactive", "--name", "missing-prompt"]
+        )
+
+        goodbye_output = io.StringIO()
+        with redirect_stdout(goodbye_output):
+            goodbye_handler()
+
+        output = (result.output or "").lower()
+        goodbye_text = goodbye_output.getvalue().lower()
+        assert result.exit_code != 0
+        assert "requires a prompt" in output
+        assert "resume with:" not in goodbye_text
+        assert "goodbye!" not in goodbye_text
+
+    def test_goodbye_handler_prints_resume_hint_for_existing_conversation(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """The goodbye handler should print once a conversation log exists."""
+
+        def fake_chat(prompt_msgs, initial_msgs, logdir, *args, **kwargs):
+            (logdir / "conversation.jsonl").write_text(
+                '{"role":"user","content":"hello"}\n'
+            )
+
+        monkeypatch.setattr(cli, "chat", fake_chat)
+        result, goodbye_handler = _invoke_cli_with_captured_goodbye(
+            monkeypatch,
+            tmp_path,
+            ["--non-interactive", "--name", "resume-test", "hello"],
+        )
+
+        goodbye_output = io.StringIO()
+        with redirect_stdout(goodbye_output):
+            goodbye_handler()
+
+        assert result.exit_code == 0
+        assert "resume with: gptme --name resume-test" in goodbye_output.getvalue()
+
+    def test_fatal_chat_error_has_no_fake_resume_hint(
+        self, monkeypatch, tmp_path: Path
+    ):
+        """Fatal chat errors must not advertise a resume hint for the failed run."""
+
+        def fake_chat(prompt_msgs, initial_msgs, logdir, *args, **kwargs):
+            (logdir / "conversation.jsonl").write_text(
+                '{"role":"user","content":"hello"}\n'
+            )
+            raise RuntimeError(f"Another gptme instance is using {logdir}")
+
+        monkeypatch.setattr(cli, "chat", fake_chat)
+        result, goodbye_handler = _invoke_cli_with_captured_goodbye(
+            monkeypatch,
+            tmp_path,
+            ["--non-interactive", "--name", "fatal-resume", "hello"],
+        )
+
+        goodbye_output = io.StringIO()
+        with redirect_stdout(goodbye_output):
+            goodbye_handler()
+
+        output = (result.output or "").lower()
+        goodbye_text = goodbye_output.getvalue().lower()
+        assert result.exit_code != 0
+        assert "fatal error occurred" in output
+        assert "another gptme instance is using" in output
+        assert "resume with:" not in goodbye_text
+        assert "goodbye!" not in goodbye_text
+
+    def test_should_print_resume_hint_handles_missing_conversation_log(
+        self, tmp_path: Path
+    ):
+        """A missing conversation log should be treated as no resumable chat."""
+        assert cli._should_print_resume_hint(tmp_path, "text") is False
+
     def test_output_format_default(self):
         """Default output_format should be 'text'."""
         runner = CliRunner()
         result = runner.invoke(cli.main, ["--help"])
         assert result.exit_code == 0
         assert "--output--format" in result.output or "--output-format" in result.output
+
+
+class TestJSONRuntimeSuppression:
+    """Runtime output in JSON mode must stay off the human-readable stdout rail.
+
+    Uses capfd (capture file descriptors) instead of capsys because Rich's
+    Console/rprint hold a reference to the real sys.stdout at import time, so
+    capsys (which redirects the Python-level sys.stdout object) cannot intercept
+    their output. capfd captures at the OS file-descriptor level and catches
+    everything.
+    """
+
+    def test_init_model_suppresses_model_banner_in_json_mode(self, monkeypatch, capfd):
+        set_output_format("json")
+        monkeypatch.setattr(gptme_init, "init_llm", lambda _provider: None)
+        monkeypatch.setattr(gptme_init, "set_default_model", lambda _model: None)
+
+        gptme_init.init_model("openai/gpt-4o-mini", interactive=False)
+
+        captured = capfd.readouterr()
+        assert captured.out == ""
+
+    def test_guess_provider_suppresses_banner_in_json_mode(self, monkeypatch, capfd):
+        set_output_format("json")
+        monkeypatch.setattr(
+            llm,
+            "list_available_providers",
+            lambda: [("openai", "OPENAI_API_KEY")],
+        )
+
+        provider = llm.guess_provider_from_config()
+
+        captured = capfd.readouterr()
+        assert provider == "openai"
+        assert captured.out == ""
+
+    def test_init_model_suppresses_no_api_keys_warning_in_json_mode(
+        self, monkeypatch, capfd
+    ):
+        """Init model path where no API keys are set must NOT leak the
+        'No API keys set' warning to stdout when --output-format json."""
+        set_output_format("json")
+        mock_config = SimpleNamespace(chat=None, get_env=lambda key, default=None: None)
+        monkeypatch.setattr(gptme_init, "get_config", lambda: mock_config)
+        # Must patch on gptme_init, not llm — init.py imports via `from .llm import ...`,
+        # which creates a module-level global that LOAD_GLOBAL resolves from gptme_init.
+        monkeypatch.setattr(gptme_init, "guess_provider_from_config", lambda: None)
+        monkeypatch.setattr(gptme_init, "init_llm", lambda _provider: None)
+        monkeypatch.setattr(gptme_init, "set_default_model", lambda _model: None)
+
+        # init_model raises ValueError when no keys are available
+        with pytest.raises(ValueError, match="No API key found"):
+            gptme_init.init_model(None, interactive=False)
+
+        captured = capfd.readouterr()
+        # In JSON mode, the warning must NOT leak to stdout
+        assert "No API keys set" not in captured.out
+
+    def test_streaming_reply_suppresses_progress_in_json_mode(self, monkeypatch, capfd):
+        set_output_format("json")
+
+        def fake_stream():
+            yield "OK"
+            return {"model": "openai/gpt-4o-mini"}
+
+        monkeypatch.setattr(
+            llm,
+            "_stream",
+            lambda *args, **kwargs: llm._StreamWithMetadata(
+                fake_stream(), "openai/gpt-4o-mini"
+            ),
+        )
+
+        msg = llm._reply_stream(
+            [Message("user", "hello")],
+            "openai/gpt-4o-mini",
+            tools=None,
+            break_on_tooluse=False,
+            agent_name="bob",
+        )
+
+        captured = capfd.readouterr()
+        assert msg.content == "OK"
+        assert captured.out == ""
+
+    def test_nonstream_reply_suppresses_progress_in_json_mode(self, monkeypatch, capfd):
+        set_output_format("json")
+        monkeypatch.setattr(llm, "init_llm", lambda _provider: None)
+        monkeypatch.setattr(
+            llm,
+            "_chat_complete",
+            lambda *args, **kwargs: ("OK", {"model": "openai/gpt-4o-mini"}),
+        )
+
+        msg = llm.reply(
+            [Message("user", "hello")],
+            model="openai/gpt-4o-mini",
+            tools=None,
+            stream=False,
+        )
+
+        captured = capfd.readouterr()
+        assert msg.content == "OK"
+        assert captured.out == ""
 
 
 class TestJSONRendering:
@@ -298,6 +675,23 @@ class TestJSONOutputIntegration:
             objects.append(obj)
         return objects
 
+    def _invoke_real_json_cli(self, tmp_path: Path, prompt: str):
+        """Invoke the real CLI in JSON mode with isolated data dirs and split stdout/stderr."""
+        runner_cls: Any = CliRunner
+        try:
+            runner = runner_cls(mix_stderr=False)
+        except TypeError:
+            runner = runner_cls()
+        return runner.invoke(
+            cli.main,
+            ["--output-format", "json", "--non-interactive", prompt],
+            env={
+                "HOME": str(tmp_path),
+                "XDG_DATA_HOME": str(tmp_path),
+                "XDG_STATE_HOME": str(tmp_path / "state"),
+            },
+        )
+
     def test_stdout_is_pure_jsonl(self):
         """Core invariant: stdout contains ONLY valid JSON objects, zero non-JSON lines."""
         messages = [
@@ -360,4 +754,51 @@ class TestJSONOutputIntegration:
             )
         assert received_format == ["json"], (
             f"CLI must pass output_format='json' to chat(); got {received_format}"
+        )
+
+    def test_help_command_stdout_stays_jsonl(self, tmp_path: Path):
+        """Slash commands must not leak plain text onto stdout in JSON mode."""
+        result = self._invoke_real_json_cli(tmp_path, "/help")
+
+        assert result.exit_code == 0, result.stderr
+        objects = self._assert_pure_jsonl(result.stdout, min_lines=2)
+        assert objects[0]["role"] == "user"
+        assert objects[0]["content"] == "/help"
+        assert objects[-1]["role"] == "assistant"
+        assert "Available commands:" in objects[-1]["content"]
+        assert "Keyboard shortcuts:" in objects[-1]["content"]
+
+    def test_tokens_command_stdout_stays_jsonl(self, tmp_path: Path):
+        """Rich console command output must also stay on the JSONL rail."""
+        result = self._invoke_real_json_cli(tmp_path, "/tokens")
+
+        assert result.exit_code == 0, result.stderr
+        objects = self._assert_pure_jsonl(result.stdout, min_lines=2)
+        assert objects[0]["content"] == "/tokens"
+        assert objects[-1]["role"] == "assistant"
+        assert "No cost data available" in objects[-1]["content"]
+
+    def test_impersonate_command_stdout_stays_jsonl(self, tmp_path: Path):
+        """Commands that yield Messages must still emit those messages directly in JSON mode."""
+        result = self._invoke_real_json_cli(tmp_path, "/impersonate hello")
+
+        assert result.exit_code == 0, result.stderr
+        objects = self._assert_pure_jsonl(result.stdout, min_lines=2)
+        assert len(objects) == 2
+        assert objects[0]["content"] == "/impersonate hello"
+        assert objects[1]["role"] == "assistant"
+        assert objects[1]["content"] == "hello"
+
+    def test_unknown_command_stdout_stays_jsonl(self, tmp_path: Path):
+        """Unknown commands should also stay on the JSONL rail."""
+        result = self._invoke_real_json_cli(tmp_path, "/definitely-not-a-command")
+
+        assert result.exit_code == 0, result.stderr
+        objects = self._assert_pure_jsonl(result.stdout, min_lines=2)
+        assert len(objects) == 2
+        assert objects[0]["content"] == "/definitely-not-a-command"
+        assert objects[1]["role"] == "assistant"
+        assert (
+            objects[1]["content"]
+            == "Unknown command. Use /help to see available commands."
         )

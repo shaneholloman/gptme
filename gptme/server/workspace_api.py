@@ -60,7 +60,9 @@ class UploadedFileMetadata(BaseModel):
 
     name: str = Field(..., description="File name")
     path: str = Field(
-        ..., description="Absolute filesystem path for use in message files"
+        ...,
+        description="Path relative to conversation logdir (e.g. 'attachments/filename'). "
+        "Use with GET /api/v2/conversations/{id}/files/<path> to retrieve the file.",
     )
     type: Literal["file", "directory"] = Field(..., description="File type")
     size: int = Field(..., description="File size in bytes")
@@ -294,6 +296,8 @@ def browse_workspace(conversation_id: str, subpath: str | None = None):
         if path.is_file():
             # Return single file metadata
             return flask.jsonify(WorkspaceFile(path, workspace).to_dict())
+        if not path.exists():
+            return flask.jsonify({"error": "File or directory not found"}), 404
         # Return directory listing
         return flask.jsonify(list_directory(path, workspace, show_hidden))
 
@@ -316,6 +320,7 @@ def browse_workspace(conversation_id: str, subpath: str | None = None):
         200: UploadFileResponse,
         400: ErrorResponse,
         404: ErrorResponse,
+        409: ErrorResponse,
         413: ErrorResponse,
         500: ErrorResponse,
     },
@@ -328,7 +333,9 @@ def upload_files(conversation_id: str):
     (<logdir>/attachments/). Accepts multipart/form-data with file fields.
     Uploaded files are intended for the agent to read as context; the agent can
     move them into the workspace if it needs to modify them.
-    Returns absolute file paths so they can be included directly in message files.
+    Returns logdir-relative paths (e.g. ``attachments/filename``) for each
+    uploaded file. Retrieve a file via
+    ``GET /api/v2/conversations/{id}/files/<path>``.
     """
     if error := _validate_conversation_id(conversation_id):
         return error
@@ -358,7 +365,7 @@ def upload_files(conversation_id: str):
                 continue
 
             # Sanitize filename (prevent path traversal via filename)
-            filename = Path(file.filename).name
+            filename = Path(file.filename).name.strip()
             if not filename or filename.startswith("."):
                 continue
 
@@ -379,7 +386,7 @@ def upload_files(conversation_id: str):
                     attachments_dir, filename, reserved_names
                 )
             except ValueError as e:
-                return flask.jsonify({"error": str(e)}), 500
+                return flask.jsonify({"error": str(e)}), 409
             reserved_names.add(file_path.name)
             validated.append((file_path, content))
 

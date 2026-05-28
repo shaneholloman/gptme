@@ -8,6 +8,7 @@ from .types import (
     _DATE_SUFFIX_PATTERN,
     _MODEL_FAMILY_PATTERN,
     MODEL_ALIASES,
+    PROVIDER_ALIASES,
     PROVIDERS,
     ModelMeta,
     Provider,
@@ -162,6 +163,14 @@ def _find_closest_model_properties(
 
 
 def get_model(model: str) -> ModelMeta:
+    # Apply provider aliases (e.g. "gptme.ai" -> "gptme")
+    if "/" in model:
+        prefix, rest = model.split("/", 1)
+        if prefix in PROVIDER_ALIASES:
+            model = f"{PROVIDER_ALIASES[prefix]}/{rest}"
+    elif model in PROVIDER_ALIASES:
+        model = PROVIDER_ALIASES[model]
+
     # if only provider is given, get recommended model
     if model in PROVIDERS:
         provider = cast(Provider, model)
@@ -229,7 +238,7 @@ def get_model(model: str) -> ModelMeta:
                 )
 
             # For providers that support dynamic fetching, use _get_models_for_provider
-            if provider == "openrouter":
+            if provider in ("openrouter", "gptme"):
                 try:
                     from .listing import _get_models_for_provider  # fmt: skip
 
@@ -259,7 +268,8 @@ def get_model(model: str) -> ModelMeta:
                 except Exception as e:
                     # Fall back to unknown model metadata
                     logger.debug(
-                        "Failed to fetch OpenRouter models for %s: %s",
+                        "Failed to fetch dynamic %s models for %s: %s",
+                        provider,
                         model_name,
                         e,
                     )
@@ -286,7 +296,7 @@ def get_model(model: str) -> ModelMeta:
                 )
             return ModelMeta(provider, model_name, context=128_000)
         # Unknown provider
-        logger.warning(f"Unknown model {model}, using fallback metadata")
+        log_warn_once(f"Unknown model {model}, using fallback metadata")
         return ModelMeta(provider="unknown", model=model, context=128_000)
     # try to find model in all providers, starting with static models
     for provider in cast(list[Provider], MODELS.keys()):
@@ -318,7 +328,7 @@ def get_model(model: str) -> ModelMeta:
     except Exception as e:
         logger.debug("Failed to fetch OpenRouter models for %s: %s", model, e)
 
-    logger.warning(f"Unknown model {model}, using fallback metadata")
+    log_warn_once(f"Unknown model {model}, using fallback metadata")
     return ModelMeta(provider="unknown", model=model, context=128_000)
 
 

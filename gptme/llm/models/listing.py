@@ -58,24 +58,30 @@ def _get_models_for_provider(
 
     # Try dynamic fetching first for supported providers
     if dynamic_fetch and (
-        provider in ("openrouter", "local") or is_custom_provider(provider)
+        provider in ("openrouter", "local", "gptme") or is_custom_provider(provider)
     ):
         try:
             dynamic_models = get_available_models(provider)
             models_to_show = dynamic_models
         except Exception as e:
-            # Fall back to static models (only for built-in providers)
-            logger.debug(
-                "Failed to fetch dynamic models for %s, falling back to static: %s",
-                provider,
-                e,
-            )
-            if provider in MODELS:
-                static_models = [
-                    get_model(f"{provider}/{name}") for name in MODELS[provider]
-                ]
-                models_to_show = static_models
-            # Custom providers have no static fallback
+            from ..llm_gptme import GptmeAuthError  # fmt: skip
+
+            if isinstance(e, GptmeAuthError):
+                # Auth error: surface the actionable hint to the user
+                logger.warning("gptme provider: %s", e)
+            else:
+                # Fall back to static models (only for built-in providers)
+                logger.debug(
+                    "Failed to fetch dynamic models for %s, falling back to static: %s",
+                    provider,
+                    e,
+                )
+                if provider in MODELS:
+                    static_models = [
+                        get_model(f"{provider}/{name}") for name in MODELS[provider]
+                    ]
+                    models_to_show = static_models
+                # Custom providers have no static fallback
     else:
         # Use static models
         if MODELS.get(provider):
@@ -250,7 +256,7 @@ def _print_detailed_format(
     else:
         print(f"\n{provider}:")
 
-    if dynamic_fetch and provider == "openrouter" and len(models) > 0:
+    if dynamic_fetch and provider in ("openrouter", "gptme") and len(models) > 0:
         print(f"  ({len(models)} models available via API)")
 
     # Show up to 10 models with details

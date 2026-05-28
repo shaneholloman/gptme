@@ -6,10 +6,55 @@ import {
 } from '@/stores/servers';
 
 const DEFAULT_API_URL = 'http://127.0.0.1:5700';
+const DEFAULT_CLOUD_APP_BASE_URL = 'https://gptme.ai';
+const DEFAULT_CLOUD_EXCHANGE_BASE_URL = 'https://fleet.gptme.ai';
 
-// Cloud service URL for auth code exchange (gptme.ai)
-// Configure via VITE_GPTME_CLOUD_BASE_URL environment variable
-const CLOUD_BASE_URL = import.meta.env.VITE_GPTME_CLOUD_BASE_URL || 'https://gptme.ai';
+function trimTrailingSlash(url: string): string {
+  return url.replace(/\/+$/, '');
+}
+
+// Vite statically replaces `import.meta.env.VITE_*` at build time for browser
+// bundles. Jest can't parse import.meta syntax (it's ESM-only), so we wrap it
+// in a Function() body to defer evaluation, then fall back to process.env
+// shimmed by jest.setup.ts. All three env vars (CLOUD_BASE_URL, FLEET_BASE_URL,
+// API_URL) will silently fall through to hardcoded defaults in browsers — a
+// known limitation also present in SetupWizard.tsx.
+function getEnvVar(name: string): string | undefined {
+  try {
+    return Function(`return import.meta.env.${name}`)() as string | undefined;
+  } catch {
+    // Jest / Node runtime (import.meta not available)
+    if (typeof process !== 'undefined' && process.env) {
+      return process.env[name];
+    }
+    return undefined;
+  }
+}
+
+// The browser auth UI lives on gptme.ai, but the auth-code exchange POST is
+// handled by the fleet operator. For custom single-origin deployments, keep the
+// previous "same origin" behavior unless an explicit fleet base URL is set.
+const CLOUD_APP_BASE_URL = trimTrailingSlash(
+  getEnvVar('VITE_GPTME_CLOUD_BASE_URL') || DEFAULT_CLOUD_APP_BASE_URL
+);
+
+export function resolveCloudExchangeBaseUrl(
+  cloudAppBaseUrl: string,
+  fleetBaseUrl?: string
+): string {
+  if (fleetBaseUrl) {
+    return trimTrailingSlash(fleetBaseUrl);
+  }
+  if (trimTrailingSlash(cloudAppBaseUrl) === DEFAULT_CLOUD_APP_BASE_URL) {
+    return DEFAULT_CLOUD_EXCHANGE_BASE_URL;
+  }
+  return trimTrailingSlash(cloudAppBaseUrl);
+}
+
+const CLOUD_EXCHANGE_BASE_URL = resolveCloudExchangeBaseUrl(
+  CLOUD_APP_BASE_URL,
+  getEnvVar('VITE_GPTME_FLEET_BASE_URL')
+);
 
 export interface ConnectionConfig {
   baseUrl: string;
@@ -80,10 +125,11 @@ function getAuthCodeParams(hash?: string): { code: string } | null {
 
 /**
  * Get the exchange URL for auth code flow.
- * Derives from VITE_GPTME_CLOUD_BASE_URL environment variable.
+ * Derives from VITE_GPTME_FLEET_BASE_URL when present, otherwise falls back to
+ * the managed-service default or the custom cloud app origin.
  */
 function getExchangeUrl(): string {
-  return `${CLOUD_BASE_URL}/api/v1/operator/auth/exchange`;
+  return `${CLOUD_EXCHANGE_BASE_URL}/api/v1/operator/auth/exchange`;
 }
 
 export function getConnectionConfigFromSources(hash?: string): ConnectionConfig {
@@ -137,7 +183,7 @@ export function getConnectionConfigFromSources(hash?: string): ConnectionConfig 
 
   // Fallback (should not happen since registry always has at least one server)
   return {
-    baseUrl: import.meta.env.VITE_GPTME_API_URL || DEFAULT_API_URL,
+    baseUrl: getEnvVar('VITE_GPTME_API_URL') || DEFAULT_API_URL,
     authToken: null,
     useAuthToken: false,
   };
@@ -194,7 +240,7 @@ export async function processConnectionFromHash(hash?: string): Promise<Connecti
  */
 export function getApiBaseUrl(): string {
   const server = getActiveServer();
-  return server?.baseUrl || import.meta.env.VITE_GPTME_API_URL || DEFAULT_API_URL;
+  return server?.baseUrl || getEnvVar('VITE_GPTME_API_URL') || DEFAULT_API_URL;
 }
 
 /**

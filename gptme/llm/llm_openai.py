@@ -1618,12 +1618,22 @@ def get_available_models(provider: Provider) -> list[ModelMeta]:
     if is_custom_provider(provider):
         custom = next((p for p in config.user.providers if p.name == provider), None)
         if custom:
-            return _get_local_models(config, provider, custom.base_url)
+            return _get_openai_compatible_models(config, provider, custom.base_url)
         # Fall through to local if custom provider not found in config
-        return _get_local_models(config, provider)
+        return _get_openai_compatible_models(config, provider)
 
     if provider == "local":
-        return _get_local_models(config, provider)
+        return _get_openai_compatible_models(config, provider)
+
+    if provider == "gptme":
+        from .llm_gptme import get_api_key, get_base_url
+
+        return _get_openai_compatible_models(
+            config,
+            provider,
+            base_url=get_base_url(config),
+            api_key=get_api_key(config),
+        )
 
     if provider != "openrouter":
         raise ValueError(f"Provider {provider} does not support listing models")
@@ -1665,10 +1675,13 @@ def get_available_models(provider: Provider) -> list[ModelMeta]:
         raise
 
 
-def _get_local_models(
-    config, provider_name: str = "local", base_url: str | None = None
+def _get_openai_compatible_models(
+    config,
+    provider_name: str = "local",
+    base_url: str | None = None,
+    api_key: str | None = None,
 ) -> list[ModelMeta]:
-    """Get available models from local provider (ollama or other OpenAI-compatible server)."""
+    """Get models from an OpenAI-compatible provider."""
     # Get base URL from parameter (custom provider) or env var (local provider)
     if base_url is None:
         base_url = config.get_env("OPENAI_BASE_URL", "http://localhost:11434/v1")
@@ -1683,45 +1696,64 @@ def _get_local_models(
         models_url = f"{base_url.rstrip('/')}/v1/models"
 
     try:
-        response = requests.get(models_url, timeout=10)
+        headers = {"Authorization": f"Bearer {api_key}"} if api_key else None
+        response = requests.get(models_url, headers=headers, timeout=10)
         response.raise_for_status()
         data = response.json()
 
         # OpenAI-compatible format: {"data": [...], "object": "list"}
         raw_models = data.get("data", [])
-        return [_local_model_to_modelmeta(model, provider_name) for model in raw_models]
+        return [
+            _openai_compatible_model_to_modelmeta(model, provider_name)
+            for model in raw_models
+        ]
     except requests.RequestException as e:
-        logger.debug(f"Failed to retrieve models from {provider_name} provider: {e}")
+        log_fn = logger.debug if provider_name == "local" else logger.warning
+        log_fn(f"Failed to retrieve models from {provider_name} provider: {e}")
         # Return empty list instead of raising - local server might not be running
         return []
     except Exception as e:
-        logger.debug(f"Unexpected error retrieving {provider_name} models: {e}")
+        log_fn = logger.debug if provider_name == "local" else logger.warning
+        log_fn(f"Unexpected error retrieving {provider_name} models: {e}")
         return []
 
 
-def _local_model_to_modelmeta(model_data: dict, provider_name: str) -> ModelMeta:
-    """Convert local/ollama model data to ModelMeta object."""
+def _openai_compatible_model_to_modelmeta(
+    model_data: dict, provider_name: str
+) -> ModelMeta:
+    """Convert OpenAI-compatible model data to ModelMeta."""
 
     model_id = model_data.get("id", model_data.get("name", "unknown"))
 
-    # Ollama models typically have context of 128k, but this may vary
-    # Try to extract from model data if available
     context = model_data.get("context_length", 128_000)
 
     # Use CustomProvider for non-builtin providers, "local" for local provider
-    provider: Provider = (
-        "local" if provider_name == "local" else CustomProvider(provider_name)
-    )
+    provider: Provider
+    if provider_name == "local":
+        provider = "local"
+    elif provider_name == "gptme":
+        provider = "gptme"
+    else:
+        provider = CustomProvider(provider_name)
+
+    # Detect vision support from architecture/modality info if available
+    architecture = model_data.get("architecture", {})
+    input_modalities = architecture.get("input_modalities", [])
+    supports_vision = "image" in input_modalities
+    if not supports_vision and not input_modalities:
+        modality = architecture.get("modality", "")
+        input_side = modality.split("->")[0] if "->" in modality else ""
+        supports_vision = "image" in input_side
 
     return ModelMeta(
         provider=provider,
         model=model_id,
         context=context,
-        max_output=None,  # Ollama doesn't typically report this
+        max_output=None,
         supports_streaming=True,
-        supports_vision=False,  # Could be enhanced to detect vision models
+        supports_vision=supports_vision,
         supports_reasoning=False,
-        price_input=0,  # Local models are free
+        price_input=0,  # pricing unknown for dynamically discovered models
         price_output=0,
     )
 

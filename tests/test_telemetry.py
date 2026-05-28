@@ -1,5 +1,6 @@
 """Tests for telemetry functionality."""
 
+import logging
 import subprocess
 import sys
 from unittest.mock import patch
@@ -81,6 +82,63 @@ def test_pushgateway_periodic_push(monkeypatch):
         shutdown_telemetry()
 
 
+def test_connection_error_filter_truncates_read_timeout_traceback():
+    """Timeout-style OTLP export errors should be reduced to one-line noise."""
+    from gptme.util._telemetry import TelemetryConnectionErrorFilter
+
+    class ReadTimeout(Exception):
+        pass
+
+    record = logging.LogRecord(
+        name="opentelemetry.sdk._shared_internal",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="Exception while exporting Span.",
+        args=("stale-format-arg",),
+        exc_info=(ReadTimeout, ReadTimeout("read timed out"), None),
+    )
+
+    filter_ = TelemetryConnectionErrorFilter(cooldown_seconds=300.0)
+
+    assert filter_.filter(record) is True
+    assert record.exc_info is None
+    assert record.exc_text is None
+    assert record.args == ()
+    assert record.msg == "Telemetry export failed: read timed out"
+
+
+def test_connection_error_filter_debounces_repeated_timeouts():
+    """Repeated OTLP timeout errors should be suppressed inside the cooldown."""
+    from gptme.util._telemetry import TelemetryConnectionErrorFilter
+
+    class ReadTimeout(Exception):
+        pass
+
+    filter_ = TelemetryConnectionErrorFilter(cooldown_seconds=300.0)
+    first = logging.LogRecord(
+        name="opentelemetry.sdk._shared_internal",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=1,
+        msg="Exception while exporting Span.",
+        args=("stale-format-arg",),
+        exc_info=(ReadTimeout, ReadTimeout("read timed out"), None),
+    )
+    second = logging.LogRecord(
+        name="opentelemetry.sdk._shared_internal",
+        level=logging.ERROR,
+        pathname=__file__,
+        lineno=2,
+        msg="Exception while exporting Span.",
+        args=("stale-format-arg",),
+        exc_info=(ReadTimeout, ReadTimeout("read timed out"), None),
+    )
+
+    assert filter_.filter(first) is True
+    assert filter_.filter(second) is False
+
+
 def test_record_hook_call_records_span():
     """Hook spans should preserve timing and attributes for tracing."""
     from gptme.telemetry import record_hook_call
@@ -151,3 +209,54 @@ def test_record_hook_call_records_span():
             },
         )
     ]
+
+
+def test_otlp_timeout_seconds_default_when_unset(monkeypatch):
+    """Unset OTEL_EXPORTER_OTLP_TIMEOUT falls back to the provided default."""
+    from gptme.util._telemetry import _otlp_timeout_seconds
+
+    monkeypatch.delenv("OTEL_EXPORTER_OTLP_TIMEOUT", raising=False)
+    assert _otlp_timeout_seconds(default=10.0) == 10.0
+    assert _otlp_timeout_seconds(default=5.0) == 5.0
+
+
+def test_otlp_timeout_seconds_honors_env_milliseconds(monkeypatch):
+    """OTEL_EXPORTER_OTLP_TIMEOUT is read in milliseconds and converted to seconds."""
+    from gptme.util._telemetry import _otlp_timeout_seconds
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "1000")
+    assert _otlp_timeout_seconds(default=10.0) == 1.0
+    # Same env value applies regardless of the default (fast-fail override).
+    assert _otlp_timeout_seconds(default=5.0) == 1.0
+
+
+def test_otlp_timeout_seconds_invalid_falls_back(monkeypatch):
+    """A non-integer env value falls back to the default instead of raising."""
+    from gptme.util._telemetry import _otlp_timeout_seconds
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "not-a-number")
+    assert _otlp_timeout_seconds(default=10.0) == 10.0
+
+
+def test_otlp_timeout_seconds_zero_falls_back(monkeypatch):
+    """A zero timeout is spec-invalid (must be positive) and falls back to default."""
+    from gptme.util._telemetry import _otlp_timeout_seconds
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "0")
+    assert _otlp_timeout_seconds(default=10.0) == 10.0
+
+
+def test_otlp_timeout_seconds_negative_falls_back(monkeypatch):
+    """A negative timeout is spec-invalid and falls back to default with a warning."""
+    from gptme.util._telemetry import _otlp_timeout_seconds
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "-1000")
+    assert _otlp_timeout_seconds(default=10.0) == 10.0
+
+
+def test_otlp_timeout_seconds_overflow_falls_back(monkeypatch):
+    """An 'inf' value triggers OverflowError on int() and falls back to the default."""
+    from gptme.util._telemetry import _otlp_timeout_seconds
+
+    monkeypatch.setenv("OTEL_EXPORTER_OTLP_TIMEOUT", "inf")
+    assert _otlp_timeout_seconds(default=10.0) == 10.0

@@ -285,9 +285,16 @@ def run(workspace: Path | None = None) -> None:
             # No input — return empty (CC may call hooks with empty stdin)
             _output_empty()
             return
-        hook_input: dict = json.loads(raw)
+        hook_input = json.loads(raw)
     except (json.JSONDecodeError, OSError) as e:
         logger.debug("Failed to parse hook input: %s", e)
+        _output_empty()
+        return
+
+    if not isinstance(hook_input, dict):
+        # Valid JSON but not an object (e.g. a list or scalar) — CC always
+        # sends an object, so anything else is malformed. Pass through.
+        logger.debug("Hook input is not a JSON object: %s", type(hook_input).__name__)
         _output_empty()
         return
 
@@ -312,7 +319,8 @@ def run(workspace: Path | None = None) -> None:
         _output_empty()
         return
 
-    if not match_text.strip():
+    if not isinstance(match_text, str) or not match_text.strip():
+        # A malformed event may carry a non-string "prompt" — treat as no match.
         _output_empty()
         return
 
@@ -365,6 +373,9 @@ def run(workspace: Path | None = None) -> None:
 
     # Take top N
     new_results = new_results[:max_lessons]
+    for result in new_results:
+        if result.lesson.is_stub:
+            result.lesson = index.materialize_lesson(result.lesson)
 
     # Build context text
     parts = []
@@ -512,7 +523,7 @@ def _extract_pretooluse_text(hook_input: dict) -> str:
     parts: list[str] = []
 
     tool_name = hook_input.get("tool_name", "")
-    if tool_name:
+    if isinstance(tool_name, str) and tool_name:
         parts.append(tool_name)
 
     tool_input = hook_input.get("tool_input", {})
@@ -522,7 +533,11 @@ def _extract_pretooluse_text(hook_input: dict) -> str:
     # Recent transcript (assistant + tool output) for context-aware matching
     transcript = hook_input.get("transcript", [])
     recent_text: list[str] = []
+    if not isinstance(transcript, list):
+        transcript = []
     for entry in transcript[-6:]:  # Last 6 entries
+        if not isinstance(entry, dict):
+            continue
         role = entry.get("role", "")
         content = entry.get("content", "")
         if role in ("assistant", "tool") and isinstance(content, str):

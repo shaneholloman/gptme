@@ -13,6 +13,18 @@ from ..logmanager.conversations import ConversationMeta
 from ..prompt_queue import queue_prompt
 from ..tools import get_tools, init_tools
 from ..tools.chats import find_empty_conversations, list_chats, search_chats
+from ..util.conversation_ids import is_valid_conversation_id
+
+
+def _is_valid_id(id: str) -> bool:
+    """Return True if id is a plausible conversation identifier.
+
+    Rejects IDs that are too long for the filesystem (Linux NAME_MAX is 255
+    UTF-8 bytes per path component) or contain path-traversal sequences.
+    These would otherwise raise ``OSError: [Errno 36] File name too long``
+    deep inside ``Path.exists()`` or ``os.stat()``.
+    """
+    return is_valid_conversation_id(id)
 
 
 def _ensure_tools():
@@ -57,12 +69,21 @@ def chats():
 
 
 @chats.command("list")
-@click.option("-n", "--limit", default=20, help="Maximum number of chats to show.")
+@click.option(
+    "-n",
+    "--limit",
+    default=20,
+    type=click.IntRange(min=1),
+    help="Maximum number of chats to show.",
+)
 @click.option(
     "--summarize", is_flag=True, help="Generate LLM-based summaries for chats"
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
-def chats_list(limit: int, summarize: bool, output_json: bool):
+@click.option(
+    "--metadata", is_flag=True, help="Show full metadata (ID, model, cost, tokens)."
+)
+def chats_list(limit: int, summarize: bool, output_json: bool, metadata: bool):
     """List conversation logs."""
     _ensure_tools()
 
@@ -83,18 +104,24 @@ def chats_list(limit: int, summarize: bool, output_json: bool):
             tool_allowlist=[],
             tool_format="markdown",
         )
-    list_chats(max_results=limit, include_summary=summarize)
+    list_chats(max_results=limit, metadata=metadata, include_summary=summarize)
 
 
 @chats.command("search")
 @click.argument("query")
-@click.option("-n", "--limit", default=20, help="Maximum number of chats to show.")
+@click.option(
+    "-n",
+    "--limit",
+    default=20,
+    type=click.IntRange(min=1),
+    help="Maximum number of chats to show.",
+)
 @click.option(
     "--summarize", is_flag=True, help="Generate LLM-based summaries for chats"
 )
 @click.option("--json", "output_json", is_flag=True, help="Output as JSON.")
 @click.option(
-    "-c", "--context", default=50, help="Characters of context around each match."
+    "-c", "--context", default=1, help="Lines of context to show around each match."
 )
 @click.option(
     "-m", "--matches", default=1, help="Maximum matches to show per conversation."
@@ -108,6 +135,8 @@ def chats_search(
     matches: int,
 ):
     """Search conversation logs."""
+    if not query.strip():
+        raise click.UsageError("search query cannot be empty")
     _ensure_tools()
 
     if output_json:
@@ -147,12 +176,18 @@ def chats_search(
             tool_allowlist=[],
             tool_format="markdown",
         )
-    search_chats(query, max_results=limit, context_size=context, max_matches=matches)
+    search_chats(query, max_results=limit, context_lines=context, max_matches=matches)
 
 
 @chats.command("read")
 @click.argument("id")
-@click.option("-n", "--limit", default=20, help="Maximum number of messages to show.")
+@click.option(
+    "-n",
+    "--limit",
+    default=20,
+    type=click.IntRange(min=1),
+    help="Maximum number of messages to show.",
+)
 @click.option("--system", is_flag=True, help="Include system messages.")
 @click.option(
     "-c", "--context", default=0, help="Messages of context before start message."
@@ -168,6 +203,13 @@ def chats_read(id: str, limit: int, system: bool, context: int, start: int | Non
     _ensure_tools()
 
     from ..tools.chats import read_chat  # fmt: skip
+
+    if (
+        not _is_valid_id(id)
+        or not (get_logs_dir() / id / "conversation.jsonl").exists()
+    ):
+        click.echo(f"Conversation '{id}' not found.")
+        raise SystemExit(1)
 
     read_chat(
         id,
@@ -189,11 +231,11 @@ def chats_rename(id: str, name: str):
     """
     from ..logmanager import rename_conversation  # fmt: skip
 
-    if rename_conversation(id, name):
-        print(f"Renamed '{id}' to '{name}'")
-    else:
+    if not _is_valid_id(id) or not rename_conversation(id, name):
         print(f"Chat '{id}' not found")
         sys.exit(1)
+    else:
+        print(f"Renamed '{id}' to '{name}'")
 
 
 @chats.command("send")
@@ -205,6 +247,9 @@ def chats_send(id: str, message: tuple[str, ...]):
     This is useful when another gptme process is busy in the same chat and you
     already know the next instruction you want to send.
     """
+    if not _is_valid_id(id):
+        click.echo(f"Chat '{id}' not found")
+        raise SystemExit(1)
     logdir = get_logs_dir() / id
     if not logdir.exists():
         click.echo(f"Chat '{id}' not found")
@@ -247,7 +292,7 @@ def chats_export(id: str, fmt: str, output: str | None):
     from ..util.export import export_chat_to_html, export_chat_to_markdown  # fmt: skip
 
     logdir = get_logs_dir() / id
-    if not logdir.exists():
+    if not _is_valid_id(id) or not logdir.exists():
         click.echo(f"Chat '{id}' not found")
         raise SystemExit(1)
 

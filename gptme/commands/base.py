@@ -2,9 +2,11 @@
 Core command registry, decorator, and base types.
 """
 
+import io
 import logging
 import re
 from collections.abc import Callable, Generator
+from contextlib import redirect_stdout
 from dataclasses import dataclass
 from typing import TYPE_CHECKING
 
@@ -168,11 +170,69 @@ def execute_cmd(msg: "Message", log: "LogManager") -> bool:
     return False
 
 
+def _emit_json_command_output(content: str) -> None:
+    """Emit captured command output as a JSON-mode assistant message."""
+    from ..message import Message, print_msg  # fmt: skip
+
+    content = content.rstrip("\n")
+    if content:
+        print_msg(Message("assistant", content))
+
+
+def _collect_command_outputs(*captured_outputs: str) -> list[str]:
+    """Collect distinct captured outputs while preserving order."""
+    outputs: list[str] = []
+    seen: set[str] = set()
+    for output in captured_outputs:
+        output = output.rstrip("\n")
+        if output and output not in seen:
+            outputs.append(output)
+            seen.add(output)
+    return outputs
+
+
+def _yield_json_command_output(
+    handler: CommandHandler,
+    ctx: CommandContext,
+) -> Generator["Message", None, None]:
+    """Capture command stdout per generator step without hijacking yielded messages."""
+    from ..util import console  # fmt: skip
+
+    command_iter = iter(handler(ctx))
+    while True:
+        stdout_buffer = io.StringIO()
+        next_msg = None
+        completed = False
+        error = None
+        with console.capture() as console_capture, redirect_stdout(stdout_buffer):
+            try:
+                next_msg = next(command_iter)
+            except StopIteration:
+                completed = True
+            except Exception as exc:  # pragma: no cover - passthrough
+                error = exc
+
+        outputs = _collect_command_outputs(
+            stdout_buffer.getvalue(),
+            console_capture.get(),
+        )
+        if outputs:
+            _emit_json_command_output("\n".join(outputs))
+        if error is not None:
+            raise error
+        if completed:
+            return
+        assert next_msg is not None
+        yield next_msg
+
+
 def handle_cmd(
     cmd: str,
     manager: "LogManager",
 ) -> Generator["Message", None, None]:
     """Handles a command."""
+    from ..message import is_output_json  # fmt: skip
+
     cmd = cmd.lstrip("/")
     logger.debug(f"Executing command: {cmd}")
     name, *args = [s for s in re.split(r"[\n\s]", cmd) if s]
@@ -180,8 +240,12 @@ def handle_cmd(
 
     # Check if command is registered
     if name in _command_registry:
+        handler = _command_registry[name]
         ctx = CommandContext(args=args, full_args=full_args, manager=manager)
-        yield from _command_registry[name](ctx)
+        if is_output_json():
+            yield from _yield_json_command_output(handler, ctx)
+            return
+        yield from handler(ctx)
         return
 
     # Fallback to tool execution
@@ -192,7 +256,12 @@ def handle_cmd(
         yield from tooluse.execute(log=manager.log, workspace=manager.workspace)
     else:
         manager.undo(1, quiet=True)
-        print("Unknown command. Use /help to see available commands.")
+        if is_output_json():
+            _emit_json_command_output(
+                "Unknown command. Use /help to see available commands."
+            )
+        else:
+            print("Unknown command. Use /help to see available commands.")
 
 
 def get_commands_with_descriptions() -> list[tuple[str, str]]:

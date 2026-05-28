@@ -26,7 +26,7 @@ _session_id: ContextVar[str | None] = ContextVar("session_id", default=None)
 
 
 class TelemetryConnectionErrorFilter(logging.Filter):
-    """Filter to debounce and truncate verbose connection error traces from OpenTelemetry.
+    """Filter to debounce and truncate verbose network/export traces from OpenTelemetry.
 
     This filter:
     1. Simplifies verbose stack traces to single-line messages
@@ -34,8 +34,17 @@ class TelemetryConnectionErrorFilter(logging.Filter):
     3. Periodically shows a count of suppressed errors
 
     The filter ensures users see at least one error message when telemetry fails,
-    but prevents spam from repeated connection failures.
+    but prevents spam from repeated exporter network failures.
     """
+
+    _NETWORK_ERROR_NAME_FRAGMENTS = (
+        "ConnectionError",
+        "NewConnectionError",
+        "MaxRetryError",
+        "ReadTimeout",
+        "ConnectTimeout",
+        "TimeoutError",
+    )
 
     def __init__(self, cooldown_seconds: float = 300.0):
         super().__init__()
@@ -55,14 +64,12 @@ class TelemetryConnectionErrorFilter(logging.Filter):
         ):
             return True
 
-        # Check if this is a connection error
+        # Check if this is a connection/export error
         if record.levelno == logging.ERROR and record.exc_info:
             exc_type, exc_value, _ = record.exc_info
-            # Check if it's a connection-related error
-            if exc_type and (
-                "ConnectionError" in exc_type.__name__
-                or "NewConnectionError" in exc_type.__name__
-                or "MaxRetryError" in exc_type.__name__
+            if exc_type and any(
+                fragment in exc_type.__name__
+                for fragment in self._NETWORK_ERROR_NAME_FRAGMENTS
             ):
                 # Create error key for deduplication (type + truncated message)
                 error_key = f"{exc_type.__name__}"
@@ -82,13 +89,14 @@ class TelemetryConnectionErrorFilter(logging.Filter):
                     # Replace verbose stack trace with simple message
                     record.exc_info = None
                     record.exc_text = None
+                    record.args = ()
 
                     if count == 1:
-                        record.msg = f"Telemetry connection failed: {exc_value}"
+                        record.msg = f"Telemetry export failed: {exc_value}"
                     else:
                         # Show count of suppressed errors
                         record.msg = (
-                            f"Telemetry connection still failing "
+                            f"Telemetry export still failing "
                             f"({count} occurrences): {exc_value}"
                         )
                     return True
@@ -281,6 +289,43 @@ def enrich_span_with_llm_metrics(
         span.set_attribute("llm.cost.usd", cost)
 
 
+def _otlp_timeout_seconds(default: float) -> float:
+    """OTLP export timeout in seconds, honoring the standard OTel env var.
+
+    gptme previously hardcoded the OTLP export and force-flush timeouts. When a
+    collector accepts the TCP connection but stalls on the HTTP request (a
+    half-wedged collector), every session then blocks for the full timeout on
+    shutdown, with no way to fast-fail.
+
+    This honors the standard ``OTEL_EXPORTER_OTLP_TIMEOUT`` env var (milliseconds,
+    per the OpenTelemetry spec) so operators can fast-fail an unreachable
+    collector, e.g. ``OTEL_EXPORTER_OTLP_TIMEOUT=1000`` for a 1s timeout. Falls
+    back to ``default`` seconds when unset or invalid.
+    """
+    raw = os.getenv("OTEL_EXPORTER_OTLP_TIMEOUT")
+    if not raw:
+        return default
+    try:
+        ms = int(float(raw))
+    except (ValueError, OverflowError):
+        logger.warning(
+            "Invalid OTEL_EXPORTER_OTLP_TIMEOUT=%r (expected integer milliseconds); "
+            "using %ss",
+            raw,
+            default,
+        )
+        return default
+    if ms <= 0:
+        logger.warning(
+            "Invalid OTEL_EXPORTER_OTLP_TIMEOUT=%r (must be a positive integer); "
+            "using %ss",
+            raw,
+            default,
+        )
+        return default
+    return max(0.001, ms / 1000.0)
+
+
 def init_telemetry(
     service_name: str = "gptme",
     enable_flask_instrumentation: bool = True,
@@ -408,9 +453,15 @@ def init_telemetry(
         if not trace_endpoint.endswith("/v1/traces"):
             trace_endpoint = trace_endpoint.rstrip("/") + "/v1/traces"
 
+        # Export timeout (seconds). Defaults to 10s but honors
+        # OTEL_EXPORTER_OTLP_TIMEOUT so operators can fast-fail a wedged collector.
+        export_timeout = _otlp_timeout_seconds(default=10.0)
+
         otlp_exporter = OTLPSpanExporter(
             endpoint=trace_endpoint,
-            timeout=10,  # 10 second timeout for exports
+            # round() returns int (SDK requires int); max(1, ...) avoids truncating
+            # sub-second values to 0 (which causes immediate timeout).
+            timeout=max(1, round(export_timeout)),
         )
         span_processor = BatchSpanProcessor(
             otlp_exporter,
@@ -430,12 +481,14 @@ def init_telemetry(
 
             otlp_metric_exporter = OTLPMetricExporter(
                 endpoint=metric_endpoint,
-                timeout=10,  # 10 second timeout for exports
+                # round() returns int (SDK requires int); max(1, ...) avoids truncating
+                # sub-second values to 0 (which causes immediate timeout).
+                timeout=max(1, round(export_timeout)),
             )
             metric_reader = PeriodicExportingMetricReader(
                 otlp_metric_exporter,
                 export_interval_millis=10000,  # Export every 10 seconds (faster feedback)
-                export_timeout_millis=10000,  # 10 second timeout for export
+                export_timeout_millis=int(export_timeout * 1000),
             )
             # Configure custom histogram buckets for different metrics
             # Tool durations: 0.1s to 5min (most tools: 0.1-30s)
@@ -585,12 +638,22 @@ def shutdown_telemetry() -> None:
         logger.warning("Cannot shut down telemetry: %s", e)
         return
 
+    # Flush timeout (ms). Defaults to 5s but honors OTEL_EXPORTER_OTLP_TIMEOUT so
+    # a wedged collector doesn't block session shutdown for the full default.
+    # Note: OTEL_EXPORTER_OTLP_TIMEOUT is technically a per-request HTTP timeout,
+    # but we reuse it here for the overall flush window too. Setting it short
+    # (e.g. 2000 for 2s) caps the entire force_flush, not just a single export —
+    # if the collector is slow the flush may abort before a batch completes.
+    # This is intentional: fast-fail is the point, and a separate env var would
+    # add complexity with little gain for gptme's single-batch shutdown pattern.
+    flush_timeout_millis = int(_otlp_timeout_seconds(default=5.0) * 1000)
+
     try:
         # Force flush any pending spans before shutdown
         tracer_provider = trace.get_tracer_provider()
         if hasattr(tracer_provider, "force_flush"):
             logger.debug("Flushing pending traces...")
-            tracer_provider.force_flush(timeout_millis=5000)  # 5 second timeout
+            tracer_provider.force_flush(timeout_millis=flush_timeout_millis)
 
         # Shutdown tracer provider
         if hasattr(tracer_provider, "shutdown"):
@@ -600,7 +663,7 @@ def shutdown_telemetry() -> None:
         meter_provider = metrics.get_meter_provider()
         if hasattr(meter_provider, "force_flush"):
             logger.debug("Flushing pending metrics...")
-            meter_provider.force_flush(timeout_millis=5000)  # 5 second timeout
+            meter_provider.force_flush(timeout_millis=flush_timeout_millis)
         if hasattr(meter_provider, "shutdown"):
             logger.debug("Shutting down meter provider...")
             meter_provider.shutdown()

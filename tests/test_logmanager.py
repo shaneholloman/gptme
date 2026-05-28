@@ -3,7 +3,12 @@ from pathlib import Path
 import pytest
 
 from gptme.dirs import get_logs_dir
-from gptme.logmanager import Log, LogManager, check_for_modifications
+from gptme.logmanager import (
+    Log,
+    LogManager,
+    check_for_modifications,
+    conversation_name_error,
+)
 from gptme.message import Message
 from gptme.tools import init_tools
 
@@ -50,6 +55,36 @@ def test_branch():
     d = log.to_dict(branches=True)
     assert "main" in d["branches"]
     assert "dev" in d["branches"]
+
+
+def test_fork_rejects_path_traversal(tmp_path: Path, monkeypatch):
+    """Fork names must stay within the logs directory."""
+    monkeypatch.setenv("GPTME_LOGS_HOME", str(tmp_path / "logs"))
+    log = LogManager(logdir=get_logs_dir() / "seed")
+    log.append(Message("user", "hello"))
+    log.write()
+
+    with pytest.raises(
+        ValueError, match="conversation name must be a single path component"
+    ):
+        log.fork("../escape")
+
+    assert not (tmp_path / "escape").exists()
+
+
+@pytest.mark.parametrize(
+    ("value", "expected"),
+    [
+        (" leading", "conversation name cannot start or end with whitespace."),
+        ("trailing ", "conversation name cannot start or end with whitespace."),
+        ("foo\tbar", "conversation name cannot contain control characters."),
+        ("foo\nbar", "conversation name cannot contain control characters."),
+    ],
+)
+def test_conversation_name_error_rejects_control_and_edge_whitespace(
+    value: str, expected: str
+):
+    assert conversation_name_error(value) == expected
 
 
 def test_write_persists_main_branch_when_on_other_branch(tmp_path: Path, monkeypatch):
@@ -333,6 +368,22 @@ def test_read_jsonl_malformed(tmp_path):
         '{"role": "assistant", "content": "world", "timestamp": "2025-01-01T00:00:01Z"}\n'
     )
     log = Log.read_jsonl(jsonl_file)
+    assert len(log.messages) == 2
+    assert log.messages[0].content == "hello"
+    assert log.messages[1].content == "world"
+
+
+def test_read_jsonl_unknown_field(tmp_path):
+    """Unknown message fields (e.g. from a newer gptme version) should be
+    dropped rather than crashing the whole read with a TypeError."""
+    jsonl_file = tmp_path / "test.jsonl"
+    jsonl_file.write_text(
+        '{"role": "user", "content": "hello", "timestamp": "2025-01-01T00:00:00Z", '
+        '"some_future_field": 42}\n'
+        '{"role": "assistant", "content": "world", "timestamp": "2025-01-01T00:00:01Z"}\n'
+    )
+    log = Log.read_jsonl(jsonl_file)
+    # Both messages must survive; the unknown key is just ignored.
     assert len(log.messages) == 2
     assert log.messages[0].content == "hello"
     assert log.messages[1].content == "world"

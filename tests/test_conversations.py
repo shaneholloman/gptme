@@ -1,11 +1,18 @@
 """Tests for conversation metadata, including last message preview."""
 
 import json
+import sys
 from pathlib import Path
 
 import pytest
 
-from gptme.logmanager.conversations import ConversationMeta, get_conversations
+import gptme.logmanager.conversations as conversations_mod
+from gptme.logmanager.conversations import (
+    ConversationMeta,
+    get_conversations,
+    get_user_conversations,
+    list_conversations,
+)
 
 
 def _make_conversation(
@@ -293,3 +300,71 @@ def test_detail_false_multi_model_consistency(logs_dir):
     assert full[0].model == "model-late"
     assert fast[0].model == "model-late"
     assert fast[0].model == full[0].model
+
+
+def test_get_user_conversations_skips_test_logs_before_scanning(logs_dir, monkeypatch):
+    """User conversation listing must not scan test/eval logs at all."""
+    _make_conversation(
+        logs_dir,
+        "real-conversation",
+        [
+            {
+                "role": "user",
+                "content": "hello",
+                "timestamp": "2025-01-01T00:00:00Z",
+            },
+        ],
+    )
+    _make_conversation(
+        logs_dir,
+        "test-fixture-conversation",
+        [
+            {
+                "role": "user",
+                "content": "should be skipped",
+                "timestamp": "2025-01-01T00:00:00Z",
+            },
+        ],
+    )
+
+    scanned: list[str] = []
+    original_full_scan = conversations_mod._full_scan
+
+    def wrapped_full_scan(conv_fn: Path):
+        scanned.append(conv_fn.parent.name)
+        if conv_fn.parent.name.startswith("test-"):
+            raise AssertionError("test conversation was scanned on user path")
+        return original_full_scan(conv_fn)
+
+    monkeypatch.setattr("gptme.logmanager.conversations._full_scan", wrapped_full_scan)
+
+    convs = list(get_user_conversations())
+    assert [conv.id for conv in convs] == ["real-conversation"]
+    assert scanned == ["real-conversation"]
+
+
+@pytest.mark.parametrize(
+    ("limit", "expected"),
+    [(-5, 0), (0, 0), (1, 1), (10, 2), (sys.maxsize + 1, 2), (10**30, 2)],
+)
+def test_list_conversations_limit_bounds(logs_dir, limit, expected):
+    """list_conversations clamps out-of-range limits instead of crashing islice().
+
+    islice() rejects stop values outside [0, sys.maxsize], so both negative
+    limits and limits larger than sys.maxsize (e.g. `chats list --limit 10**30`)
+    previously raised ValueError. Clamping returns an empty/full list instead.
+    """
+    _make_conversation(
+        logs_dir,
+        "conv-one",
+        [{"role": "user", "content": "hi", "timestamp": "2025-01-01T00:00:00Z"}],
+    )
+    _make_conversation(
+        logs_dir,
+        "conv-two",
+        [{"role": "user", "content": "yo", "timestamp": "2025-01-02T00:00:00Z"}],
+    )
+
+    # Previously list_conversations(-5) raised ValueError from islice().
+    convs = list_conversations(limit)
+    assert len(convs) == expected

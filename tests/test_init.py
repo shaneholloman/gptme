@@ -12,6 +12,7 @@ from unittest.mock import MagicMock, call, patch
 
 import pytest
 
+from gptme.llm.llm_gptme import GptmeAuthError
 from gptme.llm.models.types import CustomProvider, ModelMeta
 
 # ---------------------------------------------------------------------------
@@ -566,7 +567,7 @@ class TestInitModelParsing:
     @patch("gptme.init.is_custom_provider", return_value=False)
     @patch("gptme.init.get_config")
     @patch("gptme.init.console")
-    def test_unknown_provider_treated_as_provider_only(
+    def test_bare_provider_less_model_resolved_via_get_model(
         self,
         mock_console,
         mock_config_fn,
@@ -577,20 +578,63 @@ class TestInitModelParsing:
         mock_set_default,
         dummy_model_meta,
     ):
-        """'unknownprov/model' where unknownprov is neither builtin nor custom
-        should treat the entire string as provider, model=None."""
+        """A provider-less model name with a slash (e.g. OpenRouter's
+        'meta-llama/llama-3.1-405b-instruct') should be resolved via get_model(),
+        not mistaken for a provider name. Regression test: the CLI previously
+        crashed on model names that get_model() resolves fine."""
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
             chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
         )
-        mock_recommend.return_value = "default-model"
-        mock_get_model.return_value = dummy_model_meta
+        # get_model resolves the bare OpenRouter-style name to provider=openrouter
+        mock_get_model.return_value = ModelMeta(
+            provider="openrouter",
+            model="meta-llama/llama-3.1-405b-instruct",
+            context=128_000,
+        )
 
-        init_model(model="unknownprov/some-model")
+        init_model(model="meta-llama/llama-3.1-405b-instruct")
 
-        # Should have called get_recommended_model since model_name was None
-        mock_recommend.assert_called_once()
+        # Provider resolved from get_model, not from treating the whole string
+        # as a provider; model_name was resolved so get_recommended_model is unused.
+        mock_init_llm.assert_called_once_with("openrouter")
+        mock_recommend.assert_not_called()
+
+    @patch("gptme.init.set_default_model")
+    @patch("gptme.init.get_model")
+    @patch("gptme.init.init_llm")
+    @patch("gptme.init.get_recommended_model")
+    @patch("gptme.init.is_custom_provider", return_value=False)
+    @patch("gptme.init.get_config")
+    @patch("gptme.init.console")
+    def test_unresolvable_model_raises_clear_error(
+        self,
+        mock_console,
+        mock_config_fn,
+        mock_custom,
+        mock_recommend,
+        mock_init_llm,
+        mock_get_model,
+        mock_set_default,
+        dummy_model_meta,
+    ):
+        """A genuinely unresolvable 'a/b' model (get_model falls back to
+        provider='unknown') should raise a clear error, not the misleading
+        'provider requires a model' crash from get_recommended_model()."""
+        from gptme.init import init_model
+
+        mock_config_fn.return_value = MagicMock(
+            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+        )
+        mock_get_model.return_value = ModelMeta(
+            provider="unknown",
+            model="totally/nonexistent-model",
+            context=128_000,
+        )
+
+        with pytest.raises(ValueError, match="Unknown model"):
+            init_model(model="totally/nonexistent-model")
 
     @patch("gptme.init.set_default_model")
     @patch("gptme.init.get_model")
@@ -1216,6 +1260,123 @@ class TestInitModelInteractive:
 
         mock_ask.assert_not_called()
 
+    @patch("gptme.init.set_default_model")
+    @patch("gptme.init.get_model")
+    @patch("gptme.init.init_llm")
+    @patch("gptme.llm.llm_gptme.device_flow_authenticate")
+    @patch("gptme.init.is_output_json", return_value=False)
+    @patch("gptme.init.get_config")
+    @patch("gptme.init.console")
+    def test_interactive_gptme_missing_auth_runs_inline_device_flow(
+        self,
+        mock_console,
+        mock_config_fn,
+        mock_json_mode,
+        mock_device_flow,
+        mock_init_llm,
+        mock_get_model,
+        mock_set_default,
+        dummy_model_meta,
+    ):
+        """Interactive gptme runs should offer inline login and retry init."""
+        from gptme.init import init_model
+
+        config = MagicMock()
+        config.chat = MagicMock(model=None)
+        config.get_env.return_value = None
+        mock_config_fn.return_value = config
+        mock_console.input.return_value = ""
+        mock_get_model.return_value = dummy_model_meta
+        mock_init_llm.side_effect = [
+            GptmeAuthError("gptme provider requires authentication"),
+            None,
+        ]
+
+        init_model(model="gptme/claude-sonnet-4-6", interactive=True)
+
+        mock_console.input.assert_called_once()
+        mock_device_flow.assert_called_once_with(server_url="https://fleet.gptme.ai")
+        assert mock_init_llm.call_args_list == [call("gptme"), call("gptme")]
+
+    @patch("gptme.init.set_default_model")
+    @patch("gptme.init.get_model")
+    @patch("gptme.init.init_llm")
+    @patch("gptme.llm.llm_gptme.device_flow_authenticate")
+    @patch("gptme.init.is_output_json", return_value=False)
+    @patch("gptme.init.get_config")
+    @patch("gptme.init.console")
+    def test_interactive_gptme_decline_keeps_keyerror(
+        self,
+        mock_console,
+        mock_config_fn,
+        mock_json_mode,
+        mock_device_flow,
+        mock_init_llm,
+        mock_get_model,
+        mock_set_default,
+        dummy_model_meta,
+    ):
+        """Declining the inline gptme login should preserve the original failure."""
+        from gptme.init import init_model
+
+        config = MagicMock()
+        config.chat = MagicMock(model=None)
+        config.get_env.return_value = None
+        mock_config_fn.return_value = config
+        mock_console.input.return_value = "n"
+        mock_get_model.return_value = dummy_model_meta
+        mock_init_llm.side_effect = GptmeAuthError(
+            "gptme provider requires authentication"
+        )
+
+        with pytest.raises(
+            GptmeAuthError, match="gptme provider requires authentication"
+        ):
+            init_model(model="gptme/claude-sonnet-4-6", interactive=True)
+
+        mock_console.input.assert_called_once()
+        mock_device_flow.assert_not_called()
+        mock_init_llm.assert_called_once_with("gptme")
+
+    @patch("gptme.init.set_default_model")
+    @patch("gptme.init.get_model")
+    @patch("gptme.init.init_llm")
+    @patch("gptme.llm.llm_gptme.device_flow_authenticate")
+    @patch("gptme.init.is_output_json", return_value=False)
+    @patch("gptme.init.get_config")
+    @patch("gptme.init.console")
+    def test_non_interactive_gptme_missing_auth_does_not_prompt(
+        self,
+        mock_console,
+        mock_config_fn,
+        mock_json_mode,
+        mock_device_flow,
+        mock_init_llm,
+        mock_get_model,
+        mock_set_default,
+        dummy_model_meta,
+    ):
+        """Non-interactive gptme runs should still fail fast without prompting."""
+        from gptme.init import init_model
+
+        config = MagicMock()
+        config.chat = MagicMock(model=None)
+        config.get_env.return_value = None
+        mock_config_fn.return_value = config
+        mock_get_model.return_value = dummy_model_meta
+        mock_init_llm.side_effect = GptmeAuthError(
+            "gptme provider requires authentication"
+        )
+
+        with pytest.raises(
+            GptmeAuthError, match="gptme provider requires authentication"
+        ):
+            init_model(model="gptme/claude-sonnet-4-6", interactive=False)
+
+        mock_console.input.assert_not_called()
+        mock_device_flow.assert_not_called()
+        mock_init_llm.assert_called_once_with("gptme")
+
 
 # ===========================================================================
 # init_model() — all builtin providers
@@ -1381,6 +1542,18 @@ class TestInitLogging:
         init_logging(verbose=False)
         handlers = logging.getLogger().handlers
         assert any(isinstance(h, _RichHandler) for h in handlers)
+
+    def test_rich_handler_defaults_to_stderr(self):
+        """Default logging should preserve RichHandler's stderr behavior."""
+        from rich.logging import RichHandler as _RichHandler
+
+        from gptme.init import init_logging
+
+        init_logging(verbose=False)
+        handler = next(
+            h for h in logging.getLogger().handlers if isinstance(h, _RichHandler)
+        )
+        assert handler.console.stderr is True
 
     def test_atexit_cleanup_registered(self):
         """An atexit cleanup handler should be registered."""

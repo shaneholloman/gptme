@@ -1,6 +1,9 @@
 import os
 import random
+import signal
 import tempfile
+import threading
+import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
 
@@ -58,6 +61,21 @@ def runner():
         yield runner
 
 
+def _write_conversation(
+    conv_id: str, content: str = "hello", workspace: Path | None = None
+) -> Path:
+    conv_dir = cli.get_logs_dir() / conv_id
+    conv_dir.mkdir(parents=True, exist_ok=True)
+    (conv_dir / "conversation.jsonl").write_text(
+        f'{{"role":"user","content":"{content}"}}\n'
+    )
+    if workspace is not None:
+        workspace = workspace.resolve()
+        workspace.mkdir(parents=True, exist_ok=True)
+        (conv_dir / "config.toml").write_text(f'[chat]\nworkspace = "{workspace}"\n')
+    return conv_dir
+
+
 def test_help(runner: CliRunner):
     result = runner.invoke(cli.main, ["--help"])
     assert result.exit_code == 0
@@ -69,6 +87,574 @@ def test_version(runner: CliRunner):
     result = runner.invoke(cli.main, ["--version"])
     assert result.exit_code == 0
     assert "gptme" in result.output
+
+
+@pytest.mark.skipif(os.name == "nt", reason="SIGALRM-based pipe guard is POSIX-only")
+def test_read_stdin_open_pipe_without_data_returns_empty(monkeypatch):
+    """An idle pipe should not block forever waiting for stdin bytes."""
+    read_fd, write_fd = os.pipe()
+    read_file = os.fdopen(read_fd)
+    monkeypatch.setattr(cli.sys, "stdin", read_file)
+
+    def _timeout(_signum, _frame):
+        raise TimeoutError("stdin read blocked on an idle pipe")
+
+    previous_handler = signal.signal(signal.SIGALRM, _timeout)
+    signal.setitimer(signal.ITIMER_REAL, 1.5)
+    try:
+        assert cli._read_stdin() == ""
+    finally:
+        signal.setitimer(signal.ITIMER_REAL, 0)
+        signal.signal(signal.SIGALRM, previous_handler)
+        read_file.close()
+        os.close(write_fd)
+
+
+def test_read_stdin_pipe_with_data_reads_all(monkeypatch):
+    """Actual piped stdin should still be consumed fully."""
+    read_fd, write_fd = os.pipe()
+    os.write(write_fd, b"hello from pipe")
+    os.close(write_fd)
+    read_file = os.fdopen(read_fd)
+    monkeypatch.setattr(cli.sys, "stdin", read_file)
+
+    try:
+        assert cli._read_stdin() == "hello from pipe"
+    finally:
+        read_file.close()
+
+
+def test_read_stdin_waits_briefly_for_slow_pipe_writer(monkeypatch):
+    """A slightly slow producer should still count as piped stdin."""
+    read_fd, write_fd = os.pipe()
+    read_file = os.fdopen(read_fd)
+    monkeypatch.setattr(cli.sys, "stdin", read_file)
+
+    def _writer():
+        time.sleep(0.2)
+        os.write(write_fd, b"hello after delay")
+        os.close(write_fd)
+
+    writer = threading.Thread(target=_writer)
+    writer.start()
+    try:
+        assert cli._read_stdin() == "hello after delay"
+    finally:
+        writer.join()
+        read_file.close()
+
+
+@pytest.mark.parametrize("bad_name", ["../bad-name", ".", "..", "foo/bar", "foo\\bar"])
+def test_name_rejects_path_traversal(bad_name: str, runner: CliRunner):
+    result = runner.invoke(
+        cli.main,
+        ["--name", bad_name, "--non-interactive", "hello"],
+    )
+    assert result.exit_code == 2
+    assert "conversation name must be a single path component" in result.output
+
+
+@pytest.mark.parametrize("bad_name", ["", " ", "   ", "\t"])
+def test_name_rejects_empty_or_whitespace_only_values(bad_name: str, runner: CliRunner):
+    result = runner.invoke(
+        cli.main,
+        ["--name", bad_name, "--non-interactive", "hello"],
+    )
+    assert result.exit_code == 2
+    assert "conversation name cannot be empty" in result.output
+
+
+@pytest.mark.parametrize(
+    ("bad_name", "expected_message"),
+    [
+        (" leading", "conversation name cannot start or end with whitespace"),
+        ("trailing ", "conversation name cannot start or end with whitespace"),
+        (" leading-trailing ", "conversation name cannot start or end with whitespace"),
+        ("foo\tbar", "conversation name cannot contain control characters"),
+        ("foo\nbar", "conversation name cannot contain control characters"),
+    ],
+)
+def test_name_rejects_control_characters_and_edge_whitespace(
+    bad_name: str, expected_message: str, runner: CliRunner
+):
+    result = runner.invoke(
+        cli.main,
+        ["--name", bad_name, "--non-interactive", "hello"],
+    )
+    assert result.exit_code == 2
+    assert expected_message in result.output
+
+
+def test_command_fork_rejects_path_traversal(runner: CliRunner, runid: int, name: str):
+    escape_name = f"../escape-{runid}"
+    escape_path = cli.get_logs_dir().parent / f"escape-{runid}"
+
+    result = runner.invoke(
+        cli.main,
+        ["--name", name, "--non-interactive", f"/fork {escape_name}"],
+    )
+
+    assert result.exit_code == 0
+    assert "conversation name must be a single path component" in result.output
+    assert not escape_path.exists()
+
+
+def test_get_logdir_resume_named_conversation_prefers_explicit_name(runid: int):
+    target_dir = _write_conversation(f"resume-target-{runid}", content="target")
+    recent_dir = _write_conversation(f"resume-recent-{runid}", content="recent")
+    os.utime(target_dir / "conversation.jsonl", (1, 1))
+    os.utime(recent_dir / "conversation.jsonl", (2, 2))
+
+    assert cli.get_logdir_resume(f"resume-target-{runid}") == target_dir
+
+
+def test_resume_named_missing_conversation_does_not_fallback_to_latest(
+    runner: CliRunner, runid: int
+):
+    _write_conversation(f"resume-recent-{runid}", content="recent")
+    missing = f"resume-missing-{runid}"
+
+    result = runner.invoke(
+        cli.main,
+        ["--resume", "--name", missing, "--non-interactive"],
+    )
+
+    assert result.exit_code == 2
+    assert f"No conversation named '{missing}' to resume" in result.output
+
+
+def test_get_logdir_resume_named_conversation_skips_conversation_scan(
+    monkeypatch, runid: int
+):
+    conv_id = f"resume-fast-{runid}"
+    conv_dir = _write_conversation(conv_id, content="fast")
+
+    def fail_get_user_conversations(*args, **kwargs):
+        raise AssertionError("named resume should not scan conversation metadata")
+
+    monkeypatch.setattr(cli, "get_user_conversations", fail_get_user_conversations)
+
+    assert cli.get_logdir_resume(conv_id) == conv_dir
+
+
+def test_get_logdir_resume_random_filters_by_workspace(tmp_path: Path, runid: int):
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+
+    older_match = _write_conversation(
+        f"resume-a-older-{runid}", content="older", workspace=workspace_a
+    )
+    newest_other = _write_conversation(
+        f"resume-b-newest-{runid}", content="other", workspace=workspace_b
+    )
+    newest_match = _write_conversation(
+        f"resume-a-newest-{runid}", content="newest", workspace=workspace_a
+    )
+
+    os.utime(older_match / "conversation.jsonl", (1, 1))
+    os.utime(newest_match / "conversation.jsonl", (2, 2))
+    os.utime(newest_other / "conversation.jsonl", (3, 3))
+
+    assert cli.get_logdir_resume(workspace=workspace_a) == newest_match
+
+
+def test_get_logdir_resume_random_workspace_without_match_errors(
+    tmp_path: Path, runid: int
+):
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+
+    _write_conversation(
+        f"resume-b-only-{runid}", content="other", workspace=workspace_b
+    )
+
+    with pytest.raises(
+        ValueError,
+        match=f"No previous conversations to resume for workspace '{workspace_a.resolve()}'",
+    ):
+        cli.get_logdir_resume(workspace=workspace_a)
+
+
+def test_resume_with_workspace_uses_matching_conversation(
+    monkeypatch, runner: CliRunner, tmp_path: Path, runid: int
+):
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+
+    target = _write_conversation(
+        f"resume-workspace-target-{runid}", content="target", workspace=workspace_a
+    )
+    newer_other = _write_conversation(
+        f"resume-workspace-other-{runid}", content="other", workspace=workspace_b
+    )
+    os.utime(target / "conversation.jsonl", (1, 1))
+    os.utime(newer_other / "conversation.jsonl", (2, 2))
+
+    selected_logdirs: list[Path] = []
+
+    def fake_chat(prompt_msgs, initial_msgs, logdir, *args, **kwargs):
+        selected_logdirs.append(logdir)
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+
+    result = runner.invoke(
+        cli.main,
+        ["--resume", "--workspace", str(workspace_a), "--non-interactive"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert selected_logdirs == [target]
+
+
+def test_resume_without_explicit_workspace_uses_cwd(
+    monkeypatch, runner: CliRunner, tmp_path: Path, runid: int
+):
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+
+    target = _write_conversation(
+        f"resume-cwd-target-{runid}", content="target", workspace=workspace_a
+    )
+    newer_other = _write_conversation(
+        f"resume-cwd-other-{runid}", content="other", workspace=workspace_b
+    )
+    os.utime(target / "conversation.jsonl", (1, 1))
+    os.utime(newer_other / "conversation.jsonl", (2, 2))
+
+    selected_logdirs: list[Path] = []
+
+    def fake_chat(prompt_msgs, initial_msgs, logdir, *args, **kwargs):
+        selected_logdirs.append(logdir)
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(cli.Path, "cwd", classmethod(lambda cls: workspace_a))
+
+    result = runner.invoke(
+        cli.main,
+        ["--resume", "--non-interactive"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert selected_logdirs == [target]
+
+
+def test_resume_with_log_workspace_uses_global_latest(
+    monkeypatch, runner: CliRunner, tmp_path: Path, runid: int
+):
+    workspace_a = tmp_path / "workspace-a"
+    workspace_b = tmp_path / "workspace-b"
+
+    older_target = _write_conversation(
+        f"resume-log-target-{runid}", content="target", workspace=workspace_a
+    )
+    newest_other = _write_conversation(
+        f"resume-log-other-{runid}", content="other", workspace=workspace_b
+    )
+    now = time.time()
+    os.utime(older_target / "conversation.jsonl", (now, now))
+    os.utime(newest_other / "conversation.jsonl", (now + 1, now + 1))
+
+    selected_logdirs: list[Path] = []
+
+    def fake_chat(prompt_msgs, initial_msgs, logdir, *args, **kwargs):
+        selected_logdirs.append(logdir)
+
+    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(cli.Path, "cwd", classmethod(lambda cls: workspace_a))
+
+    result = runner.invoke(
+        cli.main,
+        ["--resume", "--workspace", "@log", "--non-interactive"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert selected_logdirs == [newest_other]
+
+
+def test_workspace_tilde_path_is_expanded(monkeypatch, tmp_path: Path):
+    home = tmp_path / "home"
+    workspace = home / "workspace"
+    workspace.mkdir(parents=True)
+
+    monkeypatch.setenv("HOME", str(home))
+
+    result = cli.WorkspacePath().convert("~/workspace", None, None)
+
+    assert result == str(workspace.resolve())
+
+
+def test_missing_custom_tool_path_is_reported_as_usage_error(
+    runner: CliRunner, tmp_path: Path
+):
+    missing_tool = tmp_path / "missing_tool.py"
+
+    result = runner.invoke(
+        cli.main,
+        [
+            "--non-interactive",
+            "--name",
+            "missing-custom-tool",
+            "-t",
+            str(missing_tool),
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Tool" in result.output
+    assert str(missing_tool) in result.output
+    assert "Traceback" not in result.output
+
+
+def test_missing_explicit_path_prompt_is_reported_as_usage_error(
+    runner: CliRunner, tmp_path: Path
+):
+    missing_path = tmp_path / "missing-prompt.txt"
+    result = runner.invoke(
+        cli.main,
+        [
+            "--non-interactive",
+            "--name",
+            "missing-explicit-path-prompt",
+            str(missing_path),
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "explicit local path" in result.output
+    assert str(missing_path) in result.output
+    assert "Traceback" not in result.output
+
+
+def test_malformed_output_schema_is_reported_as_usage_error(runner: CliRunner):
+    result = runner.invoke(
+        cli.main,
+        [
+            "--non-interactive",
+            "--name",
+            "malformed-output-schema",
+            "--output-schema",
+            "notamodule",  # missing ':ClassName'
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--output-schema" in result.output
+    assert "notamodule" in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(
+    "schema",
+    [
+        "gptme.message:NoSuchClass",  # real module, missing class
+        ":ClassName",  # empty module name
+        "invalid/path:ClassName",  # invalid module name
+    ],
+)
+def test_unloadable_output_schema_is_reported_as_usage_error(
+    runner: CliRunner, schema: str
+):
+    result = runner.invoke(
+        cli.main,
+        [
+            "--non-interactive",
+            "--name",
+            "unloadable-output-schema",
+            "--output-schema",
+            schema,
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "--output-schema" in result.output
+    assert schema in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize(
+    "prompts",
+    [
+        ["MISSING_PATH", "hello"],
+        ["hello", "MISSING_PATH"],
+    ],
+)
+def test_missing_explicit_path_prompt_with_other_prompt_is_usage_error(
+    runner: CliRunner, tmp_path: Path, prompts: list[str]
+):
+    missing_path = tmp_path / "missing-prompt.txt"
+    argv = [
+        "--non-interactive",
+        "--name",
+        "missing-explicit-path-plus-prompt",
+    ]
+    argv.extend(
+        str(missing_path) if prompt == "MISSING_PATH" else prompt for prompt in prompts
+    )
+
+    result = runner.invoke(cli.main, argv)
+
+    assert result.exit_code == 2
+    assert "explicit local path" in result.output
+    assert str(missing_path) in result.output
+    assert "Traceback" not in result.output
+
+
+@pytest.mark.parametrize("flag", ["--architect-model", "--editor-model"])
+def test_architect_model_unqualified_is_usage_error(
+    flag: str, runner: CliRunner, runid: int
+):
+    # A malformed architect/editor model name (no provider prefix) should be
+    # reported as a clean usage error, not a raw ValueError traceback from
+    # llm_reply mid-planning. The other model is given a valid value so the
+    # failure is unambiguously the unqualified one being validated.
+    other = "--editor-model" if flag == "--architect-model" else "--architect-model"
+
+    result = runner.invoke(
+        cli.main,
+        [
+            "--non-interactive",
+            "--name",
+            f"test-architect-model-{runid}-{flag.strip('-')}",
+            "--architect",
+            flag,
+            "bad-no-provider",
+            other,
+            "anthropic/claude-sonnet-4-5",
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+    assert flag in result.output
+    assert "provider prefix" in result.output
+
+
+def test_empty_model_is_usage_error(runner: CliRunner, runid: int):
+    # --model "" should give a clean UsageError, not silently fall back to the
+    # default model with a warning. An empty string is an obvious user mistake.
+    result = runner.invoke(
+        cli.main,
+        [
+            "--non-interactive",
+            "--name",
+            f"test-empty-model-{runid}",
+            "--model",
+            "",
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+    assert "empty" in result.output.lower()
+
+
+def test_unknown_agent_profile_stays_off_stdout_in_json_mode():
+    # Click < 8.2 defaults to mix_stderr=True; Click 8.2 removed that kwarg
+    # and separates streams by default. Use try/except to handle both.
+    try:
+        runner = CliRunner(mix_stderr=False)  # type: ignore[call-arg]
+    except TypeError:
+        runner = CliRunner()
+    result = runner.invoke(
+        cli.main,
+        [
+            "--non-interactive",
+            "--output-format",
+            "json",
+            "--agent-profile",
+            "definitely-missing-profile",
+            "hello",
+        ],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 2
+    assert (
+        result.stdout == ""
+    )  # stdout clean — no profile error leaking into JSON stream
+    assert "Invalid value for '--agent-profile'" in result.stderr
+    assert "gptme-util profile list" in result.stderr
+
+
+def test_noninteractive_missing_prompt_does_not_leave_orphan_logdir(
+    monkeypatch, tmp_path: Path
+):
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    runner = CliRunner()
+
+    named = runner.invoke(
+        cli.main,
+        ["--non-interactive", "--name", "missing-prompt"],
+        input="",
+    )
+    assert named.exit_code != 0
+    assert not (cli.get_logs_dir() / "missing-prompt").exists()
+
+    random = runner.invoke(cli.main, ["--non-interactive"], input="")
+    assert random.exit_code != 0
+    logs_dir = cli.get_logs_dir()
+    assert not logs_dir.exists() or not any(logs_dir.iterdir())
+
+
+def test_noninteractive_whitespace_only_prompt_rejected(monkeypatch, tmp_path: Path):
+    """Whitespace-only prompts should be treated as missing, not sent to the LLM."""
+    monkeypatch.chdir(tmp_path)
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    runner = CliRunner()
+
+    for whitespace_prompt in ["   ", "\t", "\n", "  \t  "]:
+        result = runner.invoke(
+            cli.main,
+            ["--non-interactive", "--name", "ws-prompt", whitespace_prompt],
+            input="",
+        )
+        assert result.exit_code != 0, (
+            f"Expected non-zero exit for whitespace prompt {whitespace_prompt!r}"
+        )
+        assert not (cli.get_logs_dir() / "ws-prompt").exists(), (
+            f"Orphan logdir created for whitespace prompt {whitespace_prompt!r}"
+        )
+
+
+def test_should_print_resume_hint_requires_nonempty_conversation_log(tmp_path: Path):
+    logdir = tmp_path / "resume-hint"
+    logdir.mkdir()
+
+    assert not cli._should_print_resume_hint(logdir, "text")
+
+    log_file = logdir / "conversation.jsonl"
+    log_file.write_text("")
+    assert not cli._should_print_resume_hint(logdir, "text")
+
+    log_file.write_text('{"role":"user","content":"hello"}\n')
+    assert cli._should_print_resume_hint(logdir, "text")
+
+
+def test_should_print_resume_hint_is_disabled_for_json_output(tmp_path: Path):
+    logdir = tmp_path / "json-output"
+    logdir.mkdir()
+    (logdir / "conversation.jsonl").write_text('{"role":"user","content":"hello"}\n')
+
+    assert not cli._should_print_resume_hint(logdir, "json")
+
+
+def test_format_resume_hint_shell_quotes_space_containing_name():
+    assert cli._format_resume_hint("foo bar") == "gptme --name 'foo bar'"
 
 
 def test_command_exit(args: list[str], runner: CliRunner):
@@ -494,6 +1080,40 @@ def test_comma_separated_choice_minus_prefix():
         csc.convert("-nonexistent", None, None)
 
 
+def test_comma_separated_choice_strips_short_option_equals_prefix():
+    """Accept Click's `-x=value` short-option form for comma-separated choices."""
+    from gptme.cli.main import CommaSeparatedChoice
+
+    csc = CommaSeparatedChoice(
+        ["shell", "browser", "save", "read"], allow_prefixes=["+", "-"]
+    )
+
+    assert csc.convert("=browser", None, None) == "browser"
+    assert csc.convert("=-browser,-save", None, None) == "-browser,-save"
+
+    with pytest.raises(click.exceptions.BadParameter):
+        csc.convert("=", None, None)
+
+
+def test_comma_separated_choice_allows_excluding_unavailable_tools():
+    """Allow `-tool` exclusions even when that tool is unavailable locally."""
+    from gptme.cli.main import CommaSeparatedChoice
+
+    csc = CommaSeparatedChoice(
+        ["shell", "save", "read"],
+        allow_prefixes=["+", "-"],
+        extra_choices_for_prefix={"-": ["browser"]},
+    )
+
+    assert csc.convert("-browser", None, None) == "-browser"
+
+    with pytest.raises(click.exceptions.BadParameter):
+        csc.convert("browser", None, None)
+
+    with pytest.raises(click.exceptions.BadParameter):
+        csc.convert("+browser", None, None)
+
+
 def test_tool_exclusion_mixed_bare_and_minus_raises():
     """Test that mixing bare tool names with '-' exclusion syntax raises UsageError."""
     from click.testing import CliRunner
@@ -508,3 +1128,58 @@ def test_tool_exclusion_mixed_bare_and_minus_raises():
     assert "Cannot mix bare tool names" in error_text, (
         f"Expected 'Cannot mix bare tool names' in output, got: {error_text!r}"
     )
+
+
+def test_tools_short_option_equals_syntax_works(runner: CliRunner):
+    """The documented `-t=-browser` short form should parse successfully."""
+    result = runner.invoke(cli.main, ["-t=-browser", "--version"])
+    assert result.exit_code == 0, result.output
+    assert "gptme v" in result.output
+
+
+@pytest.mark.parametrize(
+    "tool_spec",
+    [
+        "./definitely-missing-custom-tool.py",
+        "+./definitely-missing-custom-tool.py",
+        "-./definitely-missing-custom-tool.py",
+    ],
+)
+def test_missing_custom_tool_path_fails_before_config_init(
+    runner: CliRunner, tool_spec: str
+):
+    result = runner.invoke(cli.main, ["-n", "--tools", tool_spec, "hi"])
+
+    assert result.exit_code != 0
+    assert (
+        "Tool file does not exist: ./definitely-missing-custom-tool.py" in result.output
+    )
+    assert "Skipping all confirmation prompts." not in result.output
+    assert "stdin is not a TTY and prompts provided" not in result.output
+    assert "Using project configuration" not in result.output
+    assert "Using local configuration" not in result.output
+
+
+@pytest.mark.parametrize(
+    "tool_spec",
+    [
+        "./definitely-missing-custom-tool.bash",
+        "+./definitely-missing-custom-tool.bash",
+        "-./definitely-missing-custom-tool.bash",
+    ],
+)
+def test_non_python_custom_tool_path_reports_suffix_before_existence(
+    runner: CliRunner, tool_spec: str
+):
+    result = runner.invoke(cli.main, ["-n", "--tools", tool_spec, "hi"])
+
+    assert result.exit_code != 0
+    assert (
+        "Tool file must be a .py file: ./definitely-missing-custom-tool.bash"
+        in result.output
+    )
+    assert "Tool file does not exist" not in result.output
+    assert "Skipping all confirmation prompts." not in result.output
+    assert "stdin is not a TTY and prompts provided" not in result.output
+    assert "Using project configuration" not in result.output
+    assert "Using local configuration" not in result.output

@@ -18,7 +18,7 @@ The web UI is used in several different configurations:
 | **Local dev** | Run alongside `gptme-server` for local development | `http://127.0.0.1:5700` |
 | **Desktop app** | Bundled in [gptme-tauri](https://github.com/gptme/gptme-tauri) as a native desktop app | Local gptme-server embedded |
 | **Hosted (open)** | Hosted at [chat.gptme.org](https://chat.gptme.org/) — bring your own server | User-configured |
-| **Cloud** | Managed service at [gptme.ai](https://gptme.ai) — no server setup needed | `https://api.gptme.ai` |
+| **Cloud** | Managed service at [gptme.ai](https://gptme.ai) — no server setup needed | Auto-discovered instance URL via the `gptme.ai` auth flow |
 | **Custom remote** | Connect to remote servers (VMs, workstations, agent instances) | User-configured |
 
 All modes use the same codebase. The multi-backend feature lets you connect to several of these simultaneously.
@@ -34,6 +34,25 @@ npm run dev       # starts at http://localhost:5701
 pipx install 'gptme[server]'
 gptme-server --cors-origin='http://localhost:5701'
 ```
+
+### Using the hosted UI with your own server
+
+The **Hosted (open)** mode at [chat.gptme.org](https://chat.gptme.org/) is a
+static frontend that connects to a server you run. It comes pre-configured to
+talk to a local server at `http://127.0.0.1:5700` (see [Pre-configured
+servers](#pre-configured-servers)), so you only need to start one:
+
+```sh
+pipx install 'gptme[server]'
+gptme-server --cors-origin='https://chat.gptme.org'
+```
+
+The `--cors-origin` must match the origin you load the UI from. Pointing the
+hosted UI at a server started without it (or with only the local-dev origin
+`http://localhost:5701`) fails with a browser CORS error and a "server may not
+allow requests from this origin" message in the console — the server is
+reachable, it just rejects the cross-origin request. Pass a comma-separated
+list to allow several origins at once.
 
 ## Multi-Backend Support
 
