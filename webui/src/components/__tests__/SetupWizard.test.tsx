@@ -9,8 +9,12 @@ const mockConnect = jest.fn();
 const mockOpen = jest.fn();
 const mockFetch = jest.fn();
 const mockInvokeTauri = jest.fn();
+const mockProcessConnectionFromHash = jest.fn();
 const isConnected$ = observable(false);
 const mockIsTauriEnvironment = jest.fn(() => false);
+const CLOUD_AUTH_BASE_URL = process.env['VITE_GPTME_CLOUD_BASE_URL'] || 'https://gptme.ai';
+const CLOUD_AUTH_URL = `${CLOUD_AUTH_BASE_URL}/authorize`;
+const CLOUD_AUTH_ORIGIN = new URL(CLOUD_AUTH_URL).origin;
 
 type MockTauriServerStatus = {
   running: boolean;
@@ -56,6 +60,10 @@ jest.mock('@/utils/tauri', () => ({
 
 jest.mock('@/hooks/useTauriServerStatus', () => ({
   useTauriServerStatus: () => mockUseTauriServerStatus(),
+}));
+
+jest.mock('@/utils/connectionConfig', () => ({
+  processConnectionFromHash: (...args: unknown[]) => mockProcessConnectionFromHash(...args),
 }));
 
 jest.mock('@legendapp/state/react', () => ({
@@ -143,10 +151,16 @@ describe('SetupWizard', () => {
     mockOpen.mockReset();
     mockFetch.mockReset();
     mockInvokeTauri.mockReset();
+    mockProcessConnectionFromHash.mockReset();
     mockFetch.mockResolvedValue({
       ok: true,
       status: 200,
       json: async () => ({ provider_configured: true }),
+    });
+    mockProcessConnectionFromHash.mockResolvedValue({
+      baseUrl: 'https://fleet.gptme.ai/api/v1/instances/test',
+      authToken: 'tok-123',
+      useAuthToken: true,
     });
     Object.defineProperty(window, 'fetch', {
       writable: true,
@@ -213,7 +227,7 @@ describe('SetupWizard', () => {
     fireEvent.click(screen.getByRole('button', { name: /cloud/i }));
     fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
 
-    expect(mockOpen).toHaveBeenCalledWith('https://gptme.ai/authorize', '_blank');
+    expect(mockOpen).toHaveBeenCalledWith(CLOUD_AUTH_URL, '_blank');
     expect(screen.getByText(/waiting for sign-in to complete/i)).toBeInTheDocument();
     expect(screen.queryByText(/you're all set/i)).not.toBeInTheDocument();
 
@@ -226,6 +240,137 @@ describe('SetupWizard', () => {
 
     await waitFor(() => {
       expect(screen.getByRole('heading', { name: /you're all set/i })).toBeInTheDocument();
+    });
+  });
+
+  it('processes cloud auth codes posted back from the authorize popup', async () => {
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /cloud/i }));
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          origin: CLOUD_AUTH_ORIGIN,
+          data: {
+            type: 'gptme-cloud-auth-code',
+            code: 'deadbeef',
+          },
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockProcessConnectionFromHash).toHaveBeenCalledWith('code=deadbeef');
+    });
+
+    await waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledWith({
+        baseUrl: 'https://fleet.gptme.ai/api/v1/instances/test',
+        authToken: 'tok-123',
+        useAuthToken: true,
+      });
+    });
+  });
+
+  it('ignores duplicate cloud auth postMessages (once-guard)', async () => {
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /cloud/i }));
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    const authMessage = new MessageEvent('message', {
+      origin: CLOUD_AUTH_ORIGIN,
+      data: { type: 'gptme-cloud-auth-code', code: 'deadbeef' },
+    });
+
+    await act(async () => {
+      window.dispatchEvent(authMessage);
+      window.dispatchEvent(authMessage); // duplicate
+    });
+
+    await waitFor(() => {
+      expect(mockProcessConnectionFromHash).toHaveBeenCalledTimes(1);
+    });
+
+    expect(mockConnect).toHaveBeenCalledTimes(1);
+  });
+
+  it('allows retrying cloud auth after a failed code exchange', async () => {
+    mockProcessConnectionFromHash
+      .mockRejectedValueOnce(new Error('expired code'))
+      .mockResolvedValueOnce({
+        baseUrl: 'https://fleet.gptme.ai/api/v1/instances/test',
+        authToken: 'tok-123',
+        useAuthToken: true,
+      });
+    mockConnect.mockImplementation(async () => {
+      isConnected$.set(true);
+    });
+
+    render(
+      <SettingsProvider>
+        <SetupWizard />
+      </SettingsProvider>
+    );
+
+    fireEvent.click(screen.getByRole('button', { name: /get started/i }));
+    fireEvent.click(screen.getByRole('button', { name: /cloud/i }));
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          origin: CLOUD_AUTH_ORIGIN,
+          data: { type: 'gptme-cloud-auth-code', code: 'expired' },
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(screen.getByText('expired code')).toBeInTheDocument();
+    });
+
+    fireEvent.click(screen.getByRole('button', { name: /sign in to gptme.ai/i }));
+
+    await act(async () => {
+      window.dispatchEvent(
+        new MessageEvent('message', {
+          origin: CLOUD_AUTH_ORIGIN,
+          data: { type: 'gptme-cloud-auth-code', code: 'fresh-code' },
+        })
+      );
+    });
+
+    await waitFor(() => {
+      expect(mockProcessConnectionFromHash).toHaveBeenNthCalledWith(2, 'code=fresh-code');
+    });
+
+    await waitFor(() => {
+      expect(mockConnect).toHaveBeenCalledWith({
+        baseUrl: 'https://fleet.gptme.ai/api/v1/instances/test',
+        authToken: 'tok-123',
+        useAuthToken: true,
+      });
     });
   });
 
