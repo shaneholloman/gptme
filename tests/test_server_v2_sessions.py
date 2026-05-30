@@ -263,6 +263,23 @@ class TestStepEndpoint:
         assert data is not None
         assert data["error"] == "session_id must be a string"
 
+    @pytest.mark.parametrize(
+        "whitespace_id",
+        ["   ", "\t", "\n", " \t\n "],
+    )
+    def test_whitespace_only_session_id(
+        self, conv, client: FlaskClient, whitespace_id: str
+    ):
+        """Whitespace-only session_id should be rejected with 400, not 404."""
+        response = client.post(
+            f"/api/v2/conversations/{conv['conversation_id']}/step",
+            json={"session_id": whitespace_id},
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert data["error"] == "session_id is required"
+
     def test_invalid_use_acp_type(self, conv, client: FlaskClient):
         """Step with non-boolean use_acp returns 400."""
         response = client.post(
@@ -456,6 +473,23 @@ class TestInterruptEndpoint:
         assert data is not None
         assert data["error"] == "session_id must be a string"
 
+    @pytest.mark.parametrize(
+        "whitespace_id",
+        ["   ", "\t", "\n", " \t\n "],
+    )
+    def test_whitespace_only_session_id(
+        self, conv, client: FlaskClient, whitespace_id: str
+    ):
+        """Whitespace-only session_id should be rejected with 400, not 404."""
+        response = client.post(
+            f"/api/v2/conversations/{conv['conversation_id']}/interrupt",
+            json={"session_id": whitespace_id},
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert data["error"] == "session_id is required"
+
     def test_interrupt_when_not_generating(self, conv, client: FlaskClient):
         """Interrupt when not generating is idempotent (returns 200)."""
         response = client.post(
@@ -533,6 +567,27 @@ class TestToolConfirmEndpoint:
         data = response.get_json()
         assert data is not None
         assert data["error"] == "action must be a string"
+
+    @pytest.mark.parametrize(
+        "whitespace_session_id",
+        ["", "   ", "\t", "\n", "  \t\n  "],
+    )
+    def test_whitespace_session_id(
+        self, conv, client: FlaskClient, whitespace_session_id: str
+    ):
+        """Whitespace-only session_id returns 400 in tool confirm endpoint."""
+        response = client.post(
+            f"/api/v2/conversations/{conv['conversation_id']}/tool/confirm",
+            json={
+                "session_id": whitespace_session_id,
+                "tool_id": "some-tool",
+                "action": "confirm",
+            },
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert "session_id" in data["error"]
 
     @pytest.mark.parametrize("bad_session_id", [["boom"], {"boom": 1}, 0, False])
     def test_non_string_session_id(
@@ -801,6 +856,23 @@ class TestRerunEndpoint:
         data = response.get_json()
         assert data is not None
         assert data["error"] == "session_id must be a string"
+
+    @pytest.mark.parametrize(
+        "whitespace_id",
+        ["   ", "\t", "\n", " \t\n "],
+    )
+    def test_whitespace_only_session_id(
+        self, conv, client: FlaskClient, whitespace_id: str
+    ):
+        """Whitespace-only session_id should be rejected with 400, not 404."""
+        response = client.post(
+            f"/api/v2/conversations/{conv['conversation_id']}/rerun",
+            json={"session_id": whitespace_id},
+        )
+        assert response.status_code == 400
+        data = response.get_json()
+        assert data is not None
+        assert data["error"] == "session_id is required"
 
     def test_rerun_while_generating(self, conv, client: FlaskClient):
         """Rerun while generation in progress returns 409."""

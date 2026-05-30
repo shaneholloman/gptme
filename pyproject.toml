@@ -34,6 +34,7 @@ gptme-auth = "gptme.cli.auth:main"
 gptme-onboard = "gptme.cli.onboard:main"
 gptme-wut = "gptme.cli.wut:main"
 gptme-checkpoint = "gptme.cli.checkpoint:main"
+gptme-init = "gptme.cli.cmd_init:main"
 gptme-dspy = "gptme.eval.dspy:main"
 gptme-eval-trends = "gptme.eval.trends:main"
 
@@ -41,7 +42,7 @@ gptme-eval-trends = "gptme.eval.trends:main"
 packages = [
     { include = "gptme" },
 ]
-include = ["gptme/server/static/**/*", "gptme/eval/tbench/setup.sh", "media/*.png", "media/*.wav"]
+include = ["gptme/server/static/**/*", "gptme/server/webui-dist/**/*", "gptme/eval/tbench/setup.sh", "media/*.png", "media/*.wav"]
 
 [tool.poetry.dependencies]
 python = "^3.10"
