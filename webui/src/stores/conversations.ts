@@ -35,6 +35,13 @@ export interface ConversationState {
   needsInitialStep: boolean;
   // Currently displayed branch name
   currentBranch: string;
+  // Max tokens setting for model responses, persisted across operations.
+  // Set by ChatInput when sending a message; read by all step() call sites.
+  maxTokens?: number;
+  // Sampling temperature, persisted across operations. Undefined = provider default.
+  temperature?: number;
+  // Nucleus sampling top_p, persisted across operations. Undefined = provider default.
+  topP?: number;
 }
 
 // Central store for all conversations
@@ -151,6 +158,18 @@ export function initConversation(
 
 export function setNeedsInitialStep(id: string, needsInitialStep: boolean) {
   updateConversation(id, { needsInitialStep });
+}
+
+export function setMaxTokens(id: string, maxTokens: number | undefined) {
+  updateConversation(id, { maxTokens });
+}
+
+export function setTemperature(id: string, temperature: number | undefined) {
+  updateConversation(id, { temperature });
+}
+
+export function setTopP(id: string, topP: number | undefined) {
+  updateConversation(id, { topP });
 }
 
 // Update conversation data in the store

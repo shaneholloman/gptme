@@ -99,6 +99,9 @@ export const WelcomeView = () => {
         stream: options?.stream,
         workspace: options?.workspace || '.',
         pendingFiles: options?.pendingFiles,
+        maxTokens: options?.maxTokens,
+        temperature: options?.temperature,
+        topP: options?.topP,
       });
 
       // Navigate immediately - server-side creation happens in background

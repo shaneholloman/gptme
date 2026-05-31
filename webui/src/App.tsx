@@ -9,6 +9,8 @@ import { EmbeddedContextProvider } from './contexts/EmbeddedContext';
 import { SettingsProvider } from './contexts/SettingsContext';
 import { lazy, Suspense, type FC } from 'react';
 import { CommandPalette } from './components/CommandPalette';
+import { ErrorBoundary } from './components/ErrorBoundary';
+import { ShortcutsDialog } from './components/ShortcutsDialog';
 import { SetupWizard } from './components/SetupWizard';
 
 // Lazy-loaded route pages — code-split at route boundaries for smaller initial bundle
@@ -19,6 +21,7 @@ const Agents = lazy(() => import('./pages/Agents'));
 const Workspaces = lazy(() => import('./pages/Workspaces'));
 const History = lazy(() => import('./pages/History'));
 const ExternalSessions = lazy(() => import('./pages/ExternalSessions'));
+const Admin = lazy(() => import('./pages/Admin'));
 const NotFound = lazy(() => import('./pages/NotFound'));
 
 const queryClient = new QueryClient({
@@ -71,23 +74,27 @@ const App: FC = () => {
                     v7_relativeSplatPath: true,
                   }}
                 >
-                  <Suspense fallback={<RouteLoader />}>
-                    <Routes>
-                      <Route path="/" element={<Index />} />
-                      <Route path="/chat" element={<Index />} />
-                      <Route path="/chat/:id" element={<Index />} />
-                      <Route path="/tasks" element={<Tasks />} />
-                      <Route path="/tasks/:id" element={<Tasks />} />
-                      <Route path="/agents" element={<Agents />} />
-                      <Route path="/workspaces" element={<Workspaces />} />
-                      <Route path="/history" element={<History />} />
-                      <Route path="/external-sessions" element={<ExternalSessions />} />
-                      <Route path="/workspace/:id" element={<Workspace />} />
-                      <Route path="*" element={<NotFound />} />
-                    </Routes>
-                  </Suspense>
+                  <ErrorBoundary>
+                    <Suspense fallback={<RouteLoader />}>
+                      <Routes>
+                        <Route path="/" element={<Index />} />
+                        <Route path="/chat" element={<Index />} />
+                        <Route path="/chat/:id" element={<Index />} />
+                        <Route path="/tasks" element={<Tasks />} />
+                        <Route path="/tasks/:id" element={<Tasks />} />
+                        <Route path="/agents" element={<Agents />} />
+                        <Route path="/workspaces" element={<Workspaces />} />
+                        <Route path="/history" element={<History />} />
+                        <Route path="/external-sessions" element={<ExternalSessions />} />
+                        <Route path="/admin" element={<Admin />} />
+                        <Route path="/workspace/:id" element={<Workspace />} />
+                        <Route path="*" element={<NotFound />} />
+                      </Routes>
+                    </Suspense>
+                  </ErrorBoundary>
                   <SetupWizard />
                   <CommandPalette />
+                  <ShortcutsDialog />
                   <Toaster />
                   <Sonner />
                 </BrowserRouter>

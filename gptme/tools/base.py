@@ -466,12 +466,17 @@ class ToolUse:
             tool = get_tool(self.tool)
             if tool and tool.execute:
                 try:
+                    from ..hooks.types import ToolExecutePreData  # fmt: skip
+
                     # Trigger pre-execution hooks (tool.execute.pre)
-                    if pre_hook_msgs := trigger_hook(
-                        HookType.TOOL_EXECUTE_PRE,
+                    pre_data = ToolExecutePreData(
                         log=log,
                         workspace=workspace,
                         tool_use=self,
+                    )
+                    if pre_hook_msgs := trigger_hook(
+                        HookType.TOOL_EXECUTE_PRE,
+                        pre_data,
                     ):
                         yield from pre_hook_msgs
 
@@ -489,6 +494,7 @@ class ToolUse:
                     # Set context var so tools can access current ToolUse
                     # via get_current_tool_use() or implicitly in get_confirmation()
                     token = _current_tool_use.set(self)
+                    result_msgs: list[Message] = []
                     try:
                         ex = tool.execute(
                             self.content,
@@ -497,10 +503,12 @@ class ToolUse:
                         )
                         if isinstance(ex, Generator):
                             # Convert generator to list to measure execution time properly
-                            results = list(ex)
-                            yield from results
+                            result_msgs = list(ex)
+                            yield from result_msgs
                         else:
-                            yield ex
+                            if ex is not None:
+                                result_msgs = [ex]
+                            yield from result_msgs
                     finally:
                         _current_tool_use.reset(token)
 
@@ -515,12 +523,20 @@ class ToolUse:
                         tool_format=self._format,
                     )
 
+                    from ..hooks.types import ToolExecutePostData  # fmt: skip
+
                     # Trigger post-execution hooks (tool.execute.post)
-                    if post_hook_msgs := trigger_hook(
-                        HookType.TOOL_EXECUTE_POST,
+                    post_data = ToolExecutePostData(
                         log=log,
                         workspace=workspace,
                         tool_use=self,
+                        result_msgs=tuple(result_msgs)
+                        if isinstance(ex, Generator)
+                        else None,
+                    )
+                    if post_hook_msgs := trigger_hook(
+                        HookType.TOOL_EXECUTE_POST,
+                        post_data,
                     ):
                         yield from post_hook_msgs
 

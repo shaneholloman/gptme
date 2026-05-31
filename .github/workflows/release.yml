@@ -174,11 +174,7 @@ jobs:
 
       - name: Generate changelog
         run: |
-          # Download the shared changelog generator (same as `make dist/CHANGELOG.md`)
-          # Pinned to specific commit to avoid supply-chain risk from mutable master branch
-          wget -q -O scripts/build_changelog.py \
-            https://raw.githubusercontent.com/ActivityWatch/activitywatch/ade74fd7636abb2b675591682b4f753e289deb72/scripts/build_changelog.py
-          chmod +x scripts/build_changelog.py
+          # build_changelog.py is vendored in scripts/ (no longer downloaded from external URL)
           pip install -q requests
 
           TAG="${{ steps.version.outputs.tag }}"
@@ -258,6 +254,16 @@ jobs:
         rm -f dist/*.whl dist/*.tar.gz
         poetry build
 
+    - name: Validate package (dry-run publish)
+      run: |
+        # Dry-run validates artifact structure and metadata — no upload, no auth check
+        poetry publish --dry-run --no-interaction
+
+    - name: Publish to PyPI
+      env:
+        POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
+      run: poetry publish
+
     - name: Upload packages to GitHub release
       env:
         GH_TOKEN: ${{ github.token }}
@@ -274,12 +280,49 @@ jobs:
       env:
         GH_TOKEN: ${{ github.token }}
       run: |
+        # Verify a workflow_dispatch run actually registered after triggering.
+        # `gh workflow run` is fire-and-forget and exits 0 even when the run
+        # never starts (e.g. workflow file syntax error on the target branch,
+        # missing workflow_dispatch trigger). Without this check a release can
+        # silently ship the PyPI package with no binaries/installers built.
+        # Returns 0 if any workflow_dispatch run created at or after
+        # TRIGGER_TIME registers within ~30s, else 1. Including recently-
+        # completed runs avoids a misleading "no run registered" error when
+        # the triggered workflow starts and fast-fails before the first poll.
+        verify_triggered() {
+          local workflow="$1"
+          echo "Verifying ${workflow} run started..."
+          for i in 1 2 3 4 5 6; do
+            count="$(gh run list --workflow="${workflow}" --event=workflow_dispatch \
+              --limit 5 --json status,createdAt | \
+              jq --arg since "${TRIGGER_TIME}" \
+              '[.[] | select(.status != "completed" or .createdAt >= $since)] | length')"
+            if [ "${count:-0}" -gt 0 ]; then
+              echo "✓ ${workflow} run registered (attempt ${i}/6)"
+              return 0
+            fi
+            # Don't sleep after the final attempt — nothing follows it.
+            if [ "${i}" -lt 6 ]; then
+              echo "Waiting for ${workflow} run to register... (${i}/6)"
+              sleep 5
+            fi
+          done
+          echo "::error::${workflow} was triggered but no active run registered within ~30s"
+          return 1
+        }
+
+        # Capture time before dispatching so verify_triggered can distinguish
+        # runs created by this dispatch from pre-existing completed runs.
+        TRIGGER_TIME="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
+
         echo "Triggering Build workflow for ${TAG}..."
         gh workflow run build.yml -f tag="${TAG}"
         echo "Triggering Tauri workflow for ${TAG}..."
         gh workflow run tauri.yml -f tag="${TAG}"
 
-    - name: Publish to PyPI
-      env:
-        PYPI_TOKEN: ${{ secrets.PYPI_TOKEN }}
-      run: poetry publish --username=__token__ --password=$PYPI_TOKEN
+        # Check both even if the first fails, so the job reports every missing
+        # trigger in one run (set -eo pipefail would otherwise stop at the first).
+        rc=0
+        verify_triggered build.yml || rc=1
+        verify_triggered tauri.yml || rc=1
+        exit "${rc}"

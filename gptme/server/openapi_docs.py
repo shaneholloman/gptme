@@ -420,6 +420,23 @@ class ChatConfig(BaseModel):
     model: str | None = Field(None, description="Default model")
     tools: list[str] | None = Field(None, description="Enabled tools")
     workspace: str | None = Field(None, description="Workspace path")
+    max_tokens: int | None = Field(
+        None,
+        description="Max tokens for the model's response (None = model default)",
+        gt=0,
+    )
+    temperature: float | None = Field(
+        None,
+        description="Sampling temperature (None = env/constant default 0; 0 = deterministic; higher = more creative). Max 1.0 for Anthropic; up to 2.0 for OpenAI (values above 1.0 will fail for Anthropic).",
+        ge=0.0,
+        le=2.0,
+    )
+    top_p: float | None = Field(
+        None,
+        description="Top-p nucleus sampling (None = env/constant default 0.1)",
+        ge=0.0,
+        le=1.0,
+    )
 
 
 # Helper functions for automatic inference

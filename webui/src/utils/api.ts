@@ -1,5 +1,6 @@
 import { type CreateAgentResponse, type CreateAgentRequest } from '@/components/CreateAgentDialog';
 import type {
+  ActiveSession,
   ApiError,
   ApiErrorDetails,
   ChatConfig,
@@ -15,7 +16,7 @@ import { getApiBaseUrl } from '@/utils/connectionConfig';
 import { isLocalUrl, withLocalAddressSpace } from '@/utils/addressSpace';
 import { type Observable } from '@legendapp/state';
 import { observable } from '@legendapp/state';
-import { initConversation } from '@/stores/conversations';
+import { initConversation, setMaxTokens, setTemperature, setTopP } from '@/stores/conversations';
 
 // Add DOM types
 type RequestInit = globalThis.RequestInit;
@@ -949,6 +950,9 @@ export class ApiClient {
       stream?: boolean;
       workspace?: string;
       pendingFiles?: File[];
+      maxTokens?: number;
+      temperature?: number;
+      topP?: number;
     }
   ): Promise<string> {
     // Generate conversation ID immediately
@@ -977,6 +981,15 @@ export class ApiClient {
       },
       { needsInitialStep: true }
     );
+    if (options?.maxTokens !== undefined) {
+      setMaxTokens(conversationId, options.maxTokens);
+    }
+    if (options?.temperature !== undefined) {
+      setTemperature(conversationId, options.temperature);
+    }
+    if (options?.topP !== undefined) {
+      setTopP(conversationId, options.topP);
+    }
 
     if (options?.pendingFiles?.length) {
       // When files are attached: create an empty conversation first (no message yet),
@@ -1129,7 +1142,10 @@ export class ApiClient {
     logfile: string,
     model?: string,
     stream: boolean = true,
-    branch: string = 'main'
+    branch: string = 'main',
+    maxTokens?: number,
+    temperature?: number,
+    topP?: number
   ): Promise<void> {
     if (!this.isConnected) {
       throw new Error('Not connected to API');
@@ -1172,7 +1188,15 @@ export class ApiClient {
         {
           method: 'POST',
           headers,
-          body: JSON.stringify({ session_id: sessionId, model, branch, stream }),
+          body: JSON.stringify({
+            session_id: sessionId,
+            model,
+            branch,
+            stream,
+            ...(maxTokens !== undefined ? { max_tokens: maxTokens } : {}),
+            ...(temperature !== undefined ? { temperature } : {}),
+            ...(topP !== undefined ? { top_p: topP } : {}),
+          }),
           signal: this.controller.signal,
         }
       );
@@ -1340,6 +1364,16 @@ export class ApiClient {
   async getExternalSession(id: string, days = 30): Promise<ExternalSessionDetail> {
     const url = `${this.baseUrl}/api/v2/external-sessions/${id}?days=${days}`;
     return await this.fetchJson<ExternalSessionDetail>(url);
+  }
+
+  async getSessions(): Promise<ActiveSession[]> {
+    const url = `${this.baseUrl}/api/v2/sessions`;
+    return await this.fetchJson<ActiveSession[]>(url);
+  }
+
+  async deleteSession(sessionId: string): Promise<void> {
+    const url = `${this.baseUrl}/api/v2/sessions/${sessionId}`;
+    await this.fetchJson<{ status: string }>(url, { method: 'DELETE' });
   }
 }
 
