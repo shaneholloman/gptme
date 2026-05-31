@@ -98,3 +98,44 @@ def test_cors_wildcard_disables_credentials():
     assert resp.status_code == 200
     # No credentials header should be set when wildcard is in use
     assert resp.headers.get("Access-Control-Allow-Credentials") != "true"
+
+
+def test_cors_wildcard_disables_private_network():
+    """Wildcard CORS must NOT opt in to Private Network Access.
+    Enabling PNA for '*' would let any HTTPS page reach the local server,
+    defeating Chrome's loopback protection."""
+    from gptme.server.app import create_app
+
+    app = create_app(cors_origin="*")
+    with app.test_client() as client:
+        resp = client.options(
+            "/api/v2",
+            headers={
+                "Origin": "https://attacker.example.com",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+    assert resp.headers.get("Access-Control-Allow-Private-Network") != "true"
+
+
+def test_cors_preflight_allows_private_network():
+    """A public https origin (e.g. https://chat.gptme.org) reaching the local
+    server over loopback triggers Chrome's Private Network Access preflight.
+    The server must answer Access-Control-Allow-Private-Network: true, or the
+    browser blocks the request even though the origin is allowed."""
+    from gptme.server.app import create_app
+
+    app = create_app(cors_origin="https://chat.gptme.org")
+    with app.test_client() as client:
+        resp = client.options(
+            "/api/v2",
+            headers={
+                "Origin": "https://chat.gptme.org",
+                "Access-Control-Request-Method": "GET",
+                "Access-Control-Request-Private-Network": "true",
+            },
+        )
+    assert resp.status_code in (200, 204)
+    assert resp.headers.get("Access-Control-Allow-Origin") == "https://chat.gptme.org"
+    assert resp.headers.get("Access-Control-Allow-Private-Network") == "true"

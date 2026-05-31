@@ -84,7 +84,9 @@ def create_app(
     # Register v2 API, workspace API, tasks API, and auth API
     # noreorder
     from .api_v2 import v2_api  # fmt: skip
+    from .artifacts_api import artifacts_api  # fmt: skip
     from .auth import auth_api  # fmt: skip
+    from .panels_api import panels_api  # fmt: skip
     from .tasks_api import tasks_api  # fmt: skip
     from .workspace_api import workspace_api  # fmt: skip
 
@@ -92,6 +94,8 @@ def create_app(
     app.register_blueprint(auth_api)
     app.register_blueprint(workspace_api)
     app.register_blueprint(tasks_api)
+    app.register_blueprint(artifacts_api)
+    app.register_blueprint(panels_api)
 
     # Register OpenAPI documentation
     from .openapi_docs import docs_api  # fmt: skip
@@ -109,13 +113,28 @@ def create_app(
                 origins_list[0] if len(origins_list) == 1 else origins_list
             )
             # Browsers reject credentials with a wildcard origin.
-            allow_credentials = "*" not in origins_list
+            # Similarly, wildcard CORS must not opt in to Private Network
+            # Access — doing so lets *any* HTTPS page reach the local server,
+            # defeating Chrome's PNA protection. Both flags require named origins.
+            non_wildcard = "*" not in origins_list
+            allow_credentials = non_wildcard
             CORS(
                 app,
                 resources={
                     r"/api/*": {
                         "origins": origins,
                         "supports_credentials": allow_credentials,
+                        # Allow public-origin -> loopback requests. Chrome's
+                        # Private Network Access policy blocks a secure public
+                        # origin (e.g. https://chat.gptme.org) from fetching a
+                        # local server (http://127.0.0.1:5700) unless the
+                        # preflight response carries
+                        # Access-Control-Allow-Private-Network: true. Passing
+                        # a named --cors-origin is the user's opt-in for
+                        # exactly that hosted-webui -> local-server workflow.
+                        # Wildcard origins are excluded: any HTTPS page would
+                        # then be able to reach loopback, bypassing PNA.
+                        "allow_private_network": non_wildcard,
                     }
                 },
             )
