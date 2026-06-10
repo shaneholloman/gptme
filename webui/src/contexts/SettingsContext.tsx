@@ -1,13 +1,29 @@
 import React, { createContext, useContext, useState } from 'react';
+import { stopSpeaking, type TtsProvider } from '../utils/tts';
 
 export interface Settings {
   chimeEnabled: boolean;
+  ttsEnabled: boolean;
+  /**
+   * Which TTS engine to use:
+   * - 'auto': try the gptme-server endpoint, then an external gptme-tts server, then browser
+   * - 'browser': the browser's built-in speechSynthesis
+   * - 'server': the connected gptme-server's /api/v2/audio/speech (provider-backed, e.g. OpenRouter)
+   * - 'external': a standalone gptme-tts server at `ttsServerUrl`
+   */
+  ttsProvider: TtsProvider;
   blocksDefaultOpen: boolean;
   showHiddenMessages: boolean;
   showInitialSystem: boolean;
   hasCompletedSetup: boolean;
   /** CSS background for the welcome/new-chat view (image URL or gradient) */
   welcomeBackground: string;
+  /**
+   * HTTP base URL of a running gptme-tts server, e.g. http://localhost:5701.
+   * When set, TTS uses this server instead of the browser's speechSynthesis API.
+   * Leave empty to use browser TTS.
+   */
+  ttsServerUrl: string;
   /**
    * WebSocket URL for the gptme-voice-server /voice endpoint, e.g. ws://localhost:5700/voice.
    * Leave empty to hide the VoiceButton.
@@ -23,11 +39,14 @@ interface SettingsContextType {
 
 const defaultSettings: Settings = {
   chimeEnabled: true,
+  ttsEnabled: false,
+  ttsProvider: 'auto',
   blocksDefaultOpen: true,
   showHiddenMessages: false,
   showInitialSystem: false,
   hasCompletedSetup: false,
   welcomeBackground: '',
+  ttsServerUrl: '',
   voiceServerUrl: '',
 };
 
@@ -61,6 +80,9 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   const [settings, setSettings] = useState<Settings>(loadSettingsFromStorage);
 
   const updateSettings = (updates: Partial<Settings>) => {
+    if (updates.ttsEnabled === false) {
+      stopSpeaking();
+    }
     // Use functional updater to avoid stale closure if called in rapid succession.
     setSettings((current) => {
       const newSettings = { ...current, ...updates };
@@ -74,6 +96,7 @@ export const SettingsProvider: React.FC<{ children: React.ReactNode }> = ({ chil
   };
 
   const resetSettings = () => {
+    stopSpeaking();
     // Use functional updater to avoid stale closure on hasCompletedSetup.
     // Preserve hasCompletedSetup so a settings reset doesn't re-trigger the wizard.
     setSettings((current) => {

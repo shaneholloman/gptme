@@ -15,6 +15,7 @@ from .hooks import init_hooks
 from .llm import guess_provider_from_config, init_llm, is_custom_provider
 from .llm.llm_gptme import GptmeAuthError
 from .llm.models import (
+    MODEL_ALIASES,
     PROVIDERS,
     CustomProvider,
     ModelMeta,
@@ -88,22 +89,10 @@ def init(
 
 def _init_plugins():
     """Discover and initialize all plugins (folder-based + entry-point)."""
-    from pathlib import Path
-
     from .plugins import discover_all_plugins
 
     config = get_config()
-    folder_paths: list[Path] = []
-    enabled: list[str] | None = None
-
-    if config.project and config.project.plugins:
-        for path_str in config.project.plugins.paths:
-            path = Path(path_str).expanduser()
-            if not path.is_absolute() and config.project._workspace:
-                path = config.project._workspace / path
-            folder_paths.append(path)
-        enabled = config.project.plugins.enabled or None
-
+    folder_paths, enabled = config.get_plugin_config()
     discover_all_plugins(folder_paths=folder_paths or None, enabled_plugins=enabled)
 
 
@@ -114,8 +103,13 @@ def init_model(
     config = get_config()
 
     # get from config
+    # Precedence: explicit per-chat model > [models].default > MODEL env var.
     if not model:
-        model = (config.chat.model if config.chat else None) or config.get_env("MODEL")
+        model = (
+            (config.chat.model if config.chat else None)
+            or config.user.models.default
+            or config.get_env("MODEL")
+        )
 
     if not model:  # pragma: no cover
         # auto-detect depending on if OPENAI_API_KEY or ANTHROPIC_API_KEY is set
@@ -179,15 +173,41 @@ def init_model(
             model_name = "/".join(
                 model_meta.model.split("/")[1:]
             )  # Strip provider prefix
-        else:
+        elif model in PROVIDERS:
+            # Bare builtin provider name (e.g. "anthropic"): use its
+            # recommended model below via get_recommended_model().
             provider, model_name = cast(tuple[Provider, str], (model, None))
+        else:
+            # Not a provider at all - treat as a bare model name and resolve it
+            # via get_model() (e.g. "gpt-4o" -> openai/gpt-4o). Previously this
+            # blindly cast the model name to a provider, then crashed in
+            # get_recommended_model() with the misleading "Provider 'X' requires
+            # specifying a model" message. Mirrors the slash-path handling above.
+            resolved = get_model(model)
+            if resolved.provider == "unknown":
+                raise ValueError(
+                    f"Unknown model {model!r}. Use 'provider/model' with a known "
+                    f"provider (e.g. 'openai/{model}'), or configure a custom "
+                    f"provider. Run 'gptme-util models list' to see available models."
+                )
+            provider = resolved.provider
+            model_name = resolved.model
+            _resolved_meta = resolved  # reuse below; avoids a redundant second lookup
 
     # set up API_KEY and API_BASE, needs to be done before loading history to avoid saving API_KEY
     if model_name is None:
         model_name = get_recommended_model(provider)
     model_full = f"{provider}/{model_name}"
     if not is_output_json():
-        console.log(f"Using model: [green]{model_full}[/green]")
+        # Show the resolved alias if the model name is a known short alias
+        # (e.g. claude-haiku-4-5 → claude-haiku-4-5-20251001).
+        resolved_alias = MODEL_ALIASES.get(str(provider), {}).get(model_name)
+        if resolved_alias:
+            console.log(
+                f"Using model: [green]{model_full}[/green] (→ [dim]{resolved_alias}[/dim])"
+            )
+        else:
+            console.log(f"Using model: [green]{model_full}[/green]")
     try:
         init_llm(provider)
     except GptmeAuthError:
@@ -237,9 +257,17 @@ def _maybe_authenticate_gptme_interactively(
 
 
 def init_logging(verbose, *, stderr: bool = True):
-    handler = RichHandler(
-        console=Console(stderr=stderr, log_path=False)
-    )  # show_time=False
+    if not stderr:
+        # Use the shared Rich Console (same instance rprint uses) so log
+        # output is serialized with streaming assistant output through a
+        # single Console, preventing stderr/stdout interleave mid-stream.
+        from rich import get_console as _get_console
+
+        handler = RichHandler(console=_get_console())
+    else:
+        handler = RichHandler(
+            console=Console(stderr=True, log_path=False)
+        )  # show_time=False
     logging.basicConfig(
         level=logging.DEBUG if verbose else logging.INFO,
         format="%(message)s",

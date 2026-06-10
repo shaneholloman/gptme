@@ -1,0 +1,98 @@
+import '@testing-library/jest-dom';
+import { render, screen, fireEvent } from '@testing-library/react';
+import { SplitConversationView } from '../SplitConversationView';
+
+// Stub ConversationContent so tests don't need full API context
+jest.mock('../ConversationContent', () => ({
+  ConversationContent: ({
+    conversationId,
+    isReadOnly,
+  }: {
+    conversationId: string;
+    isReadOnly?: boolean;
+  }) => (
+    <div data-testid={`conversation-${conversationId}`} data-readonly={String(!!isReadOnly)}>
+      {conversationId}
+    </div>
+  ),
+}));
+
+// Stub resizable panels to simple divs
+jest.mock('@/components/ui/resizable', () => ({
+  ResizablePanelGroup: ({
+    children,
+    className,
+  }: {
+    children: React.ReactNode;
+    className?: string;
+  }) => (
+    <div data-testid="resizable-group" className={className}>
+      {children}
+    </div>
+  ),
+  ResizablePanel: ({ children }: { children: React.ReactNode }) => (
+    <div data-testid="resizable-panel">{children}</div>
+  ),
+  ResizableHandle: () => <div data-testid="resizable-handle" />,
+}));
+
+describe('SplitConversationView', () => {
+  const onClose = jest.fn();
+
+  beforeEach(() => {
+    onClose.mockClear();
+  });
+
+  it('renders both conversation panes', () => {
+    render(<SplitConversationView leftId="conv-a" rightId="conv-b" onClose={onClose} />);
+
+    expect(screen.getByTestId('conversation-conv-a')).toBeInTheDocument();
+    expect(screen.getByTestId('conversation-conv-b')).toBeInTheDocument();
+  });
+
+  it('shows "Split view" label', () => {
+    render(<SplitConversationView leftId="conv-a" rightId="conv-b" onClose={onClose} />);
+
+    expect(screen.getByText('Split view')).toBeInTheDocument();
+  });
+
+  it('forwards readonly state to each conversation pane', () => {
+    render(
+      <SplitConversationView
+        leftId="conv-a"
+        rightId="conv-b"
+        leftIsReadOnly
+        rightIsReadOnly={false}
+        onClose={onClose}
+      />
+    );
+
+    expect(screen.getByTestId('conversation-conv-a')).toHaveAttribute('data-readonly', 'true');
+    expect(screen.getByTestId('conversation-conv-b')).toHaveAttribute('data-readonly', 'false');
+  });
+
+  it('calls onClose when close button is clicked', () => {
+    render(<SplitConversationView leftId="conv-a" rightId="conv-b" onClose={onClose} />);
+
+    fireEvent.click(screen.getByTitle('Close split view'));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('keeps close button available while loading conversations', () => {
+    render(<SplitConversationView leftId="conv-a" rightId="conv-b" isLoading onClose={onClose} />);
+
+    expect(screen.getByText('Loading split view...')).toBeInTheDocument();
+    expect(screen.queryByTestId('conversation-conv-a')).not.toBeInTheDocument();
+
+    fireEvent.click(screen.getByTitle('Close split view'));
+    expect(onClose).toHaveBeenCalledTimes(1);
+  });
+
+  it('uses vertical layout on mobile', () => {
+    render(<SplitConversationView leftId="a" rightId="b" vertical onClose={onClose} />);
+
+    // Both panes still rendered
+    expect(screen.getByTestId('conversation-a')).toBeInTheDocument();
+    expect(screen.getByTestId('conversation-b')).toBeInTheDocument();
+  });
+});

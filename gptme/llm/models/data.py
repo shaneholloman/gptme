@@ -485,6 +485,30 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "preferred_edit_format": "diff",
         },
     },
+    "moonshot": {
+        # https://platform.kimi.ai/docs/models
+        # https://platform.kimi.ai/docs/api/chat
+        # Kimi docs list 256K context for k2.6/k2.5. max_completion_tokens
+        # is constrained by input + output fitting within that context; the
+        # 32K K2.5 guide value is a default, not a documented hard output cap.
+        # All kimi models require temperature=1; handled in llm_openai.py
+        "kimi-k2.6": {
+            "context": 262_144,
+            "max_output": 262_144,
+            "price_input": 0.60,
+            "price_output": 2.40,
+            "supports_vision": True,
+            "preferred_edit_format": "diff",
+        },
+        "kimi-k2": {
+            "context": 262_144,
+            "max_output": 262_144,
+            "price_input": 0.38,
+            "price_output": 1.52,
+            "supports_vision": True,
+            "preferred_edit_format": "diff",
+        },
+    },
     "nvidia": {},
     "azure": {},
     # gptme managed service — proxies to multiple providers

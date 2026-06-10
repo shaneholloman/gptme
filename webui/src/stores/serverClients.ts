@@ -5,16 +5,35 @@
  * for the "primary" server. The primary designation only controls which server
  * is the default for new conversations.
  */
-import { createApiClient, type ApiClient } from '@/utils/api';
+import { createApiClient, type IApiClient } from '@/utils/api';
+import { createDemoApiClient } from '@/utils/demoApiClient';
+import { isDemoMode } from '@/utils/connectionConfig';
 import { serverRegistry$ } from './servers';
 
-const clientPool = new Map<string, ApiClient>();
+const clientPool = new Map<string, IApiClient>();
+
+// Cache isDemoMode() once — URL params don't change without a page reload.
+const _isDemoMode = isDemoMode();
+
+// In demo mode every server resolves to a single shared offline client.
+let demoClient: IApiClient | null = null;
+function getDemoClient(): IApiClient {
+  if (!demoClient) {
+    demoClient = createDemoApiClient();
+  }
+  return demoClient;
+}
 
 /**
  * Get or create an ApiClient for a specific server.
  * Clients are cached and invalidated when baseUrl or auth changes.
+ * In demo mode (`?demo=1`) every server resolves to the offline demo client.
  */
-export function getClientForServer(serverId: string): ApiClient | null {
+export function getClientForServer(serverId: string): IApiClient | null {
+  if (_isDemoMode) {
+    return getDemoClient();
+  }
+
   const registry = serverRegistry$.get();
   const server = registry.servers.find((s) => s.id === serverId);
   if (!server) return null;
@@ -32,7 +51,11 @@ export function getClientForServer(serverId: string): ApiClient | null {
 }
 
 /** Get the client for the primary (active) server. */
-export function getPrimaryClient(): ApiClient {
+export function getPrimaryClient(): IApiClient {
+  if (_isDemoMode) {
+    return getDemoClient();
+  }
+
   const registry = serverRegistry$.get();
   const client = getClientForServer(registry.activeServerId);
   if (!client) {

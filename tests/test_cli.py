@@ -155,13 +155,96 @@ def test_name_rejects_path_traversal(bad_name: str, runner: CliRunner):
 
 
 @pytest.mark.parametrize("bad_name", ["", " ", "   ", "\t"])
-def test_name_rejects_empty_or_whitespace_only_values(bad_name: str, runner: CliRunner):
+def test_name_defaults_to_random_for_empty_or_whitespace(
+    monkeypatch, tmp_path: Path, bad_name: str, runner: CliRunner
+):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    logdir = tmp_path / "existing-conversation"
+    logdir.mkdir()
+    (logdir / "conversation.jsonl").write_text('{"role":"user","content":"hello"}\n')
+
+    selected_names: list[str] = []
+    selected_logdirs: list[Path] = []
+
+    def fake_get_logdir(name: str) -> Path:
+        selected_names.append(name)
+        return logdir
+
+    def fake_chat(prompt_msgs, initial_msgs, chat_logdir, *args, **kwargs):
+        selected_logdirs.append(chat_logdir)
+
+    monkeypatch.setattr(cli, "get_logdir", fake_get_logdir)
+    monkeypatch.setattr(cli, "chat", fake_chat)
+
     result = runner.invoke(
         cli.main,
         ["--name", bad_name, "--non-interactive", "hello"],
+        catch_exceptions=False,
     )
+
+    assert result.exit_code == 0
+    assert "Traceback" not in result.output
+    assert selected_names == ["random"]
+    assert selected_logdirs == [logdir]
+
+
+def test_name_empty_before_output_format(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+):
+    """Regression: --name "" with later flags must still normalize to random."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    logdir = tmp_path / "existing-conversation"
+    logdir.mkdir()
+    (logdir / "conversation.jsonl").write_text('{"role":"user","content":"hello"}\n')
+
+    selected_names: list[str] = []
+    selected_logdirs: list[Path] = []
+
+    def fake_get_logdir(name: str) -> Path:
+        selected_names.append(name)
+        return logdir
+
+    def fake_chat(prompt_msgs, initial_msgs, chat_logdir, *args, **kwargs):
+        selected_logdirs.append(chat_logdir)
+
+    monkeypatch.setattr(cli, "get_logdir", fake_get_logdir)
+    monkeypatch.setattr(cli, "chat", fake_chat)
+
+    result = runner.invoke(
+        cli.main,
+        ["--name", "", "--output-format", "json", "--non-interactive", "hello"],
+        catch_exceptions=False,
+    )
+
+    assert result.exit_code == 0
+    assert "Traceback" not in result.output
+    assert selected_names == ["random"]
+    assert selected_logdirs == [logdir]
+
+
+@pytest.mark.parametrize("bad_model", ["openai/", "/gpt-4o", "/", "openrouter//gpt-4o"])
+def test_model_rejects_empty_path_components(bad_model: str, runner: CliRunner):
+    result = runner.invoke(cli.main, ["--model", bad_model, "--version"])
+
     assert result.exit_code == 2
-    assert "conversation name cannot be empty" in result.output
+    assert "Model path components cannot be empty" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_model_allows_provider_owned_nested_model_path(runner: CliRunner):
+    result = runner.invoke(
+        cli.main,
+        ["--model", "openrouter/anthropic/claude-sonnet-4-6", "--version"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert "gptme v" in result.output
 
 
 @pytest.mark.parametrize(
@@ -537,8 +620,8 @@ def test_architect_model_unqualified_is_usage_error(
 
 
 def test_empty_model_is_usage_error(runner: CliRunner, runid: int):
-    # --model "" should give a clean UsageError, not silently fall back to the
-    # default model with a warning. An empty string is an obvious user mistake.
+    # --model "" should be caught at parse time by the click callback,
+    # producing a clean BadParameter error (not a late ValueError).
     result = runner.invoke(
         cli.main,
         [
@@ -547,6 +630,25 @@ def test_empty_model_is_usage_error(runner: CliRunner, runid: int):
             f"test-empty-model-{runid}",
             "--model",
             "",
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 2
+    assert "Traceback" not in result.output
+    assert "empty" in result.output.lower()
+
+
+def test_whitespace_model_is_usage_error(runner: CliRunner, runid: int):
+    # --model "  " should also be caught at parse time, same as empty string.
+    result = runner.invoke(
+        cli.main,
+        [
+            "--non-interactive",
+            "--name",
+            f"test-whitespace-model-{runid}",
+            "--model",
+            "   ",
             "hello",
         ],
     )
@@ -1078,6 +1180,37 @@ def test_comma_separated_choice_minus_prefix():
     # Should reject invalid tool name even with '-' prefix
     with pytest.raises(click.exceptions.BadParameter):
         csc.convert("-nonexistent", None, None)
+
+
+def test_comma_separated_choice_lenient_prefixes_allow_plugin_tools():
+    """Only '+'-prefixed unknown names pass (plugin tools); '-' stays strict.
+
+    Plugin tools aren't known when the CLI is built, so '+tool' must pass
+    parse-time validation (resolved against the loaded toolset later). '-tool'
+    exclusions stay strict so typos are caught early.
+    """
+    from gptme.cli.main import CommaSeparatedChoice
+
+    csc = CommaSeparatedChoice(
+        ["shell", "save", "read"],
+        allow_prefixes=["+", "-"],
+        extra_choices_for_prefix={"-": ["browser"]},
+        lenient_prefixes=["+"],
+    )
+
+    # Unknown plugin tool with '+' passes
+    assert csc.convert("+tts", None, None) == "+tts"
+    # Known tools still pass with either prefix
+    assert csc.convert("+shell", None, None) == "+shell"
+    assert csc.convert("-browser", None, None) == "-browser"
+
+    # Unknown '-' exclusion is rejected (typo protection retained)
+    with pytest.raises(click.exceptions.BadParameter):
+        csc.convert("-tts", None, None)
+
+    # Bare (unprefixed) unknown names are still rejected
+    with pytest.raises(click.exceptions.BadParameter):
+        csc.convert("tts", None, None)
 
 
 def test_comma_separated_choice_strips_short_option_equals_prefix():

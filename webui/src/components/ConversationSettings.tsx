@@ -1,4 +1,4 @@
-import { useState, type FC } from 'react';
+import { useState, useEffect, type FC } from 'react';
 import { DeleteConversationConfirmationDialog } from './DeleteConversationConfirmationDialog';
 import { Trash, Loader2, Download } from 'lucide-react';
 import { conversations$ } from '@/stores/conversations';
@@ -21,12 +21,85 @@ import {
 import { Button } from '@/components/ui/button';
 import { Input } from '@/components/ui/input';
 import { Switch } from '@/components/ui/switch';
+import { Textarea } from '@/components/ui/textarea';
 import { EnvironmentVariables } from './settings/EnvironmentVariables';
 import { ToolsConfiguration } from './settings/ToolsConfiguration';
 import { McpConfiguration } from './settings/McpConfiguration';
 import { useConversationSettings } from '@/hooks/useConversationSettings';
 import { demoConversations } from '@/democonversations';
 import { SessionCostSummary } from './SessionCostSummary';
+
+// Decimal input that avoids mid-typing snapping (Number('0.') === 0 issue).
+// Keeps a raw string in local state and only commits a number on blur.
+function DecimalInput({
+  field,
+  min,
+  max,
+  placeholder,
+  disabled,
+}: {
+  field: {
+    value: number | undefined | null;
+    onChange: (value: number | undefined) => void;
+    onBlur: () => void;
+    name: string;
+  };
+  min: number;
+  max: number;
+  placeholder: string;
+  disabled: boolean;
+}) {
+  const [raw, setRaw] = useState<string>(field.value != null ? String(field.value) : '');
+
+  // Sync raw when field.value changes externally (e.g. form reset), but not
+  // while the user is mid-typing a partial like "0.".
+  useEffect(() => {
+    if (!raw.endsWith('.')) {
+      setRaw(field.value != null ? String(field.value) : '');
+    }
+  }, [field.value]); // eslint-disable-line react-hooks/exhaustive-deps
+
+  return (
+    <Input
+      name={field.name}
+      type="text"
+      inputMode="decimal"
+      placeholder={placeholder}
+      disabled={disabled}
+      value={raw}
+      onChange={(e) => {
+        const v = e.target.value;
+        if (v === '' || /^\d*\.?\d*$/.test(v)) {
+          setRaw(v);
+          if (v === '' || v === '.') {
+            field.onChange(undefined);
+          } else {
+            const n = Number(v);
+            if (!isNaN(n)) {
+              field.onChange(Math.min(max, Math.max(min, n)));
+            }
+          }
+        }
+      }}
+      onBlur={() => {
+        if (raw !== '' && raw !== '.') {
+          const n = Number(raw);
+          if (!isNaN(n)) {
+            const clamped = Math.min(max, Math.max(min, n));
+            setRaw(String(clamped));
+            field.onChange(clamped);
+          } else {
+            setRaw(field.value != null ? String(field.value) : '');
+          }
+        } else {
+          setRaw('');
+          field.onChange(undefined);
+        }
+        field.onBlur();
+      }}
+    />
+  );
+}
 
 interface ConversationSettingsProps {
   conversationId: string;
@@ -50,6 +123,13 @@ export const ConversationSettings: FC<ConversationSettingsProps> = ({ conversati
     control,
     formState: { isDirty, isSubmitting },
   } = form;
+
+  const selectedModel = form.watch('chat.model');
+  const currentTemp = form.watch('chat.temperature');
+  const showTempProviderWarning =
+    currentTemp != null &&
+    currentTemp > 1 &&
+    /^(anthropic\/|claude-|google\/|gemini-)/.test(selectedModel ?? '');
 
   const onInvalid = (errors: Record<string, unknown>) => {
     // Surface validation errors so the user knows why save doesn't work
@@ -115,7 +195,7 @@ export const ConversationSettings: FC<ConversationSettingsProps> = ({ conversati
       ) : (
         <Form {...form}>
           <form onSubmit={handleSubmit(onSubmit, onInvalid)} className="flex h-full flex-col">
-            <div className="flex-1 space-y-8 overflow-y-auto p-4 pb-12">
+            <div className="min-h-0 flex-1 space-y-8 overflow-y-auto p-4 pb-12">
               <h3 className="mt-4 text-lg font-medium">Chat Settings</h3>
 
               {/* Session Cost Summary */}
@@ -189,9 +269,118 @@ export const ConversationSettings: FC<ConversationSettingsProps> = ({ conversati
                 isSubmitting={isSubmitting}
               />
 
+              {/* Sampling parameters */}
+              <h3 className="text-lg font-medium">Sampling</h3>
+              <div className="space-y-4 rounded-lg border px-3 py-3 shadow-sm">
+                <FormField
+                  control={control}
+                  name="chat.temperature"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Temperature</FormLabel>
+                      <FormControl>
+                        <DecimalInput
+                          field={field}
+                          min={0}
+                          max={2}
+                          placeholder="Model default"
+                          disabled={isSubmitting}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        Sampling temperature. 0–2 (OpenAI) · 0–1 (Anthropic/Gemini). Empty = model
+                        default.
+                        {showTempProviderWarning && (
+                          <span className="block text-amber-500 dark:text-amber-400">
+                            ⚠ Temperature &gt; 1 may be rejected by this provider.
+                          </span>
+                        )}
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={control}
+                  name="chat.top_p"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Top P</FormLabel>
+                      <FormControl>
+                        <DecimalInput
+                          field={field}
+                          min={0}
+                          max={1}
+                          placeholder="Model default"
+                          disabled={isSubmitting}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        Nucleus sampling probability mass (0–1). Empty = model default.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
+                <FormField
+                  control={control}
+                  name="chat.max_tokens"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>Max Tokens</FormLabel>
+                      <FormControl>
+                        <Input
+                          type="number"
+                          min={1}
+                          step={1}
+                          placeholder="Model default"
+                          value={field.value ?? ''}
+                          onChange={(e) => {
+                            const v = e.target.value;
+                            const n = Math.round(Number(v));
+                            field.onChange(v === '' || isNaN(n) ? undefined : Math.max(1, n));
+                          }}
+                          disabled={isSubmitting}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        Maximum tokens in the model&apos;s response. Empty = provider/model default.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+              </div>
+
               {/* Advanced/rare toggles */}
               <h3 className="text-lg font-medium">Advanced Settings</h3>
               <div className="space-y-2 rounded-lg border px-3 py-2 shadow-sm">
+                <FormField
+                  control={control}
+                  name="chat.system_prompt"
+                  render={({ field }) => (
+                    <FormItem>
+                      <FormLabel>System Prompt Override</FormLabel>
+                      <FormControl>
+                        <Textarea
+                          placeholder="Optional conversation-only system prompt override..."
+                          {...field}
+                          value={field.value || ''}
+                          disabled={isSubmitting}
+                          rows={8}
+                        />
+                      </FormControl>
+                      <FormDescription>
+                        Appended as an extra system message for this conversation only. It does not
+                        edit global config, profiles, or agent bootstrap files.
+                      </FormDescription>
+                      <FormMessage />
+                    </FormItem>
+                  )}
+                />
+
                 {/* Stream Field */}
                 <FormField
                   control={control}

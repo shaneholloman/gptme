@@ -10,6 +10,7 @@ import {
   File,
   ChevronDown,
   SlidersHorizontal,
+  Star,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Textarea } from '@/components/ui/textarea';
@@ -17,11 +18,14 @@ import {
   useState,
   useEffect,
   useRef,
+  useId,
   useCallback,
   type FC,
+  type Dispatch,
   type FormEvent,
   type KeyboardEvent,
   type DragEvent,
+  type SetStateAction,
 } from 'react';
 import { useApi } from '@/contexts/ApiContext';
 import { Badge } from '@/components/ui/badge';
@@ -49,10 +53,12 @@ import { useWorkspaces } from '@/hooks/useWorkspaces';
 import { WorkspaceSelector } from '@/components/WorkspaceSelector';
 import type { WorkspaceProject, Agent } from '@/utils/workspaceUtils';
 import { useModels } from '@/hooks/useModels';
+import { useToast } from '@/components/ui/use-toast';
 import { useAgents } from '@/hooks/useAgents';
 import { useFileAutocomplete } from '@/hooks/useFileAutocomplete';
 import { FileAutocomplete } from '@/components/FileAutocomplete';
 import { VoiceButton } from '@/components/VoiceButton';
+import { SpeechInputButton } from '@/components/SpeechInputButton';
 import { useSettings } from '@/contexts/SettingsContext';
 import {
   Select,
@@ -85,7 +91,7 @@ interface Props {
   defaultModel?: string;
   autoFocus$: Observable<boolean>;
   value?: string;
-  onChange?: (value: string) => void;
+  onChange?: Dispatch<SetStateAction<string>>;
   // Edit mode: reuse ChatInput for inline message editing with attachment support
   editMode?: boolean;
   editFiles?: string[]; // Pre-existing file paths from the message being edited
@@ -348,8 +354,51 @@ const ModelBadge: FC<{
             setOpen(false);
           }}
         />
+        <SetDefaultModelFooter model={model} />
       </PopoverContent>
     </Popover>
+  );
+};
+
+/** Footer in the model dropdown to make the current model the default for new chats. */
+const SetDefaultModelFooter: FC<{ model: string }> = ({ model }) => {
+  const { defaultModel, saveDefaultModel } = useModels();
+  const { toast } = useToast();
+  const [saving, setSaving] = useState(false);
+  const isDefault = defaultModel === model;
+
+  const handleSetDefault = async () => {
+    setSaving(true);
+    const { ok, restartRequired } = await saveDefaultModel(model);
+    setSaving(false);
+    if (ok) {
+      toast({
+        title: 'Default model updated',
+        description: restartRequired
+          ? 'Restart the gptme server for it to take full effect.'
+          : 'New chats will use this model.',
+      });
+    } else {
+      toast({ variant: 'destructive', title: 'Failed to set default model' });
+    }
+  };
+
+  return (
+    <div className="border-t p-1">
+      <Button
+        type="button"
+        variant="ghost"
+        size="sm"
+        className="h-7 w-full justify-start text-xs font-normal"
+        disabled={isDefault || saving}
+        onClick={() => void handleSetDefault()}
+      >
+        <Star
+          className={`mr-2 h-3.5 w-3.5 ${isDefault ? 'fill-yellow-400 text-yellow-400' : ''}`}
+        />
+        {isDefault ? 'Default for new chats' : 'Set as default for new chats'}
+      </Button>
+    </div>
   );
 };
 
@@ -364,9 +413,10 @@ const OptionsButton: FC<{ isDisabled: boolean; children: React.ReactNode }> = ({
         size="sm"
         className="h-5 rounded-sm px-1.5 text-[10px] text-muted-foreground transition-all hover:bg-accent hover:text-muted-foreground hover:opacity-100"
         disabled={isDisabled}
+        aria-label="More chat options"
       >
         <Settings className="mr-0.5 h-2.5 w-2.5" />
-        Options
+        <span className="hidden sm:inline">Options</span>
       </Button>
     </PopoverTrigger>
     <PopoverContent className="w-80" align="start">
@@ -375,27 +425,28 @@ const OptionsButton: FC<{ isDisabled: boolean; children: React.ReactNode }> = ({
   </Popover>
 );
 
-const SubmitButton: FC<{ isGenerating: boolean; isDisabled: boolean; hasText: boolean }> = ({
-  isGenerating,
+const SubmitButton: FC<{ isBusy: boolean; isDisabled: boolean; hasText: boolean }> = ({
+  isBusy,
   isDisabled,
   hasText,
 }) => {
-  // When generating: show "Queue" if there's text, "Stop" if not
-  // When not generating: show "Send"
-  const showQueue = isGenerating && hasText;
-  const showStop = isGenerating && !hasText;
+  // When busy (generating or awaiting a tool): show "Queue" if there's text,
+  // "Stop" if not. When idle: show "Send".
+  const showQueue = isBusy && hasText;
+  const showStop = isBusy && !hasText;
+  const canSubmit = !isDisabled && (isBusy || hasText);
 
   return (
     <Button
       type="submit"
-      className={`absolute bottom-2 right-2 rounded-full p-1 transition-colors ${
+      className={`shrink-0 rounded-full p-1 transition-colors ${
         showStop
           ? 'animate-[pulse_1s_ease-in-out_infinite] bg-red-600 p-3 hover:bg-red-700'
           : showQueue
             ? 'bg-blue-600 p-3 text-white hover:bg-blue-700'
-            : 'h-8 w-8 bg-green-600 text-green-100'
+            : 'h-7 w-7 bg-green-600 text-green-100'
       }`}
-      disabled={isDisabled}
+      disabled={!canSubmit}
       aria-label={showStop ? 'Stop generation' : showQueue ? 'Queue message' : 'Send message'}
     >
       {showStop ? (
@@ -665,6 +716,7 @@ export const ChatInput: FC<Props> = ({
   );
   const textareaRef = useRef<HTMLTextAreaElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
+  const inputHelpId = useId();
   // Stable string key derived from editFiles — prevents the useEffect below from
   // firing on every render due to new array references from the parent.
   const editFileKey = editFiles?.join('\0') ?? '';
@@ -779,6 +831,11 @@ export const ChatInput: FC<Props> = ({
   const autoFocus = use$(autoFocus$);
   const conversation = conversationId ? use$(conversations$.get(conversationId)) : undefined;
   const isGenerating = conversation?.isGenerating || !!conversation?.executingTool;
+  // "Busy" also covers a pending tool confirmation: generation is paused waiting
+  // for the user, but the step isn't done. Queueing/flushing must treat this as
+  // busy, otherwise a queued message flushes mid-step and the server rejects it
+  // with "Generation already in progress".
+  const isBusy = isGenerating || !!conversation?.pendingTool;
   const placeholder = isReadOnly
     ? 'This is a demo conversation (read-only)'
     : !isConnected
@@ -799,16 +856,17 @@ export const ChatInput: FC<Props> = ({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [autoFocus, isReadOnly, isConnected]);
 
-  // Track previous isGenerating state to detect when generation completes
-  const wasGenerating = useRef(false);
+  // Track previous busy state to detect when the whole step (generation +
+  // tool execution/confirmation) completes.
+  const wasBusy = useRef(false);
 
-  // Send next queued message when generation completes
+  // Send next queued message once the step is fully done (not just paused for a
+  // tool confirmation, which would flush mid-step).
   useEffect(() => {
-    // Detect transition from generating to not generating
-    if (wasGenerating.current && !isGenerating && messageQueue.length > 0) {
+    if (wasBusy.current && !isBusy && messageQueue.length > 0) {
       if (!onSend) return;
       const nextMessage = messageQueue[0];
-      console.log('[ChatInput] Generation completed, sending queued message', {
+      console.log('[ChatInput] Step completed, sending queued message', {
         remaining: messageQueue.length - 1,
       });
       // Use options captured at queue time, not current options
@@ -816,8 +874,8 @@ export const ChatInput: FC<Props> = ({
       // Remove the sent message from queue
       setMessageQueue((prev) => prev.slice(1));
     }
-    wasGenerating.current = isGenerating;
-  }, [isGenerating, messageQueue, onSend]);
+    wasBusy.current = isBusy;
+  }, [isBusy, messageQueue, onSend]);
 
   // Sync workspace from sidebar/agent selection (only for new conversations).
   // Sidebar workspace selections sync both ways. Agent default applies only when
@@ -879,7 +937,7 @@ export const ChatInput: FC<Props> = ({
     const uploadedPaths =
       attachedFiles.length > 0 ? attachedFiles.filter((f) => f.path).map((f) => f.path) : undefined;
 
-    if (isGenerating) {
+    if (isBusy) {
       // If there's a message, queue it instead of interrupting
       if (message.trim() || attachedFiles.length > 0) {
         console.log('[ChatInput] Queueing message for after generation completes', {
@@ -991,6 +1049,13 @@ export const ChatInput: FC<Props> = ({
     }
   };
 
+  const handleTranscript = useCallback(
+    (text: string) => {
+      setMessage((prev) => (prev ? prev + ' ' + text.trim() : text.trim()));
+    },
+    [setMessage]
+  );
+
   const handlePaste = useCallback(
     (e: React.ClipboardEvent) => {
       const items = e.clipboardData?.items;
@@ -1024,7 +1089,11 @@ export const ChatInput: FC<Props> = ({
   };
 
   return (
-    <form onSubmit={handleSubmit} className="p-4">
+    <form onSubmit={handleSubmit} className="p-2 sm:p-4">
+      <p id={inputHelpId} className="sr-only">
+        Press Enter to send, Shift Enter for a new line, and Escape to cancel, stop generation, or
+        leave the message field.
+      </p>
       {/* Hidden file input */}
       <input
         ref={fileInputRef}
@@ -1076,14 +1145,14 @@ export const ChatInput: FC<Props> = ({
           <Computed>
             {() => (
               <div
-                className={`relative flex flex-1 ${isDragOver ? 'rounded-md ring-2 ring-primary ring-offset-2' : ''}`}
+                className={`relative flex flex-1 ${isDragOver ? 'rounded-[1.2rem] ring-2 ring-primary ring-offset-2' : ''}`}
                 onDragOver={handleDragOver}
                 onDragLeave={handleDragLeave}
                 onDrop={handleDrop}
               >
                 {/* Drag overlay */}
                 {isDragOver && (
-                  <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-md bg-primary/10">
+                  <div className="pointer-events-none absolute inset-0 z-10 flex items-center justify-center rounded-[1.2rem] bg-primary/10">
                     <span className="text-sm font-medium text-primary">Drop files to attach</span>
                   </div>
                 )}
@@ -1107,10 +1176,12 @@ export const ChatInput: FC<Props> = ({
                   onKeyDown={handleKeyDown}
                   onPaste={handlePaste}
                   placeholder={editMode ? 'Edit message...' : placeholder}
+                  aria-label={editMode ? 'Edit message' : 'Chat message'}
+                  aria-describedby={inputHelpId}
                   className={
                     editMode
-                      ? 'max-h-[300px] min-h-[60px] resize-none overflow-y-auto pb-8'
-                      : 'max-h-[400px] min-h-[60px] resize-none overflow-y-auto pb-8 pr-16'
+                      ? 'max-h-[min(42vh,300px)] min-h-[60px] resize-none overflow-y-auto pb-12 sm:pb-8'
+                      : 'max-h-[min(42vh,400px)] min-h-[60px] resize-none overflow-y-auto rounded-[1.2rem] pb-10 sm:pb-8'
                   }
                   disabled={isDisabled}
                   autoFocus={editMode}
@@ -1164,8 +1235,8 @@ export const ChatInput: FC<Props> = ({
                   </div>
                 ) : (
                   /* Normal mode: full toolbar */
-                  <>
-                    <div className="absolute bottom-1.5 left-1.5 flex items-center gap-2">
+                  <div className="absolute bottom-1.5 left-1.5 right-1.5 flex items-center gap-2">
+                    <div className="flex min-w-0 flex-1 flex-nowrap items-center gap-1.5 overflow-x-auto overflow-y-hidden pr-1 sm:gap-2">
                       <ModelBadge
                         model={effectiveModel}
                         models={modelInfos}
@@ -1184,9 +1255,10 @@ export const ChatInput: FC<Props> = ({
                         disabled={isDisabled}
                         onClick={() => fileInputRef.current?.click()}
                         title="Attach files"
+                        aria-label="Attach files"
                       >
                         <Paperclip className="mr-0.5 h-2.5 w-2.5" />
-                        Attach
+                        <span className="hidden sm:inline">Attach</span>
                       </Button>
 
                       <OptionsButton isDisabled={isDisabled}>
@@ -1244,15 +1316,21 @@ export const ChatInput: FC<Props> = ({
                         )}
                     </div>
 
-                    {settings.voiceServerUrl && (
-                      <VoiceButton voiceServerUrl={settings.voiceServerUrl} />
-                    )}
-                    <SubmitButton
-                      isGenerating={isGenerating}
-                      isDisabled={isDisabled}
-                      hasText={!!message.trim() || attachedFiles.length > 0}
-                    />
-                  </>
+                    <div className="flex shrink-0 items-center gap-1">
+                      <SpeechInputButton
+                        onTranscript={handleTranscript}
+                        disabled={isDisabled || isGenerating}
+                      />
+                      {settings.voiceServerUrl && (
+                        <VoiceButton voiceServerUrl={settings.voiceServerUrl} />
+                      )}
+                      <SubmitButton
+                        isBusy={isBusy}
+                        isDisabled={isDisabled}
+                        hasText={!!message.trim() || attachedFiles.length > 0}
+                      />
+                    </div>
+                  </div>
                 )}
               </div>
             )}

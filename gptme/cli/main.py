@@ -53,6 +53,25 @@ from ..util.prompt import add_history
 logger = logging.getLogger(__name__)
 
 
+def _validate_model_param(
+    ctx: click.Context, param: click.Parameter, value: str | None
+) -> str | None:
+    """Reject empty --model early so the CLI exits before heavy setup work."""
+    if value is None:
+        return value
+
+    model = value.strip()
+    if not model:
+        raise click.BadParameter("Model name cannot be empty.", ctx=ctx, param=param)
+    if "/" in model and any(part == "" for part in model.split("/")):
+        raise click.BadParameter(
+            "Model path components cannot be empty. Use 'provider/model' or a bare provider name.",
+            ctx=ctx,
+            param=param,
+        )
+    return value
+
+
 script_path = Path(os.path.realpath(__file__))
 _STDIN_PIPE_GRACE_PERIOD = 1.0
 
@@ -68,6 +87,7 @@ class CommaSeparatedChoice(click.ParamType):
         allow_prefix: str | None = None,
         allow_prefixes: list[str] | None = None,
         extra_choices_for_prefix: dict[str, list[str]] | None = None,
+        lenient_prefixes: list[str] | None = None,
         metavar: str | None = None,
     ):
         self.choices = choices
@@ -83,6 +103,11 @@ class CommaSeparatedChoice(click.ParamType):
             prefix: set(prefix_choices)
             for prefix, prefix_choices in (extra_choices_for_prefix or {}).items()
         }
+        # Prefixes for which unknown names are accepted at parse time. Plugin
+        # tools aren't known when the CLI is built (plugins load later), so a
+        # prefixed name like "+tts" must pass; it's resolved against the loaded
+        # toolset later, which warns if it's genuinely missing.
+        self.lenient_prefixes = set(lenient_prefixes or [])
         self._metavar = metavar
 
     def convert(self, value, param, ctx):
@@ -102,6 +127,9 @@ class CommaSeparatedChoice(click.ParamType):
                     break
             # Allow file paths (e.g. path/to/tool.py) to pass through
             if check.endswith(".py") or "/" in check or "\\" in check:
+                continue
+            # Defer validation for lenient prefixes (e.g. "+tts" plugin tools)
+            if matched_prefix in self.lenient_prefixes:
                 continue
             extra_choices = (
                 self.extra_choices_for_prefix.get(matched_prefix, set())
@@ -148,6 +176,13 @@ class ConversationName(click.ParamType):
     def convert(self, value, param, ctx):
         if value == "random":
             return value
+        # Empty/whitespace-only names silently default to "random" instead of
+        # crashing with a validation error. This guards against Click version
+        # and shell edge cases where --name "" bypasses the ParamType's
+        # convert method and passes an empty string straight to main().
+        # Non-empty values still go through conversation_name_error() below.
+        if not value or not value.strip():
+            return "random"
         if error := conversation_name_error(value):
             self.fail(error, param, ctx)
         return value
@@ -288,6 +323,7 @@ Run 'gptme-util --help' for all utility commands."""
     "-m",
     "--model",
     default=None,
+    callback=_validate_model_param,
     help=f"Model to use, e.g. openai/{get_recommended_model('openai')}, anthropic/{get_recommended_model('anthropic')}. If only provider given then a default is used.",
 )
 @click.option(
@@ -344,9 +380,17 @@ Run 'gptme-util --help' for all utility commands."""
     default=None,
     multiple=True,
     type=CommaSeparatedChoice(
-        _available_tools + ["none"],
+        # Accept all *known* tools, not just currently-available ones, so a tool
+        # that exists but is temporarily unavailable (e.g. 'tts' when its server
+        # isn't running) is reported as unavailable at load time rather than as a
+        # misleading "invalid choice" here.
+        _known_tool_names + ["none"],
         allow_prefixes=["+", "-"],
         extra_choices_for_prefix={"-": _known_tool_names},
+        # Only '+' is lenient: plugin tools (added via '+tool') aren't known at
+        # parse time. '-tool' exclusions stay strict against known tools so typos
+        # like '-shel' are caught early instead of being silently ignored.
+        lenient_prefixes=["+"],
         metavar="TOOL",
     ),
     help=f"Tools to allow. Comma-separated or repeated. Use '+tool' to add to defaults (e.g., '-t +subagent'). Use '-tool' to exclude from defaults (e.g., '-t=-browser'). Use 'none' to disable all tools. Supports .py file paths for custom tools (e.g., '-t path/to/tool.py'). Available: {available_tool_names}.",
@@ -481,6 +525,11 @@ def main(
     output_schema: str | None,
 ):
     """Main entrypoint for the CLI."""
+
+    # Defense-in-depth: handle empty/whitespace names in case Click bypasses convert()
+    # (observed to occur in some Click versions when --name "" is passed)
+    if not name or not name.strip():
+        name = "random"
 
     # Apply agent profile if specified
     selected_profile = None
@@ -632,7 +681,11 @@ def main(
         interactive = False
 
     # init logging
-    init_logging(verbose)
+    # Route log output through stdout (via shared Rich Console) when interactive
+    # so that logging and streaming assistant output are serialized through the
+    # same Console, preventing stderr/stdout interleave mid-stream.
+    # In non-interactive/pipe modes, keep traditional stderr routing.
+    init_logging(verbose, stderr=not interactive)
 
     if not interactive:
         no_confirm = True
@@ -805,7 +858,10 @@ def main(
     # We pass the tool_allowlist CLI argument. If it's not provided, init_tools
     # will load it from the environment variable TOOL_ALLOWLIST or the chat config.
     logger.debug(f"Using tools: {config.chat.tools}")
-    tools = init_tools(config.chat.tools)
+    try:
+        tools = init_tools(config.chat.tools)
+    except ValueError as e:
+        raise click.UsageError(str(e)) from e
 
     # Check if we're opening an existing conversation (via --resume, --name, or pick)
     # If so, skip generating initial messages (including expensive context_cmd)

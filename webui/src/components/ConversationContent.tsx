@@ -1,5 +1,5 @@
 import type { FC } from 'react';
-import { useRef, useEffect, useCallback } from 'react';
+import { useRef, useEffect, useCallback, useState } from 'react';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput, type ChatOptions } from './ChatInput';
 import { CollapsedStepGroup } from './CollapsedStepGroup';
@@ -9,13 +9,16 @@ import { computeForkPoints } from '@/utils/branchUtils';
 import { buildStepRoles, type StepRole } from '@/utils/stepGrouping';
 
 import { InlineToolConfirmation } from './InlineToolConfirmation';
-import { InlineToolExecution } from './InlineToolExecution';
+import { MessageSearchBar } from './MessageSearchBar';
+import { InlineToolExecution, ToolCompletionBadge } from './InlineToolExecution';
+import { OpenConversationPathButton } from './OpenConversationPathButton';
 import { For, Memo, use$, useObservable, useObserveEffect } from '@legendapp/state/react';
 import { getObservableIndex } from '@legendapp/state';
 import { useApi } from '@/contexts/ApiContext';
 import { useSettings } from '@/contexts/SettingsContext';
 import { useModels } from '@/hooks/useModels';
-import { ArrowDown } from 'lucide-react';
+import { AlertTriangle, ArrowDown, RefreshCw, WifiOff } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 
 interface Props {
   conversationId: string;
@@ -26,6 +29,7 @@ interface Props {
 export const ConversationContent: FC<Props> = ({ conversationId, serverId, isReadOnly }) => {
   const {
     conversation$,
+    retryLoad,
     sendMessage,
     retryMessage,
     editMessage,
@@ -36,14 +40,56 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
     confirmTool,
     interruptGeneration,
   } = useConversation(conversationId, serverId);
+  const loadError = use$(() => conversation$?.loadError.get() ?? null);
+  const messageCount = use$(() => conversation$?.data.log.get()?.length ?? 0);
+  const connectionStatus = use$(() => conversation$?.connectionStatus.get() ?? 'disconnected');
+  const reconnectAttempt = use$(() => conversation$?.reconnectAttempt.get() ?? null);
+  const reconnectMaxAttempts = use$(() => conversation$?.reconnectMaxAttempts.get() ?? null);
+  const reconnectRetryInMs = use$(() => conversation$?.reconnectRetryInMs.get() ?? null);
+  const connectionError = use$(() => conversation$?.connectionError.get() ?? null);
   // State to track when to auto-focus the input
   const shouldFocus$ = useObservable(false);
   // Store the previous conversation ID to detect changes
   const prevConversationIdRef = useRef<string | null>(null);
+  const paneRef = useRef<HTMLElement>(null);
 
   const { api, connectionConfig } = useApi();
   const hasSession$ = useObservable<boolean>(false);
   const { defaultModel } = useModels();
+
+  // Message search state — declared early so keyboard handlers can reference them
+  const searchVisible$ = useObservable(false);
+  const searchQuery$ = useObservable('');
+  const searchMatchIndices$ = useObservable<number[]>([]);
+  const searchCurrentMatch$ = useObservable(0);
+
+  const activatePane = useCallback(() => {
+    const pane = paneRef.current;
+    if (!pane) return;
+
+    document
+      .querySelectorAll<HTMLElement>('[data-conversation-pane-active="true"]')
+      .forEach((activePane) => {
+        if (activePane !== pane) {
+          activePane.removeAttribute('data-conversation-pane-active');
+        }
+      });
+    pane.dataset.conversationPaneActive = 'true';
+  }, []);
+
+  const isActivePane = useCallback(() => {
+    const pane = paneRef.current;
+    if (!pane) return false;
+
+    const activePane = document.querySelector<HTMLElement>(
+      '[data-conversation-pane-active="true"]'
+    );
+    if (activePane) {
+      return activePane === pane;
+    }
+
+    return document.querySelectorAll('[data-conversation-pane]').length <= 1;
+  }, []);
 
   // Fetch user info once (cached in ApiClient)
   useEffect(() => {
@@ -71,6 +117,10 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
   // Add keyboard shortcut for focusing the input
   useEffect(() => {
     const handleKeyDown = (e: KeyboardEvent) => {
+      if (!isActivePane()) {
+        return;
+      }
+
       // Only handle 'i' key when:
       // - Not in an input/textarea
       // - Not in read-only mode
@@ -88,16 +138,51 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
 
     window.addEventListener('keydown', handleKeyDown);
     return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [isReadOnly, hasSession$, shouldFocus$]);
+  }, [isReadOnly, hasSession$, isActivePane, shouldFocus$]);
+
+  // Ctrl+F / Cmd+F to open message search (or re-focus if already open)
+  useEffect(() => {
+    const handleSearchKeyDown = (e: KeyboardEvent) => {
+      if (!isActivePane()) {
+        return;
+      }
+
+      if ((e.ctrlKey || e.metaKey) && e.key === 'f') {
+        e.preventDefault();
+        if (searchVisible$.get()) {
+          paneRef.current?.querySelector<HTMLInputElement>('[data-search-input]')?.focus();
+        } else {
+          searchVisible$.set(true);
+        }
+      }
+    };
+    window.addEventListener('keydown', handleSearchKeyDown);
+    return () => window.removeEventListener('keydown', handleSearchKeyDown);
+  }, [isActivePane, searchVisible$]);
+
+  useEffect(() => {
+    const pane = paneRef.current;
+    if (!pane) return;
+
+    if (!document.querySelector('[data-conversation-pane-active="true"]')) {
+      activatePane();
+    }
+
+    return () => {
+      if (pane.dataset.conversationPaneActive === 'true') {
+        pane.removeAttribute('data-conversation-pane-active');
+      }
+    };
+  }, [activatePane]);
 
   const firstNonSystemIndex$ = useObservable(() => {
-    return conversation$.get()?.data.log.findIndex((msg) => msg.role !== 'system') || 0;
+    return conversation$?.get()?.data?.log?.findIndex((msg) => msg.role !== 'system') ?? 0;
   });
 
   // Update the firstNonSystemIndex$ when the conversationId changes
   useEffect(() => {
     firstNonSystemIndex$.set(
-      conversation$.get()?.data.log.findIndex((msg) => msg.role !== 'system') || 0
+      conversation$?.get()?.data?.log?.findIndex((msg) => msg.role !== 'system') ?? 0
     );
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [conversationId]);
@@ -144,7 +229,7 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
   // All .get() calls inside are auto-tracked, so this re-runs when any of
   // conversation log, showHiddenMessages, showInitialSystem, or firstNonSystemIndex changes.
   useObserveEffect(() => {
-    const messages = conversation$.data.log.get();
+    const messages = conversation$?.data.log.get();
     if (!messages?.length) {
       stepRoles$.set(new Map());
       return;
@@ -181,8 +266,8 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
 
   // Compute fork points once (reactive: recomputes when branches/currentBranch change)
   const forkPoints$ = useObservable(() => {
-    const branches = conversation$.data.branches?.get();
-    const currentBranch = conversation$.currentBranch?.get() || 'main';
+    const branches = conversation$?.data.branches?.get();
+    const currentBranch = conversation$?.currentBranch?.get() || 'main';
     if (!branches || Object.keys(branches).length <= 1) return new Map();
     return computeForkPoints(currentBranch, branches);
   });
@@ -203,7 +288,7 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
   }, [isAutoScrolling$]);
 
   // Auto-scroll when the conversation is updated (e.g., streaming response)
-  useObserveEffect(conversation$.data.log, () => {
+  useObserveEffect(conversation$?.data.log, () => {
     if (!autoScrollAborted$.get()) {
       requestAnimationFrame(scrollToBottom);
     }
@@ -217,6 +302,136 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
   const handleSendMessage = (message: string, options?: ChatOptions) => {
     sendMessage({ message, options });
   };
+
+  const clearSearchHighlights = useCallback(() => {
+    scrollContainerRef.current
+      ?.querySelectorAll<HTMLElement>('[data-message-index]')
+      .forEach((el) => {
+        el.style.outline = '';
+        el.style.outlineOffset = '';
+      });
+  }, [scrollContainerRef]);
+
+  const isMessageHidden = useCallback(
+    (idx: number) => {
+      const messages = conversation$.data.log.get();
+      const msg = messages?.[idx];
+      if (!msg) return false;
+
+      const firstNonSystemIndex = firstNonSystemIndex$.get();
+      const isInitialSystem =
+        msg.role === 'system' && (firstNonSystemIndex === -1 || idx < firstNonSystemIndex);
+      if (isInitialSystem && !showInitialSystem$.get()) return true;
+      if (msg.hide && !showHiddenMessages$.get()) return true;
+
+      const stepRole = stepRoles$.get().get(idx);
+      if (
+        (stepRole?.type === 'group-start' || stepRole?.type === 'grouped') &&
+        !expandedGroups$.get().has(stepRole.groupId)
+      ) {
+        return true;
+      }
+
+      return false;
+    },
+    [
+      conversation$,
+      expandedGroups$,
+      firstNonSystemIndex$,
+      showHiddenMessages$,
+      showInitialSystem$,
+      stepRoles$,
+    ]
+  );
+
+  // Search helpers: imperative DOM highlight + scroll, avoids re-rendering all messages
+  const highlightSearchMatch = useCallback(
+    (msgIndex: number) => {
+      clearSearchHighlights();
+      const el = scrollContainerRef.current?.querySelector<HTMLElement>(
+        `[data-message-index="${msgIndex}"]`
+      );
+      if (el) {
+        el.style.outline = '2px solid rgba(234,179,8,0.6)';
+        el.style.outlineOffset = '-2px';
+        el.scrollIntoView({ behavior: 'smooth', block: 'center' });
+      }
+    },
+    [clearSearchHighlights, scrollContainerRef]
+  );
+
+  const computeSearchMatches = useCallback(
+    (query: string): number[] => {
+      if (!query.trim()) return [];
+      const q = query.toLowerCase();
+      const messages = conversation$.data.log.get();
+      if (!messages) return [];
+      return messages
+        .map((msg, i) => {
+          const content = typeof msg.content === 'string' ? msg.content.toLowerCase() : '';
+          return !isMessageHidden(i) && content.includes(q) ? i : -1;
+        })
+        .filter((i) => i >= 0);
+    },
+    [conversation$, isMessageHidden]
+  );
+
+  const resetSearchState = useCallback(() => {
+    searchVisible$.set(false);
+    searchQuery$.set('');
+    searchMatchIndices$.set([]);
+    searchCurrentMatch$.set(0);
+    clearSearchHighlights();
+  }, [
+    clearSearchHighlights,
+    searchCurrentMatch$,
+    searchMatchIndices$,
+    searchQuery$,
+    searchVisible$,
+  ]);
+
+  const handleSearchQueryChange = useCallback(
+    (query: string) => {
+      searchQuery$.set(query);
+      const matches = computeSearchMatches(query);
+      searchMatchIndices$.set(matches);
+      searchCurrentMatch$.set(0);
+      if (matches.length > 0) highlightSearchMatch(matches[0]);
+      else clearSearchHighlights();
+    },
+    [
+      clearSearchHighlights,
+      searchQuery$,
+      searchMatchIndices$,
+      searchCurrentMatch$,
+      computeSearchMatches,
+      highlightSearchMatch,
+    ]
+  );
+
+  const handleSearchNext = useCallback(() => {
+    const matches = searchMatchIndices$.get();
+    if (!matches.length) return;
+    const next = (searchCurrentMatch$.get() + 1) % matches.length;
+    searchCurrentMatch$.set(next);
+    highlightSearchMatch(matches[next]);
+  }, [searchMatchIndices$, searchCurrentMatch$, highlightSearchMatch]);
+
+  const handleSearchPrev = useCallback(() => {
+    const matches = searchMatchIndices$.get();
+    if (!matches.length) return;
+    const prev = (searchCurrentMatch$.get() - 1 + matches.length) % matches.length;
+    searchCurrentMatch$.set(prev);
+    highlightSearchMatch(matches[prev]);
+  }, [searchMatchIndices$, searchCurrentMatch$, highlightSearchMatch]);
+
+  const handleSearchClose = useCallback(() => {
+    resetSearchState();
+  }, [resetSearchState]);
+
+  useEffect(() => {
+    resetSearchState();
+  }, [conversationId, resetSearchState]);
 
   // Handle tool confirmation
   const handleConfirmTool = async () => {
@@ -251,6 +466,36 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
     isScrolledUp$.set(false);
   };
 
+  const showConnectionBanner =
+    !isReadOnly && (connectionStatus === 'reconnecting' || connectionStatus === 'disconnected');
+
+  // Live countdown timer — decrements every second while reconnecting
+  const [reconnectRetrySeconds, setReconnectRetrySeconds] = useState<number | null>(null);
+  useEffect(() => {
+    if (connectionStatus !== 'reconnecting' || !reconnectRetryInMs) {
+      setReconnectRetrySeconds(null);
+      return;
+    }
+    // Compute remaining seconds from the retry interval
+    const computeRemaining = () => {
+      if (!conversation$?.reconnectRetryStartedAt?.get()) return null;
+      const elapsed = Date.now() - conversation$.reconnectRetryStartedAt.get()!;
+      const remaining = Math.max(0, reconnectRetryInMs! - elapsed);
+      return Math.ceil(remaining / 1000);
+    };
+    setReconnectRetrySeconds(computeRemaining());
+    const interval = setInterval(() => {
+      const remaining = computeRemaining();
+      if (remaining !== null && remaining <= 0) {
+        setReconnectRetrySeconds(null);
+        clearInterval(interval);
+      } else {
+        setReconnectRetrySeconds(remaining);
+      }
+    }, 250); // update 4×/s for smooth countdown
+    return () => clearInterval(interval);
+  }, [connectionStatus, reconnectRetryInMs, conversation$]);
+
   if (!conversation$) {
     return (
       <div className="flex h-full items-center justify-center">
@@ -259,8 +504,45 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
     );
   }
 
+  if (loadError && messageCount === 0) {
+    return (
+      <div className="flex h-full items-center justify-center p-6">
+        <div className="flex max-w-md flex-col items-center gap-3 text-center">
+          <AlertTriangle className="h-8 w-8 text-destructive" />
+          <div className="font-medium">Failed to load conversation</div>
+          <div className="break-words text-sm text-muted-foreground">{loadError}</div>
+          <Button variant="outline" size="sm" onClick={() => void retryLoad()}>
+            <RefreshCw className="mr-2 h-4 w-4" />
+            Retry
+          </Button>
+        </div>
+      </div>
+    );
+  }
+
   return (
-    <main className="relative flex h-full flex-col">
+    <main
+      ref={paneRef}
+      data-conversation-pane
+      className="relative flex h-full flex-col"
+      onFocus={activatePane}
+      onPointerDown={activatePane}
+    >
+      <Memo>
+        {() =>
+          searchVisible$.get() ? (
+            <MessageSearchBar
+              query={searchQuery$.get()}
+              matchCount={searchMatchIndices$.get().length}
+              currentMatch={searchCurrentMatch$.get() + 1}
+              onQueryChange={handleSearchQueryChange}
+              onNext={handleSearchNext}
+              onPrev={handleSearchPrev}
+              onClose={handleSearchClose}
+            />
+          ) : null
+        }
+      </Memo>
       <div
         className="flex-1 overflow-y-auto"
         ref={scrollContainerRef}
@@ -280,7 +562,30 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
           }
         }}
       >
-        <For each={conversation$.data.log}>
+        <Memo>
+          {() => {
+            const log = conversation$.data.log.get();
+            let activeModel: string | undefined;
+            if (log) {
+              for (let i = log.length - 1; i >= 0; i--) {
+                const msg = log[i];
+                if (msg.role === 'assistant' && msg.metadata?.model) {
+                  activeModel = msg.metadata.model;
+                  break;
+                }
+              }
+            }
+            return (
+              <OpenConversationPathButton
+                logdir={conversation$.data.logdir.get()}
+                baseUrl={connectionConfig.baseUrl}
+                activeModel={activeModel}
+              />
+            );
+          }}
+        </Memo>
+
+        <For each={conversation$?.data.log ?? []}>
           {(msg$) => {
             const index = getObservableIndex(msg$);
             // Hide all system messages before the first non-system message by default
@@ -297,32 +602,14 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
               return <div key={`${index}-${msg$.timestamp.get()}`} />;
             }
 
-            // Helper to check if a message at a given index is hidden
-            const isHiddenAt = (idx: number) => {
-              const m = conversation$.data.log[idx];
-              if (!m?.get()) return false;
-              const r = m.role.get();
-              const h = m.hide?.get();
-              const isInitial =
-                r === 'system' && (firstNonSystemIndex === -1 || idx < firstNonSystemIndex);
-              if (isInitial && !showInitialSystem$.get()) return true;
-              if (h && !showHiddenMessages$.get()) return true;
-              // Messages in collapsed step groups are visually hidden
-              const role = stepRoles$.get().get(idx);
-              if (role?.type === 'group-start' || role?.type === 'grouped') {
-                if (!expandedGroups$.get().has(role.groupId)) return true;
-              }
-              return false;
-            };
-
             // Get the previous and next *visible* messages for chain context
             // (skip hidden messages so they don't break chain grouping)
             let prevIdx = index - 1;
-            while (prevIdx >= 0 && isHiddenAt(prevIdx)) prevIdx--;
+            while (prevIdx >= 0 && isMessageHidden(prevIdx)) prevIdx--;
             const previousMessage$ = prevIdx >= 0 ? conversation$.data.log[prevIdx] : undefined;
 
             let nextIdx = index + 1;
-            while (conversation$.data.log[nextIdx]?.get() && isHiddenAt(nextIdx)) nextIdx++;
+            while (conversation$.data.log[nextIdx]?.get() && isMessageHidden(nextIdx)) nextIdx++;
             const nextMessage$ = conversation$.data.log[nextIdx]?.get()
               ? conversation$.data.log[nextIdx]
               : undefined;
@@ -342,6 +629,7 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
                 <CollapsedStepGroup
                   count={stepRole.count}
                   tools={stepRole.tools}
+                  steps={stepRole.steps}
                   isExpanded={expandedGroups$.get().has(stepRole.groupId)}
                   onToggle={() => toggleGroup(stepRole.groupId)}
                 />
@@ -361,7 +649,7 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
             const agentName = conversation$.data.agent?.name?.get();
 
             return (
-              <div key={`${index}-${msg$.timestamp.get()}`}>
+              <div key={`${index}-${msg$.timestamp.get()}`} data-message-index={index}>
                 {/* Show summary bar above first message when group is expanded */}
                 {groupSummary}
                 <ChatMessage
@@ -409,6 +697,9 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
         {/* Inline Tool Execution */}
         <InlineToolExecution executingTool$={conversation$?.executingTool} />
 
+        {/* Tool completion badge — briefly shows after tool finishes */}
+        <ToolCompletionBadge lastCompletedTool$={conversation$?.lastCompletedTool} />
+
         {/* Add padding at the bottom to account for the floating input */}
         <div className="mb-40" />
       </div>
@@ -422,6 +713,28 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
         >
           <ArrowDown className="h-4 w-4" />
         </button>
+      )}
+
+      {showConnectionBanner && (
+        <div className="absolute bottom-28 left-1/2 z-20 w-[min(calc(100%_-_2rem),42rem)] -translate-x-1/2 rounded-md border border-border bg-background/95 px-3 py-2 text-sm shadow-sm">
+          {connectionStatus === 'reconnecting' ? (
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <RefreshCw className="h-4 w-4 shrink-0 animate-spin text-amber-500" />
+              <span className="truncate">
+                Reconnecting event stream
+                {reconnectAttempt && reconnectMaxAttempts
+                  ? ` (${reconnectAttempt}/${reconnectMaxAttempts})`
+                  : ''}
+                {reconnectRetrySeconds ? ` in ${reconnectRetrySeconds}s` : ''}
+              </span>
+            </div>
+          ) : (
+            <div className="flex items-center gap-2 text-muted-foreground">
+              <WifiOff className="h-4 w-4 shrink-0 text-destructive" />
+              <span className="truncate">{connectionError || 'Event stream disconnected'}</span>
+            </div>
+          )}
+        </div>
       )}
 
       <div className="absolute bottom-0 left-0 right-0 bg-gradient-to-t from-background via-background/80 to-transparent">

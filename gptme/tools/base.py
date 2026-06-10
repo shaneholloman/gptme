@@ -252,6 +252,8 @@ class ToolSpec:
         execute: An optional function that is called when the tool executes a block.
         block_types: A list of block types that the tool will execute.
         available: Whether the tool is available for use.
+        available_hint: Optional guidance shown when the tool is explicitly
+            requested but currently unavailable (e.g. "start the TTS server").
         parameters: Descriptor of parameters use by this tool.
         load_priority: Influence the loading order of this tool. The higher the later.
         disabled_by_default: Whether this tool should be disabled by default.
@@ -269,6 +271,7 @@ class ToolSpec:
     execute: ExecuteFunc | None = None
     block_types: list[str] = field(default_factory=list)
     available: bool | Callable[[], bool] = True
+    available_hint: str | None = None
     parameters: list[Parameter] = field(default_factory=list)
     load_priority: int = 0
     disabled_by_default: bool = False
@@ -454,6 +457,7 @@ class ToolUse:
         self,
         log: Log | None = None,
         workspace: Path | None = None,
+        on_result_message: Callable[[Message], None] | None = None,
     ) -> Generator[Message, None, None]:
         """Executes a tool-use tag and returns the output."""
         # noreorder
@@ -501,14 +505,23 @@ class ToolUse:
                             self.args,
                             self.kwargs,
                         )
-                        if isinstance(ex, Generator):
-                            # Convert generator to list to measure execution time properly
-                            result_msgs = list(ex)
-                            yield from result_msgs
-                        else:
-                            if ex is not None:
-                                result_msgs = [ex]
-                            yield from result_msgs
+                        generator_result = ex if isinstance(ex, Generator) else None
+                        single_result = (
+                            None
+                            if generator_result is not None
+                            else cast(Message | None, ex)
+                        )
+                        if generator_result is not None:
+                            for msg in generator_result:
+                                result_msgs.append(msg)
+                                if on_result_message:
+                                    on_result_message(msg)
+                                yield msg
+                        elif single_result is not None:
+                            result_msgs = [single_result]
+                            if on_result_message:
+                                on_result_message(single_result)
+                            yield single_result
                     finally:
                         _current_tool_use.reset(token)
 
@@ -531,7 +544,7 @@ class ToolUse:
                         workspace=workspace,
                         tool_use=self,
                         result_msgs=tuple(result_msgs)
-                        if isinstance(ex, Generator)
+                        if generator_result is not None
                         else None,
                     )
                     if post_hook_msgs := trigger_hook(

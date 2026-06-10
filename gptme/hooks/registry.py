@@ -6,6 +6,7 @@ and module-level API functions (register_hook, trigger_hook, etc.).
 
 import contextvars
 import functools
+import inspect
 import logging
 import threading
 from collections.abc import Generator
@@ -25,6 +26,7 @@ from .types import (
     CwdChangedHook,
     FilePostSaveHook,
     FilePreSaveHook,
+    GenerationChunkHook,
     GenerationPostHook,
     GenerationPreHook,
     Hook,
@@ -40,6 +42,40 @@ from .types import (
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _filter_kwargs_for_hook(hook: Hook, kwargs: dict[str, Any]) -> dict[str, Any]:
+    """Return kwargs accepted by a hook, preserving **kwargs-compatible hooks."""
+    if not kwargs:
+        return kwargs
+
+    try:
+        parameters = inspect.signature(hook.func).parameters
+    except (TypeError, ValueError):
+        return kwargs
+
+    if any(
+        param.kind == inspect.Parameter.VAR_KEYWORD for param in parameters.values()
+    ):
+        return kwargs
+
+    accepted_kwargs = {
+        name
+        for name, param in parameters.items()
+        if param.kind
+        in (inspect.Parameter.POSITIONAL_OR_KEYWORD, inspect.Parameter.KEYWORD_ONLY)
+    }
+    filtered = {
+        name: value for name, value in kwargs.items() if name in accepted_kwargs
+    }
+    dropped = set(kwargs) - set(filtered)
+    if dropped:
+        logger.debug(
+            "Dropping unsupported hook kwargs for legacy hook '%s': %s",
+            hook.name,
+            ", ".join(sorted(dropped)),
+        )
+    return filtered
 
 
 def _record_sync_hook_call(
@@ -191,7 +227,7 @@ class HookRegistry:
             start_time_ns = int(t_start * 1_000_000_000)
             t_delta = 0.0
             try:
-                result = hook.func(*args, **kwargs)
+                result = hook.func(*args, **_filter_kwargs_for_hook(hook, kwargs))
                 t_delta = time() - t_start
 
                 # If hook returns a generator, yield from it
@@ -296,7 +332,7 @@ class HookRegistry:
         """
         try:
             t_start = time()
-            result = hook.func(*args, **kwargs)
+            result = hook.func(*args, **_filter_kwargs_for_hook(hook, kwargs))
             t_end = time()
             t_delta = t_end - t_start
 
@@ -508,6 +544,17 @@ def register_hook(
     name: str,
     hook_type: Literal[HookType.GENERATION_POST],
     func: GenerationPostHook,
+    priority: int = 0,
+    enabled: bool = True,
+    async_mode: bool = False,
+) -> None: ...
+
+
+@overload
+def register_hook(
+    name: str,
+    hook_type: Literal[HookType.GENERATION_CHUNK],
+    func: GenerationChunkHook,
     priority: int = 0,
     enabled: bool = True,
     async_mode: bool = False,

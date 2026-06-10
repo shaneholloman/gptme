@@ -14,13 +14,17 @@ filename heuristics.
 import hashlib
 import logging
 import mimetypes
+import re
+from collections.abc import Iterator
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Literal, cast, get_args
+from typing import Any, Literal, NamedTuple, cast, get_args
 
 import flask
+import json_repair
 from pydantic import BaseModel, Field
 
+from ..codeblock import Codeblock
 from ..logmanager import LogManager
 from .api_v2_common import _validate_conversation_id
 from .auth import require_auth
@@ -110,6 +114,10 @@ class Artifact(BaseModel):
     )
     preview: ArtifactPreview = Field(..., description="Preview/renderer hint")
     actions: list[ArtifactAction] = Field(..., description="Available user actions")
+    diff: str | None = Field(
+        None,
+        description="Unified diff of the change, for files modified by the conversation",
+    )
 
 
 class ArtifactListResponse(BaseModel):
@@ -284,6 +292,7 @@ def _artifact_from_descriptor(
         ),
         preview=ArtifactPreview(type=_PREVIEW_FOR_KIND.get(kind, "none")),
         actions=actions,
+        diff=desc["diff"] if isinstance(desc.get("diff"), str) else None,
     )
 
 
@@ -308,6 +317,288 @@ def _artifacts_from_messages(
             if art is not None:
                 if target_id is None or art.id == target_id:
                     out.append(art)
+    return out
+
+
+# File-writing tools whose target becomes a conversation artifact. "save"
+# creates a file; the rest modify an existing one. patch_many writes several
+# files in a single tool use.
+_FILE_WRITE_TOOLS = {"save", "append", "patch", "morph", "patch_many"}
+_CREATE_TOOLS = {"save"}
+_MULTI_PATH_TOOLS = {"patch_many"}
+
+# Matches the per-file header of multi-hunk patch_many bodies (mirrors
+# gptme.tools.patch_many._CONFIRM_HEADER_RE), used to recover paths embedded in
+# the codeblock body rather than the langtag/args.
+_PATCH_MANY_PATH_RE = re.compile(r"(?m)^=== PATH: (?P<path>.+?) ===\s*$")
+
+
+class _FileWrite(NamedTuple):
+    """One file-writing operation recovered from a message, format-agnostic."""
+
+    tool: str
+    raw_path: str
+    # Edit payload for diff generation (patch body, appended text, ...). None
+    # when the tool's change can't be turned into a diff (e.g. morph).
+    payload: str | None
+
+
+def _diff_for_write(tool: str, payload: str | None) -> str | None:
+    """Build a unified-diff string for a modifying write, or None if not derivable.
+
+    ``patch``/``patch_many`` payloads carry ORIGINAL/UPDATED blocks we can diff
+    directly. ``append`` is pure additions. ``morph`` edits use ``... existing
+    code ...`` placeholders with no recoverable original, so they get no diff.
+    """
+    if not payload:
+        return None
+    if tool in ("patch", "patch_many"):
+        from ..tools.patch import Patch  # local import: avoids tools import at load
+
+        try:
+            diffs = [p.diff_minimal() for p in Patch._from_codeblock(payload)]
+        except Exception:
+            return None
+        body = "\n".join(d for d in diffs if d)
+        return body or None
+    if tool == "append":
+        added = "\n".join("+" + line for line in payload.splitlines())
+        return added or None
+    return None
+
+
+def _iter_file_writes(content: str) -> Iterator[_FileWrite]:
+    """Yield file-writing operations in a message across all tool formats.
+
+    Handles markdown codeblocks, XML tool-use, and native tool-call JSON without
+    requiring the tool registry to be initialized (the artifact read path runs in
+    a server process that hasn't loaded tools). patch_many yields one entry per
+    target file.
+    """
+    yield from _iter_markdown_writes(content)
+    yield from _iter_xml_writes(content)
+    yield from _iter_toolcall_writes(content)
+
+
+def _split_patch_many_body(paths: list[str], body: str) -> Iterator[_FileWrite]:
+    """Pair patch_many paths with their patch bodies (header- or embedded-form)."""
+    embedded = list(_PATCH_MANY_PATH_RE.finditer(body))
+    if embedded:
+        # Multi-hunk form: `=== PATH: x ===` headers delimit per-file patches.
+        for i, m in enumerate(embedded):
+            start = m.end()
+            end = embedded[i + 1].start() if i + 1 < len(embedded) else len(body)
+            yield _FileWrite("patch_many", m.group("path"), body[start:end].strip())
+        return
+    # Simple form: paths in the header, one conflict-marker patch each (in order).
+    from ..tools.patch import DIVIDER, ORIGINAL, UPDATED, Patch  # local import
+
+    try:
+        patches = list(Patch._from_codeblock(body))
+    except Exception:
+        patches = []
+    for i, raw_path in enumerate(paths):
+        payload = (
+            f"{ORIGINAL}{patches[i].original}{DIVIDER}{patches[i].updated}{UPDATED}"
+            if i < len(patches)
+            else None
+        )
+        yield _FileWrite("patch_many", raw_path, payload)
+
+
+def _iter_markdown_writes(content: str) -> Iterator[_FileWrite]:
+    for cb in Codeblock.iter_from_markdown(content):
+        parts = cb.lang.strip().split()
+        if not parts or parts[0] not in _FILE_WRITE_TOOLS:
+            continue
+        tool = parts[0]
+        if tool in _MULTI_PATH_TOOLS:
+            yield from _split_patch_many_body(parts[1:], cb.content)
+        elif len(parts) >= 2:
+            # Keep the path intact even if it contains spaces.
+            raw_path = cb.lang.strip().split(None, 1)[1]
+            yield _FileWrite(tool, raw_path, cb.content)
+
+
+def _iter_xml_writes(content: str) -> Iterator[_FileWrite]:
+    from ..tools.base import ToolUse  # local import: avoids tools import at load
+
+    for tu in ToolUse._iter_from_xml(content):
+        tool = tu.tool
+        if tool not in _FILE_WRITE_TOOLS:
+            continue
+        args = [str(a) for a in (tu.args or [])]
+        body = tu.content or ""
+        if tool in _MULTI_PATH_TOOLS:
+            paths = [tok for a in args for tok in a.split()]
+            yield from _split_patch_many_body(paths, body)
+        elif args:
+            # args[0] is the path; tolerate a stray leading tool-name token. A
+            # bare tool name with no path (e.g. args="save") yields nothing.
+            tokens = args[0].split()
+            if tokens and tokens[0] == tool:
+                raw_path = tokens[1] if len(tokens) >= 2 else None
+            else:
+                raw_path = args[0]
+            if raw_path and raw_path.strip():
+                yield _FileWrite(tool, raw_path.strip(), body)
+
+
+def _iter_toolcall_writes(content: str) -> Iterator[_FileWrite]:
+    from ..tools.base import (  # local import: avoids tools import at load
+        _codeblock_char_ranges,
+        find_json_end,
+        toolcall_re,
+    )
+
+    # Skip `@tool(...): {...}` matches inside fenced code blocks so tool-call
+    # syntax shown in examples/docs doesn't register as a real file write.
+    codeblock_ranges = _codeblock_char_ranges(content)
+    search_from = 0
+    while match := toolcall_re.search(content, search_from):
+        block_end = next(
+            (end for start, end in codeblock_ranges if start <= match.start() < end),
+            None,
+        )
+        if block_end is not None:
+            search_from = block_end
+            continue
+        tool = match.group(1)
+        json_start = match.start(3)
+        json_end = find_json_end(content, json_start)
+        if json_end is None:
+            break
+        search_from = json_end
+        if tool not in _FILE_WRITE_TOOLS:
+            continue
+        try:
+            kwargs = json_repair.loads(content[json_start:json_end])
+        except Exception:
+            continue
+        if not isinstance(kwargs, dict):
+            continue
+        if tool in _MULTI_PATH_TOOLS:
+            raw = kwargs.get("patches")
+            if isinstance(raw, str):
+                try:
+                    raw = json_repair.loads(raw)
+                except Exception:
+                    raw = None
+            if isinstance(raw, list):
+                for entry in raw:
+                    if isinstance(entry, dict) and entry.get("path"):
+                        yield _FileWrite(
+                            "patch_many",
+                            str(entry["path"]),
+                            entry.get("patch"),
+                        )
+        else:
+            path = kwargs.get("path")
+            if path:
+                payload = kwargs.get("patch") or kwargs.get("content")
+                yield _FileWrite(tool, str(path), payload)
+
+
+def _normalize_workspace_path(raw: str, workspace: Path) -> str | None:
+    """Resolve a tool-written path to a workspace-relative path.
+
+    Returns None for empty paths or files outside the workspace (those can't be
+    previewed via the workspace root).
+    """
+    raw = (raw or "").strip()
+    if not raw:
+        return None
+    candidate = Path(raw) if Path(raw).is_absolute() else workspace / raw
+    try:
+        return str(candidate.resolve().relative_to(workspace))
+    except (ValueError, OSError):
+        return None
+
+
+def _artifacts_from_tool_writes(
+    manager: LogManager, target_id: str | None = None
+) -> list[Artifact]:
+    """Collect artifacts for workspace files created/modified by the conversation.
+
+    Parses file-writing tool uses (save/append/patch/morph/patch_many) from
+    assistant messages — reliable and unaffected by parallel agents, unlike a
+    workspace diff. Handles markdown, XML, and native tool-call formats without
+    requiring the tool registry (the read path runs in a server process that
+    hasn't loaded tools). Dedups by path: a file saved then patched is reported
+    once, marked as created. Modified files carry a unified ``diff`` when one can
+    be derived from the edit.
+    """
+    workspace = manager.workspace
+    # relpath -> {tool, created, message_index, created_at, diff}
+    by_path: dict[str, dict[str, Any]] = {}
+    for idx, msg in enumerate(manager.log):
+        if msg.role != "assistant":
+            continue
+        for write in _iter_file_writes(msg.content):
+            relpath = _normalize_workspace_path(write.raw_path, workspace)
+            if not relpath:
+                continue
+            ts = msg.timestamp
+            if ts.tzinfo is None:
+                ts = ts.replace(tzinfo=timezone.utc)
+            created = write.tool in _CREATE_TOOLS
+            diff = _diff_for_write(write.tool, write.payload)
+            entry = by_path.get(relpath)
+            if entry is None:
+                by_path[relpath] = {
+                    "tool": write.tool,
+                    "created": created,
+                    "message_index": idx,  # first touch (kept across writes)
+                    "created_at": ts.isoformat(),  # touch time; updated on later writes
+                    "diff": diff,
+                }
+            else:
+                entry["created"] = entry["created"] or created
+                entry["tool"] = write.tool  # most recent operation
+                entry["created_at"] = ts.isoformat()  # most recent touch
+                if diff is not None:
+                    entry["diff"] = diff  # keep most recent derivable diff
+
+    out: list[Artifact] = []
+    for relpath, info in by_path.items():
+        # Key the id on the path (same scheme as workspace descriptors in Phase 2)
+        # so a metadata-declared artifact for the same file can override this one.
+        artifact_id = _artifact_id(relpath)
+        if target_id is not None and artifact_id != target_id:
+            continue
+        mime_type, _ = mimetypes.guess_type(relpath)
+        kind = classify_kind(Path(relpath), mime_type)
+        size: int | None = None
+        try:
+            size = (workspace / relpath).stat().st_size
+        except OSError:
+            pass
+        out.append(
+            Artifact(
+                id=artifact_id,
+                kind=kind,
+                title=Path(relpath).name,
+                source=ArtifactSource(type="workspace", path=relpath, url=None),
+                created_at=info["created_at"],
+                size=size,
+                mime_type=mime_type,
+                provenance=ArtifactProvenance(
+                    message_index=info["message_index"],
+                    # "save" => created; otherwise the most recent modifying tool.
+                    tool="save" if info["created"] else info["tool"],
+                ),
+                preview=ArtifactPreview(type=_PREVIEW_FOR_KIND.get(kind, "none")),
+                actions=[
+                    ArtifactAction(type="download", panel=None, artifact_id=None),
+                    ArtifactAction(type="open_workspace", panel=None, artifact_id=None),
+                    ArtifactAction(
+                        type="open_panel", panel="artifacts", artifact_id=artifact_id
+                    ),
+                ],
+                # Only modified files carry a diff; created files show full content.
+                diff=None if info["created"] else info.get("diff"),
+            )
+        )
     return out
 
 
@@ -377,7 +668,14 @@ def derive_artifacts(
                 ),
                 preview=ArtifactPreview(type=_PREVIEW_FOR_KIND.get(kind, "none")),
                 actions=actions,
+                diff=None,  # uploaded/attachment files have no conversation diff
             )
+
+    # Phase 3: workspace files created/modified by file-writing tool uses.
+    # setdefault so an attachment with the same id (none, ids are namespaced)
+    # or a richer metadata descriptor (merged below) takes precedence.
+    for art in _artifacts_from_tool_writes(manager, target_id=target_id):
+        by_id.setdefault(art.id, art)
 
     # Merge in tool/plugin-declared artifacts; these win on id collision.
     for art in _artifacts_from_messages(manager, target_id=target_id):

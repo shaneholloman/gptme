@@ -1,7 +1,9 @@
+import io
+import json
 import random
 import time
 import unittest.mock
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
 
@@ -80,6 +82,74 @@ def test_v2_api_root(client: FlaskClient, monkeypatch):
     assert "provider_configured" in data
 
 
+def test_start_tool_execution_streams_only_real_tool_output(
+    v2_conv, client: FlaskClient, monkeypatch
+):
+    from gptme.message import Message
+    from gptme.server.session_models import SessionManager, ToolExecution
+    from gptme.server.session_step import start_tool_execution
+    from gptme.tools import ToolUse
+
+    conversation_id = v2_conv["conversation_id"]
+    session_id = v2_conv["session_id"]
+    session = SessionManager.get_session(session_id)
+    assert session is not None
+
+    tool_id = "tool-1"
+    session.pending_tools[tool_id] = ToolExecution(
+        tool_id=tool_id,
+        tooluse=ToolUse("shell", [], "echo hello", call_id="call-1"),
+    )
+
+    def fake_execute(self, log=None, workspace=None, on_result_message=None):
+        pre_hook = Message("system", "pre hook chatter")
+        actual_output = Message("system", "real tool output")
+        post_hook = Message("system", "post hook chatter")
+        yield pre_hook
+        if on_result_message:
+            on_result_message(actual_output)
+        yield actual_output
+        yield post_hook
+
+    monkeypatch.setattr("gptme.tools.base.ToolUse.execute", fake_execute)
+    monkeypatch.setattr(
+        "gptme.server.session_step.prepare_execution_environment",
+        lambda workspace, tools, chat_config: None,
+    )
+    monkeypatch.setattr(
+        "gptme.server.session_step._start_step_thread",
+        lambda *args, **kwargs: None,
+    )
+
+    thread = start_tool_execution(
+        conversation_id=conversation_id,
+        session=session,
+        tool_id=tool_id,
+        edited_tooluse=None,
+        model="openai/mock-model",
+        chat_config=ChatConfig(),
+    )
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    tool_output_events = [e for e in session.events if e["type"] == "tool_output"]
+    assert tool_output_events == [
+        {
+            "type": "tool_output",
+            "tool_id": tool_id,
+            "output": "real tool output",
+        }
+    ]
+
+    response = client.get(f"/api/v2/conversations/{conversation_id}")
+    assert response.status_code == 200
+    messages = response.get_json()["log"]
+    system_messages = [m["content"] for m in messages if m["role"] == "system"]
+    assert "pre hook chatter" in system_messages
+    assert "real tool output" in system_messages
+    assert "post hook chatter" in system_messages
+
+
 def test_v2_api_root_provider_configured(client: FlaskClient, monkeypatch):
     """provider_configured reflects whether get_default_model() returns a model."""
     from gptme.llm.models.types import ModelMeta
@@ -107,6 +177,89 @@ def test_v2_api_root_provider_configured(client: FlaskClient, monkeypatch):
     assert data["provider_configured"] is True
 
 
+def test_webui_deploy_status_disabled(client: FlaskClient, monkeypatch):
+    """The web UI deploy endpoint reports disabled state by default."""
+    monkeypatch.delenv("GPTME_WEBUI_ENABLE_DEV_DEPLOY", raising=False)
+    monkeypatch.delenv("GPTME_WEBUI_GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GITHUB_TOKEN", raising=False)
+    monkeypatch.delenv("GPTME_WEBUI_DEPLOY_WORKFLOW", raising=False)
+
+    response = client.get("/api/v2/dev/deploy-staging")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["enabled"] is False
+    assert data["configured"] is False
+    assert data["repository"] == "gptme/gptme"
+    assert data["workflow"] == ""
+
+
+def test_webui_deploy_trigger_disabled(client: FlaskClient, monkeypatch):
+    """The deploy trigger fails closed until explicitly enabled."""
+    monkeypatch.delenv("GPTME_WEBUI_ENABLE_DEV_DEPLOY", raising=False)
+
+    response = client.post("/api/v2/dev/deploy-staging", json={})
+
+    assert response.status_code == 403
+    data = response.get_json()
+    assert "disabled" in data["error"]
+
+
+def test_webui_deploy_trigger_requires_workflow(client: FlaskClient, monkeypatch):
+    """Enabled deploy trigger still requires an explicit workflow name."""
+    monkeypatch.setenv("GPTME_WEBUI_ENABLE_DEV_DEPLOY", "true")
+    monkeypatch.setenv("GPTME_WEBUI_GITHUB_TOKEN", "test-token")
+    monkeypatch.delenv("GPTME_WEBUI_DEPLOY_WORKFLOW", raising=False)
+
+    response = client.post("/api/v2/dev/deploy-staging", json={})
+
+    assert response.status_code == 503
+    data = response.get_json()
+    assert "WORKFLOW" in data["error"]
+
+
+def test_webui_deploy_trigger_dispatches_workflow(client: FlaskClient, monkeypatch):
+    """The deploy trigger posts workflow_dispatch to GitHub when configured."""
+    captured = {}
+
+    class FakeResponse:
+        status = 204
+
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+    def fake_urlopen(request, timeout):
+        captured["url"] = request.full_url
+        captured["timeout"] = timeout
+        captured["payload"] = json.loads(request.data.decode("utf-8"))
+        captured["authorization"] = request.headers["Authorization"]
+        return FakeResponse()
+
+    monkeypatch.setenv("GPTME_WEBUI_ENABLE_DEV_DEPLOY", "true")
+    monkeypatch.setenv("GPTME_WEBUI_GITHUB_TOKEN", "test-token")
+    monkeypatch.setenv("GPTME_WEBUI_DEPLOY_REPOSITORY", "gptme/web ui#preview")
+    monkeypatch.setenv("GPTME_WEBUI_DEPLOY_WORKFLOW", "webui-staging.yml")
+    monkeypatch.setenv("GPTME_WEBUI_DEPLOY_REF", "master")
+    monkeypatch.setenv("GPTME_WEBUI_DEPLOY_INPUTS_JSON", '{"environment":"staging"}')
+    monkeypatch.setattr("gptme.server.api_v2.urllib.request.urlopen", fake_urlopen)
+
+    response = client.post("/api/v2/dev/deploy-staging", json={})
+
+    assert response.status_code == 202
+    data = response.get_json()
+    assert data["status"] == "queued"
+    assert data["workflow"] == "webui-staging.yml"
+    assert captured == {
+        "url": "https://api.github.com/repos/gptme/web%20ui%23preview/actions/workflows/webui-staging.yml/dispatches",
+        "timeout": 20,
+        "payload": {"ref": "master", "inputs": {"environment": "staging"}},
+        "authorization": "Bearer test-token",
+    }
+
+
 def test_v2_user_api_key_persists_env_entry(client: FlaskClient, tmp_path, monkeypatch):
     """Saving an API key should write the provider env var into user config."""
     import gptme.config.user as user_mod
@@ -130,7 +283,8 @@ def test_v2_user_api_key_persists_env_entry(client: FlaskClient, tmp_path, monke
         "restart_required": False,
     }
 
-    saved = tomlkit.loads(config_file.read_text()).unwrap()
+    local_file = tmp_path / "config.local.toml"
+    saved = tomlkit.loads(local_file.read_text()).unwrap()
     assert saved["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
 
 
@@ -179,7 +333,8 @@ def test_v2_user_api_key_persists_default_model(
     )
 
     assert response.status_code == 200
-    saved = tomlkit.loads(config_file.read_text()).unwrap()
+    local_file = tmp_path / "config.local.toml"
+    saved = tomlkit.loads(local_file.read_text()).unwrap()
     assert saved["env"]["ANTHROPIC_API_KEY"] == "sk-ant-test-key"
     assert saved["env"]["MODEL"] == "anthropic/claude-sonnet-4-7"
 
@@ -213,7 +368,7 @@ def test_v2_user_api_key_rejects_unknown_provider(client: FlaskClient):
 def test_v2_user_default_model_persists_and_applies(
     client: FlaskClient, tmp_path, monkeypatch
 ):
-    """Saving a default model should write env.MODEL and update runtime state."""
+    """Saving a default model should write [models].default and update runtime state."""
     import gptme.config.user as user_mod
 
     config_file = tmp_path / "config.toml"
@@ -240,7 +395,7 @@ def test_v2_user_default_model_persists_and_applies(
     }
 
     saved = tomlkit.loads(config_file.read_text()).unwrap()
-    assert saved["env"]["MODEL"] == "anthropic/claude-sonnet-4-7"
+    assert saved["models"]["default"] == "anthropic/claude-sonnet-4-7"
     assert applied["model"].full == "anthropic/claude-sonnet-4-7"
 
 
@@ -253,6 +408,137 @@ def test_v2_user_default_model_rejects_unqualified_model(client: FlaskClient):
     assert response.status_code == 400
     data = response.get_json()
     assert data == {"error": "model must be fully qualified as provider/model"}
+
+
+def test_v2_user_config_file_get_reads_raw_toml(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """GET /api/v2/user/config-file should return the raw main config.toml text."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    config_file.write_text('[env]\nMODEL = "anthropic/claude-sonnet-4-7"\n')
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+
+    response = client.get("/api/v2/user/config-file")
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["content"] == '[env]\nMODEL = "anthropic/claude-sonnet-4-7"\n'
+    assert data["path"] == str(config_file)
+    assert data["write_target"] == str(config_file)
+    assert data["local_config_exists"] is False
+
+
+def test_v2_user_config_file_get_creates_missing_config(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """GET should create the default config.toml when the file is missing."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+
+    response = client.get("/api/v2/user/config-file")
+
+    assert response.status_code == 200
+    assert config_file.exists()
+    assert response.get_json()["content"] == config_file.read_text()
+
+
+def test_v2_user_config_file_put_validates_and_writes_toml(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """PUT /api/v2/user/config-file should reject bad TOML and write valid TOML."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    reload_calls: list[str] = []
+    config_file.write_text('[env]\nMODEL = "old/model"\n')
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr(
+        "gptme.config.core.reload_config", lambda: reload_calls.append("reload")
+    )
+
+    invalid_response = client.put(
+        "/api/v2/user/config-file",
+        json={"content": "[env\nMODEL = broken"},
+    )
+    assert invalid_response.status_code == 400
+    assert "Invalid TOML" in invalid_response.get_json()["error"]
+    assert config_file.read_text() == '[env]\nMODEL = "old/model"\n'
+
+    valid_content = '[env]\nMODEL = "anthropic/claude-sonnet-4-7"\n'
+    response = client.put(
+        "/api/v2/user/config-file",
+        json={"content": valid_content},
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "ok"
+    assert data["content"] == valid_content
+    assert config_file.read_text() == valid_content
+    assert reload_calls == ["reload"]
+
+
+def test_v2_user_config_file_patch_updates_dotted_key(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """PATCH /api/v2/user/config-file should persist one dotted key."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+
+    response = client.patch(
+        "/api/v2/user/config-file",
+        json={
+            "key": "env.MODEL",
+            "value": "anthropic/claude-sonnet-4-7",
+            "reload": False,
+        },
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "ok"
+    assert data["key"] == "env.MODEL"
+    saved = tomlkit.loads(config_file.read_text()).unwrap()
+    assert saved["env"]["MODEL"] == "anthropic/claude-sonnet-4-7"
+
+
+def test_v2_user_config_file_patch_preserves_boolean_value(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """PATCH /api/v2/user/config-file should preserve non-string JSON scalars."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+
+    response = client.patch(
+        "/api/v2/user/config-file",
+        json={
+            "key": "lessons.enabled",
+            "value": True,
+            "reload": False,
+        },
+    )
+
+    assert response.status_code == 200
+    saved = tomlkit.loads(config_file.read_text()).unwrap()
+    assert saved["lessons"]["enabled"] is True
+
+
+def test_v2_user_config_file_patch_rejects_invalid_key(client: FlaskClient):
+    response = client.patch(
+        "/api/v2/user/config-file",
+        json={"key": "env..MODEL", "value": "anthropic/claude-sonnet-4-7"},
+    )
+
+    assert response.status_code == 400
+    assert "dotted path" in response.get_json()["error"]
 
 
 @pytest.mark.parametrize(
@@ -846,6 +1132,114 @@ def test_external_session_gptme_directory_no_jsonl_skipped(tmp_path: Path):
     assert items == [], f"Expected no sessions, got: {items}"
 
 
+def test_v2_server_health_empty(client: FlaskClient, monkeypatch):
+    """Server health endpoint returns green status with no active sessions."""
+    monkeypatch.setattr(
+        "gptme.server.api_v2.SessionManager.get_all_sessions",
+        lambda: [],
+    )
+
+    response = client.get("/api/v2/server/health")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["session_count"] == 0
+    assert data["generating_count"] == 0
+    assert data["idle_count"] == 0
+    assert data["health"] == "green"
+    assert data["slots"] == []
+
+
+def test_v2_server_health_with_session(v2_conv, client: FlaskClient, monkeypatch):
+    """Server health endpoint reports idle session after creation."""
+    from gptme.server.session_models import SessionManager
+
+    session_id = v2_conv["session_id"]
+    session = SessionManager.get_session(session_id)
+    assert session is not None
+
+    monkeypatch.setattr(
+        "gptme.server.api_v2.SessionManager.get_all_sessions",
+        lambda: [(session_id, session)],
+    )
+
+    response = client.get("/api/v2/server/health")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["session_count"] == 1
+    assert data["generating_count"] == 0
+    assert data["idle_count"] == 1
+    assert data["health"] == "green"
+    assert len(data["slots"]) == 1
+    slot = data["slots"][0]
+    assert not slot["generating"]
+    assert slot["elapsed_seconds"] is None
+
+
+def test_v2_server_health_yellow(client: FlaskClient, monkeypatch):
+    """Server health returns yellow when some sessions are generating."""
+    from gptme.server.session_models import ConversationSession
+
+    now = datetime.now(tz=timezone.utc)
+    idle_session = ConversationSession(id="idle-1234", conversation_id="conv-1")
+    gen_session = ConversationSession(
+        id="gen-5678",
+        conversation_id="conv-2",
+        generating=True,
+        generating_since=now - timedelta(seconds=30),
+    )
+    monkeypatch.setattr(
+        "gptme.server.api_v2.SessionManager.get_all_sessions",
+        lambda: [("idle-1234", idle_session), ("gen-5678", gen_session)],
+    )
+
+    response = client.get("/api/v2/server/health")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["session_count"] == 2
+    assert data["generating_count"] == 1
+    assert data["idle_count"] == 1
+    assert data["health"] == "yellow"
+    assert len(data["slots"]) == 2
+    # Verify generating slot has elapsed time
+    gen_slot = next(s for s in data["slots"] if s["generating"])
+    assert gen_slot["elapsed_seconds"] is not None
+    assert gen_slot["elapsed_seconds"] >= 0  # type: ignore[operator]
+
+
+def test_v2_server_health_red(client: FlaskClient, monkeypatch):
+    """Server health returns red when all sessions are generating."""
+    from gptme.server.session_models import ConversationSession
+
+    now = datetime.now(tz=timezone.utc)
+    sessions = [
+        ConversationSession(
+            id=f"gen-{i:04d}",
+            conversation_id=f"conv-{i}",
+            generating=True,
+            generating_since=now - timedelta(seconds=10 + i),
+        )
+        for i in range(3)
+    ]
+    monkeypatch.setattr(
+        "gptme.server.api_v2.SessionManager.get_all_sessions",
+        lambda: [(s.id, s) for s in sessions],
+    )
+
+    response = client.get("/api/v2/server/health")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["session_count"] == 3
+    assert data["generating_count"] == 3
+    assert data["idle_count"] == 0
+    assert data["health"] == "red"
+    assert len(data["slots"]) == 3
+    assert all(s["generating"] for s in data["slots"])
+
+
 def test_v2_conversations_list(client: FlaskClient):
     """Test listing V2 conversations."""
     response = client.get("/api/v2/conversations")
@@ -863,6 +1257,7 @@ def test_v2_conversation_get(v2_conv, client: FlaskClient):
     data = response.get_json()
     assert data is not None
     assert "log" in data
+    assert data["logdir"] == str(Path(data["logfile"]).parent)
 
     # Should contain system messages (custom system prompt + possibly workspace prompt)
     assert len(data["log"]) >= 1  # At least custom system prompt
@@ -1245,6 +1640,17 @@ def _normalize_config_for_comparison(config_dict: dict) -> dict:
     return result
 
 
+def test_v2_conversation_put_injects_system_prompt(client: FlaskClient):
+    """Creating a conversation with system_prompt should inject it via api_conversation_put."""
+    config = ChatConfig(system_prompt="Answer in bullet points.")
+    conversation = create_conversation(client, config=config)
+    conversation_id = conversation["conversation_id"]
+
+    data = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    system_messages = [m["content"] for m in data["log"] if m["role"] == "system"]
+    assert "Answer in bullet points." in system_messages
+
+
 def test_v2_chat_config_saved_on_conversation_create(client: FlaskClient):
     """Test that the chat config is saved on conversation create."""
     input_config = ChatConfig(model="openai/gpt-4o")
@@ -1341,6 +1747,47 @@ def test_v2_chat_config_update_works(client: FlaskClient):
     assert _normalize_config_for_comparison(
         config.to_dict()
     ) == _normalize_config_for_comparison(input_config.to_dict())
+
+
+def test_v2_chat_config_system_prompt_roundtrip_and_clear(client: FlaskClient):
+    """Config PATCH should persist, apply, and clear a conversation-local system prompt."""
+    conversation_id = create_conversation(client)["conversation_id"]
+    system_prompt = "Answer in bullet points."
+
+    response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/config",
+        json={"chat": {"system_prompt": system_prompt}},
+    )
+    assert response.status_code == 200
+
+    config_response = client.get(f"/api/v2/conversations/{conversation_id}/config")
+    config = ChatConfig.from_dict(config_response.get_json())
+    assert config.system_prompt == system_prompt
+
+    conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    system_messages = [
+        m["content"] for m in conversation["log"] if m["role"] == "system"
+    ]
+    assert system_messages[-1] == system_prompt
+
+    clear_response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/config",
+        json={"chat": {"system_prompt": ""}},
+    )
+    assert clear_response.status_code == 200
+
+    cleared_config = client.get(
+        f"/api/v2/conversations/{conversation_id}/config"
+    ).get_json()
+    assert "system_prompt" not in cleared_config["chat"]
+
+    cleared_conversation = client.get(
+        f"/api/v2/conversations/{conversation_id}"
+    ).get_json()
+    cleared_system_messages = [
+        m["content"] for m in cleared_conversation["log"] if m["role"] == "system"
+    ]
+    assert system_prompt not in cleared_system_messages
 
 
 def test_v2_chat_config_update_missing_conversation_returns_404(client: FlaskClient):
@@ -1542,6 +1989,68 @@ def test_v2_edit_message_rejects_invalid_files_payload(
 
 
 @pytest.mark.parametrize(
+    ("files_payload", "expected_error"),
+    [
+        (["/etc/passwd"], "Absolute file paths are not supported"),
+        (["../outside.txt"], "File path escapes workspace"),
+    ],
+)
+def test_v2_edit_message_rejects_files_outside_workspace(
+    client: FlaskClient, files_payload: list[str], expected_error: str
+):
+    """Editing message files must reject local paths outside the workspace."""
+    conversation_id = create_conversation(client)["conversation_id"]
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "user", "content": "Original message"},
+    )
+    assert response.status_code == 200
+
+    conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    assert conversation is not None
+    user_index = len(conversation["log"]) - 1
+
+    response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/messages/{user_index}",
+        json={"files": files_payload},
+    )
+
+    assert response.status_code == 400
+    assert expected_error in response.get_json()["error"]
+
+    conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    assert conversation is not None
+    assert "files" not in conversation["log"][user_index]
+
+
+def test_v2_edit_message_resolves_relative_files_against_workspace(
+    client: FlaskClient,
+):
+    """Relative edited files are stored under the conversation workspace."""
+    conversation_id = create_conversation(client)["conversation_id"]
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "user", "content": "Original message"},
+    )
+    assert response.status_code == 200
+
+    conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    assert conversation is not None
+    user_index = len(conversation["log"]) - 1
+
+    response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/messages/{user_index}",
+        json={"files": ["attachments/ok.txt"]},
+    )
+
+    assert response.status_code == 200
+
+    conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    assert conversation is not None
+    assert conversation["log"][user_index]["files"] == ["attachments/ok.txt"]
+
+
+@pytest.mark.parametrize(
     "files_payload",
     [
         "attachments/image.png",
@@ -1641,6 +2150,53 @@ def test_v2_edit_message_preserves_uri_files(client: FlaskClient):
     conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
     assert conversation is not None
     assert conversation["log"][user_index]["files"] == [uri]
+
+
+@pytest.mark.parametrize(
+    "endpoint_builder",
+    [
+        lambda conversation_id, user_index: (
+            f"/api/v2/conversations/{conversation_id}",
+            {
+                "role": "user",
+                "content": "Test message",
+                "files": ["file:///etc/passwd"],
+            },
+            None,
+        ),
+        lambda conversation_id, user_index: (
+            f"/api/v2/conversations/{conversation_id}/messages/{user_index}",
+            {"files": ["file:///etc/passwd"]},
+            user_index,
+        ),
+    ],
+)
+def test_v2_message_file_uris_reject_file_scheme(client: FlaskClient, endpoint_builder):
+    """POST and PATCH message files must reject local file:// URIs."""
+    conversation_id = create_conversation(client)["conversation_id"]
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "user", "content": "Original message"},
+    )
+    assert response.status_code == 200
+
+    conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    assert conversation is not None
+    user_index = len(conversation["log"]) - 1
+
+    endpoint, payload, patched_index = endpoint_builder(conversation_id, user_index)
+    response = client.open(
+        endpoint, method="PATCH" if patched_index is not None else "POST", json=payload
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {
+        "error": "file:// URIs are not supported for message attachments"
+    }
+
+    conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    assert conversation is not None
+    assert conversation["log"][user_index].get("files") is None
 
 
 def test_v2_edit_message_rejects_non_string_content(client: FlaskClient):
@@ -2091,13 +2647,11 @@ def test_v2_user_settings_returns_providers_and_model(client: FlaskClient, monke
     )
     monkeypatch.setattr(
         "gptme.server.api_v2.get_user_config_env_source",
-        lambda key: (
-            "config.local.toml"
-            if key == "ANTHROPIC_API_KEY"
-            else "config.toml"
-            if key == "MODEL"
-            else None
-        ),
+        lambda key: "config.local.toml" if key == "ANTHROPIC_API_KEY" else None,
+    )
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_default_model_source",
+        lambda: "config.toml",
     )
     monkeypatch.setattr(
         "gptme.server.api_v2.get_user_config_runtime_info",
@@ -2135,6 +2689,7 @@ def test_v2_user_settings_no_providers_no_model(client: FlaskClient, monkeypatch
     monkeypatch.setattr(
         "gptme.server.api_v2.get_user_config_env_source", lambda _key: None
     )
+    monkeypatch.setattr("gptme.server.api_v2.get_default_model_source", lambda: None)
     monkeypatch.setattr(
         "gptme.server.api_v2.get_user_config_runtime_info",
         lambda: {
@@ -2154,6 +2709,102 @@ def test_v2_user_settings_no_providers_no_model(client: FlaskClient, monkeypatch
     assert data["default_model"] is None
     assert data["default_model_source"] is None
     assert data["config_files"]["local_config_exists"] is False
+
+
+def test_v2_audio_transcriptions_success(client: FlaskClient, monkeypatch):
+    """POST /api/v2/audio/transcriptions proxies a short recording to OpenRouter."""
+
+    class FakeConfig:
+        def get_env(self, key: str, default: str | None = None):
+            if key == "OPENROUTER_API_KEY":
+                return "sk-or-test"
+            return default
+
+    captured: dict[str, Any] = {}
+
+    class FakeResponse:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, exc_type, exc, tb):
+            return False
+
+        def read(self):
+            return json.dumps(
+                {
+                    "text": "hello from openrouter",
+                    "usage": {"seconds": 1.2, "total_tokens": 12},
+                }
+            ).encode("utf-8")
+
+    def fake_urlopen(req, timeout=0):
+        captured["url"] = req.full_url
+        captured["timeout"] = timeout
+        captured["body"] = json.loads(req.data.decode("utf-8"))
+        return FakeResponse()
+
+    monkeypatch.setattr("gptme.server.api_v2.get_config", lambda: FakeConfig())
+    monkeypatch.setattr("gptme.server.api_v2.urllib.request.urlopen", fake_urlopen)
+
+    response = client.post(
+        "/api/v2/audio/transcriptions",
+        data={
+            "file": (io.BytesIO(b"audio-bytes"), "speech.webm"),
+            "format": "webm",
+            "language": "en",
+        },
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data == {
+        "text": "hello from openrouter",
+        "model": "openai/whisper-1",
+        "usage": {"seconds": 1.2, "total_tokens": 12},
+    }
+    assert captured["url"] == "https://openrouter.ai/api/v1/audio/transcriptions"
+    assert captured["timeout"] == 60
+    assert captured["body"]["model"] == "openai/whisper-1"
+    assert captured["body"]["language"] == "en"
+    assert captured["body"]["input_audio"]["format"] == "webm"
+    assert isinstance(captured["body"]["input_audio"]["data"], str)
+
+
+def test_v2_audio_transcriptions_requires_file(client: FlaskClient):
+    """POST /api/v2/audio/transcriptions rejects empty multipart uploads."""
+    response = client.post(
+        "/api/v2/audio/transcriptions",
+        data={},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 400
+    assert response.get_json() == {"error": "No audio file provided"}
+
+
+def test_v2_audio_transcriptions_requires_openrouter(client: FlaskClient, monkeypatch):
+    """POST /api/v2/audio/transcriptions fails cleanly without OpenRouter config."""
+
+    class FakeConfig:
+        def get_env(self, _key: str, default: str | None = None):
+            return default
+
+    monkeypatch.setattr("gptme.server.api_v2.get_config", lambda: FakeConfig())
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_stored_api_key", lambda _provider: None
+    )
+
+    response = client.post(
+        "/api/v2/audio/transcriptions",
+        data={"file": (io.BytesIO(b"audio-bytes"), "speech.webm"), "format": "webm"},
+        content_type="multipart/form-data",
+    )
+
+    assert response.status_code == 503
+    assert response.get_json() == {
+        "error": "OpenRouter is not configured on this server"
+    }
 
 
 def test_v2_conversation_transcript_append(

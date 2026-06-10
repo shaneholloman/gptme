@@ -28,8 +28,8 @@ import {
   exportConversationAsJSON,
   getExportableMessages,
 } from '@/utils/exportConversation';
+import { chatRoute } from '@/utils/routes';
 import { toast } from 'sonner';
-import { settingsModal$ } from '@/stores/settingsModal';
 
 interface CommandAction {
   id: string;
@@ -79,6 +79,26 @@ export function CommandPalette() {
     return () => document.removeEventListener('keydown', down);
   }, []);
 
+  // Alt+N — new conversation (skip when typing in an input)
+  useEffect(() => {
+    const down = (e: KeyboardEvent) => {
+      if (e.code !== 'KeyN' || !e.altKey || e.metaKey || e.ctrlKey) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      e.preventDefault();
+      navigate('/');
+      setOpen(false);
+    };
+    document.addEventListener('keydown', down);
+    return () => document.removeEventListener('keydown', down);
+  }, [navigate, setOpen]);
+
   // Reset search when closing
   useEffect(() => {
     if (!open) {
@@ -105,7 +125,7 @@ export function CommandPalette() {
     const currentSearch = search;
     searchTimerRef.current = setTimeout(async () => {
       try {
-        const results = await api.searchConversations(currentSearch, 10);
+        const results = await api.searchConversations(currentSearch, 10, true);
         if (!cancelled) {
           setConversationResults(results);
         }
@@ -163,7 +183,7 @@ export function CommandPalette() {
         keywords: ['settings', 'preferences', 'config'],
         action: () => {
           setOpen(false);
-          settingsModal$.open.set(true);
+          navigate('/settings');
         },
         group: 'Navigation',
       },
@@ -322,7 +342,7 @@ export function CommandPalette() {
                   key={`conv-${conv.id}`}
                   value={`conv-${conv.id} ${conv.name}`}
                   onSelect={() => {
-                    navigate(`/chat/${conv.id}`);
+                    navigate(chatRoute(conv.id));
                     setOpen(false);
                   }}
                 >
@@ -330,7 +350,7 @@ export function CommandPalette() {
                   <div className="flex flex-1 flex-col overflow-hidden">
                     <span className="truncate">{stripDatePrefix(conv.name)}</span>
                     <span className="text-xs text-muted-foreground">
-                      {conv.messages} messages · {formatRelativeTime(conv.modified)}
+                      {conv.messages ?? 0} messages · {formatRelativeTime(conv.modified)}
                     </span>
                   </div>
                 </CommandItem>

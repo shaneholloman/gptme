@@ -24,6 +24,8 @@ import {
 } from '@/components/ui/dropdown-menu';
 import { withLocalAddressSpace } from '@/utils/addressSpace';
 import { isLikelyChromeCorsPna } from '@/utils/api';
+import { isDemoMode } from '@/utils/connectionConfig';
+import { chatRoute } from '@/utils/routes';
 
 const DEFAULT_LOCAL_SERVER_URLS = new Set(['http://127.0.0.1:5700', 'http://localhost:5700']);
 
@@ -47,6 +49,7 @@ export const WelcomeView = () => {
   const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null);
   const navigate = useNavigate();
   const { api, isConnected$, connectionConfig, switchServer, connect } = useApi();
+  const demoMode = isDemoMode();
   const queryClient = useQueryClient();
   const isConnected = use$(isConnected$);
   const lastConnectionResult = use$(api.lastConnectionResult$);
@@ -106,7 +109,7 @@ export const WelcomeView = () => {
 
       // Navigate immediately - server-side creation happens in background
       // Errors from backend are handled via toast in api.ts
-      navigate(`/chat/${conversationId}`);
+      navigate(chatRoute(conversationId));
 
       // Invalidate conversations query to refresh the list (async, don't block)
       queryClient.invalidateQueries({
@@ -175,7 +178,7 @@ export const WelcomeView = () => {
   // settings path. Users on a custom server have already chosen their setup, so
   // their disconnected banner is left unchanged.
   const isFirstVisit = !settings.hasCompletedSetup;
-  const showGuidedSetup = isDefaultLocalServer && isFirstVisit;
+  const showGuidedSetup = isDefaultLocalServer && isFirstVisit && !demoMode;
 
   // Classify the last connection failure into actionable buckets for targeted guidance.
   const errorBucket = (() => {
@@ -188,7 +191,13 @@ export const WelcomeView = () => {
     errorBucket === 'unknown' && isDefaultLocalServer && isHostedOrigin && hostedLoopbackReachable;
 
   useEffect(() => {
-    if (isConnected || !isDefaultLocalServer || !isHostedOrigin || errorBucket !== 'unknown') {
+    if (
+      demoMode ||
+      isConnected ||
+      !isDefaultLocalServer ||
+      !isHostedOrigin ||
+      errorBucket !== 'unknown'
+    ) {
       setHostedLoopbackReachable(false);
       return;
     }
@@ -237,6 +246,7 @@ export const WelcomeView = () => {
   }, [
     activeServerBaseUrl,
     connect,
+    demoMode,
     errorBucket,
     isConnected,
     isDefaultLocalServer,

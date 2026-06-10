@@ -9,6 +9,7 @@ import type {
   ExternalSessionCatalogItem,
   ExternalSessionDetail,
   SendMessageRequest,
+  ServerHealth,
   UserInfo,
 } from '@/types/api';
 import type { ConversationSummary, Message, ToolUse } from '@/types/conversation';
@@ -22,6 +23,12 @@ import { initConversation, setMaxTokens, setTemperature, setTopP } from '@/store
 type RequestInit = globalThis.RequestInit;
 type Response = globalThis.Response;
 type HeadersInit = globalThis.HeadersInit;
+
+export interface AudioTranscriptionResponse {
+  text: string;
+  model: string;
+  usage?: Record<string, number> | null;
+}
 
 // Error type for API client
 export class ApiClientError extends Error {
@@ -166,6 +173,30 @@ export function isLikelyChromeCorsPna(targetUrl: string): boolean {
   }
 }
 
+function inferTranscriptionFormat(blobType: string | undefined): string {
+  const mimeType = (blobType ?? '').split(';', 1)[0].trim().toLowerCase();
+  switch (mimeType) {
+    case 'audio/aac':
+      return 'aac';
+    case 'audio/flac':
+      return 'flac';
+    case 'audio/m4a':
+    case 'audio/mp4':
+      return 'm4a';
+    case 'audio/mp3':
+    case 'audio/mpeg':
+      return 'mp3';
+    case 'audio/ogg':
+      return 'ogg';
+    case 'audio/wav':
+    case 'audio/x-wav':
+      return 'wav';
+    case 'audio/webm':
+    default:
+      return 'webm';
+  }
+}
+
 // Result of a connection probe — captures enough context for a useful user-facing message.
 export type ConnectionProbeResult =
   | { ok: true; url: string }
@@ -184,6 +215,13 @@ export interface ToolPendingEvent {
   auto_confirm: boolean;
 }
 
+export interface ToolCompleteEvent {
+  type: 'tool_complete';
+  tool_id: string;
+  duration_ms: number;
+  success: boolean;
+}
+
 export interface ToolConfirmationRequest {
   session_id: string;
   tool_id: string;
@@ -191,6 +229,17 @@ export interface ToolConfirmationRequest {
   content?: string;
   count?: number;
 }
+
+export type EventStreamConnectionState =
+  | { status: 'connecting' }
+  | { status: 'connected' }
+  | {
+      status: 'reconnecting';
+      attempt: number;
+      maxAttempts: number;
+      retryInMs: number;
+    }
+  | { status: 'disconnected'; message: string };
 
 export class ApiClient {
   public baseUrl: string;
@@ -203,6 +252,8 @@ export class ApiClient {
   public sessions$: Observable<Map<string, string>> = observable(new Map()); // Map conversation IDs to session IDs
   public userInfo$: Observable<UserInfo | null> = observable<UserInfo | null>(null);
   private eventSources: Map<string, EventSource> = new Map(); // Map conversation IDs to EventSource instances
+  private eventStreamTimers: Map<string, { reconnectTimer?: number; sessionIdTimeout?: number }> =
+    new Map();
   private isCleaningUp = false;
   private authCookieSet = false;
   private authCookieSetAt: number | null = null;
@@ -417,9 +468,8 @@ export class ApiClient {
       }
 
       // Close all event sources
-      for (const [conversationId, eventSource] of this.eventSources.entries()) {
-        eventSource.close();
-        this.eventSources.delete(conversationId);
+      for (const conversationId of Array.from(this.eventSources.keys())) {
+        this.closeEventStream(conversationId);
       }
     } finally {
       this.isCleaningUp = false;
@@ -530,10 +580,13 @@ export class ApiClient {
       onMessageAdded: (message: Message) => void;
       onToolPending: (toolId: string, tooluse: ToolUse, auto_confirm: boolean) => void;
       onToolExecuting: (toolId: string) => void;
+      onToolOutput?: (toolId: string, output: string) => void;
+      onToolComplete?: (toolId: string, durationMs: number, success: boolean) => void;
       onInterrupted: () => void;
       onError: (error: string) => void;
       onConfigChanged?: (config: ChatConfig, changedFields: string[]) => void;
       onConnected?: () => void;
+      onConnectionState?: (state: EventStreamConnectionState) => void;
       onReconnectState?: (state: {
         generating: boolean;
         pendingTools: Array<{
@@ -548,32 +601,65 @@ export class ApiClient {
         log: Message[];
         branches: Record<string, Message[]>;
       }) => void;
-    }
+    },
+    reconnectAttempt = 0
   ): Promise<void> {
+    const maxReconnects = 5;
+
     // Close any existing event stream for this conversation
     this.closeEventStream(conversationId);
+    callbacks.onConnectionState?.(
+      reconnectAttempt > 0
+        ? {
+            status: 'reconnecting',
+            attempt: reconnectAttempt,
+            maxAttempts: maxReconnects,
+            retryInMs: 0,
+          }
+        : { status: 'connecting' }
+    );
 
     // Function to reconnect to the event stream if it fails, or we fail to get a session ID
-    const reconnect = () => {
+    const reconnect = (attempt: number) => {
       console.log(`[ApiClient] Attempting reconnection for ${conversationId}`);
       this.closeEventStream(conversationId);
       // Reset cookie state so expired cookies (24h TTL) are re-fetched on reconnect
       this.resetAuthCookie();
-      this.subscribeToEvents(conversationId, callbacks).catch((err) => {
+      this.subscribeToEvents(conversationId, callbacks, attempt).catch((err) => {
         console.error('[ApiClient] Reconnect failed:', err);
         callbacks.onError?.(String(err));
       });
     };
 
     // Create a timeout that will reconnect if we don't get a session ID after 5 seconds
-    const sessionIdTimeout = setTimeout(() => {
+    const sessionIdTimeout = window.setTimeout(() => {
       if (!this.sessions$.has(conversationId)) {
         console.log(
           `[ApiClient] Timed out waiting for session ID for ${conversationId}, reconnecting`
         );
-        reconnect();
+        const nextAttempt = reconnectAttempt + 1;
+        if (nextAttempt <= maxReconnects) {
+          callbacks.onConnectionState?.({
+            status: 'reconnecting',
+            attempt: nextAttempt,
+            maxAttempts: maxReconnects,
+            retryInMs: 0,
+          });
+          reconnect(nextAttempt);
+        } else {
+          this.closeEventStream(conversationId);
+          callbacks.onConnectionState?.({
+            status: 'disconnected',
+            message: 'Timed out waiting for event stream session',
+          });
+          callbacks.onError?.('Timed out waiting for event stream session');
+        }
       }
     }, 5000);
+    this.eventStreamTimers.set(conversationId, {
+      ...this.eventStreamTimers.get(conversationId),
+      sessionIdTimeout,
+    });
 
     /**
      * For SSE connections, we prefer cookie-based authentication (set via
@@ -613,23 +699,23 @@ export class ApiClient {
     }
 
     const eventSource = new EventSource(url.toString(), { withCredentials: true });
+    this.eventSources.set(conversationId, eventSource);
 
     // Add connect event notification
     let isConnected = false;
+    let reconnectCount = reconnectAttempt;
 
-    // Track reconnection attempts
-    let reconnectCount = 0;
-    const maxReconnects = 5;
-    let reconnectTimer: number | null = null;
+    const isCurrentEventSource = () => this.eventSources.get(conversationId) === eventSource;
 
     // Handle connection open
     eventSource.onopen = () => {
+      if (!isCurrentEventSource()) return;
       console.log(`[ApiClient] Event stream connected for ${conversationId}`);
       isConnected = true;
-      reconnectCount = 0; // Reset reconnect count on successful connection
     };
 
     eventSource.onmessage = (event) => {
+      if (!isCurrentEventSource()) return;
       try {
         const data = JSON.parse(event.data);
 
@@ -680,6 +766,24 @@ export class ApiClient {
             break;
           }
 
+          case 'tool_output': {
+            console.log(`[ApiClient] Tool output:`, data);
+            const toolOutputEvent = data as { tool_id: string; output: string };
+            callbacks.onToolOutput?.(toolOutputEvent.tool_id, toolOutputEvent.output);
+            break;
+          }
+
+          case 'tool_complete': {
+            console.log(`[ApiClient] Tool complete:`, data);
+            const toolCompleteEvent = data as ToolCompleteEvent;
+            callbacks.onToolComplete?.(
+              toolCompleteEvent.tool_id,
+              toolCompleteEvent.duration_ms,
+              toolCompleteEvent.success
+            );
+            break;
+          }
+
           case 'error':
             console.error(`[ApiClient] Error event:`, data);
             callbacks.onError(data.error);
@@ -694,8 +798,14 @@ export class ApiClient {
             // Resolve the promise with the session ID
             this.sessions$.set(conversationId, data.session_id);
             // Clear the session ID timeout
-            clearTimeout(sessionIdTimeout);
+            window.clearTimeout(sessionIdTimeout);
+            this.eventStreamTimers.set(conversationId, {
+              ...this.eventStreamTimers.get(conversationId),
+              sessionIdTimeout: undefined,
+            });
+            reconnectCount = 0; // Reset reconnect count after the server handshake succeeds
             // Notify that connection is established
+            callbacks.onConnectionState?.({ status: 'connected' });
             callbacks.onConnected?.();
             // Restore state on reconnect (pending tools, generating flag)
             if (callbacks.onReconnectState && (data.pending_tools?.length || data.generating)) {
@@ -731,52 +841,78 @@ export class ApiClient {
       }
     };
 
-    eventSource.onerror = (error) => {
-      console.error(`[ApiClient] Event stream error for ${conversationId}:`, error);
+    eventSource.onerror = (_error) => {
+      if (!isCurrentEventSource()) return;
+      console.error(`[ApiClient] Event stream error for ${conversationId}:`);
 
       // Clear the session ID timeout
-      clearTimeout(sessionIdTimeout);
+      window.clearTimeout(sessionIdTimeout);
+      this.eventStreamTimers.set(conversationId, {
+        ...this.eventStreamTimers.get(conversationId),
+        sessionIdTimeout: undefined,
+      });
 
-      // If we were previously connected, try to reconnect
+      // Close the old EventSource and clean up — we'll reconnect from scratch
+      const wasConnected = isConnected;
       if (isConnected) {
-        console.log(`[ApiClient] Connection was established before, attempting to reconnect...`);
         isConnected = false;
+      }
+      eventSource.close();
+      this.eventSources.delete(conversationId);
 
-        // Only auto-reconnect if we haven't exceeded the max reconnects
-        if (reconnectCount < maxReconnects) {
-          reconnectCount++;
+      // Attempt retry with exponential backoff regardless of whether
+      // we were previously connected (dropped stream) or never connected
+      // (initial failure). Both paths use the same retry budget.
+      if (reconnectCount < maxReconnects) {
+        reconnectCount++;
 
-          // Exponential backoff for reconnection (1s, 2s, 4s, 8s, 16s)
-          const delay = Math.pow(2, reconnectCount - 1) * 1000;
+        const delay = Math.pow(2, reconnectCount - 1) * 1000;
 
-          console.log(
-            `[ApiClient] Reconnecting in ${delay}ms (attempt ${reconnectCount}/${maxReconnects})`
-          );
+        console.log(
+          `[ApiClient] Reconnecting in ${delay}ms (attempt ${reconnectCount}/${maxReconnects})`
+        );
 
-          // Clear any existing timer
-          if (reconnectTimer !== null) {
-            window.clearTimeout(reconnectTimer);
-          }
+        callbacks.onConnectionState?.({
+          status: 'reconnecting',
+          attempt: reconnectCount,
+          maxAttempts: maxReconnects,
+          retryInMs: delay,
+        });
 
-          // Set a new timer for reconnection
-          reconnectTimer = window.setTimeout(() => {
-            reconnect();
-          }, delay);
-        } else {
-          console.warn(`[ApiClient] Max reconnects (${maxReconnects}) reached, giving up`);
-          callbacks.onError?.('Connection lost and max reconnects reached');
-        }
+        const reconnectTimer = window.setTimeout(() => {
+          reconnect(reconnectCount);
+        }, delay);
+        this.eventStreamTimers.set(conversationId, {
+          ...this.eventStreamTimers.get(conversationId),
+          reconnectTimer,
+        });
       } else {
-        // We never established a connection, report the error
-        callbacks.onError?.('Failed to connect to event stream');
+        console.warn(`[ApiClient] Max reconnects (${maxReconnects}) reached, giving up`);
+        callbacks.onConnectionState?.({
+          status: 'disconnected',
+          message: wasConnected
+            ? 'Connection lost and max reconnects reached'
+            : 'Failed to connect to event stream',
+        });
+        callbacks.onError?.(
+          wasConnected
+            ? 'Connection lost and max reconnects reached'
+            : 'Failed to connect to event stream'
+        );
       }
     };
-
-    // Store the event source
-    this.eventSources.set(conversationId, eventSource);
   }
 
   closeEventStream(conversationId: string): void {
+    const timers = this.eventStreamTimers.get(conversationId);
+    if (timers?.reconnectTimer !== undefined) {
+      window.clearTimeout(timers.reconnectTimer);
+    }
+    if (timers?.sessionIdTimeout !== undefined) {
+      window.clearTimeout(timers.sessionIdTimeout);
+    }
+    this.eventStreamTimers.delete(conversationId);
+
     if (this.eventSources.has(conversationId)) {
       this.eventSources.get(conversationId)!.close();
       this.eventSources.delete(conversationId);
@@ -803,13 +939,16 @@ export class ApiClient {
     return data;
   }
 
-  async getConversations(limit: number = 100): Promise<ConversationSummary[]> {
+  async getConversations(
+    limit: number = 100,
+    detail: boolean = false
+  ): Promise<ConversationSummary[]> {
     if (!this.isConnected) {
       throw new ApiClientError('Not connected to API');
     }
     try {
       return await this.fetchJson<ConversationSummary[]>(
-        `${this.baseUrl}/api/v2/conversations?limit=${limit}`
+        `${this.baseUrl}/api/v2/conversations?limit=${limit}&detail=${detail}`
       );
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -819,13 +958,17 @@ export class ApiClient {
     }
   }
 
-  async searchConversations(query: string, limit: number = 20): Promise<ConversationSummary[]> {
+  async searchConversations(
+    query: string,
+    limit: number = 20,
+    detail: boolean = false
+  ): Promise<ConversationSummary[]> {
     if (!this.isConnected) {
       throw new ApiClientError('Not connected to API');
     }
     try {
       return await this.fetchJson<ConversationSummary[]>(
-        `${this.baseUrl}/api/v2/conversations?search=${encodeURIComponent(query)}&limit=${limit}`
+        `${this.baseUrl}/api/v2/conversations?search=${encodeURIComponent(query)}&limit=${limit}&detail=${detail}`
       );
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -837,7 +980,8 @@ export class ApiClient {
 
   async getConversationsPaginated(
     pageParam: number = 0,
-    pageSize: number = 20
+    pageSize: number = 20,
+    detail: boolean = false
   ): Promise<{
     conversations: ConversationSummary[];
     nextCursor: number | undefined;
@@ -849,7 +993,7 @@ export class ApiClient {
       // Fetch one more than needed to detect if there are more conversations
       const fetchLimit = pageParam + pageSize + 1;
       const allConversations = await this.fetchJson<ConversationSummary[]>(
-        `${this.baseUrl}/api/v2/conversations?limit=${fetchLimit}`
+        `${this.baseUrl}/api/v2/conversations?limit=${fetchLimit}&detail=${detail}`
       );
 
       // Slice to get only the requested page
@@ -979,7 +1123,7 @@ export class ApiClient {
         branches: {},
         workspace: options?.workspace || '.',
       },
-      { needsInitialStep: true }
+      { needsInitialStep: true, initialStepStream: options?.stream }
     );
     if (options?.maxTokens !== undefined) {
       setMaxTokens(conversationId, options.maxTokens);
@@ -1136,6 +1280,52 @@ export class ApiClient {
       throw new ApiClientError(`Upload failed: ${response.status}`, response.status);
     }
     return data;
+  }
+
+  async transcribeAudio(
+    audio: Blob,
+    options?: { language?: string; model?: string; signal?: AbortSignal }
+  ): Promise<AudioTranscriptionResponse> {
+    if (!this.isConnected) {
+      throw new ApiClientError('Not connected to API');
+    }
+
+    const format = inferTranscriptionFormat(audio.type);
+    const formData = new FormData();
+    formData.append('file', audio, `speech.${format}`);
+    formData.append('format', format);
+    if (options?.language) {
+      formData.append('language', options.language);
+    }
+    if (options?.model) {
+      formData.append('model', options.model);
+    }
+
+    const headers: Record<string, string> = {};
+    if (this.authHeader) {
+      headers.Authorization = this.authHeader;
+    }
+
+    const url = `${this.baseUrl}/api/v2/audio/transcriptions`;
+    const response = await fetch(
+      url,
+      withLocalAddressSpace(url, {
+        method: 'POST',
+        headers,
+        body: formData,
+        signal: options?.signal,
+      })
+    );
+    const data = await response.json();
+    if (!response.ok) {
+      if (isApiErrorResponse(data)) {
+        const apiError = normalizeApiError(data, response.status);
+        throw new ApiClientError(apiError.message, apiError.status, apiError);
+      }
+      throw new ApiClientError(`Transcription failed: ${response.status}`, response.status);
+    }
+
+    return data as AudioTranscriptionResponse;
   }
 
   async step(
@@ -1371,11 +1561,30 @@ export class ApiClient {
     return await this.fetchJson<ActiveSession[]>(url);
   }
 
+  async getServerHealth(): Promise<ServerHealth> {
+    const url = `${this.baseUrl}/api/v2/server/health`;
+    return await this.fetchJson<ServerHealth>(url);
+  }
+
   async deleteSession(sessionId: string): Promise<void> {
     const url = `${this.baseUrl}/api/v2/sessions/${sessionId}`;
     await this.fetchJson<{ status: string }>(url, { method: 'DELETE' });
   }
 }
+
+/**
+ * Public surface of {@link ApiClient}, with the class's private members
+ * stripped. `keyof` on a class type excludes `private`/`protected` members, so
+ * `Pick<ApiClient, keyof ApiClient>` yields exactly the public API as a plain
+ * structural type — `ApiClient` satisfies it for free, and an alternative
+ * implementation (e.g. the offline `createDemoApiClient`) can satisfy it
+ * *without* re-declaring the private fields a `class … extends ApiClient`
+ * would inherit. This is the seam the client pool (`stores/serverClients.ts`)
+ * and `ApiContext` are typed against so a live or demo backend can be swapped
+ * transparently. Self-maintaining: a new public method on `ApiClient` is
+ * automatically required of every `IApiClient` implementation.
+ */
+export type IApiClient = Pick<ApiClient, keyof ApiClient>;
 
 export const createApiClient = (baseUrl?: string, authHeader?: string | null): ApiClient => {
   return new ApiClient(baseUrl, authHeader);

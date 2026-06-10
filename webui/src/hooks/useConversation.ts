@@ -1,17 +1,21 @@
-import { useEffect, useRef } from 'react';
+import { useCallback, useEffect, useRef, useState } from 'react';
 import { useApi } from '@/contexts/ApiContext';
 import { useToast } from '@/components/ui/use-toast';
 import type { Message, StreamingMessage } from '@/types/conversation';
 import type { ChatOptions } from '@/components/ChatInput';
 import { demoConversations, getDemoMessages } from '@/democonversations';
+import { isDemoMode } from '@/utils/connectionConfig';
 import { use$ } from '@legendapp/state/react';
 import {
   conversations$,
   updateConversation,
   setGenerating,
   setConnected,
+  setConnectionStatus,
   setPendingTool,
   setExecutingTool,
+  setToolOutput,
+  setToolComplete,
   addMessage,
   setMessageStatus,
   removeMessage,
@@ -21,12 +25,13 @@ import {
   initConversation,
   selectedConversation$,
   updateConversationName,
-  setNeedsInitialStep,
+  clearInitialStepState,
   setMaxTokens,
   setTemperature,
   setTopP,
 } from '@/stores/conversations';
 import { playChime } from '@/utils/audio';
+import { speakText } from '@/utils/tts';
 import { findLatestAssistantIndexForError } from '@/utils/conversationErrorHandling';
 import { notifyGenerationComplete, notifyToolConfirmation } from '@/utils/notifications';
 import { ApiClientError, getApiErrorPresentation } from '@/utils/api';
@@ -46,6 +51,8 @@ export function useConversation(conversationId: string, serverId?: string) {
   const topP = use$(() => conversation$?.topP.get());
 
   const messageJustCompleted = useRef(false);
+  // Bumped by retryLoad() to re-run the load+connect effect after a failure.
+  const [retryNonce, setRetryNonce] = useState(0);
 
   // Initialize conversation in store if needed
   useEffect(() => {
@@ -54,6 +61,36 @@ export function useConversation(conversationId: string, serverId?: string) {
       initConversation(conversationId);
     }
   }, [conversationId, conversation$]);
+
+  // Ensure the conversation's chat config is loaded whenever it's missing.
+  // The main load+connect effect below early-returns for already-connected
+  // conversations, so without this, switching to a previously-opened
+  // conversation leaves chatConfig (and thus the model selector) stale until
+  // the user opens Chat Settings.
+  useEffect(() => {
+    if (!isConnected || isDemoMode()) return;
+    if (demoConversations.some((c) => c.id === conversationId)) return;
+    // Only handle the already-connected case; the load+connect effect below
+    // fetches chatConfig for not-yet-connected conversations, so skipping here
+    // avoids a duplicate request on initial open.
+    if (!conversation$?.isConnected.peek()) return;
+    if (conversation$?.chatConfig.peek()) return;
+    let cancelled = false;
+    api
+      .getChatConfig(conversationId)
+      .then((chatConfig) => {
+        if (!cancelled) updateConversation(conversationId, { chatConfig });
+      })
+      .catch((error) => {
+        console.warn(
+          `[useConversation] Failed to preload chat config for ${conversationId}:`,
+          error
+        );
+      });
+    return () => {
+      cancelled = true;
+    };
+  }, [conversationId, isConnected, api, conversation$]);
 
   // Load conversation data and connect to event stream
   useEffect(() => {
@@ -95,7 +132,7 @@ export function useConversation(conversationId: string, serverId?: string) {
             // Also load the chat config
             try {
               const chatConfig = await api.getChatConfig(conversationId);
-              updateConversation(conversationId, { data, chatConfig });
+              updateConversation(conversationId, { data, chatConfig, loadError: null });
               console.log(`[useConversation] Loaded conversation and config for ${conversationId}`);
             } catch (error) {
               console.warn(
@@ -103,14 +140,23 @@ export function useConversation(conversationId: string, serverId?: string) {
                 error
               );
               // Still update with conversation data even if config fails
-              updateConversation(conversationId, { data });
+              updateConversation(conversationId, { data, loadError: null });
             }
           } catch (error) {
             console.warn(
               `[useConversation] Failed to load conversation ${conversationId} from API:`,
               error
             );
-            // Don't overwrite existing placeholder data if API call fails
+            // Don't overwrite existing placeholder data if API call fails, but
+            // surface the failure so the user isn't left staring at a blank chat.
+            const message = error instanceof Error ? error.message : 'Failed to load conversation';
+            updateConversation(conversationId, { loadError: message });
+            toast({
+              variant: 'destructive',
+              title: 'Failed to load conversation',
+              description: message,
+            });
+            return;
           }
         }
 
@@ -215,6 +261,7 @@ export function useConversation(conversationId: string, serverId?: string) {
                   playChime().catch((error) => {
                     console.warn('Failed to play completion chime:', error);
                   });
+                  speakText(message.content);
                   notifyGenerationComplete(conversation$?.data.name.get()).catch((error) => {
                     console.warn('Failed to show completion notification:', error);
                   });
@@ -271,13 +318,39 @@ export function useConversation(conversationId: string, serverId?: string) {
               if (pendingTool && pendingTool.id === toolId) {
                 // Move from pending to executing (generating stays false - tools can't be interrupted)
                 setPendingTool(conversationId, null, null);
-                setExecutingTool(conversationId, toolId, pendingTool.tooluse);
+                setExecutingTool(conversationId, toolId, pendingTool.tooluse, Date.now());
               } else {
                 console.warn(
                   '[useConversation] No matching pending tool found for executing tool:',
                   toolId
                 );
               }
+            },
+            onToolOutput: (toolId, content) => {
+              const executingTool = conversation$?.executingTool.get();
+              if (executingTool && executingTool.id === toolId) {
+                setToolOutput(conversationId, content);
+              }
+            },
+            onToolComplete: (toolId, durationMs, success) => {
+              console.log('[useConversation] Tool complete:', { toolId, durationMs, success });
+              const executingTool = conversation$?.executingTool.get();
+              if (!executingTool) {
+                console.warn(
+                  '[useConversation] tool_complete received with no executing tool — ignoring stale event:',
+                  { toolId }
+                );
+                return;
+              }
+              if (executingTool.id !== toolId) {
+                console.warn(
+                  '[useConversation] tool_complete ID mismatch — ignoring stale event:',
+                  { received: toolId, executing: executingTool.id }
+                );
+                return;
+              }
+              const toolName = executingTool.tooluse.tool;
+              setToolComplete(conversationId, toolName, durationMs, success);
             },
             onInterrupted: () => {
               console.log('[useConversation] Generation interrupted');
@@ -339,20 +412,47 @@ export function useConversation(conversationId: string, serverId?: string) {
               }
             },
             onConnected: () => {
-              setConnected(conversationId, true);
-
               // Check if this conversation needs initial step (was created from WelcomeView)
               // This fixes the race condition where step() was called before subscription
               const needsStep = conversation$?.needsInitialStep?.get();
               if (needsStep) {
                 console.log('[useConversation] Triggering initial step after subscription');
-                setNeedsInitialStep(conversationId, false);
+                const initialStepStream = conversation$?.initialStepStream?.get();
+                clearInitialStepState(conversationId);
                 api
-                  .step(conversationId, undefined, true, 'main', maxTokens, temperature, topP)
+                  .step(
+                    conversationId,
+                    undefined,
+                    initialStepStream ?? true,
+                    'main',
+                    maxTokens,
+                    temperature,
+                    topP
+                  )
                   .catch((error) => {
                     console.error('[useConversation] Error triggering initial step:', error);
                     toastStepStartError(toast, error);
                   });
+              }
+            },
+            onConnectionState: (state) => {
+              switch (state.status) {
+                case 'connected':
+                  setConnectionStatus(conversationId, 'connected');
+                  break;
+                case 'reconnecting':
+                  setConnectionStatus(conversationId, 'reconnecting', {
+                    attempt: state.attempt,
+                    maxAttempts: state.maxAttempts,
+                    retryInMs: state.retryInMs,
+                  });
+                  break;
+                case 'disconnected':
+                  setConnectionStatus(conversationId, 'disconnected', { error: state.message });
+                  break;
+                case 'connecting':
+                  setConnectionStatus(conversationId, 'connecting');
+                  break;
               }
             },
             onReconnectState: (state) => {
@@ -409,7 +509,7 @@ export function useConversation(conversationId: string, serverId?: string) {
         setConnected(conversationId, false);
       }
     };
-  }, [conversationId, isConnected, api, conversation$, toast]);
+  }, [conversationId, isConnected, api, conversation$, toast, retryNonce]);
 
   const sendMessage = async ({ message, options }: { message: string; options?: ChatOptions }) => {
     if (!conversation$) {
@@ -680,8 +780,18 @@ export function useConversation(conversationId: string, serverId?: string) {
     setCurrentBranch(conversationId, branchName);
   };
 
+  // Re-attempt loading the conversation after a load failure. Bumping the nonce
+  // re-runs the load+connect effect, which both re-fetches data AND re-subscribes
+  // to the SSE event stream (the data-only retry left the conversation
+  // permanently disconnected).
+  const retryLoad = useCallback(() => {
+    updateConversation(conversationId, { loadError: null });
+    setRetryNonce((n) => n + 1);
+  }, [conversationId]);
+
   return {
     conversation$,
+    retryLoad,
     sendMessage,
     retryMessage,
     editMessage,

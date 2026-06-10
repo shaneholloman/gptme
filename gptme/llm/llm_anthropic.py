@@ -722,6 +722,7 @@ def stream(
     max_tokens: int | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
+    _partial: dict | None = None,
 ) -> Generator[str, None, MessageMetadata | None]:
     import anthropic.types  # fmt: skip
     from anthropic import NOT_GIVEN  # fmt: skip
@@ -783,11 +784,11 @@ def stream(
         messages=messages_dicts,
         system=system_messages,
         temperature=_temperature if not model_meta.supports_reasoning else 1,
-        top_p=_top_p if not model_meta.supports_reasoning else NOT_GIVEN,
+        top_p=_top_p if not model_meta.supports_reasoning else NOT_GIVEN,  # type: ignore[arg-type]
         max_tokens=max_tokens,
-        tools=tools_dict or NOT_GIVEN,
+        tools=tools_dict or NOT_GIVEN,  # type: ignore[arg-type]
         thinking=thinking_param if thinking_param is not None else NOT_GIVEN,  # type: ignore[arg-type]
-        **output_config_kwargs,
+        **output_config_kwargs,  # type: ignore[arg-type]
         **_fast_mode_kwargs(),
     ) as stream:
         for chunk in stream:
@@ -862,7 +863,28 @@ def stream(
                         anthropic.types.MessageStartEvent,
                         chunk,
                     )
-                    # Don't record usage here, wait for message_delta with final usage
+                    # Capture input/cache token counts now as a fallback for
+                    # callers that break the stream before message_delta arrives
+                    # (e.g. break_on_tooluse).  Written into the shared _partial
+                    # dict; _StreamWithMetadata reads it in its finally block.
+                    if _partial is not None and chunk.message.usage:
+                        usage = chunk.message.usage
+                        partial_usage: dict = {}
+                        if (v := getattr(usage, "input_tokens", None)) is not None:
+                            partial_usage["input_tokens"] = v
+                        if (
+                            v := getattr(usage, "cache_read_input_tokens", None)
+                        ) is not None:
+                            partial_usage["cache_read_tokens"] = v
+                        if (
+                            v := getattr(usage, "cache_creation_input_tokens", None)
+                        ) is not None:
+                            partial_usage["cache_creation_tokens"] = v
+                        if partial_usage:
+                            _partial["metadata"] = {
+                                "model": model,
+                                "usage": partial_usage,
+                            }
                 case "message_delta":
                     chunk = cast(anthropic.types.MessageDeltaEvent, chunk)
                     # Record usage from message_delta which contains the final/cumulative usage

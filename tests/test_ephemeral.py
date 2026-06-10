@@ -4,7 +4,6 @@ from datetime import datetime, timezone
 from typing import Literal
 
 from gptme.logmanager.manager import (
-    _auto_tag_ephemeral,
     ephemeral_cache_boundary,
     prune_ephemeral_messages,
 )
@@ -154,7 +153,7 @@ def test_pinned_message_never_pruned():
     assert len(pinned_msgs) == 1
 
 
-def test_prune_merges_consecutive_roles_after_drop():
+def test_prune_merges_consecutive_roles_after_thinking_only_drop():
     msgs = [
         _msg("system", "System"),
         _msg("user", "Q0"),
@@ -250,35 +249,20 @@ def test_ephemeral_cache_boundary_none_when_first_msg_is_ephemeral():
     assert ephemeral_cache_boundary(msgs) is None
 
 
-# ---------------------------------------------------------------------------
-# _auto_tag_ephemeral
-# ---------------------------------------------------------------------------
-
-
-def test_auto_tag_thinking_message():
-    msg = _msg("assistant", "Let me think.\n<think>\nreasoning here\n</think>\nAnswer.")
-    tagged = _auto_tag_ephemeral(msg)
-    assert tagged.ephemeral_ttl is not None
-    assert tagged.ephemeral_ttl > 0
-
-
-def test_auto_tag_thinking_tag():
-    msg = _msg("assistant", "<thinking>chain of thought</thinking>Result.")
-    tagged = _auto_tag_ephemeral(msg)
-    assert tagged.ephemeral_ttl is not None
-
-
-def test_auto_tag_no_thinking_unchanged():
-    msg = _msg("assistant", "Plain answer with no thinking block.")
-    tagged = _auto_tag_ephemeral(msg)
-    assert tagged.ephemeral_ttl is None
-
-
-def test_auto_tag_respects_existing_ttl():
-    msg = _msg("assistant", "<think>x</think>", ttl=5)
-    # Should not overwrite existing TTL set by caller
-    tagged = _auto_tag_ephemeral(msg)
-    assert tagged.ephemeral_ttl == 5
+def test_unmarked_thinking_message_not_pruned_by_default():
+    msgs = [
+        _msg("system", "System"),
+        _msg("user", "Q0"),
+        _msg("assistant", "<think>reasoning</think>A0"),
+        _msg("user", "Q1"),
+        _msg("assistant", "A1"),
+        _msg("user", "Q2"),
+        _msg("assistant", "A2"),
+        _msg("user", "Q3"),
+        _msg("assistant", "A3"),
+    ]
+    result = prune_ephemeral_messages(msgs)
+    assert result == msgs
 
 
 # ---------------------------------------------------------------------------

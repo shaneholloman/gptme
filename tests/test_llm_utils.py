@@ -449,6 +449,54 @@ def test_reply_stream_on_token_callback(monkeypatch):
     assert len(collected) < len(expected_text)
 
 
+def test_reply_stream_generation_chunk_hook(monkeypatch):
+    """generation.chunk hooks receive streamed lines even without an on_token callback."""
+    from gptme.hooks import HookType, clear_hooks, register_hook
+    from gptme.llm import _reply_stream
+    from gptme.message import Message
+
+    chunks_to_yield = ["Hello world.\n", "How are you?"]
+
+    def _fake_gen(chunks):
+        yield from chunks
+
+    class _FakeStream:
+        def __init__(self, chunks):
+            self.gen = _fake_gen(chunks)
+            self.metadata = {"model": "test/model"}
+
+        def __iter__(self):
+            yield from self.gen
+
+    monkeypatch.setattr(
+        "gptme.llm._stream",
+        lambda *args, **kwargs: _FakeStream(chunks_to_yield),
+    )
+
+    received: list[str] = []
+
+    def chunk_hook(chunk, **kwargs):
+        received.append(chunk)
+        return
+        yield  # make it a generator
+
+    clear_hooks(HookType.GENERATION_CHUNK)
+    register_hook("test.chunk", HookType.GENERATION_CHUNK, chunk_hook)
+    try:
+        # Note: no on_token — the hook alone drives chunk emission.
+        result = _reply_stream(
+            messages=[Message("user", "hi")],
+            model="test/model",
+            tools=None,
+        )
+    finally:
+        clear_hooks(HookType.GENERATION_CHUNK)
+
+    assert result.content == "Hello world.\nHow are you?"
+    # Hook receives whole lines (newline-terminated) plus the final partial line.
+    assert received == ["Hello world.\n", "How are you?"]
+
+
 def test_reply_stream_on_token_break_on_tooluse(monkeypatch):
     """on_token receives only content up to the break_on_tooluse breakpoint."""
     from gptme.llm import _reply_stream
@@ -662,6 +710,127 @@ def test_reply_stream_on_token_thinking_tag_suppressed(monkeypatch):
     # newline before the answer.  (Without the `and line_buffer` guard, callers
     # would receive "\nHello, world!" instead of "Hello, world!".)
     assert not received_text.startswith("\n")
+
+
+def test_reply_stream_multiline_think_sig_suppressed(monkeypatch):
+    """Multiline <!-- think-sig: ... --> comments must be invisible in streaming.
+
+    The fix in #2703 only suppressed the FIRST line of the comment.  Continuation
+    lines (plain base64) were still printed dimly because are_thinking=True.
+    This test verifies all lines of the comment are hidden from the terminal
+    output AND from on_token callbacks.
+    """
+    from gptme.llm import _reply_stream
+    from gptme.message import Message
+
+    # Multiline think-sig as Anthropic emits it
+    chunks = [
+        "<think>\n",
+        "some reasoning\n",
+        "<!-- think-sig: abc123\n",  # first line starts comment
+        "continuation_base64\n",  # continuation line — was leaked before fix
+        "more_base64 -->\n",  # closing line
+        "\n</think>\n\n",
+        "Actual answer",
+    ]
+    full_text = "".join(chunks)
+
+    def _fake_gen(c):
+        yield from c
+
+    class _FakeStream:
+        def __init__(self, c):
+            self.gen = _fake_gen(c)
+            self.metadata = {"model": "test/model"}
+
+        def __iter__(self):
+            yield from self.gen
+
+    monkeypatch.setattr(
+        "gptme.llm._stream",
+        lambda *args, **kwargs: _FakeStream(chunks),
+    )
+
+    collected: list[str] = []
+    result = _reply_stream(
+        messages=[Message("user", "hi")],
+        model="test/model",
+        tools=None,
+        on_token=collected.append,
+    )
+
+    # Full output (stored log) must include the raw comment for round-tripping
+    assert "think-sig" in result.content
+    assert result.content == full_text
+
+    received_text = "".join(collected)
+
+    # Terminal / on_token output must be clean
+    assert received_text == "Actual answer", repr(received_text)
+    assert "think-sig" not in received_text
+    assert "continuation_base64" not in received_text
+    assert "more_base64" not in received_text
+
+
+def test_reply_stream_think_sig_long_line_not_printed(monkeypatch):
+    """Long think-sig lines must never reach rprint (terminal display).
+
+    The previous fix (#2703) called print_clear() after printing each char
+    dim one-by-one.  For lines longer than the terminal width the content
+    already wrapped, and print_clear() (which only issues \\r + spaces for
+    the current row) could not erase the wrapped rows.
+
+    The fix: buffer thinking-block chars and emit per-line, so think-sig lines
+    are simply discarded from the buffer without ever touching the terminal.
+    """
+    from gptme.llm import _reply_stream
+    from gptme.message import Message
+
+    # A long base64-looking think-sig line that would wrap in an 80-col terminal
+    long_sig = "A" * 300
+    chunks = [
+        "<think>\n",
+        "short reasoning\n",
+        f"<!-- think-sig: {long_sig}\n",  # first line (>80 chars)
+        f"{long_sig} -->\n",  # closing line still long
+        "</think>\n\n",
+        "Answer",
+    ]
+
+    def _fake_gen(c):
+        yield from c
+
+    class _FakeStream:
+        def __init__(self, c):
+            self.gen = _fake_gen(c)
+            self.metadata = {"model": "test/model"}
+
+        def __iter__(self):
+            yield from self.gen
+
+    monkeypatch.setattr(
+        "gptme.llm._stream",
+        lambda *args, **kwargs: _FakeStream(chunks),
+    )
+
+    printed: list[str] = []
+    monkeypatch.setattr("gptme.llm.rprint", lambda *a, **kw: printed.append(str(a)))
+
+    result = _reply_stream(
+        messages=[Message("user", "hi")],
+        model="test/model",
+        tools=None,
+    )
+
+    # The raw signature must survive in stored content for round-tripping
+    assert "think-sig" in result.content
+
+    # No think-sig content must ever have been passed to rprint
+    printed_text = " ".join(printed)
+    assert "think-sig" not in printed_text, (
+        f"think-sig leaked to terminal: {printed_text[:200]}"
+    )
+    assert long_sig not in printed_text, "long sig line leaked to terminal"
 
 
 def test_extract_thinking_content_with_signature():

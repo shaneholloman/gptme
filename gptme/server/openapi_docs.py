@@ -101,6 +101,7 @@ class ConversationResponse(BaseModel):
 
     name: str = Field(..., description="Conversation name")
     log: list[dict] = Field(..., description="Message history as raw objects")
+    logdir: str = Field(..., description="Conversation log directory path")
     workspace: str = Field(..., description="Workspace path")
     session: dict | None = Field(
         None,
@@ -207,6 +208,72 @@ class UserDefaultModelSaveResponse(BaseModel):
     )
 
 
+class UserFavoritesSaveRequest(BaseModel):
+    """Request to save the user's favorite models."""
+
+    favorites: list[str] = Field(
+        ...,
+        description="Fully-qualified model ids to store as favorites",
+    )
+
+
+class UserFavoritesSaveResponse(BaseModel):
+    """Response after persisting favorite models."""
+
+    status: str = Field(..., description="Operation status")
+    favorites: list[str] = Field(..., description="Favorite model ids that were saved")
+
+
+class UserConfigFileResponse(BaseModel):
+    """Raw user config file contents plus path metadata."""
+
+    content: str = Field(..., description="Raw TOML contents of config.toml")
+    path: str = Field(..., description="Main config file path")
+    write_target: str = Field(..., description="Config path writes are applied to")
+    local_config_path: str = Field(..., description="Local override config path")
+    local_config_exists: bool = Field(
+        ..., description="Whether config.local.toml exists"
+    )
+    local_overrides_main: bool = Field(
+        True, description="Whether local config values override main config values"
+    )
+
+
+class UserConfigFileSaveRequest(BaseModel):
+    """Request to replace the raw user config file."""
+
+    content: str = Field(..., description="Raw TOML contents to write to config.toml")
+
+
+class UserConfigFileSaveResponse(UserConfigFileResponse):
+    """Response after replacing the raw user config file."""
+
+    status: str = Field(..., description="Operation status")
+
+
+class UserConfigFilePatchRequest(BaseModel):
+    """Request to update one dotted key in the user config file."""
+
+    key: str = Field(..., description="Dotted key path, for example env.MODEL")
+    value: str | int | float | bool = Field(
+        ...,
+        description=(
+            "JSON scalar value to persist at the key path. Strings remain "
+            "strings; booleans and numbers keep their TOML type."
+        ),
+    )
+    reload: bool = Field(
+        True, description="Whether to reload gptme config after writing the value"
+    )
+
+
+class UserConfigFilePatchResponse(UserConfigFileResponse):
+    """Response after updating one config value."""
+
+    status: str = Field(..., description="Operation status")
+    key: str = Field(..., description="Dotted key path that was updated")
+
+
 class UserSettingsResponse(BaseModel):
     """Current user settings state (read-only snapshot)."""
 
@@ -238,6 +305,22 @@ class UserSettingsResponse(BaseModel):
         description=(
             "Paths and merge behavior for user config files, including the main "
             "config path, local override path, and the write target used by the UI."
+        ),
+    )
+
+
+class AudioTranscriptionResponse(BaseModel):
+    """Response from the speech-to-text transcription endpoint."""
+
+    text: str = Field(..., description="Transcribed text")
+    model: str = Field(
+        ..., description="Fully qualified OpenRouter model used for transcription"
+    )
+    usage: dict[str, int | float] | None = Field(
+        None,
+        description=(
+            "Optional usage/cost metadata returned by OpenRouter, such as "
+            "seconds, tokens, and cost."
         ),
     )
 

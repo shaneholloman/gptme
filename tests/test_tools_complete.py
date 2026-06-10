@@ -30,6 +30,7 @@ from gptme.tools.complete import (
     auto_reply_hook,
     complete_hook,
     execute_complete,
+    stuck_detect_hook,
     tool,
 )
 
@@ -376,8 +377,126 @@ class TestAutoReplyHook:
         assert isinstance(msg, Message)
         assert msg.role == "user"
 
+    # ── TestToolSpec ──────────────────────���───────────────────────────────────
 
-# ── TestToolSpec ──────────────────────���───────────────────────────────────
+    # ── Interactive + no_confirm mode tests ──
+
+    def test_interactive_no_confirm_nudges_think_only(self):
+        """In interactive+no_confirm mode, injects a quiet nudge on think-only."""
+        manager = _mock_manager(
+            [
+                _user("implement feature X"),
+                _assistant("Let me think about the best approach for X..."),
+            ]
+        )
+        gen = auto_reply_hook(
+            manager, interactive=True, prompt_queue=None, no_confirm=True
+        )
+        results = list(gen)
+        assert len(results) == 1
+        msg = results[0]
+        assert isinstance(msg, Message)
+        assert msg.role == "user"
+        assert "No tool call detected" in msg.content
+        assert msg.quiet is True
+
+    def test_interactive_no_confirm_noop_when_has_tools(self):
+        """In interactive+no_confirm mode, no nudge when assistant used tools."""
+        manager = _mock_manager(
+            [
+                _user("save a file"),
+                _assistant("```save test.txt\nhello\n```"),
+            ]
+        )
+        gen = auto_reply_hook(
+            manager, interactive=True, prompt_queue=None, no_confirm=True
+        )
+        results = list(gen)
+        assert results == []
+
+    def test_interactive_no_confirm_noop_on_second_nudge(self):
+        """In interactive+no_confirm mode, only nudges once per think-only sequence."""
+        manager = _mock_manager(
+            [
+                _user("implement feature X"),
+                _assistant("Let me think about this..."),
+                _user(
+                    "<system>No tool call detected. Please continue with a tool call, or use `complete` if done.</system>"
+                ),
+                _assistant("I'm still thinking about the approach..."),
+            ]
+        )
+        gen = auto_reply_hook(
+            manager, interactive=True, prompt_queue=None, no_confirm=True
+        )
+        results = list(gen)
+        # Second think-only after nudge should be silent (no pile-on)
+        assert results == []
+
+    def test_interactive_no_confirm_does_not_exit(self):
+        """Interactive+no_confirm nudge has no exit logic (no SessionCompleteException)."""
+        manager = _mock_manager(
+            [
+                _user("do something"),
+                _assistant("I'm thinking..."),
+                _user(
+                    "<system>No tool call detected. Please continue with a tool call, or use `complete` if done.</system>"
+                ),
+                _assistant("Still thinking about the best approach..."),
+            ]
+        )
+        # Should not raise an exception regardless of how many think-only responses
+        gen = auto_reply_hook(
+            manager, interactive=True, prompt_queue=None, no_confirm=True
+        )
+        results = list(gen)
+        assert results == []
+
+    def test_interactive_no_confirm_noop_when_no_assistant_msg(self):
+        """Early return in _auto_reply_nudge_interactive when no assistant message exists."""
+        manager = _mock_manager(
+            [
+                _user("do something"),
+            ]
+        )
+        gen = auto_reply_hook(
+            manager, interactive=True, prompt_queue=None, no_confirm=True
+        )
+        results = list(gen)
+        assert results == []
+
+    def test_interactive_no_confirm_nudge_stops_at_prior_tool_use(self):
+        """Nudge counting loop stops at a prior assistant message with tools.
+
+        The backward nudge scan walks past nudges and think-only assistant messages,
+        and when it reaches a prior assistant turn that DID use tools, it breaks
+        without iterating further.
+        """
+        manager = _mock_manager(
+            [
+                _user("write a file"),
+                _assistant(
+                    "```save hello.txt\nworld\n```"
+                ),  # has tools — scan boundary
+                # First think-only sequence: nudged
+                _user(
+                    "<system>No tool call detected. Please continue with a tool call, or use `complete` if done.</system>"
+                ),
+                _assistant("I'm thinking..."),
+                # Second think-only sequence: nudged again (previous was different)
+                _user(
+                    "<system>No tool call detected. Please continue with a tool call, or use `complete` if done.</system>"
+                ),
+                _assistant("Still thinking..."),
+                # Third think-only: should NOT nudge (already 2 nudges in sequence)
+            ]
+        )
+        gen = auto_reply_hook(
+            manager, interactive=True, prompt_queue=None, no_confirm=True
+        )
+        results = list(gen)
+        # Already nudged twice, scan reaches the save tool use and breaks → no more nudges
+        assert results == []
 
 
 class TestToolSpec:
@@ -424,3 +543,161 @@ class TestToolSpec:
         examples = tool.examples
         assert isinstance(examples, str)
         assert "complete" in examples.lower()
+
+
+# ── TestStuckDetectHook ────────────────────────────────────────────────────
+
+
+class TestStuckDetectHook:
+    """Tests for stuck_detect_hook — LOOP_CONTINUE hook for repeating-tool loops.
+
+    Unlike auto_reply_hook, this fires when the last assistant message *has* tool
+    uses but keeps repeating the same action without progress (gptme/gptme#2725).
+    """
+
+    _SAVE_A = "```save a.txt\nhello\n```"
+    _SAVE_B = "```save b.txt\nworld\n```"
+
+    def test_interactive_noop(self):
+        """No action in interactive mode, even with identical repeats."""
+        manager = _mock_manager([_assistant(self._SAVE_A)] * 3)
+        results = list(stuck_detect_hook(manager, interactive=True, prompt_queue=None))
+        assert results == []
+
+    def test_disabled_via_env_noop(self, monkeypatch):
+        """No action when GPTME_STUCK_DETECT is turned off."""
+        monkeypatch.setenv("GPTME_STUCK_DETECT", "0")
+        manager = _mock_manager([_assistant(self._SAVE_A)] * 3)
+        results = list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+        assert results == []
+
+    def test_queued_prompts_noop(self):
+        """No action when prompt queue has items."""
+        manager = _mock_manager([_assistant(self._SAVE_A)] * 3)
+        results = list(
+            stuck_detect_hook(manager, interactive=False, prompt_queue=["next"])
+        )
+        assert results == []
+
+    def test_below_threshold_noop(self):
+        """No action when identical repeats are fewer than the threshold."""
+        manager = _mock_manager([_assistant(self._SAVE_A)] * 2)
+        results = list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+        assert results == []
+
+    def test_no_tool_use_noop(self):
+        """No action when the last assistant message has no tool uses.
+
+        That case belongs to auto_reply_hook, not this hook.
+        """
+        manager = _mock_manager([_assistant("just thinking out loud")] * 3)
+        results = list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+        assert results == []
+
+    def test_distinct_calls_noop(self):
+        """No action when each turn issues a different tool call."""
+        manager = _mock_manager(
+            [
+                _assistant(self._SAVE_A),
+                _assistant(self._SAVE_B),
+                _assistant("```save c.txt\n!\n```"),
+            ]
+        )
+        results = list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+        assert results == []
+
+    def test_three_identical_turns_nudges(self):
+        """Three identical tool-call turns yield a single stuck nudge, no raise."""
+        manager = _mock_manager([_assistant(self._SAVE_A)] * 3)
+        results = list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+        assert len(results) == 1
+        msg = results[0]
+        assert isinstance(msg, Message)
+        assert msg.role == "user"
+        assert "appear stuck" in msg.content.lower()
+        assert "save" in msg.content
+
+    def test_different_call_resets_after_repeats(self):
+        """A different tool call on top of a stuck run resets detection."""
+        manager = _mock_manager(
+            [
+                _assistant(self._SAVE_A),
+                _assistant(self._SAVE_A),
+                _assistant(self._SAVE_A),
+                _assistant(self._SAVE_B),  # different action breaks the loop
+            ]
+        )
+        results = list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+        assert results == []
+
+    def test_raises_after_escalate_max(self):
+        """Raises SessionCompleteException once escalations hit the max unbroken."""
+        marker = "<system>You appear stuck: same action repeated.</system>"
+        manager = _mock_manager(
+            [
+                _assistant(self._SAVE_A),
+                _user(marker),
+                _assistant(self._SAVE_A),
+                _user(marker),
+                _assistant(self._SAVE_A),
+            ]
+        )
+        with pytest.raises(SessionCompleteException, match="escalations"):
+            list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+
+    def test_raises_after_escalate_max_with_system_msgs(self):
+        """Raises SessionCompleteException with a realistic log that includes system messages.
+
+        In real sessions LOOP_CONTINUE fires after tool execution, so the log
+        always ends with a system message (tool result). The escalation counter
+        must skip those instead of stopping at them, otherwise escalation_count
+        stays 0 and SessionCompleteException never fires.
+        """
+        marker = "<system>You appear stuck: same action repeated.</system>"
+        manager = _mock_manager(
+            [
+                _assistant(self._SAVE_A),
+                _system("Output: hello"),  # tool result after first repeat
+                _user(marker),
+                _assistant(self._SAVE_A),
+                _system("Output: hello"),  # tool result after second repeat
+                _user(marker),
+                _assistant(self._SAVE_A),
+                _system("Output: hello"),  # tool result present when hook fires
+            ]
+        )
+        with pytest.raises(SessionCompleteException, match="escalations"):
+            list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+
+    def test_custom_threshold_via_env(self, monkeypatch):
+        """Repeat threshold is configurable; 2 identical turns trip a lower one."""
+        monkeypatch.setenv("GPTME_STUCK_REPEAT_THRESHOLD", "2")
+        manager = _mock_manager([_assistant(self._SAVE_A)] * 2)
+        results = list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+        assert len(results) == 1
+        msg = results[0]
+        assert isinstance(msg, Message)
+        assert "appear stuck" in msg.content.lower()
+
+    def test_multi_tool_turn_order_independent(self):
+        """Reordered multi-tool turns share a fingerprint (still detected stuck).
+
+        Also verifies that the nudge message names ALL repeated tools, not just the
+        first one alphabetically (P2 fix: use full set instead of latest_fp[0][0]).
+        """
+        turn1 = f"{self._SAVE_A}\n{self._SAVE_B}"
+        turn2 = f"{self._SAVE_B}\n{self._SAVE_A}"  # same multiset, different order
+        manager = _mock_manager(
+            [_assistant(turn1), _assistant(turn2), _assistant(turn1)]
+        )
+        results = list(stuck_detect_hook(manager, interactive=False, prompt_queue=None))
+        assert len(results) == 1
+        msg = results[0]
+        assert isinstance(msg, Message)
+        assert "appear stuck" in msg.content.lower()
+        # Both tool names must appear in the nudge (not just the alphabetically-first one)
+        assert "save" in msg.content  # both _SAVE_A and _SAVE_B use the "save" tool
+
+    def test_stuck_detect_hook_registered(self):
+        """Stuck-detect hook is registered on the complete tool spec."""
+        assert "stuck_detect" in tool.hooks

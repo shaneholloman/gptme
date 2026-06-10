@@ -1,7 +1,6 @@
 import { render, screen, fireEvent, waitFor } from '@testing-library/react';
 import { BrowserRouter } from 'react-router-dom';
 import { CommandPalette } from '../CommandPalette';
-import { settingsModal$ } from '@/stores/settingsModal';
 
 // Mock ApiContext with a stable `api` reference to avoid infinite re-render loop.
 // useEffect in CommandPalette has [search, api] as deps — if useApi() returns a
@@ -11,11 +10,6 @@ jest.mock('@/contexts/ApiContext', () => {
   const api = { searchConversations: jest.fn().mockResolvedValue([]) };
   return { useApi: () => ({ api }) };
 });
-
-// Mock settingsModal$ store - use inline jest.fn() to avoid hoisting issues
-jest.mock('@/stores/settingsModal', () => ({
-  settingsModal$: { open: { set: jest.fn() } },
-}));
 
 // Mock commandPalette$ store
 jest.mock('@/stores/commandPalette', () => ({
@@ -87,7 +81,6 @@ jest.mock('react-router-dom', () => {
 describe('CommandPalette', () => {
   beforeEach(() => {
     mockNavigate.mockClear();
-    (settingsModal$.open.set as jest.Mock).mockClear();
   });
 
   afterEach(() => {
@@ -159,6 +152,41 @@ describe('CommandPalette', () => {
       document.dispatchEvent(event);
 
       expect(preventDefaultSpy).toHaveBeenCalled();
+    });
+
+    it('navigates to home with Alt+N', () => {
+      renderCommandPalette();
+      fireEvent.keyDown(document, { key: 'n', code: 'KeyN', altKey: true });
+      expect(mockNavigate).toHaveBeenCalledWith('/');
+    });
+
+    it('prevents default browser behavior for Alt+N', () => {
+      renderCommandPalette();
+      const event = new KeyboardEvent('keydown', {
+        key: 'n',
+        code: 'KeyN',
+        altKey: true,
+        cancelable: true,
+      });
+      const preventDefaultSpy = jest.spyOn(event, 'preventDefault');
+
+      document.dispatchEvent(event);
+
+      expect(preventDefaultSpy).toHaveBeenCalled();
+    });
+
+    it('does not navigate with Alt+N when typing in an input', () => {
+      render(
+        <BrowserRouter>
+          <>
+            <input data-testid="text-field" />
+            <CommandPalette />
+          </>
+        </BrowserRouter>
+      );
+      const input = screen.getByTestId('text-field');
+      fireEvent.keyDown(input, { key: 'n', code: 'KeyN', altKey: true });
+      expect(mockNavigate).not.toHaveBeenCalled();
     });
   });
 
@@ -284,7 +312,7 @@ describe('CommandPalette', () => {
       expect(mockNavigate).toHaveBeenCalledWith('/');
     });
 
-    it('opens settings modal when selecting Settings', async () => {
+    it('navigates to settings when selecting Settings', async () => {
       renderCommandPalette();
 
       fireEvent.keyDown(document, { key: 'k', metaKey: true });
@@ -292,7 +320,7 @@ describe('CommandPalette', () => {
       const settings = await screen.findByText('Settings');
       fireEvent.click(settings);
 
-      expect(settingsModal$.open.set).toHaveBeenCalledWith(true);
+      expect(mockNavigate).toHaveBeenCalledWith('/settings');
     });
 
     it('closes after action execution', async () => {

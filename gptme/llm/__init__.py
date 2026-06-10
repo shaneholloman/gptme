@@ -54,6 +54,34 @@ def _tooluse_break_check_char(char: str) -> bool:
     return char == "\n"
 
 
+def _drain_toolbreak_stream(stream: "_StreamWithMetadata") -> None:
+    """Drain the generator after a break_on_tooluse to capture message_delta.
+
+    When break_on_tooluse fires before message_delta, the output tokens and
+    cost ($0.0000) are lost from the per-step breakdown.  Draining the
+    remaining generator processes the pending events (including message_delta)
+    so the metadata is complete.
+
+    This is safe because after the tool-use break, we discard the drained
+    content — it's only the side-effects (metadata capture) we care about.
+    """
+    discarded = 0
+    try:
+        while True:
+            next(stream.gen)
+            discarded += 1
+    except StopIteration as e:
+        # Capture the metadata that the provider generator set as its
+        # return value (e.g. Anthropic message_delta usage, OpenAI
+        # response.completed usage).  This overwrites the partial fallback
+        # (message_start only has input/cache counts) so the per-step
+        # breakdown shows accurate output tokens and cost.
+        if e.value:
+            stream.metadata = e.value
+    if discarded:
+        logger.debug("Drained %d chunks after tool-use break", discarded)
+
+
 # Cheap/fast default model per provider for first-run / fallback scenarios.
 # Azure is intentionally absent: deployments are tenant-specific, so there is
 # no universal default — users must supply a full model name.
@@ -66,6 +94,7 @@ PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     "groq": "groq/llama-3.1-8b-instant",
     "xai": "xai/grok-3-mini",
     "deepseek": "deepseek/deepseek-chat",
+    "moonshot": "moonshot/kimi-k2.6",
 }
 
 # Mapping from provider name to the environment variable that holds its API key.
@@ -78,6 +107,7 @@ PROVIDER_API_KEYS: dict[str, str] = {
     "groq": "GROQ_API_KEY",
     "xai": "XAI_API_KEY",
     "deepseek": "DEEPSEEK_API_KEY",
+    "moonshot": "MOONSHOT_API_KEY",
     "azure": "AZURE_OPENAI_API_KEY",
 }
 
@@ -382,26 +412,45 @@ class _StreamWithMetadata:
 
     Metadata is returned by the provider generator as its return value
     (captured via StopIteration). When the stream is broken early (e.g.
-    tool-use detection), we still populate the model name so messages
-    always have at least basic metadata.
+    tool-use detection), we fall back to partial metadata captured from the
+    provider's early events (e.g. Anthropic's message_start which carries
+    input/cache token counts before the model starts generating).
     """
 
-    def __init__(self, gen: Generator[str, None, MessageMetadata | None], model: str):
+    def __init__(
+        self,
+        gen: Generator[str, None, MessageMetadata | None],
+        model: str,
+        partial: dict | None = None,
+    ):
         self.gen = gen
         self.model = model
         self.metadata: MessageMetadata | None = None
+        # Optional dict populated by the provider generator with partial usage
+        # from early stream events (e.g. message_start).  Used as fallback when
+        # the stream is closed before the final usage event arrives.
+        self._partial = partial
 
     def __iter__(self) -> Iterator[str]:
         try:
             while True:
                 yield next(self.gen)
         except StopIteration as e:
-            self.metadata = e.value
-        finally:
-            # Ensure model is always set, even if the stream was broken early
-            # (break_on_tooluse, KeyboardInterrupt) before the final chunk arrived
             if self.metadata is None:
-                self.metadata = {"model": self.model}
+                # Only capture from StopIteration if the drain didn't already
+                # set it.  _drain_toolbreak_stream consumes the generator and
+                # sets metadata from message_delta / response.completed, but
+                # the exhausted generator then raises StopIteration a second
+                # time with value=None — don't overwrite the rich metadata.
+                self.metadata = e.value
+        finally:
+            if self.metadata is None:
+                # Fall back to partial metadata captured from message_start if
+                # the stream was closed before message_delta (break_on_tooluse).
+                partial_meta: MessageMetadata | None = (
+                    self._partial.get("metadata") if self._partial else None
+                )
+                self.metadata = partial_meta or {"model": self.model}
             elif "model" not in self.metadata:
                 self.metadata["model"] = self.model
 
@@ -441,6 +490,10 @@ def _stream(
     if provider == "anthropic":
         from .llm_anthropic import stream as stream_anthropic
 
+        # Shared dict: Anthropic generator writes partial usage from
+        # message_start; _StreamWithMetadata reads it as a fallback when the
+        # stream is closed before message_delta (break_on_tooluse path).
+        partial: dict = {}
         gen = stream_anthropic(
             messages,
             _get_base_model(model),
@@ -449,8 +502,9 @@ def _stream(
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
+            _partial=partial,
         )
-        return _StreamWithMetadata(gen, model)
+        return _StreamWithMetadata(gen, model, partial=partial)
     if provider == "openai-subscription":
         from .llm_openai_subscription import stream as stream_subscription
 
@@ -490,6 +544,21 @@ def _reply_stream(
         length = length or shutil.get_terminal_size().columns
         rprint("\r" + " " * length, end="\r")
 
+    # Combine the on_token callback (ACP/display) with generation.chunk hooks
+    # (e.g. streaming TTS) into a single emitter, so the per-line buffering below
+    # runs whenever either consumer is interested — not just when on_token is set.
+    from ..hooks import HookType, get_hooks, trigger_hook
+
+    _chunk_hooks_active = bool(get_hooks(HookType.GENERATION_CHUNK))
+    emit_active = on_token is not None or _chunk_hooks_active
+
+    def _emit_chunk(text: str) -> None:
+        if _chunk_hooks_active:
+            for _ in trigger_hook(HookType.GENERATION_CHUNK, chunk=text):
+                pass
+        if on_token is not None:
+            on_token(text)
+
     output = ""
     start_time = time.time()
     first_token_time = None
@@ -497,10 +566,26 @@ def _reply_stream(
     # Set to True when we detect a closing </think> tag so we can suppress the
     # one trailing blank "\n" that Anthropic always emits after </think>.
     just_closed_thinking = False
+    # True while inside a multiline <!-- think-sig: ... --> comment.
+    # Only the first line starts with "<!-- think-sig:"; continuation lines and
+    # the closing "-->" are also suppressed until the comment ends.
+    in_think_sig = False
     # Buffer chars for the current line before forwarding to on_token.
     # Thinking-tag lines are only detectable at the '\n' that closes them, so we
     # must buffer the entire line and then decide whether to emit or suppress it.
     line_buffer: list[str] = []
+    # Buffer chars inside thinking blocks for display purposes.
+    # We emit per-line rather than per-char so that long think-sig lines (hundreds
+    # of base64 chars) never get printed to the terminal: printing char-by-char and
+    # then calling print_clear() only erases the current terminal row, leaving
+    # already-wrapped rows visible.  By buffering and emitting at the newline we
+    # can simply discard think-sig lines without any terminal-clear gymnastics.
+    think_display_buffer: list[str] = []
+    # Buffer for normal (non-thinking) chars accumulated within a stream chunk.
+    # Flushed at chunk boundaries and before each newline.  Reduces rprint() and
+    # sys.stdout.flush() calls from O(chars) to O(chunks) — the main source of
+    # bursty terminal rendering (gptme/gptme#2717 terminal side).
+    normal_display_buffer: list[str] = []
 
     # Create stream wrapper to capture metadata
     stream = _stream(
@@ -513,8 +598,15 @@ def _reply_stream(
         top_p=top_p,
     )
 
+    def _chars_with_chunk_end(text_chunks):
+        """Yield (char, is_last_in_chunk) — lets the loop flush once per chunk."""
+        for chunk in text_chunks:
+            n = len(chunk)
+            for i, c in enumerate(chunk):
+                yield c, i == n - 1
+
     try:
-        for char in (char for chunk in stream for char in chunk):
+        for char, _is_chunk_end in _chars_with_chunk_end(stream):
             if not output:  # first character
                 first_token_time = time.time()
                 print_clear()
@@ -534,31 +626,79 @@ def _reply_stream(
 
                 # Check for opening tag at the end of this line
                 if last_line == "<think>" or last_line == "<thinking>":
-                    # Print spaces to clear the line
+                    # Print spaces to clear the line (in case chars were
+                    # already flushed to the terminal at a chunk boundary).
                     print_clear(len(last_line))
+                    # Discard buffered tag chars so they aren't flushed again
+                    # at the newline below (mirrors think_display_buffer.clear()
+                    # done for the closing tag).
+                    normal_display_buffer.clear()
                     # Print styled version
                     if not json_mode:
                         rprint(f"[dim]{last_line}[/dim]", end="")
                     are_thinking = True
                 # Check for closing tag
                 elif last_line == "</think>" or last_line == "</thinking>":
-                    print_clear(len(last_line))
-                    # Print styled version
+                    # Chars were buffered in think_display_buffer, not printed;
+                    # no print_clear needed.
+                    think_display_buffer.clear()
                     if not json_mode:
                         rprint(f"[dim]{last_line}[/dim]", end="")
                     are_thinking = False
+                    in_think_sig = False
                     just_closed_thinking = True
+                # Suppress Anthropic think-sig comment from display.
+                # The comment can span multiple lines:
+                #   <!-- think-sig: base64...   ← first line (starts the comment)
+                #   continuation_base64...       ← suppressed by in_think_sig
+                #   more_base64... -->           ← last line (ends the comment)
+                # The line is still accumulated in `output` so the signature
+                # survives message serialisation and API round-tripping.
+                elif are_thinking and last_line.startswith("<!-- think-sig:"):
+                    in_think_sig = not last_line.endswith("-->")
+                    # Chars were buffered in think_display_buffer, not printed;
+                    # just discard — no print_clear needed.
+                    think_display_buffer.clear()
+                    output += char
+                    continue
+                elif in_think_sig:
+                    # Continuation or closing line of a multiline think-sig comment.
+                    if last_line.endswith("-->"):
+                        in_think_sig = False
+                    # in_think_sig chars are suppressed (not buffered), so
+                    # think_display_buffer is already empty; clear defensively.
+                    think_display_buffer.clear()
+                    output += char
+                    continue
 
-                # Now print the newline
+                # Now print the newline, flushing any buffered content first.
                 if not json_mode:
+                    if normal_display_buffer:
+                        # Flush buffered normal chars before the newline so the
+                        # line content appears before the line ending.
+                        rprint("".join(normal_display_buffer), end="")
+                        normal_display_buffer.clear()
+                    if think_display_buffer:
+                        # Emit the entire buffered line dimly in one shot.
+                        rprint(f"[dim]{''.join(think_display_buffer)}[/dim]", end="")
+                        think_display_buffer.clear()
                     rprint(char, end="")
             else:
                 # Print normal characters
                 if not json_mode:
-                    if are_thinking:
-                        rprint(f"[dim]{char}[/dim]", end="")
+                    if in_think_sig:
+                        pass  # suppress think-sig comment body chars
+                    elif are_thinking:
+                        # Buffer instead of printing char-by-char.  Per-char dim
+                        # printing causes terminal-wrap issues for long lines
+                        # (print_clear only erases the current row, leaving
+                        # already-wrapped rows visible when think-sig is detected).
+                        think_display_buffer.append(char)
                     else:
-                        rprint(char, end="")
+                        # Accumulate in normal_display_buffer; flushed at chunk
+                        # boundaries and before each newline.  This reduces
+                        # rprint() calls from O(chars) to O(chunks).
+                        normal_display_buffer.append(char)
 
             assert len(char) == 1
             output += char
@@ -568,7 +708,7 @@ def _reply_stream(
             # line is not a thinking-tag delimiter.  This prevents the opening
             # <think> tag characters from leaking to callers before are_thinking
             # flips at the trailing '\n'.
-            if on_token:
+            if emit_active:
                 if char == "\n":
                     # A thinking-tag transition happened on this newline when
                     # are_thinking != prev_thinking.  In that case discard the
@@ -576,7 +716,7 @@ def _reply_stream(
                     if not are_thinking and not prev_thinking:
                         if line_buffer:
                             # Normal line — emit the whole line as one chunk.
-                            on_token("".join(line_buffer) + "\n")
+                            _emit_chunk("".join(line_buffer) + "\n")
                         elif just_closed_thinking:
                             # Suppress the one blank "\n" that Anthropic always
                             # emits after "\n</think>\n\n".  Without this guard
@@ -585,7 +725,7 @@ def _reply_stream(
                             pass
                         else:
                             # Intentional blank line in response content.
-                            on_token("\n")
+                            _emit_chunk("\n")
                         # Only reset here (inside the normal-line branch), NOT on
                         # the "\n" that triggered the </think> detection — that "\n"
                         # has prev_thinking=True so it skips this block entirely,
@@ -598,8 +738,13 @@ def _reply_stream(
                     line_buffer.append(char)
                 # else: are_thinking is True — skip thinking content
 
-            # need to flush stdout to get the print to show up
-            if not json_mode:
+            # Flush buffered normal chars and sync stdout once per chunk.
+            # Moving flush from O(chars) to O(chunks) eliminates the main source
+            # of bursty terminal rendering (per-char syscall overhead).
+            if _is_chunk_end and not json_mode:
+                if normal_display_buffer:
+                    rprint("".join(normal_display_buffer), end="")
+                    normal_display_buffer.clear()
                 sys.stdout.flush()
 
             # Trigger tool detection at cheap format-specific breakpoints.
@@ -617,23 +762,40 @@ def _reply_stream(
                 ]
                 if tooluses:
                     logger.debug("Found tool use, breaking")
+                    # Drain remaining stream to capture message_delta (output tokens).
+                    # When break_on_tooluse fires before message_delta, the
+                    # _StreamWithMetadata fallback only has input/cache counts from
+                    # message_start — output tokens and cost are lost.
+                    _drain_toolbreak_stream(stream)
                     break
 
         # Flush any remaining buffered chars (responses that end without a
         # trailing newline, or partial lines left after a break_on_tooluse break).
-        if on_token and line_buffer and not are_thinking:
-            on_token("".join(line_buffer))
+        if not json_mode and normal_display_buffer:
+            rprint("".join(normal_display_buffer), end="")
+            normal_display_buffer.clear()
+        if not json_mode and think_display_buffer:
+            rprint(f"[dim]{''.join(think_display_buffer)}[/dim]", end="")
+            think_display_buffer.clear()
+        if emit_active and line_buffer and not are_thinking:
+            _emit_chunk("".join(line_buffer))
             line_buffer.clear()
 
     except KeyboardInterrupt:
+        # Flush any chars buffered since the last chunk boundary so the terminal
+        # shows everything received before the interrupt.
+        if not json_mode and normal_display_buffer:
+            rprint("".join(normal_display_buffer), end="")
+            normal_display_buffer.clear()
         # Flush partial line before the interrupt suffix so callers see the
         # content that was streamed up to the interrupt point.
-        if on_token and line_buffer:
-            on_token("".join(line_buffer))
+        if emit_active and line_buffer:
+            _emit_chunk("".join(line_buffer))
             line_buffer.clear()
         suffix = "... ^C Interrupted"
         if on_token:
             # Emit as one chunk; ACP batching callback handles downstream chunking.
+            # Display/ACP only — not a chunk hook event (don't speak the suffix).
             on_token(suffix)
         return Message("assistant", output + suffix, metadata=stream.metadata)
     finally:

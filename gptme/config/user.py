@@ -21,6 +21,8 @@ from ..util import path_with_tilde
 from .models import (
     LessonsConfig,
     MCPConfig,
+    ModelsConfig,
+    PluginsConfig,
     ProviderConfig,
     UserConfig,
     UserIdentityConfig,
@@ -124,6 +126,24 @@ def get_user_config_env_source(key: str, path: str | None = None) -> str | None:
     return None
 
 
+def get_default_model_source(path: str | None = None) -> str | None:
+    """Return where the default model comes from.
+
+    Precedence mirrors model resolution: ``[models].default`` (local then main
+    config) takes priority, then the ``MODEL`` env var / ``[env]`` source.
+    """
+    config_file, local_path = get_user_config_paths(path)
+    if local_path.exists():
+        with open(local_path) as f:
+            local_doc = tomlkit.load(f)
+        if _get_nested_config_value(local_doc, "models", "default") is not None:
+            return USER_CONFIG_SOURCE_LOCAL
+    main_doc = _load_config_doc(str(config_file))
+    if _get_nested_config_value(main_doc, "models", "default") is not None:
+        return USER_CONFIG_SOURCE_MAIN
+    return get_user_config_env_source("MODEL", path)
+
+
 def get_user_config_runtime_info(path: str | None = None) -> dict[str, str | bool]:
     """Return read/write path details for the user config UI."""
     config_file, local_path = get_user_config_paths(path)
@@ -203,12 +223,41 @@ def load_user_config(path: str | None = None) -> UserConfig:
     providers_config = config.pop("providers", [])
     providers = [ProviderConfig(**provider) for provider in providers_config]
 
+    # Parse [models] section (model-related preferences like favorites)
+    models_data = config.pop("models", {})
+    if not isinstance(models_data, dict):
+        logger.warning(f"[models] should be a table, got {type(models_data).__name__}")
+        models_data = {}
+    favorites_data = models_data.get("favorites", [])
+    if not isinstance(favorites_data, list):
+        logger.warning(
+            f"[models].favorites should be a list, got {type(favorites_data).__name__}"
+        )
+        favorites_data = []
+    default_model = models_data.get("default")
+    if default_model is not None and not isinstance(default_model, str):
+        logger.warning("[models].default should be a string")
+        default_model = None
+    models_config = ModelsConfig(
+        default=default_model,
+        favorites=[str(m) for m in favorites_data if isinstance(m, str)],
+    )
+
     # Parse lessons config
     lessons_data = config.pop("lessons", None)
     lessons = (
         LessonsConfig(dirs=lessons_data.get("dirs", []))
         if lessons_data and isinstance(lessons_data, dict)
         else None
+    )
+
+    # Parse [plugins] section (search paths + enabled allowlist)
+    plugins_data = config.pop("plugins", {})
+    if not isinstance(plugins_data, dict):
+        raise ValueError("plugins must be an object")
+    plugins = PluginsConfig(
+        paths=plugins_data.get("paths", []),
+        enabled=plugins_data.get("enabled", []),
     )
 
     # Extract plugin-prefixed keys (e.g., [plugin.retrieval] -> plugin["retrieval"])
@@ -228,6 +277,8 @@ def load_user_config(path: str | None = None) -> UserConfig:
         mcp=mcp,
         providers=providers,
         lessons=lessons,
+        models=models_config,
+        plugins=plugins,
         plugin=plugin_config,
     )
 
@@ -260,22 +311,41 @@ def _load_config_doc(path: str | None = None) -> tomlkit.TOMLDocument:
 
 
 def set_config_value(
-    key: str, value: str, reload: bool = True
-) -> None:  # pragma: no cover
-    """Set a value in the user config file."""
-    doc: TOMLDocument | Container = _load_config_doc()
+    key: str, value: Any, reload: bool = True, local: bool = False
+) -> None:
+    """Set a value in the user config file.
+
+    Args:
+        key: Dot-separated key path (e.g. "env.ANTHROPIC_API_KEY").
+        value: Value to set. Type is preserved in the TOML output.
+        reload: Whether to reload the in-memory config after writing.
+        local: If True, write to config.local.toml instead of config.toml.
+               Use for secrets (API keys) that should not be in the shared config.
+    """
+    if local:
+        _, local_path = get_user_config_paths()
+        write_path = str(local_path)
+        # Load existing local config or start empty (no defaults)
+        doc: TOMLDocument | Container = (
+            _load_config_doc(write_path) if local_path.exists() else tomlkit.document()
+        )
+    else:
+        write_path = config_path
+        doc = _load_config_doc()
 
     # Set the value
     keypath = key.split(".")
     d: TOMLDocument | Container = doc
-    for key in keypath[:-1]:
-        if key not in d:
-            d[key] = tomlkit.table()
-        d = d[key]  # type: ignore[assignment]
+    for k in keypath[:-1]:
+        if k not in d:
+            d[k] = tomlkit.table()
+        d = d[k]  # type: ignore[assignment]
     d[keypath[-1]] = value
 
     # Write the config
-    with open(config_path, "w") as config_file:
+    if local:
+        os.makedirs(os.path.dirname(write_path), exist_ok=True)
+    with open(write_path, "w") as config_file:
         tomlkit.dump(doc, config_file)
 
     if reload:

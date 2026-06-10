@@ -1,6 +1,7 @@
 import dataclasses
 import json
 import logging
+import re
 import shutil
 import sys
 import textwrap
@@ -468,6 +469,16 @@ timestamp = "{self.timestamp.isoformat()}"
         return tok * price
 
 
+def _strip_think_sig(content: str) -> str:
+    """Strip think-sig comments from message content.
+
+    Anthropic extended thinking signatures may be serialized into message
+    content as multiline comments. They are implementation noise the user
+    shouldn't see, while the surrounding thinking text can still be useful.
+    """
+    return re.sub(r"<!--\s*think-sig:.*?-->\s*", "", content, flags=re.DOTALL)
+
+
 def format_msgs(
     msgs: list[Message],
     oneline: bool = False,
@@ -491,18 +502,19 @@ def format_msgs(
 
         # get terminal width
         max_len = shutil.get_terminal_size().columns - len(userprefix)
+        stripped_content = _strip_think_sig(msg.content)
         output = ""
         if oneline:
-            content = msg.content.replace("\n", "\\n")
+            content = stripped_content.replace("\n", "\\n")
             if highlight:
                 content = escape_markup(content)
             output += textwrap.shorten(content, width=max_len, placeholder="...")
             if len(output) < 20:
                 output = content[:max_len] + "..."
         else:
-            multiline = len(msg.content.split("\n")) > 1
+            multiline = len(stripped_content.split("\n")) > 1
             output += "\n" + indent * " " if multiline else ""
-            for i, block in enumerate(msg.content.split("```")):
+            for i, block in enumerate(stripped_content.split("```")):
                 if i % 2 == 0:
                     # Escape Rich markup in non-code-block content
                     if highlight:
@@ -594,7 +606,7 @@ def print_msg(
             print(s)
     if skipped_hidden:
         console.print(
-            f"[grey30]Skipped {skipped_hidden} hidden system messages, show with --show-hidden[/]"
+            f"[grey30]Skipped {skipped_hidden} hidden system messages, use /log --hidden to show[/]"
         )
 
 

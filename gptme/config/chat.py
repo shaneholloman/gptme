@@ -65,6 +65,7 @@ class ChatConfig:
     # through from_logdir/load_or_create to get per-conversation workspaces.
     workspace: Path = field(default_factory=Path.cwd)
     agent: Path | None = None
+    system_prompt: str | None = None
 
     env: dict = field(default_factory=dict)
     mcp: MCPConfig | None = None
@@ -115,6 +116,10 @@ class ChatConfig:
         else:
             agent = _coerce_config_path(agent_path, "agent")
 
+        system_prompt = chat_data.get("system_prompt")
+        if system_prompt is not None and not isinstance(system_prompt, str):
+            raise ValueError("chat.system_prompt must be a string")
+
         env = config_data.pop("env", {})
         if not isinstance(env, dict):
             raise ValueError("env must be an object")
@@ -122,6 +127,22 @@ class ChatConfig:
         if mcp_data is not None and not isinstance(mcp_data, dict):
             raise ValueError("mcp must be an object")
         mcp = MCPConfig.from_dict(mcp_data) if mcp_data is not None else None
+
+        # Type-validate numeric fields so wrong-type values raise ValueError here
+        # (at the API boundary) instead of silently storing bad types that crash later.
+        for field_name in ("temperature", "top_p"):
+            val = chat_data.get(field_name)
+            if val is not None and not isinstance(val, int | float):
+                raise ValueError(
+                    f"chat.{field_name} must be a number, got {type(val).__name__}"
+                )
+        max_tokens_val = chat_data.get("max_tokens")
+        if max_tokens_val is not None and (
+            not isinstance(max_tokens_val, int) or isinstance(max_tokens_val, bool)
+        ):
+            raise ValueError(
+                f"chat.max_tokens must be an integer, got {type(max_tokens_val).__name__}"
+            )
 
         # Check for unknown keys
         if config_data:
@@ -225,7 +246,10 @@ class ChatConfig:
 
         # Only create symlink if workspace is different from the log workspace
         if self.workspace != workspace_path:
-            if workspace_path.exists():
+            # Use is_symlink() too: exists() follows symlinks and returns False
+            # for a dangling one (e.g. a tmp workspace that was cleaned up),
+            # which would skip removal and make symlink_to raise FileExistsError.
+            if workspace_path.is_symlink() or workspace_path.exists():
                 if workspace_path.is_dir() and not workspace_path.is_symlink():
                     try:
                         # If it's an empty directory (e.g., auto-created by
@@ -293,6 +317,9 @@ class ChatConfig:
     @classmethod
     def load_or_create(cls, logdir: Path, cli_config: Self) -> Self:
         """Load or create a chat config, applying CLI overrides."""
+        # Check before from_logdir: it may create dirs but never writes config.toml.
+        is_new_conversation = not (logdir / "config.toml").exists()
+
         # Load existing config if it exists
         config = cls.from_logdir(logdir)
         defaults = cls()
@@ -304,8 +331,16 @@ class ChatConfig:
             cli_value = getattr(cli_config, field_name)
             default_value = getattr(defaults, field_name)
 
+            if field_name == "workspace" and is_new_conversation:
+                # For new conversations from_logdir creates logdir/workspace as a
+                # server-safe default, but CLI callers want their own cwd.  Always
+                # use the cli_config workspace for new conversations so the caller
+                # controls where work lands.  Server sessions must pass an explicit
+                # workspace (e.g. "@log" → logdir/workspace) in the request config.
+                logger.debug(f"New conversation: using CLI workspace: {cli_value}")
+                config = replace(config, workspace=cli_value)
             # For optional fields that default to None, check if explicitly provided
-            if (
+            elif (
                 field_name in ["model", "tool_format", "tools", "agent"]
                 and cli_value is not None
             ):
@@ -325,5 +360,10 @@ class ChatConfig:
             if project_config and project_config.agent:
                 config = replace(config, agent=config.workspace)
                 logger.debug(f"Auto-detected agent workspace: {config.workspace}")
+
+        # API clients use empty-string as an explicit clear signal for optional
+        # text fields that would otherwise be indistinguishable from "omitted".
+        if config.system_prompt == "":
+            config = replace(config, system_prompt=None)
 
         return config

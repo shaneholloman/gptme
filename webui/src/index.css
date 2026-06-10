@@ -151,14 +151,7 @@
 }
 
 .chat-message .inline-codeblock > code {
-  @apply min-w-0 flex-1 border-0 bg-transparent py-1.5 text-white text-xs;
-  background-color: transparent !important;
-  white-space: pre-wrap;
-  overflow-wrap: break-word;
-  word-break: normal;
-  /* Hanging indent: first line flush, wrapped lines indented 2ch */
-  padding-left: calc(0.75rem + 2ch);
-  text-indent: -2ch;
+  @apply min-w-0 flex-1 whitespace-pre-wrap break-words border-0 !bg-transparent px-3 py-1.5 text-xs text-white;
 }
 
 .chat-message details {
@@ -166,13 +159,11 @@
 }
 
 .chat-message details summary {
-  @apply cursor-pointer rounded-md bg-muted px-3 py-2 text-xs transition-colors;
-  user-select: none;
-  list-style: none;
+  @apply cursor-pointer select-none list-none rounded-md bg-muted px-3 py-2 text-xs transition-colors;
 }
 
 .chat-message details summary::-webkit-details-marker {
-  display: none;
+  @apply hidden;
 }
 
 .chat-message details:not([open]) summary {

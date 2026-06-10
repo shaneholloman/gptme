@@ -84,6 +84,8 @@ def test_init_tools_allowlist_from_env():
         mock_config = mock_get_config.return_value
         # Mock the get_env method to return the custom_env_value
         mock_config.get_env.side_effect = mock_get_env
+        # No plugin search paths / allowlist for this test
+        mock_config.get_plugin_config.return_value = ([], None)
 
         init_tools()
 
@@ -121,6 +123,11 @@ def test_tool_loading_with_missing_package():
 def test_get_available_tools():
     # Clear cache to ensure test uses mocked config
     clear_tools()
+    # Also clear the plugin registry so globally-discovered plugins (e.g. an
+    # installed gptme-tts) don't leak extra tools into this exact-set assertion.
+    from gptme.plugins.registry import clear_registry
+
+    clear_registry()
     custom_env_value = "gptme.tools.save,gptme.tools.patch"
 
     with patch("gptme.config.get_config") as mock_get_config:
@@ -128,6 +135,8 @@ def test_get_available_tools():
         mock_config = mock_get_config.return_value
         # Mock the get_env method to return the custom_env_value
         mock_config.get_env.return_value = custom_env_value
+        # No plugin search paths / allowlist for this test
+        mock_config.get_plugin_config.return_value = ([], None)
 
         tools = get_available_tools()
 
@@ -411,6 +420,38 @@ def test_get_toolchain_strict_raises_on_unavailable():
             get_toolchain(["fake_unavailable_strict"], strict=True)
     finally:
         available.remove(unavailable_tool)
+
+
+def test_get_toolchain_unavailable_uses_available_hint():
+    """An unavailable tool's available_hint is surfaced in the error message."""
+    from gptme.tools.base import ToolSpec
+
+    available = get_available_tools()
+    unavailable_tool = ToolSpec(
+        name="fake_with_hint",
+        desc="A fake unavailable tool",
+        available=False,
+        available_hint="start the fake server (or set FAKE_BACKEND=cloud)",
+    )
+    available.append(unavailable_tool)
+    try:
+        with pytest.raises(
+            ValueError, match="start the fake server .or set FAKE_BACKEND=cloud."
+        ):
+            get_toolchain(["fake_with_hint"], strict=True)
+    finally:
+        available.remove(unavailable_tool)
+
+
+def test_unavailable_message_falls_back_to_generic():
+    """Without a hint, the message is accurate (not 'invalid choice'/'missing deps')."""
+    from gptme.tools import _unavailable_message
+    from gptme.tools.base import ToolSpec
+
+    spec = ToolSpec(name="foo", desc="x", available=False)
+    msg = _unavailable_message("foo", [spec])
+    assert msg.startswith("Tool 'foo' is unavailable")
+    assert "availability check failed" in msg
 
 
 def test_get_toolchain_nonstrict_skips_missing():

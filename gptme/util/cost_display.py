@@ -93,6 +93,13 @@ def _short_model_name(full_model: str) -> str:
     return model
 
 
+def _format_cost(cost: float) -> str:
+    """Format USD costs without rounding tiny positive values to zero."""
+    if 0 < cost < 0.0001:
+        return "<$0.0001"
+    return f"${cost:.4f}"
+
+
 def gather_session_costs() -> CostData | None:
     """Get costs from CostTracker (current session only).
 
@@ -153,22 +160,26 @@ def gather_conversation_costs(messages: list[Message]) -> CostData | None:
 
             if msg.role == "assistant":
                 last_metadata = msg.metadata
-                request_count += 1
+                # Only count requests that have actual token data — consistent
+                # with gather_per_step_costs so the Requests field matches the
+                # number of rows in the Per-Step Breakdown.
+                if msg_input > 0 or msg_output > 0 or msg_cache_read > 0:
+                    request_count += 1
 
-                turn_input_total = msg_input + msg_cache_read + msg_cache_created
-                if biggest_turn is None or turn_input_total > (
-                    biggest_turn.input_tokens
-                    + biggest_turn.cache_read_tokens
-                    + biggest_turn.cache_creation_tokens
-                ):
-                    biggest_turn = BiggestTurn(
-                        request_index=request_count,
-                        input_tokens=msg_input,
-                        output_tokens=msg_output,
-                        cache_read_tokens=msg_cache_read,
-                        cache_creation_tokens=msg_cache_created,
-                        cost=msg_cost,
-                    )
+                    turn_input_total = msg_input + msg_cache_read + msg_cache_created
+                    if biggest_turn is None or turn_input_total > (
+                        biggest_turn.input_tokens
+                        + biggest_turn.cache_read_tokens
+                        + biggest_turn.cache_creation_tokens
+                    ):
+                        biggest_turn = BiggestTurn(
+                            request_index=request_count,
+                            input_tokens=msg_input,
+                            output_tokens=msg_output,
+                            cache_read_tokens=msg_cache_read,
+                            cache_creation_tokens=msg_cache_created,
+                            cost=msg_cost,
+                        )
 
             total_input += msg_input
             total_output += msg_output
@@ -315,21 +326,37 @@ def display_costs(
         console.log(
             f"  Cache:   {last_req.cache_read_tokens:,} read / {last_req.cache_creation_tokens:,} created"
         )
-        console.log(f"  Cost:    ${last_req.cost:.4f}")
+        console.log(f"  Cost:    {_format_cost(last_req.cost)}")
         console.log("")
 
-    # Show session total if available
-    if session:
+    # Only show the session/conversation split when there IS prior history that
+    # makes the distinction useful (conversation includes older requests that
+    # aren't in the current session).
+    has_prior_history = (
+        session
+        and conversation
+        and conversation.total.request_count > session.total.request_count
+    )
+
+    if session and has_prior_history:
         console.log("[bold]Session Total:[/bold] (current session)")
         _display_total(session.total)
         console.log("")
 
-    # Show conversation total if available and different from session
-    if conversation and (
-        not session or conversation.total.request_count > session.total.request_count
-    ):
-        console.log("[bold]Conversation Total:[/bold] (all messages)")
+    # Prefer conversation (most complete) when available; fall back to session.
+    if conversation:
+        if has_prior_history:
+            label, suffix = "Conversation Total", " (all messages)"
+        elif session is None:
+            # No active session (e.g. gptme -r resume) — label it as conversation
+            label, suffix = "Conversation Total", ""
+        else:
+            label, suffix = "Total", ""
+        console.log(f"[bold]{label}:[/bold]{suffix}")
         _display_total(conversation.total)
+    elif session:
+        console.log("[bold]Total:[/bold]")
+        _display_total(session.total)
 
     # Highlight the largest single-turn input (helps catch context spikes,
     # e.g. when a tool result blows up the next turn's input).
@@ -373,31 +400,40 @@ def display_costs(
             "  "
             + "Step".rjust(4)
             + "  "
-            + "Input".rjust(7)
+            + "TotalIn".rjust(8)
+            + "  "
+            + "Uncached".rjust(8)
             + "  "
             + "Output".rjust(7)
             + "  "
-            + "Cache".rjust(7)
+            + "CacheR".rjust(8)
             + "  "
-            + "Total".rjust(7)
+            + "CacheW".rjust(8)
+            + "  "
+            + "Cost".rjust(9)
             + "  "
             + "Model"
         )
         for step in per_step:
-            cache_tokens = step.cache_read_tokens + step.cache_creation_tokens
-            total_tokens = step.input_tokens + step.output_tokens + cache_tokens
+            total_input_tokens = (
+                step.input_tokens + step.cache_read_tokens + step.cache_creation_tokens
+            )
             model_short = _short_model_name(step.model) if step.model else ""
             console.log(
                 "  "
                 + str(step.step_index).rjust(4)
                 + "  "
-                + f"{step.input_tokens:,}".rjust(7)
+                + f"{total_input_tokens:,}".rjust(8)
+                + "  "
+                + f"{step.input_tokens:,}".rjust(8)
                 + "  "
                 + f"{step.output_tokens:,}".rjust(7)
                 + "  "
-                + f"{cache_tokens:,}".rjust(7)
+                + f"{step.cache_read_tokens:,}".rjust(8)
                 + "  "
-                + f"{total_tokens:,}".rjust(7)
+                + f"{step.cache_creation_tokens:,}".rjust(8)
+                + "  "
+                + _format_cost(step.cost).rjust(9)
                 + "  "
                 + model_short
             )
@@ -412,6 +448,6 @@ def _display_total(total: TotalCosts) -> None:
     console.log(
         f"  Cache:   {total.cache_read_tokens:,} read / {total.cache_creation_tokens:,} created"
     )
-    console.log(f"  Hit rate: {total.cache_hit_rate * 100:.1f}%")
-    console.log(f"  Cost:    ${total.cost:.4f}")
+    console.log(f"  Cache hit rate: {total.cache_hit_rate * 100:.1f}%")
+    console.log(f"  Cost:    {_format_cost(total.cost)}")
     console.log(f"  Requests: {total.request_count}")

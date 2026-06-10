@@ -13,6 +13,7 @@ import contextvars
 import logging
 import os
 import threading
+import time
 import uuid
 from collections.abc import Iterable
 from datetime import datetime, timezone
@@ -674,6 +675,25 @@ def step(
         tooluses = []
         # Handle streaming vs non-streaming differently
         metadata = None
+
+        # Batch settings for SSE events: accumulate chars and flush at a
+        # batch boundary (~20 chars) or on newline, to dramatically reduce
+        # SSE event volume (10K events → ~500 for a typical response).
+        _SSE_BATCH_SIZE = 20
+        sse_token_batch: list[str] = []
+
+        def _flush_sse_batch() -> None:
+            if not sse_token_batch:
+                return
+            SessionManager.add_event(
+                conversation_id,
+                {
+                    "type": "generation_progress",
+                    "token": "".join(sse_token_batch),
+                },
+            )
+            sse_token_batch.clear()
+
         if stream:
             stream_wrapper = _stream(
                 msgs,
@@ -703,18 +723,22 @@ def step(
                 break
 
             output += token
+            sse_token_batch.append(token)
 
-            # Send token to clients
-            SessionManager.add_event(
-                conversation_id, {"type": "generation_progress", "token": token}
-            )
+            # Flush batch: on newline (tool detection needs it) or at batch cap
+            if token == "\n" or len(sse_token_batch) >= _SSE_BATCH_SIZE:
+                _flush_sse_batch()
 
             # Check for complete tool uses on \n
             if "\n" in token:
                 if tooluses := list(ToolUse.iter_from_content(output)):
+                    _flush_sse_batch()  # flush remaining before break
                     break
         else:
             tooluses = list(ToolUse.iter_from_content(output))
+
+        # Flush any remaining buffered tokens before completion
+        _flush_sse_batch()
 
         # Capture metadata from stream after iteration completes
         if (
@@ -726,7 +750,21 @@ def step(
 
         # Persist the assistant message
         msg = Message("assistant", output, metadata=metadata)
+
         _append_and_notify(manager, session, msg)
+
+        # Signal generation_complete AFTER message_added but BEFORE expensive
+        # disk writes, so the frontend receives the completion event as early
+        # as possible without stalling on message persistence.
+        logger.debug("Generation complete")
+        SessionManager.add_event(
+            conversation_id,
+            {
+                "type": "generation_complete",
+                "message": msg2dict(msg, manager.workspace, manager.logdir),
+            },
+        )
+
         # Write immediately after assistant message to ensure it's persisted
         manager.write()
         logger.debug("Persisted assistant message and wrote to disk")
@@ -743,16 +781,6 @@ def step(
         # This fixes race condition where messages might not be available when log is retrieved
         manager.write()
         logger.debug("Wrote messages to disk")
-
-        # Signal message generation complete
-        logger.debug("Generation complete")
-        SessionManager.add_event(
-            conversation_id,
-            {
-                "type": "generation_complete",
-                "message": msg2dict(msg, manager.workspace, manager.logdir),
-            },
-        )
 
         # Auto-generate display name AFTER signaling generation_complete,
         # so the event isn't blocked by a potentially slow LLM call.
@@ -883,7 +911,8 @@ def start_tool_execution(
             # Remove the tool from pending
             session.pending_tools.pop(current_tool_id, None)
 
-            # Notify about tool execution
+            # Record start time and notify about tool execution
+            tool_exec.started_at = time.monotonic()
             SessionManager.add_event(
                 conversation_id,
                 {"type": "tool_executing", "tool_id": current_tool_id},
@@ -893,8 +922,31 @@ def start_tool_execution(
             # Execute the tool
             try:
                 logger.info(f"Executing tool: {tooluse.tool}")
+                stream_tool_id = current_tool_id
+
+                def stream_tool_output(
+                    tool_output: Message, tool_id: str = stream_tool_id
+                ) -> None:
+                    if (
+                        tool_output.role == "system"
+                        and not tool_output.hide
+                        and not tool_output.quiet
+                    ):
+                        SessionManager.add_event(
+                            conversation_id,
+                            {
+                                "type": "tool_output",
+                                "tool_id": tool_id,
+                                "output": tool_output.content,
+                            },
+                        )
+
                 tool_outputs = list(
-                    tooluse.execute(log=manager.log, workspace=manager.workspace)
+                    tooluse.execute(
+                        log=manager.log,
+                        workspace=manager.workspace,
+                        on_result_message=stream_tool_output,
+                    )
                 )
                 logger.info(f"Tool execution complete, outputs: {len(tool_outputs)}")
 
@@ -912,6 +964,19 @@ def start_tool_execution(
 
                 msg = Message("system", f"Error: {e!s}", call_id=tooluse.call_id)
                 _append_and_notify(manager, session, msg)
+
+            # Emit tool_complete with duration
+            if tool_exec.started_at is not None:
+                duration_ms = (time.monotonic() - tool_exec.started_at) * 1000
+                SessionManager.add_event(
+                    conversation_id,
+                    {
+                        "type": "tool_complete",
+                        "tool_id": current_tool_id,
+                        "duration_ms": duration_ms,
+                        "success": tool_exec.status != ToolStatus.FAILED,
+                    },
+                )
 
             # Persist tool outputs to disk
             manager.write()

@@ -1,4 +1,4 @@
-import { useCallback, useRef, useState, type FC } from 'react';
+import { useCallback, useRef, useState, useSyncExternalStore, type FC } from 'react';
 import type { Message, StreamingMessage } from '@/types/conversation';
 import { MessageAvatar } from './MessageAvatar';
 import { useMessageChainType } from '@/utils/messageUtils';
@@ -22,12 +22,21 @@ import {
   ExternalLink,
   FileText,
   FolderOpen,
+  Volume2,
+  Square,
 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import { Tooltip, TooltipContent, TooltipProvider, TooltipTrigger } from '@/components/ui/tooltip';
 import { Dialog, DialogContent, DialogTitle } from '@/components/ui/dialog';
 import { ChatInput } from '@/components/ChatInput';
 import { workspaceNavigateTo$ } from '@/stores/workspaceExplorer';
+import {
+  speakTextNow,
+  isSpeechSupported,
+  subscribeSpeaking,
+  getSpeakingKey,
+  stopSpeaking,
+} from '@/utils/tts';
 import { rightSidebarActiveTab$, rightSidebarVisible$ } from '@/stores/sidebar';
 
 function formatTimestamp(timestamp: string): { short: string; full: string } {
@@ -95,6 +104,10 @@ export const ChatMessage: FC<Props> = ({
 }) => {
   const { api, connectionConfig } = useApi();
   const { settings } = useSettings();
+  // TTS playback state: which message is currently being spoken (if any).
+  const ttsKey = messageIndex !== undefined ? `${conversationId}:${messageIndex}` : null;
+  const speakingKey = useSyncExternalStore(subscribeSpeaking, getSpeakingKey);
+  const isSpeakingThis = ttsKey !== null && speakingKey === ttsKey;
   // Use observables (not useState) because these are read inside <Memo>
   const isEditing$ = useObservable(false);
   const editContent$ = useObservable('');
@@ -475,6 +488,9 @@ export const ChatMessage: FC<Props> = ({
         ${visualChain === 'standalone' ? 'mb-4' : 'mb-0'}
       `;
   });
+  const contentOffsetClasses$ = useObservable(() => {
+    return isUser$.get() ? 'pr-10 md:px-12' : 'pl-10 md:px-12';
+  });
 
   return (
     <Memo>
@@ -497,7 +513,7 @@ export const ChatMessage: FC<Props> = ({
                   }
                   userName={api.userInfo$.name?.get()}
                 />
-                <div className="md:px-12">
+                <div className={contentOffsetClasses$.get()}>
                   <div className={`group/message relative ${messageClasses$.get()}`}>
                     {/* Action buttons (top-right) */}
                     <div className="absolute right-1 top-1 z-10 flex gap-0.5 opacity-0 transition-opacity hover:!opacity-100 group-hover/message:opacity-50">
@@ -547,6 +563,22 @@ export const ChatMessage: FC<Props> = ({
                           )}
                         </>
                       )}
+                      {message$.role.get() === 'assistant' && isSpeechSupported() && (
+                        <Button
+                          variant="ghost"
+                          size="sm"
+                          onClick={() =>
+                            isSpeakingThis
+                              ? stopSpeaking()
+                              : speakTextNow(message$.content.get() ?? '', ttsKey ?? undefined)
+                          }
+                          className="h-7 w-7 p-0"
+                          aria-label={isSpeakingThis ? 'Stop reading' : 'Read aloud'}
+                          title={isSpeakingThis ? 'Stop reading' : 'Read aloud'}
+                        >
+                          {isSpeakingThis ? <Square size={14} /> : <Volume2 size={14} />}
+                        </Button>
+                      )}
                       <Button
                         variant="ghost"
                         size="sm"
@@ -585,7 +617,11 @@ export const ChatMessage: FC<Props> = ({
                           conversationId={conversationId}
                           autoFocus$={editAutoFocus$}
                           value={editContent$.get()}
-                          onChange={(v) => editContent$.set(v)}
+                          onChange={(next) =>
+                            editContent$.set(
+                              typeof next === 'function' ? next(editContent$.get()) : next
+                            )
+                          }
                           editMode
                           editFiles={message$.files?.get()?.map(String)}
                           onEditSave={(content, files, pendingFiles, truncate) => {

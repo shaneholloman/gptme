@@ -88,6 +88,8 @@ def create_app(
     from .auth import auth_api  # fmt: skip
     from .panels_api import panels_api  # fmt: skip
     from .tasks_api import tasks_api  # fmt: skip
+    from .tools_api import tools_api  # fmt: skip
+    from .tts_api import tts_api  # fmt: skip
     from .workspace_api import workspace_api  # fmt: skip
 
     app.register_blueprint(v2_api)
@@ -96,6 +98,8 @@ def create_app(
     app.register_blueprint(tasks_api)
     app.register_blueprint(artifacts_api)
     app.register_blueprint(panels_api)
+    app.register_blueprint(tools_api)
+    app.register_blueprint(tts_api)
 
     # Register OpenAPI documentation
     from .openapi_docs import docs_api  # fmt: skip
@@ -174,12 +178,33 @@ def create_app(
         # Router deep-links (/settings, /conversations/xyz, …) work correctly.
         # Actual static assets (JS/CSS/images) are served first because their
         # paths exist in static_folder; only truly unknown paths fall through.
+        # API paths that reach here (unknown routes, bad URL segments) get a
+        # JSON 404 so clients don't receive index.html as an API response.
         @app.route("/<path:path>")
         def spa_fallback(path: str):
+            if path.startswith("api/"):
+                return flask.Response(
+                    response=flask.json.dumps({"error": "Not Found"}),
+                    status=404,
+                    content_type="application/json",
+                )
             asset = static_folder / path
             if asset.is_file():
                 return app.send_static_file(path)
             return app.send_static_file("index.html")
+
+    # Register JSON error handlers so all API errors return JSON instead of HTML.
+    # Without these, Flask's default handlers return HTML for 404/405/500 etc.,
+    # which breaks webui clients that expect JSON from every /api/* response.
+    from werkzeug.exceptions import HTTPException  # fmt: skip
+
+    @app.errorhandler(HTTPException)
+    def handle_http_exception(e: HTTPException) -> flask.Response:
+        return flask.Response(
+            response=flask.json.dumps({"error": e.description}),
+            status=e.code,
+            content_type="application/json",
+        )
 
     # Server confirmation hook is now registered via init_hooks(server=True)
     # in server/cli.py

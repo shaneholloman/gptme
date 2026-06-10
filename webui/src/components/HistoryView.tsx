@@ -21,6 +21,7 @@ import { Tooltip, TooltipContent, TooltipTrigger } from '@/components/ui/tooltip
 import { useApi } from '@/contexts/ApiContext';
 import { ActivityCalendar } from '@/components/ActivityCalendar';
 import { getRelativeTimeString, toISODate } from '@/utils/time';
+import { chatRoute } from '@/utils/routes';
 import type { ConversationSummary } from '@/types/conversation';
 
 const PAGE_SIZE = 50;
@@ -33,7 +34,7 @@ function useAllConversations() {
   return useQuery({
     queryKey: ['conversations-all', connectionConfig.baseUrl, isConnected],
     queryFn: async () => {
-      const result = await api.getConversationsPaginated(0, 100000);
+      const result = await api.getConversationsPaginated(0, 100000, true);
       return result.conversations;
     },
     enabled: isConnected,
@@ -64,8 +65,9 @@ const ConversationRow: FC<{
   conv: ConversationSummary;
   onClick: (conv: ConversationSummary) => void;
 }> = ({ conv, onClick }) => (
-  <div
-    className="flex cursor-pointer items-start gap-3 border-b px-4 py-3 last:border-b-0 hover:bg-accent/50"
+  <button
+    type="button"
+    className="flex w-full items-start gap-3 border-b px-4 py-3 text-left last:border-b-0 hover:bg-accent/50"
     onClick={() => onClick(conv)}
   >
     <div className="flex h-9 w-9 flex-shrink-0 items-center justify-center rounded-md bg-muted">
@@ -93,7 +95,7 @@ const ConversationRow: FC<{
       <div className="mt-1 flex items-center gap-3 text-xs text-muted-foreground">
         <span className="flex items-center gap-1">
           <MessageSquare className="h-3 w-3" />
-          {conv.messages} messages
+          {conv.messages ?? 0} messages
         </span>
         {conv.workspace && conv.workspace !== '.' && (
           <span className="truncate">{conv.workspace}</span>
@@ -103,7 +105,7 @@ const ConversationRow: FC<{
         )}
       </div>
     </div>
-  </div>
+  </button>
 );
 
 export const HistoryView: FC = () => {
@@ -155,7 +157,7 @@ export const HistoryView: FC = () => {
   // Compute stats (scoped to selected year if not current)
   const stats = useMemo(() => {
     const totalConversations = conversations.length;
-    const totalMessages = conversations.reduce((sum, c) => sum + c.messages, 0);
+    const totalMessages = conversations.reduce((sum, c) => sum + (c.messages ?? 0), 0);
     const activeDays = activityData.size;
 
     // Current streak
@@ -255,7 +257,7 @@ export const HistoryView: FC = () => {
 
   const handleConversationClick = useCallback(
     (conv: ConversationSummary) => {
-      navigate(`/chat/${conv.id}`);
+      navigate(chatRoute(conv.id));
     },
     [navigate]
   );
@@ -283,7 +285,13 @@ export const HistoryView: FC = () => {
       {/* Header */}
       <div className="flex-shrink-0 border-b px-6 py-4">
         <div className="flex items-center gap-3">
-          <Button variant="ghost" size="icon" onClick={() => navigate('/chat')} className="h-8 w-8">
+          <Button
+            variant="ghost"
+            size="icon"
+            onClick={() => navigate('/chat')}
+            className="h-8 w-8"
+            aria-label="Back to chat"
+          >
             <ArrowLeft className="h-4 w-4" />
           </Button>
           <div>
@@ -333,6 +341,7 @@ export const HistoryView: FC = () => {
                   size="icon"
                   className="h-7 w-7"
                   onClick={handleYearPrev}
+                  aria-label="Previous year"
                   disabled={
                     selectedYear !== null &&
                     selectedYear <= (availableYears[availableYears.length - 1] ?? selectedYear)
@@ -348,6 +357,7 @@ export const HistoryView: FC = () => {
                   size="icon"
                   className="h-7 w-7"
                   onClick={handleYearNext}
+                  aria-label="Next year"
                   disabled={selectedYear === null}
                 >
                   <ChevronRight className="h-4 w-4" />
@@ -406,6 +416,7 @@ export const HistoryView: FC = () => {
                   value={searchQuery}
                   onChange={(e) => setSearchQuery(e.target.value)}
                   className="h-8 pl-8"
+                  aria-label="Search conversations"
                 />
               </div>
             </div>

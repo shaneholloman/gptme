@@ -36,6 +36,7 @@ def mock_config():
     config = MagicMock()
     config.chat = MagicMock()
     config.chat.model = None
+    config.user.models.default = None
     config.get_env.return_value = None
     return config
 
@@ -411,7 +412,9 @@ class TestInitModelParsing:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -443,7 +446,9 @@ class TestInitModelParsing:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -475,7 +480,9 @@ class TestInitModelParsing:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -504,7 +511,9 @@ class TestInitModelParsing:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -539,7 +548,9 @@ class TestInitModelParsing:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
 
         resolved_meta = ModelMeta(
@@ -585,7 +596,9 @@ class TestInitModelParsing:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         # get_model resolves the bare OpenRouter-style name to provider=openrouter
         mock_get_model.return_value = ModelMeta(
@@ -625,7 +638,9 @@ class TestInitModelParsing:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = ModelMeta(
             provider="unknown",
@@ -635,6 +650,87 @@ class TestInitModelParsing:
 
         with pytest.raises(ValueError, match="Unknown model"):
             init_model(model="totally/nonexistent-model")
+
+    @patch("gptme.init.set_default_model")
+    @patch("gptme.init.get_model")
+    @patch("gptme.init.init_llm")
+    @patch("gptme.init.get_recommended_model")
+    @patch("gptme.init.is_custom_provider", return_value=False)
+    @patch("gptme.init.get_config")
+    @patch("gptme.init.console")
+    def test_bare_model_name_without_slash_resolved_via_get_model(
+        self,
+        mock_console,
+        mock_config_fn,
+        mock_custom,
+        mock_recommend,
+        mock_init_llm,
+        mock_get_model,
+        mock_set_default,
+        dummy_model_meta,
+    ):
+        """A bare model name without a slash (e.g. 'gpt-4o') that get_model()
+        resolves should be treated as a model, not a provider. Regression test:
+        the no-slash path previously cast the whole string to a provider and
+        crashed in get_recommended_model() with the misleading
+        'Provider X requires specifying a model' message."""
+        from gptme.init import init_model
+
+        mock_config_fn.return_value = MagicMock(
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
+        )
+        mock_get_model.return_value = ModelMeta(
+            provider="openai",
+            model="gpt-4o",
+            context=128_000,
+        )
+
+        init_model(model="gpt-4o")
+
+        # Provider resolved from get_model, model_name already known so the
+        # recommended-model fallback is never reached.
+        mock_init_llm.assert_called_once_with("openai")
+        mock_recommend.assert_not_called()
+
+    @patch("gptme.init.set_default_model")
+    @patch("gptme.init.get_model")
+    @patch("gptme.init.init_llm")
+    @patch("gptme.init.get_recommended_model")
+    @patch("gptme.init.is_custom_provider", return_value=False)
+    @patch("gptme.init.get_config")
+    @patch("gptme.init.console")
+    def test_bare_unknown_model_without_slash_raises_clear_error(
+        self,
+        mock_console,
+        mock_config_fn,
+        mock_custom,
+        mock_recommend,
+        mock_init_llm,
+        mock_get_model,
+        mock_set_default,
+        dummy_model_meta,
+    ):
+        """A bare unresolvable model name (get_model falls back to
+        provider='unknown') should raise the clear 'Unknown model' error, not
+        the misleading 'provider requires a model' crash. This is the no-slash
+        sibling of test_unresolvable_model_raises_clear_error."""
+        from gptme.init import init_model
+
+        mock_config_fn.return_value = MagicMock(
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
+        )
+        mock_get_model.return_value = ModelMeta(
+            provider="unknown",
+            model="claude-sonnet",
+            context=128_000,
+        )
+
+        with pytest.raises(ValueError, match="Unknown model"):
+            init_model(model="claude-sonnet")
 
     @patch("gptme.init.set_default_model")
     @patch("gptme.init.get_model")
@@ -658,7 +754,9 @@ class TestInitModelParsing:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -688,7 +786,9 @@ class TestInitModelParsing:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -730,6 +830,7 @@ class TestInitModelConfig:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat.model = "anthropic/claude-sonnet-4-6"
         config.get_env.return_value = None
         mock_config_fn.return_value = config
@@ -762,6 +863,7 @@ class TestInitModelConfig:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat.model = None
         config.get_env.return_value = "openai/gpt-5"
         mock_config_fn.return_value = config
@@ -794,6 +896,7 @@ class TestInitModelConfig:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat = None
         config.get_env.return_value = "anthropic/claude-haiku-4-5"
         mock_config_fn.return_value = config
@@ -826,6 +929,7 @@ class TestInitModelConfig:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat = MagicMock(model=None)
         config.get_env.return_value = None
         mock_config_fn.return_value = config
@@ -857,6 +961,7 @@ class TestInitModelConfig:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat = MagicMock(model="anthropic/claude-sonnet-4-6")
         mock_config_fn.return_value = config
         mock_get_model.return_value = dummy_model_meta
@@ -901,7 +1006,9 @@ class TestInitModelContextOverride:
             context=200000,
         )
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = original_meta
 
@@ -941,7 +1048,9 @@ class TestInitModelContextOverride:
             context=200000,
         )
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = original_meta
 
@@ -978,7 +1087,9 @@ class TestInitModelContextOverride:
             context=128000,
         )
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = original_meta
 
@@ -1016,7 +1127,9 @@ class TestInitModelContextOverride:
             context=8192,
         )
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = original_meta
 
@@ -1052,7 +1165,9 @@ class TestInitModelContextOverride:
             context=200000,
         )
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = original_meta
 
@@ -1094,7 +1209,9 @@ class TestInitModelContextOverride:
             price_output=75.0,
         )
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = original_meta
 
@@ -1141,7 +1258,9 @@ class TestInitModelConsole:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -1173,7 +1292,9 @@ class TestInitModelConsole:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -1217,6 +1338,7 @@ class TestInitModelInteractive:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat = MagicMock(model=None)
         config.get_env.return_value = None
         mock_config_fn.return_value = config
@@ -1251,6 +1373,7 @@ class TestInitModelInteractive:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat = MagicMock(model=None)
         config.get_env.return_value = None
         mock_config_fn.return_value = config
@@ -1282,6 +1405,7 @@ class TestInitModelInteractive:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat = MagicMock(model=None)
         config.get_env.return_value = None
         mock_config_fn.return_value = config
@@ -1320,6 +1444,7 @@ class TestInitModelInteractive:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat = MagicMock(model=None)
         config.get_env.return_value = None
         mock_config_fn.return_value = config
@@ -1360,6 +1485,7 @@ class TestInitModelInteractive:
         from gptme.init import init_model
 
         config = MagicMock()
+        config.user.models.default = None
         config.chat = MagicMock(model=None)
         config.get_env.return_value = None
         mock_config_fn.return_value = config
@@ -1426,7 +1552,9 @@ class TestInitModelBuiltinProviders:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -1474,7 +1602,9 @@ class TestInitModelBuiltinProviders:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 
@@ -1554,6 +1684,28 @@ class TestInitLogging:
             h for h in logging.getLogger().handlers if isinstance(h, _RichHandler)
         )
         assert handler.console.stderr is True
+
+    def test_rich_handler_stderr_false_uses_shared_console(self):
+        """stderr=False should use the shared rich Console for single-console output."""
+        import sys
+
+        from rich import get_console as _get_console
+        from rich.logging import RichHandler as _RichHandler
+
+        from gptme.init import init_logging
+
+        init_logging(verbose=False, stderr=False)
+        handler = next(
+            h for h in logging.getLogger().handlers if isinstance(h, _RichHandler)
+        )
+        shared = _get_console()
+        assert handler.console is shared, (
+            "RichHandler should reuse the shared Console when stderr=False"
+        )
+        # Should NOT be writing to stderr directly
+        assert handler.console.file != sys.stderr, (
+            "should not use stderr when stderr=False"
+        )
 
     def test_atexit_cleanup_registered(self):
         """An atexit cleanup handler should be registered."""
@@ -1704,7 +1856,9 @@ class TestInitEdgeCases:
         from gptme.init import init_model
 
         mock_config_fn.return_value = MagicMock(
-            chat=MagicMock(model=None), get_env=MagicMock(return_value=None)
+            chat=MagicMock(model=None),
+            user=MagicMock(models=MagicMock(default=None)),
+            get_env=MagicMock(return_value=None),
         )
         mock_get_model.return_value = dummy_model_meta
 

@@ -5,16 +5,26 @@ This module contains the main conversation CRUD endpoints for the V2 API.
 Session management, tool execution, and agent creation are handled by separate modules.
 """
 
+import json
 import logging
 import os
 import shutil
-from dataclasses import replace
+import threading
+import time
+import urllib.error
+import urllib.parse
+import urllib.request
+from base64 import b64encode
+from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import wait as futures_wait
+from dataclasses import asdict, replace
 from datetime import datetime, timezone
 from itertools import islice
 from pathlib import Path
 from typing import Literal, cast
 
 import flask
+import tomlkit
 from dateutil.parser import isoparse
 from flask import request
 
@@ -27,7 +37,9 @@ from gptme.config import (
     set_config,
     set_config_value,
 )
+from gptme.credentials import get_stored_api_key
 from gptme.llm import PROVIDER_API_KEYS, list_available_providers
+from gptme.llm.constants import OPENROUTER_APP_HEADERS
 from gptme.llm.models import (
     PROVIDERS,
     Provider,
@@ -38,17 +50,23 @@ from gptme.llm.models import (
     get_recommended_model,
     set_default_model,
 )
+from gptme.llm.models.types import is_custom_provider
 from gptme.prompts import get_prompt
 
 from ..commands import handle_cmd
 from ..config import get_project_config
-from ..config.user import get_user_config_env_source, get_user_config_runtime_info
+from ..config.user import (
+    get_default_model_source,
+    get_user_config_env_source,
+    get_user_config_paths,
+    get_user_config_runtime_info,
+)
 from ..dirs import get_logs_dir
 from ..logmanager import Log, LogManager, get_user_conversations
 from ..message import Message
 from ..tools import get_toolchain, get_tools, init_tools
 from ..util.content import is_message_command
-from ..util.uri import parse_file_reference
+from ..util.uri import URI, FilePath, is_uri, parse_file_reference
 from .api_v2_agents import agents_api
 from .api_v2_common import (
     _abs_to_rel_workspace,
@@ -62,6 +80,7 @@ from .external_sessions import get_external_session_provider
 from .openapi_docs import (
     CONVERSATION_ID_PARAM,
     ApiRootResponse,
+    AudioTranscriptionResponse,
     ConversationCreateRequest,
     ConversationListResponse,
     ConversationResponse,
@@ -73,8 +92,15 @@ from .openapi_docs import (
     StatusResponse,
     UserApiKeySaveRequest,
     UserApiKeySaveResponse,
+    UserConfigFilePatchRequest,
+    UserConfigFilePatchResponse,
+    UserConfigFileResponse,
+    UserConfigFileSaveRequest,
+    UserConfigFileSaveResponse,
     UserDefaultModelSaveRequest,
     UserDefaultModelSaveResponse,
+    UserFavoritesSaveRequest,
+    UserFavoritesSaveResponse,
     UserSettingsResponse,
     api_doc,
     api_doc_simple,
@@ -91,6 +117,119 @@ _ALLOWED_AVATAR_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".ico"}
 # - edit: launches an interactive $EDITOR subprocess, blocking the worker thread
 # - delete (without --force): calls input() waiting for stdin that never arrives
 _SERVER_BLOCKED_COMMANDS = {"exit", "restart", "edit", "delete"}
+
+_TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
+_DEFAULT_OPENROUTER_STT_MODEL = "openai/whisper-1"
+_MAX_TRANSCRIPTION_AUDIO_BYTES = 25 * 1024 * 1024
+_SUPPORTED_TRANSCRIPTION_FORMATS = {"wav", "mp3", "flac", "m4a", "ogg", "webm", "aac"}
+
+
+def _env_truthy(name: str) -> bool:
+    return os.environ.get(name, "").strip().lower() in _TRUTHY_ENV_VALUES
+
+
+def _guess_audio_format(filename: str | None, mimetype: str | None) -> str | None:
+    """Infer an OpenRouter STT audio format from filename or MIME type."""
+    if mimetype:
+        mime_key = mimetype.split(";", 1)[0].strip().lower()
+        mime_map = {
+            "audio/aac": "aac",
+            "audio/flac": "flac",
+            "audio/m4a": "m4a",
+            "audio/mp3": "mp3",
+            "audio/mp4": "m4a",
+            "audio/mpeg": "mp3",
+            "audio/ogg": "ogg",
+            "audio/wav": "wav",
+            "audio/webm": "webm",
+            "audio/x-wav": "wav",
+        }
+        if mime_key in mime_map:
+            return mime_map[mime_key]
+
+    if filename:
+        suffix = Path(filename).suffix.lower().lstrip(".")
+        if suffix in _SUPPORTED_TRANSCRIPTION_FORMATS:
+            return suffix
+    return None
+
+
+def _transcribe_audio_with_openrouter(
+    audio_bytes: bytes, audio_format: str, model: str, language: str | None = None
+) -> dict:
+    """Call OpenRouter's STT endpoint and return the decoded JSON response."""
+    config = get_config()
+    api_key = config.get_env("OPENROUTER_API_KEY") or get_stored_api_key("openrouter")
+    if not api_key:
+        raise ValueError("OpenRouter is not configured on this server")
+
+    payload: dict[str, object] = {
+        "model": model,
+        "input_audio": {
+            "data": b64encode(audio_bytes).decode("ascii"),
+            "format": audio_format,
+        },
+    }
+    if language:
+        payload["language"] = language
+
+    req = urllib.request.Request(
+        "https://openrouter.ai/api/v1/audio/transcriptions",
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {api_key}",
+            "Content-Type": "application/json",
+            **OPENROUTER_APP_HEADERS,
+        },
+        method="POST",
+    )
+    with urllib.request.urlopen(req, timeout=60) as response:
+        return cast(dict, json.loads(response.read().decode("utf-8")))
+
+
+def _get_webui_deploy_config() -> dict[str, object]:
+    """Return web UI deploy trigger config without exposing the GitHub token."""
+    repository = os.environ.get("GPTME_WEBUI_DEPLOY_REPOSITORY", "gptme/gptme").strip()
+    workflow = os.environ.get("GPTME_WEBUI_DEPLOY_WORKFLOW", "").strip()
+    ref = os.environ.get("GPTME_WEBUI_DEPLOY_REF", "master").strip()
+    token = os.environ.get("GPTME_WEBUI_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    enabled = _env_truthy("GPTME_WEBUI_ENABLE_DEV_DEPLOY")
+
+    actions_url = (
+        f"https://github.com/{repository}/actions/workflows/{workflow}"
+        if workflow
+        else f"https://github.com/{repository}/actions"
+    )
+
+    return {
+        "enabled": enabled,
+        "configured": enabled
+        and bool(token)
+        and "/" in repository
+        and bool(workflow)
+        and bool(ref),
+        "repository": repository,
+        "workflow": workflow,
+        "ref": ref,
+        "has_token": bool(token),
+        "actions_url": actions_url,
+    }
+
+
+def _get_webui_deploy_inputs() -> dict[str, object] | None:
+    raw_inputs = os.environ.get("GPTME_WEBUI_DEPLOY_INPUTS_JSON")
+    if not raw_inputs:
+        return None
+
+    try:
+        inputs = json.loads(raw_inputs)
+    except json.JSONDecodeError as exc:
+        raise ValueError(f"Invalid GPTME_WEBUI_DEPLOY_INPUTS_JSON: {exc}") from exc
+
+    if not isinstance(inputs, dict):
+        raise ValueError("GPTME_WEBUI_DEPLOY_INPUTS_JSON must be a JSON object")
+
+    return inputs
 
 
 def _is_valid_image_content(path: "Path") -> bool:
@@ -133,6 +272,14 @@ def _validate_model_input(model: str, expected_provider: str | None = None) -> s
     return trimmed_model
 
 
+def _append_conversation_system_prompt(
+    messages: list[Message], system_prompt: str | None
+) -> None:
+    """Append a conversation-local system prompt override when configured."""
+    if system_prompt:
+        messages.append(Message("system", system_prompt))
+
+
 def _get_optional_string_list_field(
     req_json: dict, field: str
 ) -> list[str] | None | tuple[flask.Response, int]:
@@ -145,12 +292,49 @@ def _get_optional_string_list_field(
     return value
 
 
+def _validate_message_file_references(
+    files: list[str], workspace: Path
+) -> list[FilePath] | tuple[flask.Response, int]:
+    """Validate local message attachments stay within the conversation workspace."""
+    file_paths: list[FilePath] = []
+    for f_str in files:
+        if is_uri(f_str):
+            uri = parse_file_reference(f_str)
+            assert isinstance(uri, URI)
+            # file:// still points at local server paths and must not bypass workspace checks.
+            if uri.scheme == "file":
+                return (
+                    flask.jsonify(
+                        {
+                            "error": "file:// URIs are not supported for message attachments"
+                        }
+                    ),
+                    400,
+                )
+            file_paths.append(uri)
+            continue
+
+        f = Path(f_str)
+        if f.is_absolute():
+            return (
+                flask.jsonify({"error": f"Absolute file paths are not supported: {f}"}),
+                400,
+            )
+
+        full = (workspace / f).resolve()
+        if not full.is_relative_to(workspace):
+            return flask.jsonify({"error": f"File path escapes workspace: {f}"}), 400
+
+        file_paths.append(full)
+    return file_paths
+
+
 def _persist_default_model(model: str) -> bool:
-    """Persist env.MODEL and try to apply it in-process.
+    """Persist the default model to [models].default and try to apply in-process.
 
     Returns True if a restart is still required to guarantee the change takes effect.
     """
-    set_config_value("env.MODEL", model, reload=False)
+    set_config_value("models.default", model, reload=False)
 
     model_meta = get_model(model)
     try:
@@ -178,6 +362,36 @@ def _validate_api_key_input(api_key: str) -> str:
         raise ValueError("API key is too long")
     if any(ord(ch) < 32 or ord(ch) == 127 for ch in trimmed):
         raise ValueError("API key contains control characters")
+    return trimmed
+
+
+def _get_user_config_file_response(content: str) -> dict[str, str | bool]:
+    """Return raw config text with the same path metadata as user settings."""
+    runtime_info = get_user_config_runtime_info()
+    return {
+        "content": content,
+        "path": runtime_info["config_path"],
+        "write_target": runtime_info["write_target"],
+        "local_config_path": runtime_info["local_config_path"],
+        "local_config_exists": runtime_info["local_config_exists"],
+        "local_overrides_main": runtime_info["local_overrides_main"],
+    }
+
+
+def _read_user_config_file_text() -> str:
+    """Read config.toml, creating the default file first if it is missing."""
+    config_file, _local_path = get_user_config_paths()
+    if not config_file.exists():
+        load_user_config()
+    return config_file.read_text()
+
+
+def _validate_config_key_path(key: str) -> str:
+    trimmed = key.strip()
+    if not trimmed:
+        raise ValueError("key must not be empty")
+    if any(not segment.strip() for segment in trimmed.split(".")):
+        raise ValueError("key must be a dotted path with non-empty segments")
     return trimmed
 
 
@@ -267,6 +481,65 @@ def api_session_delete(session_id: str):
     return flask.jsonify({"status": "ok", "message": f"Session {session_id} deleted"})
 
 
+@v2_api.route("/api/v2/server/health")
+@require_auth
+@api_doc_simple(tags=["admin"])
+def api_server_health():
+    """Server connection health summary.
+
+    Returns a compact health snapshot: total session count, generating/idle
+    breakdown, a per-slot strip, and a color-coded health indicator —
+    without the per-session log-reading overhead of ``/api/v2/sessions``.
+
+    Health levels:
+    - ``green``  — no active generations or very light load
+    - ``yellow`` — some sessions generating
+    - ``red``    — all slots busy (every session is generating)
+    """
+    from .api_v2_sessions import SessionManager
+
+    now = datetime.now(tz=timezone.utc)
+    all_sessions = SessionManager.get_all_sessions()
+
+    total = len(all_sessions)
+    generating_count = 0
+    slots = []
+
+    for session_id, session in all_sessions:
+        is_gen = bool(session.generating)
+        if is_gen:
+            generating_count += 1
+        elapsed: float | None = None
+        if is_gen and session.generating_since:
+            elapsed = (now - session.generating_since).total_seconds()
+        slots.append(
+            {
+                "id": session_id[:8],
+                "generating": is_gen,
+                "elapsed_seconds": elapsed,
+            }
+        )
+
+    idle_count = total - generating_count
+
+    if total == 0 or generating_count == 0:
+        health = "green"
+    elif generating_count < total:
+        health = "yellow"
+    else:
+        health = "red"
+
+    return flask.jsonify(
+        {
+            "session_count": total,
+            "generating_count": generating_count,
+            "idle_count": idle_count,
+            "health": health,
+            "slots": slots,
+        }
+    )
+
+
 @v2_api.route("/api/v2")
 @api_doc_simple(responses={200: ApiRootResponse}, tags=["meta"])
 def api_root():
@@ -327,6 +600,153 @@ def api_config():
             agent_info["urls"] = agent.urls
 
     return flask.jsonify({"agent": agent_info})
+
+
+@v2_api.route("/api/v2/dev/deploy-staging", methods=["GET"])
+@require_auth
+def api_dev_deploy_staging_status():
+    """Return whether the web UI staging deploy trigger is configured."""
+    return flask.jsonify(_get_webui_deploy_config())
+
+
+@v2_api.route("/api/v2/dev/deploy-staging", methods=["POST"])
+@require_auth
+def api_dev_deploy_staging_trigger():
+    """Trigger the configured web UI staging deploy workflow."""
+    config = _get_webui_deploy_config()
+
+    if not config["enabled"]:
+        return (
+            flask.jsonify(
+                {
+                    "error": "Web UI deploy trigger is disabled",
+                    "detail": "Set GPTME_WEBUI_ENABLE_DEV_DEPLOY=true on the gptme server.",
+                }
+            ),
+            403,
+        )
+
+    token = os.environ.get("GPTME_WEBUI_GITHUB_TOKEN") or os.environ.get("GITHUB_TOKEN")
+    if not token:
+        return (
+            flask.jsonify(
+                {
+                    "error": "Web UI deploy trigger is not configured",
+                    "detail": "Set GPTME_WEBUI_GITHUB_TOKEN with Actions workflow permissions.",
+                }
+            ),
+            503,
+        )
+
+    repository = str(config["repository"])
+    workflow_name = str(config["workflow"])
+    ref = str(config["ref"])
+    if "/" not in repository:
+        return (
+            flask.jsonify(
+                {
+                    "error": "Invalid GPTME_WEBUI_DEPLOY_REPOSITORY",
+                    "detail": "Expected owner/repo format.",
+                }
+            ),
+            500,
+        )
+    if not workflow_name:
+        return (
+            flask.jsonify(
+                {
+                    "error": "GPTME_WEBUI_DEPLOY_WORKFLOW is required",
+                    "detail": "Set it to a workflow file that supports workflow_dispatch.",
+                }
+            ),
+            503,
+        )
+    if not ref:
+        return (
+            flask.jsonify(
+                {
+                    "error": "GPTME_WEBUI_DEPLOY_REF is required",
+                    "detail": "Set it to the branch or tag to deploy.",
+                }
+            ),
+            503,
+        )
+
+    try:
+        payload: dict[str, object] = {"ref": ref}
+        inputs = _get_webui_deploy_inputs()
+        if inputs:
+            payload["inputs"] = inputs
+    except ValueError as exc:
+        return flask.jsonify({"error": str(exc)}), 500
+
+    owner, repo_name = repository.split("/", 1)
+    encoded_repository = (
+        f"{urllib.parse.quote(owner, safe='')}/{urllib.parse.quote(repo_name, safe='')}"
+    )
+    workflow = urllib.parse.quote(workflow_name, safe="")
+    api_url = f"https://api.github.com/repos/{encoded_repository}/actions/workflows/{workflow}/dispatches"
+    request = urllib.request.Request(
+        api_url,
+        data=json.dumps(payload).encode("utf-8"),
+        method="POST",
+        headers={
+            "Accept": "application/vnd.github+json",
+            "Authorization": f"Bearer {token}",
+            "Content-Type": "application/json",
+            "User-Agent": "gptme-webui-dev-deploy",
+            "X-GitHub-Api-Version": "2022-11-28",
+        },
+    )
+
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            if response.status != 204:
+                return (
+                    flask.jsonify(
+                        {
+                            "error": "GitHub did not accept the deploy request",
+                            "detail": f"Unexpected status {response.status}",
+                        }
+                    ),
+                    502,
+                )
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        return (
+            flask.jsonify(
+                {
+                    "error": "GitHub rejected the deploy request",
+                    "github_status": exc.code,
+                    "detail": detail,
+                }
+            ),
+            502,
+        )
+    except urllib.error.URLError as exc:
+        return (
+            flask.jsonify(
+                {
+                    "error": "Could not reach GitHub",
+                    "detail": str(exc.reason),
+                }
+            ),
+            502,
+        )
+
+    return (
+        flask.jsonify(
+            {
+                "status": "queued",
+                "message": "Staging deploy workflow queued",
+                "repository": repository,
+                "workflow": workflow_name,
+                "ref": ref,
+                "actions_url": config["actions_url"],
+            }
+        ),
+        202,
+    )
 
 
 @v2_api.route("/api/v2/external-sessions")
@@ -429,6 +849,12 @@ def api_external_session(external_session_id: str):
             "schema": {"type": "string"},
             "description": "Filter conversations by name, id, or last message preview (case-insensitive substring match)",
         },
+        {
+            "name": "detail",
+            "in": "query",
+            "schema": {"type": "boolean", "default": False},
+            "description": "If true, perform a full scan to populate cost and token stats. Slower but returns accurate total_cost, total_input_tokens, and total_output_tokens fields. Suitable for paginated views; avoid on large collections. When combined with search, every conversation is fully scanned before the limit is applied — avoid on large deployments.",
+        },
     ],
 )
 def api_conversations():
@@ -436,6 +862,7 @@ def api_conversations():
 
     Get a list of user conversations with metadata using the V2 API.
     Supports optional search filtering by conversation name, id, or last message preview.
+    Pass ``detail=true`` to include cost/token stats (slower full scan).
     """
     try:
         limit = int(request.args.get("limit", 100))
@@ -443,13 +870,15 @@ def api_conversations():
         return flask.jsonify({"error": "limit must be an integer"}), 400
     limit = max(1, min(limit, 1000))
     search = request.args.get("search", "").strip().lower()
+    detail_val = request.args.get("detail")
+    detail = detail_val is not None and detail_val.lower() in ("", "1", "true", "yes")
 
-    # Use fast tail-only scan for list/search — reads last 8KB for
+    # Use fast tail-only scan for list/search by default — reads last 8KB for
     # preview/model, skips json.loads() on every metadata line.
-    # Full file is still read for line count, but without JSON parsing.
+    # Pass detail=true to opt in to full cost/token stats (slower).
     if search:
         conversations = []
-        for conv in get_user_conversations(detail=False):
+        for conv in get_user_conversations(detail=detail):
             if (
                 search in conv.name.lower()
                 or search in conv.id.lower()
@@ -459,8 +888,14 @@ def api_conversations():
                 if len(conversations) >= limit:
                     break
     else:
-        conversations = list(islice(get_user_conversations(detail=False), limit))
-    return flask.jsonify(conversations)
+        conversations = list(islice(get_user_conversations(detail=detail), limit))
+    response_items = []
+    for conv in conversations:
+        item = asdict(conv)
+        if not detail:
+            item.pop("messages", None)
+        response_items.append(item)
+    return flask.jsonify(response_items)
 
 
 @v2_api.route("/api/v2/conversations/<string:conversation_id>")
@@ -488,6 +923,7 @@ def api_conversation(conversation_id: str):
     logdir = get_logs_dir() / conversation_id
     chat_config = ChatConfig.load_or_create(logdir, ChatConfig()).save()
     log_dict = manager.to_dict(branches=True)
+    log_dict["logdir"] = str(logdir)
 
     # make all paths relative to workspace or logdir (no "../" or absolute paths)
     for msg in log_dict["log"]:
@@ -624,6 +1060,13 @@ def api_conversation_put(conversation_id: str):
     # Load or create the chat config, overriding values from request config if provided
     config_dict = dict(config_raw)
     config_dict["_logdir"] = logdir  # Pass logdir for "@log" workspace resolution
+    # Server sessions default to an isolated per-conversation workspace so they
+    # don't inherit the server process's cwd.  Clients can override by passing an
+    # explicit workspace in the request config.
+    config_dict.setdefault("chat", {})
+    if not isinstance(config_dict["chat"], dict):
+        return flask.jsonify({"error": "'config.chat' must be an object"}), 400
+    config_dict["chat"].setdefault("workspace", "@log")
     try:
         request_config = ChatConfig.from_dict(config_dict, create_workspace=False)
     except ValueError as exc:
@@ -640,14 +1083,16 @@ def api_conversation_put(conversation_id: str):
 
     chat_config = ChatConfig.load_or_create(logdir, request_config)
 
-    msgs = get_prompt(
-        tools=list(get_toolchain(chat_config.tools, strict=False)),
-        interactive=chat_config.interactive,
-        tool_format=chat_config.tool_format or "markdown",
-        model=chat_config.model,
-        prompt=prompt,
-        workspace=chat_config.workspace,
-        agent_path=chat_config.agent,
+    msgs = list(
+        get_prompt(
+            tools=list(get_toolchain(chat_config.tools, strict=False)),
+            interactive=chat_config.interactive,
+            tool_format=chat_config.tool_format or "markdown",
+            model=chat_config.model,
+            prompt=prompt,
+            workspace=chat_config.workspace,
+            agent_path=chat_config.agent,
+        )
     )
 
     # Inject output-format capability hint for webui mode
@@ -667,6 +1112,8 @@ def api_conversation_put(conversation_id: str):
                 "use ```html blocks — they render live in a sandboxed preview panel.",
             )
         )
+
+    _append_conversation_system_prompt(msgs, chat_config.system_prompt)
 
     for role, content, timestamp in validated_msgs:
         msgs.append(Message(role, content, timestamp=timestamp))
@@ -763,7 +1210,7 @@ def api_conversation_post(conversation_id: str):
             404,
         )
     try:
-        log = LogManager.load(conversation_id, branch=branch)
+        log = LogManager.load(logdir, branch=branch)
     except FileNotFoundError:
         return (
             flask.jsonify({"error": f"Branch not found: {branch}"}),
@@ -774,7 +1221,12 @@ def api_conversation_post(conversation_id: str):
     files_result = _get_optional_string_list_field(req_json, "files")
     if isinstance(files_result, tuple):
         return files_result
-    file_paths = [Path(f) for f in files_result] if files_result is not None else []
+    file_paths: list[FilePath] = []
+    if files_result is not None:
+        validated_files = _validate_message_file_references(files_result, log.workspace)
+        if isinstance(validated_files, tuple):
+            return validated_files
+        file_paths = validated_files
     msg = Message(
         req_json["role"],
         req_json["content"],
@@ -950,7 +1402,12 @@ def api_conversation_edit_message(conversation_id: str, index: int):
         if content_changed:
             replacements["content"] = content
         if files_changed and files is not None:
-            replacements["files"] = [parse_file_reference(f) for f in files]
+            validated_files = _validate_message_file_references(
+                files, manager.workspace
+            )
+            if isinstance(validated_files, tuple):
+                return validated_files
+            replacements["files"] = validated_files
         edited_msg = replace(msgs[index], **replacements)
         new_msgs = msgs[:index] + [edited_msg] + ([] if truncate else msgs[index + 1 :])
     elif truncate:
@@ -1197,13 +1654,198 @@ def api_models():
         except ValueError:
             pass
 
+    # User-curated favorites (only those still available in the model list)
+    available_ids = {m["id"] for m in models_data}
+    favorites = [m for m in config.user.models.favorites if m in available_ids]
+
     return flask.jsonify(
         {
             "models": models_data,
             "default": default_model.full if default_model else None,
             "recommended": recommended,
+            "favorites": favorites,
         }
     )
+
+
+# Cache for provider health results
+_provider_health_cache: dict[str, object] = {}
+_provider_health_cache_time: float = 0.0
+_provider_health_condition = threading.Condition()
+_provider_health_refreshing = False
+_PROVIDER_HEALTH_TTL = 60.0  # seconds
+_PROVIDER_HEALTH_TIMEOUT = 5.0  # seconds per provider
+
+
+def _probe_provider(provider_name: str) -> dict:
+    """Probe a single provider and return {status, latency_ms, error}."""
+    start = time.monotonic()
+
+    def elapsed_ms() -> int:
+        return round((time.monotonic() - start) * 1000)
+
+    try:
+        provider = cast(Provider, provider_name)
+
+        if provider_name in ("openrouter", "local", "gptme") or is_custom_provider(
+            provider
+        ):
+            # These support dynamic model listing via an HTTP call
+            from ..llm import get_available_models  # fmt: skip
+
+            models = get_available_models(provider)
+            if not models:
+                raise RuntimeError(f"No models returned from {provider_name}")
+
+        elif provider_name == "anthropic":
+            from ..llm.llm_anthropic import (
+                get_client as get_anthropic_client,  # fmt: skip
+            )
+            from ..llm.llm_anthropic import init as init_anthropic  # fmt: skip
+
+            anthropic_client = get_anthropic_client()
+            if anthropic_client is None:
+                init_anthropic(get_config())
+                anthropic_client = get_anthropic_client()
+            if anthropic_client is None:
+                return {
+                    "status": "error",
+                    "latency_ms": elapsed_ms(),
+                    "error": "Client not initialized",
+                }
+            # Lightweight list call to verify connectivity and auth
+            anthropic_health_client = anthropic_client.with_options(
+                timeout=_PROVIDER_HEALTH_TIMEOUT
+            )
+            next(iter(anthropic_health_client.models.list(limit=1)), None)
+
+        elif provider_name in (
+            "openai",
+            "azure",
+            "gemini",
+            "xai",
+            "groq",
+            "deepseek",
+            "nvidia",
+            "moonshot",
+        ):
+            from ..llm.llm_openai import get_client as get_openai_client  # fmt: skip
+            from ..llm.llm_openai import has_client  # fmt: skip
+            from ..llm.llm_openai import init as init_openai  # fmt: skip
+
+            if not has_client(provider):
+                init_openai(provider, get_config())
+            openai_client = get_openai_client(provider)
+            openai_health_client = openai_client.with_options(
+                timeout=_PROVIDER_HEALTH_TIMEOUT
+            )
+            next(iter(openai_health_client.models.list()), None)
+
+        elif provider_name == "openai-subscription":
+            from ..llm.llm_openai_subscription import (
+                get_auth as get_subscription_auth,
+            )
+
+            get_subscription_auth(timeout=_PROVIDER_HEALTH_TIMEOUT)
+
+        else:
+            # Plugin or unknown provider — key is configured but no live check
+            return {"status": "configured", "latency_ms": elapsed_ms(), "error": None}
+
+        return {"status": "ok", "latency_ms": elapsed_ms(), "error": None}
+
+    except Exception as e:
+        return {"status": "error", "latency_ms": elapsed_ms(), "error": str(e)}
+
+
+def _timeout_health_result() -> dict[str, object]:
+    return {
+        "status": "error",
+        "latency_ms": round(_PROVIDER_HEALTH_TIMEOUT * 1000),
+        "error": "Timeout",
+    }
+
+
+def _collect_provider_health(provider_names: list[str]) -> dict[str, dict]:
+    if not provider_names:
+        return {}
+
+    executor = ThreadPoolExecutor(max_workers=len(provider_names))
+    future_to_name = {
+        executor.submit(_probe_provider, name): name for name in provider_names
+    }
+
+    try:
+        done, not_done = futures_wait(future_to_name, timeout=_PROVIDER_HEALTH_TIMEOUT)
+        results: dict[str, dict] = {}
+
+        for future in done:
+            name = future_to_name[future]
+            try:
+                results[name] = future.result()
+            except Exception as e:
+                results[name] = {
+                    "status": "error",
+                    "latency_ms": None,
+                    "error": str(e),
+                }
+
+        for future in not_done:
+            name = future_to_name[future]
+            future.cancel()
+            results[name] = _timeout_health_result()
+
+        return results
+    finally:
+        # Avoid blocking the request thread on providers that ignore client-side timeouts.
+        executor.shutdown(wait=False, cancel_futures=True)
+
+
+@v2_api.route("/api/v2/providers/health")
+@require_auth
+@api_doc_simple(tags=["models"])
+def api_providers_health():
+    """Check health of all configured providers.
+
+    Probes each configured provider with a lightweight API call (model listing)
+    and returns status, latency, and any error message. Results are cached for
+    60 seconds. Pass ``?force=1`` to bypass the cache.
+    """
+    force = request.args.get("force", "").lower() in ("1", "true", "yes")
+    return flask.jsonify(_get_provider_health_response(force))
+
+
+def _get_provider_health_response(force: bool) -> dict[str, object]:
+    global _provider_health_cache, _provider_health_cache_time
+    global _provider_health_refreshing
+
+    with _provider_health_condition:
+        while True:
+            now = time.monotonic()
+            cache_fresh = (now - _provider_health_cache_time) < _PROVIDER_HEALTH_TTL
+            if not force and cache_fresh:
+                return _provider_health_cache
+            if not _provider_health_refreshing:
+                _provider_health_refreshing = True
+                break
+            _provider_health_condition.wait()
+            force = False
+
+    try:
+        available = list_available_providers()
+        provider_names = [str(p) for p, _ in available]
+        response: dict[str, object] = {
+            "providers": _collect_provider_health(provider_names)
+        }
+    finally:
+        with _provider_health_condition:
+            if "response" in locals():
+                _provider_health_cache = response
+                _provider_health_cache_time = time.monotonic()
+            _provider_health_refreshing = False
+            _provider_health_condition.notify_all()
+
+    return response
 
 
 @v2_api.route("/api/v2/commands")
@@ -1348,6 +1990,7 @@ def api_conversation_config_patch(conversation_id: str):
                 agent_path=chat_config.agent,
             )
         )
+        _append_conversation_system_prompt(new_system_msgs, chat_config.system_prompt)
         manager.log = Log(new_system_msgs + remaining_msgs)
     manager.write()
 
@@ -1597,9 +2240,9 @@ def api_user_api_key():
         return flask.jsonify({"error": str(exc)}), 400
 
     env_var = PROVIDER_API_KEYS[provider]
-    set_config_value(f"env.{env_var}", trimmed_api_key, reload=False)
+    set_config_value(f"env.{env_var}", trimmed_api_key, reload=False, local=True)
     if trimmed_model is not None:
-        set_config_value("env.MODEL", trimmed_model, reload=False)
+        set_config_value("env.MODEL", trimmed_model, reload=False, local=True)
 
     # Apply the new key immediately so the running server picks it up without restart.
     # os.environ takes priority over the config file in Config.get_env(), so the next
@@ -1661,6 +2304,53 @@ def api_user_default_model():
     )
 
 
+@v2_api.route("/api/v2/user/favorites", methods=["POST"])
+@require_auth
+@api_doc(
+    summary="Save favorite models",
+    description="Persist the user's favorite models into the global gptme config.",
+    request_body=UserFavoritesSaveRequest,
+    responses={200: UserFavoritesSaveResponse, 400: ErrorResponse},
+    tags=["user"],
+)
+def api_user_favorites():
+    """Persist favorite models into user config."""
+    req_json = request.get_json(silent=True)
+    if req_json is None:
+        return flask.jsonify({"error": "No JSON data provided"}), 400
+    if not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
+
+    favorites = req_json.get("favorites")
+    if not isinstance(favorites, list) or not all(
+        isinstance(m, str) for m in favorites
+    ):
+        return flask.jsonify({"error": "favorites must be a list of strings"}), 400
+
+    # Validate, de-duplicate (preserving order), and drop malformed entries so
+    # junk doesn't accumulate in config.toml. Favorites may reference custom
+    # providers, so we don't require a known built-in provider — just a
+    # plausible "provider/model" shape within a sane length.
+    seen: set[str] = set()
+    cleaned: list[str] = []
+    for m in favorites:
+        trimmed = m.strip()
+        if not trimmed or trimmed in seen:
+            continue
+        if "/" not in trimmed or len(trimmed) > 256:
+            logger.warning("Dropping invalid favorite model id: %r", m)
+            continue
+        if any(ord(ch) < 32 or ord(ch) == 127 for ch in trimmed):
+            logger.warning("Dropping favorite model id with control chars: %r", m)
+            continue
+        seen.add(trimmed)
+        cleaned.append(trimmed)
+
+    set_config_value("models.favorites", cleaned, reload=True)
+    logger.info("Saved %d favorite model(s) via /api/v2/user/favorites", len(cleaned))
+    return flask.jsonify({"status": "ok", "favorites": cleaned})
+
+
 @v2_api.route("/api/v2/user/avatar", methods=["GET"])
 @require_auth
 @api_doc(
@@ -1701,6 +2391,211 @@ def api_user_avatar():
     return flask.send_file(full_path)
 
 
+@v2_api.route("/api/v2/user/config-file", methods=["GET"])
+@require_auth
+@api_doc(
+    summary="Get raw user config file",
+    description="Return the raw TOML contents of the user's main config.toml file.",
+    responses={200: UserConfigFileResponse},
+    tags=["user"],
+)
+def api_user_config_file_get():
+    """Return raw config.toml contents for the settings UI."""
+    content = _read_user_config_file_text()
+    return flask.jsonify(_get_user_config_file_response(content))
+
+
+@v2_api.route("/api/v2/user/config-file", methods=["PUT"])
+@require_auth
+@api_doc(
+    summary="Replace raw user config file",
+    description=(
+        "Validate and replace the user's main config.toml file. "
+        "Malformed TOML is rejected before anything is written."
+    ),
+    request_body=UserConfigFileSaveRequest,
+    responses={200: UserConfigFileSaveResponse, 400: ErrorResponse},
+    tags=["user"],
+)
+def api_user_config_file_put():
+    """Replace config.toml with validated TOML text."""
+    req_json = request.get_json(silent=True)
+    if req_json is None:
+        return flask.jsonify({"error": "No JSON data provided"}), 400
+    if not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
+
+    content = req_json.get("content")
+    if not isinstance(content, str):
+        return flask.jsonify({"error": "content must be a string"}), 400
+
+    try:
+        tomlkit.loads(content)
+    except Exception as exc:
+        return flask.jsonify({"error": f"Invalid TOML: {exc}"}), 400
+
+    config_file, _local_path = get_user_config_paths()
+    config_file.parent.mkdir(parents=True, exist_ok=True)
+    config_file.write_text(content)
+    from gptme.config.core import reload_config
+
+    reload_config()
+
+    response = _get_user_config_file_response(content)
+    response["status"] = "ok"
+    return flask.jsonify(response)
+
+
+@v2_api.route("/api/v2/user/config-file", methods=["PATCH"])
+@require_auth
+@api_doc(
+    summary="Update one user config value",
+    description=(
+        "Update a single dotted key path in the user's main config.toml file. "
+        "JSON scalar values preserve their TOML type on write: strings stay "
+        "strings, booleans stay booleans, and numbers stay numbers."
+    ),
+    request_body=UserConfigFilePatchRequest,
+    responses={200: UserConfigFilePatchResponse, 400: ErrorResponse},
+    tags=["user"],
+)
+def api_user_config_file_patch():
+    """Persist one dotted key path into config.toml."""
+    req_json = request.get_json(silent=True)
+    if req_json is None:
+        return flask.jsonify({"error": "No JSON data provided"}), 400
+    if not isinstance(req_json, dict):
+        return flask.jsonify({"error": "JSON body must be an object"}), 400
+
+    key = req_json.get("key")
+    value = req_json.get("value")
+    reload_config = req_json.get("reload", True)
+    if not isinstance(key, str):
+        return flask.jsonify({"error": "key must be a string"}), 400
+    if not isinstance(value, str | int | float | bool):
+        return flask.jsonify(
+            {"error": "value must be a JSON scalar (string, number, or boolean)"}
+        ), 400
+    if not isinstance(reload_config, bool):
+        return flask.jsonify({"error": "reload must be a boolean"}), 400
+
+    try:
+        key = _validate_config_key_path(key)
+    except ValueError as exc:
+        return flask.jsonify({"error": str(exc)}), 400
+
+    set_config_value(key, value, reload=reload_config)
+    content = _read_user_config_file_text()
+    response = _get_user_config_file_response(content)
+    response["status"] = "ok"
+    response["key"] = key
+    return flask.jsonify(response)
+
+
+@v2_api.route("/api/v2/audio/transcriptions", methods=["POST"])
+@require_auth
+@api_doc(
+    summary="Transcribe uploaded audio with OpenRouter STT",
+    description=(
+        "Accept a short audio recording as multipart/form-data, forward it to "
+        "OpenRouter's `/api/v1/audio/transcriptions` endpoint, and return the "
+        "transcribed text."
+    ),
+    responses={
+        200: AudioTranscriptionResponse,
+        400: ErrorResponse,
+        413: ErrorResponse,
+        502: ErrorResponse,
+        503: ErrorResponse,
+    },
+    tags=["audio"],
+)
+def api_audio_transcriptions():
+    """Transcribe uploaded audio via OpenRouter."""
+    audio_file = request.files.get("file")
+    if audio_file is None or not audio_file.filename:
+        return flask.jsonify({"error": "No audio file provided"}), 400
+
+    audio_bytes = audio_file.read()
+    if not audio_bytes:
+        return flask.jsonify({"error": "Audio file is empty"}), 400
+    if len(audio_bytes) > _MAX_TRANSCRIPTION_AUDIO_BYTES:
+        size_mb = len(audio_bytes) / 1024 / 1024
+        return (
+            flask.jsonify(
+                {"error": (f"Audio file exceeds 25MB limit ({size_mb:.1f}MB)")}
+            ),
+            413,
+        )
+
+    requested_format = request.form.get("format")
+    audio_format = (requested_format or "").strip().lower() or _guess_audio_format(
+        audio_file.filename, audio_file.mimetype
+    )
+    if audio_format not in _SUPPORTED_TRANSCRIPTION_FORMATS:
+        supported_formats = ", ".join(sorted(_SUPPORTED_TRANSCRIPTION_FORMATS))
+        return (
+            flask.jsonify(
+                {
+                    "error": (
+                        "Unsupported audio format. "
+                        f"Supported formats: {supported_formats}"
+                    )
+                }
+            ),
+            400,
+        )
+
+    requested_model = request.form.get("model")
+    model = (requested_model or "").strip() or _DEFAULT_OPENROUTER_STT_MODEL
+
+    language = (request.form.get("language") or "").strip().lower() or None
+    if language and len(language) > 8:
+        return flask.jsonify({"error": "language must be a short ISO code"}), 400
+
+    try:
+        result = _transcribe_audio_with_openrouter(
+            audio_bytes=audio_bytes,
+            audio_format=audio_format,
+            model=model,
+            language=language,
+        )
+    except ValueError as exc:
+        return flask.jsonify({"error": str(exc)}), 503
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        logger.warning("OpenRouter STT request failed: %s %s", exc.code, detail)
+        return (
+            flask.jsonify(
+                {
+                    "error": (
+                        f"OpenRouter STT request failed ({exc.code}): "
+                        f"{detail or exc.reason}"
+                    )
+                }
+            ),
+            502,
+        )
+    except urllib.error.URLError as exc:
+        logger.warning("OpenRouter STT network failure: %s", exc)
+        return flask.jsonify(
+            {"error": f"OpenRouter STT request failed: {exc.reason}"}
+        ), 502
+
+    text = result.get("text")
+    if not isinstance(text, str):
+        return flask.jsonify({"error": "OpenRouter STT response missing text"}), 502
+
+    usage = result.get("usage")
+    return flask.jsonify(
+        {
+            "text": text,
+            "model": model,
+            "usage": usage if isinstance(usage, dict) else None,
+        }
+    )
+
+
 @v2_api.route("/api/v2/user/settings", methods=["GET"])
 @require_auth
 @api_doc(
@@ -1735,7 +2630,7 @@ def api_user_settings():
             "providers_configured": providers,
             "provider_sources": provider_sources,
             "default_model": default_model.full if default_model else None,
-            "default_model_source": get_user_config_env_source("MODEL"),
+            "default_model_source": get_default_model_source(),
             "config_files": get_user_config_runtime_info(),
         }
     )

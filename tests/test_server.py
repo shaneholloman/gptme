@@ -1,5 +1,8 @@
 import copy
 import random
+import threading
+import time
+from pathlib import Path
 
 import pytest
 
@@ -164,6 +167,69 @@ def test_api_conversation_search_case_insensitive(
     assert data[0]["id"] == "MySearchConversation"
 
 
+def test_api_conversation_list_detail_flag(client: FlaskClient, tmp_path, monkeypatch):
+    """Test that detail=true returns cost/token stats while default (false) zeroes them."""
+    import json
+
+    monkeypatch.setattr("gptme.logmanager.conversations.get_logs_dir", lambda: tmp_path)
+
+    # Create a conversation with an assistant message that carries usage info
+    conv_dir = tmp_path / "stats-conversation"
+    conv_dir.mkdir()
+    conv_file = conv_dir / "conversation.jsonl"
+    # Build a conversation > _TAIL_BYTES (8192) so the fast path actually activates
+    # for large files when detail=False. Pad with many user turns first.
+    messages: list[dict[str, object]] = [
+        {"role": "system", "content": "hello", "timestamp": "2026-01-01T00:00:00"},
+    ]
+    messages.extend(
+        {
+            "role": "user",
+            "content": "x" * 200,
+            "timestamp": f"2026-01-01T00:01:{i:02d}",
+        }
+        for i in range(40)
+    )
+    # The metadata-bearing assistant message (carries cost/token stats)
+    messages.append(
+        {
+            "role": "assistant",
+            "content": "reply",
+            "timestamp": "2026-01-02T00:00:00",
+            "metadata": {
+                "model": "claude-3-5-haiku",
+                "cost": 0.0001,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        }
+    )
+    conv_file.write_text("\n".join(json.dumps(m) for m in messages) + "\n")
+    assert conv_file.stat().st_size > 8192, (
+        "fixture must be > _TAIL_BYTES to trigger fast path"
+    )
+
+    # Default (detail=false) should return zeroed stats and omit the message count
+    response = client.get("/api/v2/conversations")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert "messages" not in data[0]
+    assert data[0]["total_cost"] == 0.0
+    assert data[0]["total_input_tokens"] == 0
+
+    # detail=true should return actual stats and include the message count
+    response = client.get("/api/v2/conversations?detail=true")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["messages"] == len(messages)
+    assert data[0]["total_cost"] > 0
+    assert data[0]["total_input_tokens"] > 0
+    assert data[0]["total_output_tokens"] > 0
+
+
 def test_api_conversation_get(conv, client: FlaskClient):
     response = client.get(f"/api/v2/conversations/{conv}")
     assert response.status_code == 200
@@ -244,6 +310,217 @@ def test_default_model_propagation():
         from gptme.llm.models import _default_model_var
 
         _default_model_var.set(None)
+
+
+def _reset_provider_health_cache(monkeypatch: pytest.MonkeyPatch):
+    import gptme.server.api_v2 as api_module
+
+    monkeypatch.setattr(api_module, "_provider_health_cache", {})
+    monkeypatch.setattr(api_module, "_provider_health_cache_time", 0.0)
+    monkeypatch.setattr(api_module, "_provider_health_refreshing", False)
+    return api_module
+
+
+def test_api_providers_health_structure(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Test that /api/v2/providers/health returns the expected response shape."""
+    api_module = _reset_provider_health_cache(monkeypatch)
+    monkeypatch.setattr(
+        api_module,
+        "list_available_providers",
+        lambda: [("anthropic", "ANTHROPIC_API_KEY"), ("openai", "OPENAI_API_KEY")],
+    )
+    monkeypatch.setattr(
+        api_module,
+        "_probe_provider",
+        lambda provider_name: {
+            "status": "ok" if provider_name == "anthropic" else "error",
+            "latency_ms": 42 if provider_name == "anthropic" else 17,
+            "error": None if provider_name == "anthropic" else "bad key",
+        },
+    )
+
+    response = client.get("/api/v2/providers/health")
+    assert response.status_code == 200
+    assert response.get_json() == {
+        "providers": {
+            "anthropic": {"status": "ok", "latency_ms": 42, "error": None},
+            "openai": {"status": "error", "latency_ms": 17, "error": "bad key"},
+        }
+    }
+
+
+def test_api_providers_health_cached(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Test that repeated calls use the cache instead of probing again."""
+    api_module = _reset_provider_health_cache(monkeypatch)
+    monkeypatch.setattr(
+        api_module,
+        "list_available_providers",
+        lambda: [("anthropic", "ANTHROPIC_API_KEY")],
+    )
+    calls: list[str] = []
+
+    def fake_probe(provider_name: str) -> dict[str, object]:
+        calls.append(provider_name)
+        return {"status": "ok", "latency_ms": 5, "error": None}
+
+    monkeypatch.setattr(api_module, "_probe_provider", fake_probe)
+
+    r1 = client.get("/api/v2/providers/health")
+    r2 = client.get("/api/v2/providers/health")
+    assert r1.status_code == 200
+    assert r2.status_code == 200
+    assert calls == ["anthropic"]
+    assert r1.get_json() == r2.get_json()
+
+
+def test_api_providers_health_force(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Test that ?force=1 bypasses the cache."""
+    api_module = _reset_provider_health_cache(monkeypatch)
+    monkeypatch.setattr(
+        api_module,
+        "list_available_providers",
+        lambda: [("anthropic", "ANTHROPIC_API_KEY")],
+    )
+    calls: list[str] = []
+
+    def fake_probe(provider_name: str) -> dict[str, object]:
+        calls.append(provider_name)
+        return {"status": "ok", "latency_ms": 7, "error": None}
+
+    monkeypatch.setattr(api_module, "_probe_provider", fake_probe)
+
+    response = client.get("/api/v2/providers/health")
+    forced = client.get("/api/v2/providers/health?force=1")
+    assert response.status_code == 200
+    assert forced.status_code == 200
+    assert calls == ["anthropic", "anthropic"]
+
+
+def test_probe_provider_checks_openai_subscription_auth(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """openai-subscription should get a real auth check, not configured fallback."""
+    from gptme.llm import llm_openai_subscription
+    from gptme.server import api_v2 as api_module
+
+    calls: list[float] = []
+
+    def fake_get_auth(timeout: float) -> object:
+        calls.append(timeout)
+        return object()
+
+    monkeypatch.setattr(llm_openai_subscription, "get_auth", fake_get_auth)
+
+    result = api_module._probe_provider("openai-subscription")
+
+    assert result["status"] == "ok"
+    assert result["error"] is None
+    assert calls == [api_module._PROVIDER_HEALTH_TIMEOUT]
+
+
+def test_probe_provider_empty_dynamic_models_is_unhealthy(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """local/gptme/custom probes should not report ok when model listing is empty."""
+    from gptme import llm
+    from gptme.server import api_v2 as api_module
+
+    monkeypatch.setattr(llm, "get_available_models", lambda provider: [])
+
+    result = api_module._probe_provider("local")
+
+    assert result["status"] == "error"
+    assert result["error"] == "No models returned from local"
+
+
+def test_api_providers_health_force_shares_inflight_refresh(
+    monkeypatch: pytest.MonkeyPatch,
+):
+    """Concurrent forced refreshes should share one probe instead of stampeding."""
+    api_module = _reset_provider_health_cache(monkeypatch)
+    monkeypatch.setattr(
+        api_module,
+        "list_available_providers",
+        lambda: [("anthropic", "ANTHROPIC_API_KEY")],
+    )
+    probe_started = threading.Event()
+    release_probe = threading.Event()
+    calls: list[str] = []
+
+    def fake_probe(provider_name: str) -> dict[str, object]:
+        calls.append(provider_name)
+        probe_started.set()
+        assert release_probe.wait(timeout=1)
+        return {"status": "ok", "latency_ms": 9, "error": None}
+
+    monkeypatch.setattr(api_module, "_probe_provider", fake_probe)
+
+    results: list[dict[str, object]] = []
+
+    def load_health() -> None:
+        results.append(api_module._get_provider_health_response(force=True))
+
+    first = threading.Thread(target=load_health)
+    second = threading.Thread(target=load_health)
+
+    first.start()
+    assert probe_started.wait(timeout=1)
+    second.start()
+    time.sleep(0.01)
+    assert calls == ["anthropic"]
+
+    release_probe.set()
+    first.join(timeout=1)
+    second.join(timeout=1)
+
+    assert not first.is_alive()
+    assert not second.is_alive()
+    assert calls == ["anthropic"]
+    assert results == [
+        {"providers": {"anthropic": {"status": "ok", "latency_ms": 9, "error": None}}},
+        {"providers": {"anthropic": {"status": "ok", "latency_ms": 9, "error": None}}},
+    ]
+
+
+def test_api_providers_health_timeout_returns_quickly(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Slow probes should surface as timeouts without blocking the response."""
+    api_module = _reset_provider_health_cache(monkeypatch)
+    monkeypatch.setattr(
+        api_module,
+        "list_available_providers",
+        lambda: [("anthropic", "ANTHROPIC_API_KEY")],
+    )
+    monkeypatch.setattr(api_module, "_PROVIDER_HEALTH_TIMEOUT", 0.01)
+
+    def slow_probe(_provider_name: str) -> dict[str, object]:
+        time.sleep(0.2)
+        return {"status": "ok", "latency_ms": 200, "error": None}
+
+    monkeypatch.setattr(api_module, "_probe_provider", slow_probe)
+
+    start = time.monotonic()
+    response = client.get("/api/v2/providers/health?force=1")
+    elapsed = time.monotonic() - start
+
+    assert response.status_code == 200
+    assert elapsed < 0.12
+    assert response.get_json() == {
+        "providers": {
+            "anthropic": {
+                "status": "error",
+                "latency_ms": 10,
+                "error": "Timeout",
+            }
+        }
+    }
 
 
 def test_api_v2_commands(client: FlaskClient):
@@ -493,3 +770,63 @@ def test_auth_query_param_still_works(auth_client):
 
     response = client.get(f"/api/v2/conversations?token={token}")
     assert response.status_code == 200
+
+
+def test_http_errors_return_json(client: FlaskClient):
+    """HTTP errors from Flask (404, 405) must return JSON, not HTML.
+
+    Without registered error handlers, Flask returns HTML error pages for routing
+    errors. The webui expects JSON from all /api/* responses, so HTML breaks client
+    error handling.
+    """
+    # 404: nonexistent API route
+    response = client.get("/api/v2/this-does-not-exist")
+    assert response.status_code == 404
+    assert response.content_type.startswith("application/json")
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+    # 405: valid route but wrong HTTP method
+    response = client.post("/api/v2/models")
+    assert response.status_code == 405
+    assert response.content_type.startswith("application/json")
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+    # 404: invalid message index type (-1 doesn't match <int:index> pattern)
+    response = client.delete("/api/v2/conversations/any-conv/messages/-1")
+    assert response.status_code in (404, 405)
+    assert response.content_type.startswith("application/json"), (
+        f"Expected JSON, got {response.content_type}: {response.data[:200]}"
+    )
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+
+def test_spa_fallback_api_returns_json(tmp_path: Path):
+    """In custom-webui mode, unknown api/ paths return JSON 404 (not index.html).
+
+    The spa_fallback catch-all route guards api/ prefixes explicitly so that
+    API clients don't receive index.html when they hit an unknown endpoint.
+    """
+    # Minimal webui build: any directory != static_path triggers is_custom_webui=True
+    (tmp_path / "index.html").write_text("<html></html>")
+
+    from gptme.server.app import create_app  # fmt: skip
+
+    app = create_app(webui_dir=tmp_path)
+    with app.test_client() as c:
+        # api/ path → JSON 404, never index.html
+        response = c.get("/api/v2/this-does-not-exist")
+        assert response.status_code == 404
+        assert response.content_type.startswith("application/json")
+        data = response.get_json()
+        assert data is not None
+        assert "error" in data
+
+        # non-api path → SPA fallback serves index.html
+        response = c.get("/some/deep/link")
+        assert response.status_code == 200

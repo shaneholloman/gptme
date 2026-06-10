@@ -4,6 +4,7 @@ import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/componen
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { WelcomeView } from '@/components/WelcomeView';
 import { ConversationContent } from '@/components/ConversationContent';
+import { SplitConversationView } from '@/components/SplitConversationView';
 import { TaskDetails } from '@/components/TaskDetails';
 import { RightSidebar } from '@/components/RightSidebar';
 import { RightSidebarContent } from '@/components/RightSidebarContent';
@@ -17,6 +18,7 @@ import { WorkspacesView } from '@/components/WorkspacesView';
 import { useToast } from '@/components/ui/use-toast';
 import { setDocumentTitle } from '@/utils/title';
 import { toastStepStartError } from '@/utils/stepErrorHandling';
+import { chatRoute } from '@/utils/routes';
 import { useQueryClient } from '@tanstack/react-query';
 import { useConversationsInfiniteQuery } from '@/hooks/useConversationsInfiniteQuery';
 import { useSecondaryServerConversations } from '@/hooks/useMultiServerConversations';
@@ -25,7 +27,8 @@ import { serverRegistry$ } from '@/stores/servers';
 import { demoConversations, getDemoMessages } from '@/democonversations';
 import { useSearchParams, useNavigate, useLocation } from 'react-router-dom';
 import { Memo, use$, useObservable, useObserveEffect } from '@legendapp/state/react';
-import { Loader2, GitBranch } from 'lucide-react';
+import { Loader2, GitBranch, Columns2 } from 'lucide-react';
+import { Button } from '@/components/ui/button';
 import type { ConversationSummary } from '@/types/conversation';
 import type { Task, CreateTaskRequest } from '@/types/task';
 import {
@@ -55,6 +58,12 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
   const location = useLocation();
   const stepParam = searchParams.get('step');
   const serverParam = searchParams.get('server');
+  const splitParam = searchParams.get('split');
+  const splitIds = useMemo((): [string, string] | null => {
+    if (!splitParam) return null;
+    const ids = splitParam.split(',').filter(Boolean).slice(0, 2);
+    return ids.length === 2 ? (ids as [string, string]) : null;
+  }, [splitParam]);
   const { api, isConnected$ } = useApi();
   const { toast } = useToast();
   const queryClient = useQueryClient();
@@ -150,7 +159,7 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
           const newSearchParams = new URLSearchParams(searchParams);
           newSearchParams.delete('step');
           const queryString = newSearchParams.toString();
-          const url = `/chat/${conversationId}${queryString ? `?${queryString}` : ''}`;
+          const url = chatRoute(conversationId, queryString);
           navigate(url, { replace: true });
         } else {
           setTimeout(checkAndStart, 100);
@@ -290,13 +299,14 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
       selectedConversation$.set(id);
 
       const newParams = new URLSearchParams(searchParams);
+      newParams.delete('split');
       if (serverId) {
         newParams.set('server', serverId);
       } else {
         newParams.delete('server');
       }
       const queryString = newParams.toString();
-      const url = `/chat/${id}${queryString ? `?${queryString}` : ''}`;
+      const url = chatRoute(id, queryString);
       navigate(url);
     },
     [queryClient, navigate, searchParams]
@@ -325,6 +335,39 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
     [createTaskMutation, selectedTaskId, navigate]
   );
 
+  const getSelectedConversationSummary = useCallback(
+    (selectedConversation: string): ConversationSummary => {
+      const conversation = allConversations.find((conv) => conv.id === selectedConversation);
+      if (conversation) return conversation;
+
+      const storeConversation = conversations$.get(selectedConversation)?.get();
+      if (storeConversation?.data) {
+        // Create conversation summary even if no messages yet - let ConversationContent handle loading
+        return {
+          id: selectedConversation,
+          name: storeConversation.data.name || 'New conversation',
+          modified: storeConversation.lastMessage
+            ? new Date(storeConversation.lastMessage.timestamp || Date.now()).getTime()
+            : Date.now(),
+          messages: storeConversation.data.log?.length || 0,
+          workspace: storeConversation.data.workspace || '.',
+          readonly: false,
+        };
+      }
+
+      // Even if not in store yet, create a minimal conversation to trigger ConversationContent loading
+      return {
+        id: selectedConversation,
+        name: 'Loading...',
+        modified: Date.now(),
+        messages: 0,
+        workspace: '.',
+        readonly: false,
+      };
+    },
+    [allConversations]
+  );
+
   // Immediately clear conversation state when no conversationId is provided
   if (!conversationId && !taskId) {
     if (selectedConversation$.get() !== '' || conversation$.get() !== undefined) {
@@ -337,38 +380,7 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
   // Update conversation$ when selected conversation changes
   useObserveEffect(selectedConversation$, ({ value: selectedConversation }) => {
     if (selectedConversation) {
-      let conversation = allConversations.find((conv) => conv.id === selectedConversation);
-
-      // If not found in allConversations, check the conversations store directly
-      if (!conversation) {
-        const storeConversation = conversations$.get(selectedConversation)?.get();
-
-        if (storeConversation) {
-          // Create conversation summary even if no messages yet - let ConversationContent handle loading
-          conversation = {
-            id: selectedConversation,
-            name: storeConversation.data.name || 'New conversation',
-            modified: storeConversation.lastMessage
-              ? new Date(storeConversation.lastMessage.timestamp || Date.now()).getTime()
-              : Date.now(),
-            messages: storeConversation.data.log?.length || 0,
-            workspace: storeConversation.data.workspace || '.',
-            readonly: false,
-          };
-        } else {
-          // Even if not in store yet, create a minimal conversation to trigger ConversationContent loading
-          conversation = {
-            id: selectedConversation,
-            name: 'Loading...',
-            modified: Date.now(),
-            messages: 0,
-            workspace: '.',
-            readonly: false,
-          };
-        }
-      }
-
-      conversation$.set(conversation);
+      conversation$.set(getSelectedConversationSummary(selectedConversation));
     } else {
       conversation$.set(undefined);
     }
@@ -377,14 +389,13 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
   useEffect(() => {
     const selectedId = selectedConversation$.get();
     if (selectedId) {
-      const selectedConversation = allConversations.find((conv) => conv.id === selectedId);
-      conversation$.set(selectedConversation);
+      conversation$.set(getSelectedConversationSummary(selectedId));
     } else {
       // Ensure conversation is cleared when no conversation is selected
       conversation$.set(undefined);
     }
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [allConversations]); // conversation$ is an observable we're setting, not reading
+  }, [allConversations, getSelectedConversationSummary]); // conversation$ is an observable we're setting, not reading
 
   // Update document title
   useObserveEffect(conversation$, ({ value: conversation }) => {
@@ -454,17 +465,58 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
       );
     }
 
-    // Chat section
+    // Chat section — split view
+    if (splitIds) {
+      const leftConversation = getSelectedConversationSummary(splitIds[0]);
+      const rightConversation = getSelectedConversationSummary(splitIds[1]);
+
+      return (
+        <SplitConversationView
+          leftId={splitIds[0]}
+          rightId={splitIds[1]}
+          serverId={serverParam || undefined}
+          leftIsReadOnly={leftConversation.readonly}
+          rightIsReadOnly={rightConversation.readonly}
+          vertical={isMobile}
+          onClose={() => {
+            const params = new URLSearchParams(searchParams);
+            params.delete('split');
+            const qs = params.toString();
+            navigate(chatRoute(splitIds[0], qs));
+          }}
+        />
+      );
+    }
+
+    // Chat section — single conversation
     const conversation = conversation$.get();
     if (conversation) {
       return (
-        <div className="h-full overflow-auto">
-          <ConversationContent
-            key={conversation.id}
-            conversationId={conversation.id}
-            serverId={serverParam || conversation.serverId}
-            isReadOnly={conversation.readonly}
-          />
+        <div className="flex h-full flex-col overflow-hidden">
+          <div className="flex flex-shrink-0 items-center justify-end border-b px-2 py-0.5">
+            <Button
+              variant="ghost"
+              size="sm"
+              className="h-6 gap-1 px-2 text-xs text-muted-foreground hover:text-foreground"
+              onClick={() => {
+                const params = new URLSearchParams(searchParams);
+                params.set('split', `${conversation.id},${conversation.id}`);
+                navigate(`?${params.toString()}`);
+              }}
+              title="Open in split view"
+            >
+              <Columns2 className="h-3 w-3" />
+              Split
+            </Button>
+          </div>
+          <div className="min-h-0 flex-1">
+            <ConversationContent
+              key={conversation.id}
+              conversationId={conversation.id}
+              serverId={serverParam || conversation.serverId}
+              isReadOnly={conversation.readonly}
+            />
+          </div>
         </div>
       );
     }

@@ -1,4 +1,4 @@
-import { mergeIntoObservable, observable } from '@legendapp/state';
+import { batch, mergeIntoObservable, observable } from '@legendapp/state';
 import type { ChatConfig, ConversationResponse } from '@/types/api';
 import type { Message, StreamingMessage, ToolUse } from '@/types/conversation';
 import { demoConversations, getDemoMessages } from '@/democonversations';
@@ -11,7 +11,15 @@ export interface PendingTool {
 export interface ExecutingTool {
   id: string;
   tooluse: ToolUse;
+  startedAt: number;
+  partialOutput: string;
 }
+
+export type ConversationConnectionStatus =
+  | 'connecting'
+  | 'connected'
+  | 'reconnecting'
+  | 'disconnected';
 
 export interface ConversationState {
   // The conversation data
@@ -20,10 +28,25 @@ export interface ConversationState {
   isGenerating: boolean;
   // Whether this conversation has an active event stream
   isConnected: boolean;
+  connectionStatus: ConversationConnectionStatus;
+  reconnectAttempt: number | null;
+  reconnectMaxAttempts: number | null;
+  reconnectRetryInMs: number | null;
+  reconnectRetryStartedAt: number | null;
+  connectionError: string | null;
+  // Error message if loading the conversation from the API failed
+  loadError: string | null;
   // Any pending tool
   pendingTool: PendingTool | null;
   // Any executing tool
   executingTool: ExecutingTool | null;
+  // Duration of the most recently completed tool (cleared when next tool starts)
+  lastCompletedTool: {
+    toolName: string;
+    durationMs: number;
+    completedAt: number;
+    success: boolean;
+  } | null;
   // Last received message
   lastMessage?: Message;
   // Whether to show the initial system message
@@ -33,6 +56,9 @@ export interface ConversationState {
   // Whether this conversation needs initial step after connecting
   // Used to fix race condition where step() was called before event subscription
   needsInitialStep: boolean;
+  // Stream setting captured when creating a placeholder conversation.
+  // The initial step starts before chatConfig is always loaded into the store.
+  initialStepStream?: boolean;
   // Currently displayed branch name
   currentBranch: string;
   // Max tokens setting for model responses, persisted across operations.
@@ -52,21 +78,41 @@ export const selectedConversation$ = observable<string>(demoConversations[0].id)
 
 // Helper functions
 export function updateConversation(id: string, update: Partial<ConversationState>) {
-  if (!conversations$.get(id)) {
+  // Note: conversations$.get(id) returns a truthy lazy node even for missing
+  // keys, so check the actual value via peek() to detect non-existent entries.
+  if (!conversations$.get(id)?.peek()) {
     // Initialize with defaults if conversation doesn't exist
     conversations$.set(id, {
       data: { id, name: '', log: [], logfile: id, branches: {}, workspace: '/default/workspace' },
       isGenerating: false,
       isConnected: false,
+      connectionStatus: 'disconnected',
+      reconnectAttempt: null,
+      reconnectMaxAttempts: null,
+      reconnectRetryInMs: null,
+      connectionError: null,
+      reconnectRetryStartedAt: null,
+      loadError: null,
       pendingTool: null,
       executingTool: null,
+      lastCompletedTool: null,
       showInitialSystem: false,
       chatConfig: null,
       needsInitialStep: false,
+      initialStepStream: undefined,
       currentBranch: 'main',
     });
   }
-  mergeIntoObservable(conversations$.get(id), update);
+  // mergeIntoObservable treats an undefined value as "delete this key". `data`
+  // is required, so a stray `{ data: undefined }` (e.g. an API call resolving
+  // to undefined) would wipe it and leave a dataless entry that crashes every
+  // reader. Drop it from the merge so existing/default data is preserved.
+  if ('data' in update && update.data === undefined) {
+    const { data: _ignored, ...rest } = update;
+    mergeIntoObservable(conversations$.get(id), rest);
+  } else {
+    mergeIntoObservable(conversations$.get(id), update);
+  }
 }
 
 export function addMessage(id: string, message: Message | StreamingMessage) {
@@ -114,7 +160,35 @@ export function setGenerating(id: string, isGenerating: boolean) {
 }
 
 export function setConnected(id: string, isConnected: boolean) {
-  updateConversation(id, { isConnected });
+  updateConversation(id, {
+    isConnected,
+    connectionStatus: isConnected ? 'connected' : 'disconnected',
+    reconnectAttempt: null,
+    reconnectMaxAttempts: null,
+    reconnectRetryInMs: null,
+    connectionError: null,
+  });
+}
+
+export function setConnectionStatus(
+  id: string,
+  status: ConversationConnectionStatus,
+  options?: {
+    attempt?: number;
+    maxAttempts?: number;
+    retryInMs?: number;
+    error?: string | null;
+  }
+) {
+  updateConversation(id, {
+    isConnected: status === 'connected',
+    connectionStatus: status,
+    reconnectAttempt: options?.attempt ?? null,
+    reconnectMaxAttempts: options?.maxAttempts ?? null,
+    reconnectRetryInMs: options?.retryInMs ?? null,
+    reconnectRetryStartedAt: status === 'reconnecting' && options?.retryInMs ? Date.now() : null,
+    connectionError: options?.error ?? null,
+  });
 }
 
 export function setPendingTool(id: string, toolId: string | null, tooluse: ToolUse | null) {
@@ -123,9 +197,45 @@ export function setPendingTool(id: string, toolId: string | null, tooluse: ToolU
   });
 }
 
-export function setExecutingTool(id: string, toolId: string | null, tooluse: ToolUse | null) {
+export function setExecutingTool(
+  id: string,
+  toolId: string | null,
+  tooluse: ToolUse | null,
+  startedAt?: number
+) {
+  const update: Partial<ConversationState> = {
+    executingTool:
+      toolId && tooluse
+        ? { id: toolId, tooluse, startedAt: startedAt ?? Date.now(), partialOutput: '' }
+        : null,
+  };
+  if (toolId) {
+    // Clear the completion badge when a new tool starts executing
+    update.lastCompletedTool = null;
+  }
+  updateConversation(id, update);
+}
+
+export function setToolOutput(id: string, output: string) {
+  const conversation = conversations$.get(id);
+  if (!conversation) return;
+  const executing = conversation.executingTool.get();
+  if (!executing) return;
+  conversation.executingTool.set({
+    ...executing,
+    partialOutput: (executing.partialOutput || '') + output,
+  });
+}
+
+export function setToolComplete(
+  id: string,
+  toolName: string,
+  durationMs: number,
+  success: boolean
+) {
   updateConversation(id, {
-    executingTool: toolId && tooluse ? { id: toolId, tooluse } : null,
+    executingTool: null,
+    lastCompletedTool: { toolName, durationMs, completedAt: Date.now(), success },
   });
 }
 
@@ -133,7 +243,7 @@ export function setExecutingTool(id: string, toolId: string | null, tooluse: Too
 export function initConversation(
   id: string,
   data?: ConversationResponse,
-  options?: { needsInitialStep?: boolean }
+  options?: { needsInitialStep?: boolean; initialStepStream?: boolean }
 ) {
   const initial: ConversationState = {
     data: data || {
@@ -146,11 +256,20 @@ export function initConversation(
     },
     isGenerating: false,
     isConnected: false,
+    connectionStatus: 'disconnected',
+    reconnectAttempt: null,
+    reconnectMaxAttempts: null,
+    reconnectRetryInMs: null,
+    connectionError: null,
+    reconnectRetryStartedAt: null,
+    loadError: null,
     pendingTool: null,
     executingTool: null,
+    lastCompletedTool: null,
     showInitialSystem: false,
     chatConfig: null,
     needsInitialStep: options?.needsInitialStep ?? false,
+    initialStepStream: options?.initialStepStream,
     currentBranch: 'main',
   };
   conversations$.set(id, initial);
@@ -158,6 +277,16 @@ export function initConversation(
 
 export function setNeedsInitialStep(id: string, needsInitialStep: boolean) {
   updateConversation(id, { needsInitialStep });
+}
+
+export function clearInitialStepState(id: string) {
+  const conversation = conversations$.get(id);
+  if (!conversation) return;
+
+  batch(() => {
+    conversation.needsInitialStep.set(false);
+    conversation.initialStepStream.delete();
+  });
 }
 
 export function setMaxTokens(id: string, maxTokens: number | undefined) {

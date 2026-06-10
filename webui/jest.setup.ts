@@ -1,5 +1,13 @@
 import '@testing-library/jest-dom';
 
+// Polyfill structuredClone for jsdom — Node 17+ has it but jsdom doesn't expose it.
+// Limitation: JSON.parse/JSON.stringify drops undefined properties, coerces Date to
+// string, throws on BigInt, and silently converts Map/Set to {}. Safe for the current
+// JSON-compatible conversation objects; revisit if tests start using those types.
+if (typeof structuredClone === 'undefined') {
+  global.structuredClone = <T>(val: T): T => JSON.parse(JSON.stringify(val));
+}
+
 // Shim Vite import.meta.env for Jest.
 // connectionConfig.ts and SetupWizard.tsx wrap import.meta.env accesses in
 // Function() and fall back to process.env when that throws.
