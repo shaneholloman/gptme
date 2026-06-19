@@ -165,6 +165,45 @@ class TestAutoReplyHook:
             )
             assert len(result) == 0
 
+    def test_two_auto_replies_mixed_variants_exits(self):
+        """Should exit after two no-tool replies even when the two auto-reply
+        messages are *different* variants.
+
+        Realistic production case: the first turn has incomplete todos, so the
+        reminder variant fires; the model then completes the todos but still
+        produces a tool-less response, so the confirm variant fires. Both
+        variants share the ``"No tool call detected in last message"`` marker,
+        so they must count toward the same exit threshold. This is the exact
+        cross-variant counting that gptme/gptme#2846 fixed — before that, the
+        two full-string markers were distinct and a mixed sequence undercounted
+        and never exited (infinite cycle).
+        """
+        messages = [
+            Message("assistant", "Working\n```shell\nls\n```"),
+            # First auto-reply: incomplete-todos (reminder) variant
+            Message(
+                "user",
+                "<system>No tool call detected in last message. You have incomplete todos:\n- Implement feature X (in_progress)\n\nPlease continue working on these tasks, or mark them complete/remove them before finishing.</system>",
+            ),
+            Message("assistant", "First response without tools"),
+            # Second auto-reply: confirm variant (todos now done, still no tools)
+            Message(
+                "user",
+                "<system>No tool call detected in last message. Did you mean to finish? If so, make sure you are completely done and then use the `complete` tool to end the session.</system>",
+            ),
+            Message("assistant", "Second response without tools"),
+        ]
+
+        manager = MagicMock()
+        manager.log = Log(messages)
+
+        # Should raise SessionCompleteException despite the two messages being
+        # different variants (regression guard for the shared marker).
+        with pytest.raises(SessionCompleteException) as exc_info:
+            list(auto_reply_hook(manager, interactive=False, prompt_queue=None))
+
+        assert "2 auto-reply confirmations" in str(exc_info.value)
+
 
 class TestTodoContinuationEnforcer:
     """Tests for todo-based continuation enforcement."""
@@ -209,6 +248,40 @@ class TestTodoContinuationEnforcer:
         assert "incomplete todos" in result[0].content
         assert "Implement feature X" in result[0].content
         assert "Write tests" in result[0].content
+
+    def test_two_auto_replies_with_incomplete_todos_exits(self):
+        """Should exit after 2 consecutive no-tool replies even with incomplete todos."""
+        # Add incomplete todos
+        todo._current_todos["1"] = {
+            "id": "1",
+            "text": "Implement feature X",
+            "state": "in_progress",
+            "created": "2025-01-01T00:00:00",
+            "updated": "2025-01-01T00:00:00",
+        }
+
+        messages = [
+            Message("assistant", "Working\n```shell\nls\n```"),
+            Message(
+                "user",
+                "<system>No tool call detected in last message. You have incomplete todos:\n- Implement feature X (in_progress)\n\nPlease continue working on these tasks, or mark them complete/remove them before finishing.</system>",
+            ),
+            Message("assistant", "First response without tools"),
+            Message(
+                "user",
+                "<system>No tool call detected in last message. You have incomplete todos:\n- Implement feature X (in_progress)\n\nPlease continue working on these tasks, or mark them complete/remove them before finishing.</system>",
+            ),
+            Message("assistant", "Second response without tools"),
+        ]
+
+        manager = MagicMock()
+        manager.log = Log(messages)
+
+        # Should raise SessionCompleteException (not cycle infinitely)
+        with pytest.raises(SessionCompleteException) as exc_info:
+            list(auto_reply_hook(manager, interactive=False, prompt_queue=None))
+
+        assert "2 auto-reply confirmations" in str(exc_info.value)
 
     def test_auto_reply_without_incomplete_todos(self):
         """Should show normal message when no incomplete todos."""

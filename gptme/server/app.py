@@ -9,6 +9,7 @@ from importlib import resources
 from pathlib import Path
 
 import flask
+from flask_compress import Compress
 from flask_cors import CORS
 
 logger = logging.getLogger(__name__)
@@ -66,6 +67,12 @@ def create_app(
     static_folder = _resolve_static_folder(webui_dir)
     app = flask.Flask(__name__, static_folder=static_folder)
 
+    # Enable gzip compression on API responses (reduces bandwidth ~5-10x for JSON).
+    # Compresses responses >= MIN_SIZE (default 500 bytes) for clients that send
+    # Accept-Encoding: gzip. Flask-Compress handles content negotiation and
+    # varies compression level on content-type.
+    Compress(app)
+
     # Capture the server's default model from the startup context
     # This is needed because ContextVar doesn't propagate across request contexts
     from ..llm.models import get_default_model, set_default_model
@@ -83,6 +90,7 @@ def create_app(
 
     # Register v2 API, workspace API, tasks API, and auth API
     # noreorder
+    from .a2a_api import a2a_api  # fmt: skip
     from .api_v2 import v2_api  # fmt: skip
     from .artifacts_api import artifacts_api  # fmt: skip
     from .auth import auth_api  # fmt: skip
@@ -92,6 +100,7 @@ def create_app(
     from .tts_api import tts_api  # fmt: skip
     from .workspace_api import workspace_api  # fmt: skip
 
+    app.register_blueprint(a2a_api)
     app.register_blueprint(v2_api)
     app.register_blueprint(auth_api)
     app.register_blueprint(workspace_api)
@@ -147,6 +156,11 @@ def create_app(
     from .auth import init_auth  # fmt: skip
 
     init_auth(host=host, display=False)
+
+    # Register Prometheus metrics middleware and /api/v0/metrics endpoint
+    from .metrics import init_metrics  # fmt: skip
+
+    init_metrics(app)
 
     # Track whether we're serving a custom webui build (not the legacy bundle).
     # Used below to gate SPA-specific route behaviour.

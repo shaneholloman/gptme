@@ -32,7 +32,7 @@ def main():
 @main.command("login")
 @click.option(
     "--url",
-    default="https://fleet.gptme.ai",
+    default="https://kpkxgnfpyntahyhckhgm.supabase.co",
     show_default=True,
     help="gptme service URL (used for LLM API and token storage).",
 )
@@ -64,7 +64,11 @@ def auth_login(url: str, auth_url: str | None, no_browser: bool):
 
     Works great for SSH sessions and headless environments.
     """
-    from ..llm.llm_gptme import DEFAULT_DEVICE_AUTH_URL
+    from ..llm.llm_gptme import (
+        DEFAULT_BASE_URL,
+        DEFAULT_DEVICE_AUTH_URL,
+        DEFAULT_SERVICE_URL,
+    )
 
     base_url = url.rstrip("/")
     auth_base = (auth_url or DEFAULT_DEVICE_AUTH_URL).rstrip("/")
@@ -150,15 +154,17 @@ def auth_login(url: str, auth_url: str | None, no_browser: bool):
 
             from ..llm.llm_gptme import _save_token
 
-            _save_token(
-                {
-                    "access_token": access_token,
-                    "expires_at": time.time() + token_data.get("expires_in", 86400),
-                    "server_url": base_url,
-                    "sub": sub,
-                },
-                base_url,
-            )
+            token_entry: dict = {
+                "access_token": access_token,
+                "expires_at": time.time() + token_data.get("expires_in", 86400),
+                "server_url": base_url,
+                "sub": sub,
+            }
+            # Only store base_url for the default Supabase service.
+            # Custom server tokens rely on the server_url+/v1 fallback in get_base_url().
+            if base_url == DEFAULT_SERVICE_URL.rstrip("/"):
+                token_entry["base_url"] = DEFAULT_BASE_URL
+            _save_token(token_entry, base_url)
 
             console.print("\n")
             console.print("[green bold]✓ Authorization successful![/green bold]")
@@ -204,19 +210,35 @@ def auth_login(url: str, auth_url: str | None, no_browser: bool):
 @main.command("logout")
 @click.option(
     "--url",
-    default="https://fleet.gptme.ai",
+    default="https://kpkxgnfpyntahyhckhgm.supabase.co",
     show_default=True,
     help="gptme service URL to log out from.",
 )
 def auth_logout(url: str):
     """Remove stored credentials for gptme cloud."""
-    from ..llm.llm_gptme import _get_token_path
+    from ..llm.llm_gptme import (
+        _LEGACY_SERVICE_URLS,
+        DEFAULT_SERVICE_URL,
+        _get_token_path,
+    )
 
     base_url = url.rstrip("/")
     token_path = _get_token_path(base_url)
     if token_path.exists():
         token_path.unlink()
         console.print(f"[green]✓ Logged out from {base_url}[/green]")
+    elif base_url == DEFAULT_SERVICE_URL:
+        # Migration fallback: check legacy service URL paths so users authenticated
+        # before the Supabase migration can actually log out.
+        for legacy_url in _LEGACY_SERVICE_URLS:
+            legacy_path = _get_token_path(legacy_url)
+            if legacy_path.exists():
+                legacy_path.unlink()
+                console.print(
+                    f"[green]✓ Logged out (removed legacy token from {legacy_url})[/green]"
+                )
+                return
+        console.print(f"[yellow]No credentials stored for {base_url}[/yellow]")
     else:
         console.print(f"[yellow]No credentials stored for {base_url}[/yellow]")
 
@@ -224,16 +246,21 @@ def auth_logout(url: str):
 @main.command("status")
 @click.option(
     "--url",
-    default="https://fleet.gptme.ai",
+    default="https://kpkxgnfpyntahyhckhgm.supabase.co",
     show_default=True,
     help="gptme service URL to check.",
 )
 def auth_status(url: str):
     """Show current login status for gptme cloud."""
-    from ..llm.llm_gptme import _load_token
+    from ..llm.llm_gptme import DEFAULT_SERVICE_URL, _load_token
 
     base_url = url.rstrip("/")
     token_data = _load_token(base_url)
+    # Migration fallback: when checking the default Supabase URL and no new
+    # token exists, _load_token() (no args) also searches legacy paths like
+    # fleet.gptme.ai tokens saved before the Supabase URL migration.
+    if not token_data and base_url == DEFAULT_SERVICE_URL:
+        token_data = _load_token()
 
     if not token_data:
         console.print(f"[yellow]Not logged in to {base_url}[/yellow]")

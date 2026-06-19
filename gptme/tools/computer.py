@@ -54,6 +54,10 @@ Mouse:
 Screen:
     - screenshot: Take and view a screenshot
     - cursor_position: Get current mouse position
+    - wait_for_change: Poll until screen changes, then return one screenshot
+
+Window management:
+    - window_focus: Wait for a window matching a name pattern to appear and focus it
 
 The tool automatically handles screen resolution scaling to ensure optimal performance
 with LLM vision capabilities.
@@ -79,10 +83,11 @@ import platform
 import shlex
 import shutil
 import subprocess
+import time
 from enum import Enum
 from typing import TYPE_CHECKING, Literal, TypedDict
 
-from .base import ToolSpec, ToolUse
+from .base import ToolFunction, ToolSpec, ToolUse
 from .computer_transport import get_transport
 from .screenshot import screenshot
 from .vision import view_image
@@ -119,6 +124,30 @@ def _make_screenshot_msg(path: Path, tool: str = "computer") -> Message | None:
     return dataclasses.replace(msg, metadata=existing)
 
 
+def _compute_change_ratio(path1: Path, path2: Path) -> float:
+    """Return fraction of pixels that differ between two screenshots (0.0–1.0).
+
+    Uses Pillow's pixel-level comparison after converting to a consistent mode.
+    Returns 0.0 if images can't be compared (mismatched sizes, load errors).
+    """
+    try:
+        from PIL import Image, ImageChops
+
+        img1 = Image.open(path1).convert("RGB")
+        img2 = Image.open(path2).convert("RGB")
+        if img1.size != img2.size:
+            return 0.0
+        diff = ImageChops.difference(img1, img2)
+        total_pixels = img1.width * img1.height
+        raw = diff.tobytes()  # 3 bytes per pixel for RGB
+        nonzero = sum(
+            1 for i in range(0, len(raw), 3) if raw[i] or raw[i + 1] or raw[i + 2]
+        )
+        return nonzero / total_pixels
+    except Exception:
+        return 0.0
+
+
 # Constants from Anthropic's implementation
 TYPING_DELAY_MS = 12
 TYPING_GROUP_SIZE = 50
@@ -132,9 +161,14 @@ Action = Literal[
     "right_click",
     "middle_click",
     "double_click",
+    "scroll",
     "screenshot",
     "cursor_position",
+    "wait_for_change",
+    "window_focus",
 ]
+
+ScrollDirection = Literal["up", "down", "left", "right"]
 
 
 class _Resolution(TypedDict):
@@ -466,6 +500,160 @@ def _linux_type(text: str, display: str) -> None:
         )
 
 
+def _linux_scroll(
+    x: int, y: int, direction: str, display: str, amount: int = 3
+) -> None:
+    """Scroll in a direction at (x, y) using xdotool on Linux/X11.
+
+    Button mapping: 4=up, 5=down, 6=left, 7=right.
+    """
+    button_map = {"up": "4", "down": "5", "left": "6", "right": "7"}
+    button = button_map.get(direction)
+    if button is None:
+        raise ValueError(f"Invalid scroll direction: {direction!r}")
+    _run_xdotool(f"mousemove --sync {x} {y}", display)
+    _run_xdotool(f"click --repeat {amount} {button}", display)
+
+
+def _macos_scroll(x: int, y: int, direction: str, amount: int = 3) -> None:
+    """Scroll in a direction at (x, y) on macOS using Quartz scroll wheel events."""
+    try:
+        from Quartz import (  # type: ignore[import-not-found]
+            CGEventCreateScrollWheelEvent,
+            CGEventPost,
+            CGEventSetLocation,
+            kCGHIDEventTap,
+            kCGScrollEventUnitLine,
+        )
+        from Quartz.CoreGraphics import CGPoint  # type: ignore[import-not-found]
+    except ImportError:
+        raise RuntimeError(
+            "pyobjc-framework-Quartz is required for scroll on macOS. "
+            "Install with: pip install pyobjc-framework-Quartz"
+        ) from None
+
+    _macos_mouse_move(x, y)
+
+    delta_y = 0
+    delta_x = 0
+    if direction == "up":
+        delta_y = amount
+    elif direction == "down":
+        delta_y = -amount
+    elif direction == "left":
+        delta_x = amount
+    elif direction == "right":
+        delta_x = -amount
+    else:
+        raise ValueError(f"Invalid scroll direction: {direction!r}")
+
+    event = CGEventCreateScrollWheelEvent(
+        None, kCGScrollEventUnitLine, 2, delta_y, delta_x
+    )
+    CGEventSetLocation(event, CGPoint(x, y))
+    CGEventPost(kCGHIDEventTap, event)
+
+
+def _linux_window_focus(pattern: str, display: str, timeout: float = 10.0) -> None:
+    """Wait for a window matching the name pattern to appear and focus it.
+
+    Uses xdotool's ``--sync`` flag so the call blocks until the window exists,
+    then focuses it.  This avoids the screenshot-polling workaround previously
+    needed when opening new terminal windows in X11 environments.
+
+    Args:
+        pattern: Substring matched against WM_NAME (window title).
+        display: X11 display string (e.g. ":1").
+        timeout: Seconds to wait for the window to appear (default 10).
+    """
+    env = os.environ.copy()
+    env["DISPLAY"] = display
+    try:
+        subprocess.run(
+            [
+                "xdotool",
+                "search",
+                "--sync",
+                "--limit",
+                "1",
+                "--name",
+                pattern,
+                "windowfocus",
+                "--sync",
+            ],
+            env=env,
+            check=True,
+            capture_output=True,
+            text=True,
+            timeout=timeout + 2,  # extra headroom beyond the xdotool sync wait
+        )
+    except subprocess.TimeoutExpired as e:
+        raise RuntimeError(
+            f"No window matching {pattern!r} appeared within {timeout:.0f}s"
+        ) from e
+    except subprocess.CalledProcessError as e:
+        raise RuntimeError(
+            f"xdotool search/focus failed for pattern {pattern!r}: {e.stderr}"
+        ) from e
+
+
+def _macos_window_focus(pattern: str, timeout: float = 10.0) -> None:
+    """Focus the frontmost application whose name contains pattern on macOS.
+
+    Uses AppleScript via ``osascript`` with a Python-level retry loop so the
+    call blocks until a matching window appears or the timeout expires — matching
+    the blocking semantics of the Linux xdotool path.
+
+    Args:
+        pattern: Substring matched against application/process name.
+        timeout: Seconds to wait for the window to appear (default 10).
+    """
+    script = (
+        "on run argv\n"
+        "  set needle to item 1 of argv\n"
+        '  tell application "System Events"\n'
+        "    set found to false\n"
+        "    repeat with p in (every process whose background only is false)\n"
+        "      if name of p contains needle then\n"
+        "        set frontmost of p to true\n"
+        "        set found to true\n"
+        "        exit repeat\n"
+        "      end if\n"
+        "    end repeat\n"
+        "    if found then\n"
+        '      return "found"\n'
+        "    else\n"
+        '      return "not_found"\n'
+        "    end if\n"
+        "  end tell\n"
+        "end run"
+    )
+    deadline = time.monotonic() + timeout
+    while True:
+        try:
+            result = subprocess.run(
+                ["osascript", "-e", script, pattern],
+                check=True,
+                capture_output=True,
+                text=True,
+                timeout=10,
+            )
+        except subprocess.TimeoutExpired as e:
+            raise RuntimeError(f"window_focus timed out for pattern {pattern!r}") from e
+        except subprocess.CalledProcessError as e:
+            raise RuntimeError(
+                f"Failed to focus window matching {pattern!r}: {e.stderr}"
+            ) from e
+
+        if result.stdout.strip() == "found":
+            return
+        if time.monotonic() >= deadline:
+            raise RuntimeError(
+                f"No window matching {pattern!r} appeared within {timeout:.0f}s"
+            )
+        time.sleep(0.5)
+
+
 def _macos_click(button: int) -> None:
     """
     Click mouse button using cliclick on macOS.
@@ -583,6 +771,23 @@ def _dispatch_transport(
         print(f"Performed {action}")
         return None
 
+    if action == "scroll":
+        if not coordinate:
+            raise ValueError("coordinate is required for scroll")
+        if not text:
+            raise ValueError(
+                "text (direction: up/down/left/right) is required for scroll"
+            )
+        x, y = coordinate
+        direction = text.lower()
+        if direction not in ("up", "down", "left", "right"):
+            raise ValueError(
+                f"Invalid scroll direction: {direction!r}. Must be up/down/left/right"
+            )
+        transport.scroll(x, y, direction)
+        print(f"Scrolled {direction} at {x},{y}")
+        return None
+
     if action == "screenshot":
         path = transport.screenshot()
         return _make_screenshot_msg(path)
@@ -590,6 +795,31 @@ def _dispatch_transport(
     if action == "cursor_position":
         x, y = transport.cursor_position()
         print(f"Cursor position: X={x},Y={y}")
+        return None
+
+    if action == "wait_for_change":
+        timeout = float(text) if text else 10.0
+        poll_interval = 0.5
+        change_threshold = 0.01
+        baseline = transport.screenshot()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(poll_interval)
+            current = transport.screenshot()
+            ratio = _compute_change_ratio(baseline, current)
+            if ratio >= change_threshold:
+                print(f"Screen changed ({ratio:.1%} pixels differ)")
+                return _make_screenshot_msg(current)
+        print(
+            f"No screen change detected after {timeout:.0f}s — returning current screenshot"
+        )
+        return _make_screenshot_msg(transport.screenshot())
+
+    if action == "window_focus":
+        if not text:
+            raise ValueError("text (window name pattern) is required for window_focus")
+        transport.window_focus(text)
+        print(f"Focused window matching: {text!r}")
         return None
 
     raise ValueError(f"Invalid action: {action}")
@@ -744,6 +974,27 @@ def computer(
 
         print(f"Performed {action}")
         return None
+    if action == "scroll":
+        if not coordinate:
+            raise ValueError("coordinate is required for scroll")
+        if not text:
+            raise ValueError(
+                "text (direction: up/down/left/right) is required for scroll"
+            )
+        direction = text.lower()
+        if direction not in ("up", "down", "left", "right"):
+            raise ValueError(
+                f"Invalid scroll direction: {direction!r}. Must be up/down/left/right"
+            )
+        sx, sy = _scale_coordinates(
+            _ScalingSource.API, coordinate[0], coordinate[1], width, height
+        )
+        if IS_MACOS:
+            _macos_scroll(sx, sy, direction)
+        else:
+            _linux_scroll(sx, sy, direction, display)
+        print(f"Scrolled {direction} at {coordinate[0]},{coordinate[1]}")
+        return None
     if action == "screenshot":
         path = screenshot()  # Use existing screenshot function
 
@@ -791,6 +1042,71 @@ def computer(
 
         x, y = _scale_coordinates(_ScalingSource.COMPUTER, x, y, width, height)
         print(f"Cursor position: X={x},Y={y}")
+        return None
+    if action == "wait_for_change":
+        # text holds the optional timeout (seconds) as a string; default 10s
+        timeout = float(text) if text else 10.0
+        poll_interval = 0.5
+        change_threshold = 0.01  # 1% of pixels must differ
+        baseline = screenshot()
+        deadline = time.monotonic() + timeout
+        while time.monotonic() < deadline:
+            time.sleep(poll_interval)
+            current = screenshot()
+            ratio = _compute_change_ratio(baseline, current)
+            if ratio >= change_threshold:
+                print(f"Screen changed ({ratio:.1%} pixels differ)")
+                path = current
+                if path.exists():
+                    try:
+                        subprocess.run(
+                            [
+                                "convert",
+                                str(path),
+                                "-resize",
+                                f"{width}x{height}!",
+                                str(path),
+                            ],
+                            check=True,
+                            capture_output=True,
+                            text=True,
+                            timeout=30,
+                        )
+                    except (
+                        subprocess.CalledProcessError,
+                        subprocess.TimeoutExpired,
+                        FileNotFoundError,
+                    ):
+                        pass
+                return _make_screenshot_msg(path)
+        print(
+            f"No screen change detected after {timeout:.0f}s — returning current screenshot"
+        )
+        path = screenshot()
+        if path.exists():
+            try:
+                subprocess.run(
+                    ["convert", str(path), "-resize", f"{width}x{height}!", str(path)],
+                    check=True,
+                    capture_output=True,
+                    text=True,
+                    timeout=30,
+                )
+            except (
+                subprocess.CalledProcessError,
+                subprocess.TimeoutExpired,
+                FileNotFoundError,
+            ):
+                pass
+        return _make_screenshot_msg(path)
+    if action == "window_focus":
+        if not text:
+            raise ValueError("text (window name pattern) is required for window_focus")
+        if IS_MACOS:
+            _macos_window_focus(text)
+        else:
+            _linux_window_focus(text, display)
+        print(f"Focused window matching: {text!r}")
         return None
     raise ValueError(f"Invalid action: {action}")
 
@@ -929,8 +1245,40 @@ Available actions:
 - mouse_move: Move mouse to coordinates
 - left_click, right_click, middle_click, double_click: Mouse clicks
 - left_click_drag: Click and drag to coordinates
+- scroll: Scroll the mouse wheel at coordinates (text="up"/"down"/"left"/"right")
 - screenshot: Take and view a screenshot
 - cursor_position: Get current mouse position
+- wait_for_change: Wait until the screen changes, then return a single screenshot.
+  Loops internally until ≥1% of pixels differ from the initial capture, or the
+  timeout (text="<seconds>", default 10) elapses. Returns one screenshot regardless
+  of how many internal polls were needed — avoids stacking redundant screenshots in
+  the conversation context. Use after triggering an action that produces a visual
+  response (page load, dialog open, animation finish).
+- window_focus: Wait for a window whose title contains text=<pattern> to appear,
+  then focus it. On Linux/X11 this uses xdotool --sync so no screenshot polling
+  is needed. Use after opening a new application to avoid guessing where to click.
+
+### Efficient action-verify loops
+
+Prefer wait_for_change over immediate screenshot after triggering UI changes:
+
+  computer("left_click", coordinate=(760, 540))  # trigger action
+  computer("wait_for_change", text="5")           # wait for response, see result once
+
+This prevents the conversation from accumulating multiple nearly-identical
+screenshots during transitions. Only call screenshot() directly when you need
+the current state without waiting.
+
+### Opening new windows without guessing their position
+
+Prefer window_focus over clicking at a guessed coordinate after launching a window:
+
+  computer("key", text="ctrl+alt+t")         # open terminal
+  computer("window_focus", text="Terminal")   # wait for it, then focus it
+  computer("type", text="echo hello")         # type into the now-focused window
+
+This avoids the delay/click-at-random pattern that fails when window position
+varies across sessions or virtual displays.
 
 Note: Key names are automatically mapped between platforms.
 Common modifiers (ctrl, alt, cmd/super, shift) work consistently across platforms.
@@ -969,6 +1317,30 @@ User: Double-click at current position
 Assistant: I'll perform a double-click.
 {ToolUse("ipython", [], 'computer("double_click")').to_output(tool_format)}
 System: Performed double_click
+
+User: Scroll down in the page at (512, 400)
+Assistant: I'll scroll down at those coordinates.
+{ToolUse("ipython", [], 'computer("scroll", coordinate=(512, 400), text="down")').to_output(tool_format)}
+System: Scrolled down at 512,400
+
+User: Click the Submit button then wait for the result page to load
+Assistant: I'll click Submit and wait for the screen to change before returning a screenshot.
+{ToolUse("ipython", [], 'computer("left_click", coordinate=(760, 540))').to_output(tool_format)}
+System: Performed left_click
+{ToolUse("ipython", [], 'computer("wait_for_change", text="10")').to_output(tool_format)}
+System: Screen changed (23.4% pixels differ)
+Viewing image...
+
+User: Open a terminal and run a command
+Assistant: I'll open a terminal with a keyboard shortcut, wait for it to appear and focus it, then type the command.
+{ToolUse("ipython", [], 'computer("key", text="ctrl+alt+t")').to_output(tool_format)}
+System: Sent key sequence: ctrl+alt+t
+{ToolUse("ipython", [], 'computer("window_focus", text="Terminal")').to_output(tool_format)}
+System: Focused window matching: 'Terminal'
+{ToolUse("ipython", [], 'computer("type", text="ls -la")').to_output(tool_format)}
+System: Typed text: ls -la
+{ToolUse("ipython", [], 'computer("key", text="return")').to_output(tool_format)}
+System: Sent key sequence: return
 """
 
     # Platform-specific keyboard shortcut examples
@@ -1001,7 +1373,7 @@ tool = ToolSpec(
     desc="Control the computer through X11 (keyboard, mouse, screen)",
     instructions=instructions,
     examples=examples,
-    functions=[computer],
+    functions=[ToolFunction.from_callable(computer)],
     disabled_by_default=True,
 )
 

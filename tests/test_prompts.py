@@ -5,7 +5,7 @@ from types import SimpleNamespace
 import pytest
 
 from gptme.message import len_tokens
-from gptme.prompts import get_prompt
+from gptme.prompts import format_prompt_stats, get_prompt, get_prompt_stats
 from gptme.tools import get_tools, init_tools
 
 
@@ -95,6 +95,100 @@ def test_get_prompt_selective_components():
     assert len(full_mode) >= len(empty_selective)
 
 
+def test_get_prompt_stats_breaks_out_sections(monkeypatch):
+    monkeypatch.chdir(Path(__file__).resolve().parents[1])
+
+    stats = get_prompt_stats(
+        get_tools(),
+        prompt="full",
+        context_mode="selective",
+        context_include=[],
+    )
+
+    assert isinstance(stats.sections, tuple)
+    names = [section.name for section in stats.sections]
+    assert "prompt_gptme" in names
+    assert "prompt_tools" in names
+    assert "prompt_project" in names
+    assert stats.total_tokens == sum(section.tokens for section in stats.sections)
+    assert stats.cacheable_tokens >= stats.dynamic_tokens
+
+
+def test_get_prompt_stats_short_without_tools_keeps_minimal_core():
+    stats = get_prompt_stats(
+        [],
+        prompt="short",
+        context_mode="selective",
+        context_include=[],
+    )
+
+    assert [section.name for section in stats.sections] == ["prompt_gptme"]
+
+
+def test_get_prompt_stats_includes_workspace_and_dynamic_context(tmp_path):
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# Prompt Stats")
+    (workspace / "gptme.toml").write_text(
+        '[prompt]\nfiles = ["README.md"]\ncontext_cmd = "echo DYNAMIC_STATS_MARKER"\n'
+    )
+
+    stats = get_prompt_stats(
+        get_tools(),
+        prompt="full",
+        workspace=workspace,
+    )
+
+    by_name = {section.name: section for section in stats.sections}
+    assert by_name["prompt_workspace"].tokens > 0
+    assert by_name["prompt_context_cmd_project"].tokens > 0
+    assert stats.dynamic_tokens >= by_name["prompt_context_cmd_project"].tokens
+
+
+def test_no_workspace_excludes_workspace_context(tmp_path):
+    """Test that --no-workspace (selective mode, empty include) skips files and context_cmd."""
+    workspace = tmp_path / "project"
+    workspace.mkdir()
+    (workspace / "README.md").write_text("# No-Workspace Test")
+    (workspace / "gptme.toml").write_text(
+        '[prompt]\nfiles = ["README.md"]\ncontext_cmd = "echo NO_WORKSPACE_MARKER"\n'
+    )
+
+    # Simulate --no-workspace: selective mode with empty include list
+    stats = get_prompt_stats(
+        get_tools(),
+        prompt="full",
+        workspace=workspace,
+        context_mode="selective",
+        context_include=[],
+    )
+
+    by_name = {section.name: section for section in stats.sections}
+    assert "prompt_workspace" not in by_name, (
+        "workspace files should be absent with --no-workspace"
+    )
+    assert "prompt_context_cmd_project" not in by_name, (
+        "context_cmd should be absent with --no-workspace"
+    )
+    assert "prompt_tools" in by_name, "tools should still be included"
+    assert "prompt_gptme" in by_name, "core gptme prompt should still be included"
+
+
+def test_format_prompt_stats_outputs_summary_table():
+    stats = get_prompt_stats(
+        get_tools(),
+        prompt="short",
+        context_mode="selective",
+        context_include=[],
+    )
+
+    rendered = format_prompt_stats(stats, header="Prompt stats")
+    assert "Prompt stats" in rendered
+    assert "section" in rendered
+    assert "prompt_gptme" in rendered
+    assert "total" in rendered
+
+
 def test_prompt_systeminfo_uses_workspace(tmp_path):
     """Test that prompt_systeminfo uses the provided workspace path."""
     from gptme.prompts import prompt_systeminfo
@@ -147,6 +241,84 @@ files = ["../outside/secret.txt", "README.md"]
         "secret.txt should NOT be attached (path traversal)"
     )
     assert "../outside/secret.txt" not in content, "Path traversal should be blocked"
+
+
+def test_prompt_workspace_exclude_patterns(tmp_path):
+    """Test that [prompt] exclude patterns filter context files."""
+    from gptme.prompts import prompt_workspace
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    # Files that should be included
+    (workspace / "README.md").write_text("# Project")
+    (workspace / "pyproject.toml").write_text("[project]\nname = 'test'")
+
+    # Files that should be excluded by pattern
+    (workspace / "uv.lock").write_text("lock file content")
+    (workspace / "session.jsonl").write_text('{"role": "user"}')
+
+    (workspace / "gptme.toml").write_text(
+        """
+[prompt]
+files = ["README.md", "pyproject.toml", "*.lock", "*.jsonl"]
+exclude = ["*.lock", "*.jsonl"]
+"""
+    )
+
+    msgs = list(prompt_workspace(workspace, include_user_context=False))
+    attached_files: list[str] = []
+    for msg in msgs:
+        attached_files.extend(str(f) for f in msg.files)
+
+    assert any("README.md" in f for f in attached_files), "README.md should be included"
+    assert any("pyproject.toml" in f for f in attached_files), (
+        "pyproject.toml should be included"
+    )
+    assert not any("uv.lock" in f for f in attached_files), (
+        "*.lock files should be excluded"
+    )
+    assert not any("session.jsonl" in f for f in attached_files), (
+        "*.jsonl files should be excluded"
+    )
+
+
+def test_prompt_workspace_exclude_dir_patterns(tmp_path):
+    """Test that [prompt] exclude patterns work for directory-relative paths."""
+    from gptme.prompts import prompt_workspace
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+
+    # Files at root level
+    (workspace / "README.md").write_text("# Project")
+
+    # Files in subdirectory that should be excluded
+    dist = workspace / "dist"
+    dist.mkdir()
+    (dist / "bundle.js").write_text("// bundled")
+    (dist / "bundle.css").write_text("/* styles */")
+
+    (workspace / "gptme.toml").write_text(
+        """
+[prompt]
+files = ["README.md", "dist/*.js", "dist/*.css"]
+exclude = ["dist/*.js"]
+"""
+    )
+
+    msgs = list(prompt_workspace(workspace, include_user_context=False))
+    attached_files: list[str] = []
+    for msg in msgs:
+        attached_files.extend(str(f) for f in msg.files)
+
+    assert any("README.md" in f for f in attached_files), "README.md should be included"
+    assert any("bundle.css" in f for f in attached_files), (
+        "dist/*.css should be included"
+    )
+    assert not any("bundle.js" in f for f in attached_files), (
+        "dist/*.js should be excluded"
+    )
 
 
 def test_workspace_git_status_in_git_repo(tmp_path):

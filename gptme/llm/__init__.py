@@ -91,7 +91,7 @@ PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     "openai": "openai/gpt-4o-mini",
     "openrouter": "openrouter/anthropic/claude-haiku-4-5",
     "gemini": "gemini/gemini-2.0-flash",
-    "groq": "groq/llama-3.1-8b-instant",
+    "groq": "groq/llama-3.3-70b-versatile",
     "xai": "xai/grok-3-mini",
     "deepseek": "deepseek/deepseek-chat",
     "moonshot": "moonshot/kimi-k2.6",
@@ -161,6 +161,9 @@ def init_llm(provider: Provider):
     global _subscription_initialized
     config = get_config()
 
+    # Mock provider needs no client/auth — responses are computed in-process.
+    if provider == "mock":
+        return
     # Check if it's a built-in OpenAI-compatible provider
     if provider in PROVIDERS_OPENAI and not has_openai_client(provider):
         init_openai(provider, config)
@@ -202,12 +205,15 @@ _OPENROUTER_DEFAULT_MAX_TOKENS = 16000
 
 
 def _resolve_max_tokens(model: str, max_tokens: int | None) -> int | None:
-    """Apply the GPTME_MAX_TOKENS env override or a sane default for OpenRouter models.
+    """Apply the GPTME_MAX_TOKENS env override or a sane default for providers that require it.
 
     When max_tokens is omitted, OpenRouter reserves model.max_output +
     reasoning_budget credits per request. For large models like Sonnet 4.6
     that is ~65k tokens. A partially-spent daily-budget key rejects this
     with HTTP 402 even when the actual response would fit comfortably.
+
+    The gptme cloud provider (Supabase messages function) requires max_tokens
+    explicitly — omitting it returns HTTP 400 Field required.
 
     Setting a default max_tokens reduces the reservation so partial-budget
     keys still work.
@@ -216,7 +222,10 @@ def _resolve_max_tokens(model: str, max_tokens: int | None) -> int | None:
     if max_tokens is not None:
         return max_tokens
 
-    if get_provider_from_model(model) != "openrouter":
+    provider = get_provider_from_model(model)
+
+    # Only apply defaults for providers that need them
+    if provider not in ("openrouter", "gptme"):
         return None
 
     raw = get_config().get_env("GPTME_MAX_TOKENS")
@@ -238,7 +247,14 @@ def _resolve_max_tokens(model: str, max_tokens: int | None) -> int | None:
                 )
                 _max_tokens_env_warned = True
 
-    return _OPENROUTER_DEFAULT_MAX_TOKENS
+    if provider == "openrouter":
+        return _OPENROUTER_DEFAULT_MAX_TOKENS
+
+    # provider == "gptme": use max_output from model metadata, with 4096 fallback
+    from .models import get_model  # fmt: skip
+
+    model_meta = get_model(model)
+    return model_meta.max_output or 4096
 
 
 @trace_function(name="llm.reply", attributes={"component": "llm"})
@@ -350,6 +366,28 @@ def _get_base_model(model: str) -> str:
     return model.split("/", 1)[1]
 
 
+def _gptme_backend(model: str) -> tuple[str, str] | None:
+    """For a gptme cloud model, return (backend_provider, bare_model).
+
+    gptme cloud models carry their real backend as a prefix in the resolved
+    ModelMeta.model (e.g. "anthropic/claude-sonnet-4-6", "openai/gpt-5",
+    "openrouter/openai/gpt-5.4"). This recovers that backend so a request can be
+    routed through the right SDK. Returns None for non-gptme models or when the
+    backend can't be determined (degraded/offline resolution).
+    """
+    from .models import get_model  # fmt: skip
+
+    if get_provider_from_model(model) != "gptme":
+        return None
+    meta = get_model(model)
+    if str(meta.provider) != "gptme" or "/" not in meta.model:
+        return None
+    backend, bare = meta.model.split("/", 1)
+    if backend not in ("anthropic", "openai", "openrouter"):
+        return None
+    return backend, bare
+
+
 @trace_function(name="llm.chat_complete", attributes={"component": "llm"})
 def _chat_complete(
     messages: list[Message],
@@ -364,6 +402,25 @@ def _chat_complete(
         raise ValueError(f"max_tokens must be a positive integer, got {max_tokens}")
     max_tokens = _resolve_max_tokens(model, max_tokens)
     provider = get_provider_from_model(model)
+
+    # Anthropic-backed gptme cloud models must use the Anthropic SDK (native
+    # format) — the gateway forwards the body verbatim to Anthropic, which
+    # rejects the OpenAI-only `stream_options`. openai/openrouter-backed gptme
+    # models stay on the OpenAI path below (the gateway forwards to those APIs,
+    # which accept the OpenAI request shape).
+    if (backend := _gptme_backend(model)) and backend[0] == "anthropic":
+        from .llm_anthropic import chat as chat_anthropic
+
+        return chat_anthropic(
+            messages,
+            backend[1],
+            tools,
+            output_schema=output_schema,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            via_gptme=True,
+        )
 
     # Providers with native constrained decoding support
     # Custom providers and plugin providers are OpenAI-compatible, route through OpenAI path
@@ -402,6 +459,18 @@ def _chat_complete(
             messages, _get_base_model(model), tools, max_tokens=max_tokens
         )
         return content, {"model": model}
+    if provider == "mock":
+        from .llm_mock import chat as chat_mock
+
+        return chat_mock(
+            messages,
+            model,
+            tools,
+            output_schema=output_schema,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+        )
 
     # Unsupported provider - OpenAI and Anthropic are handled above
     raise ValueError(f"Unsupported provider: {provider}")
@@ -469,6 +538,26 @@ def _stream(
         raise ValueError(f"max_tokens must be a positive integer, got {max_tokens}")
     max_tokens = _resolve_max_tokens(model, max_tokens)
     provider = get_provider_from_model(model)
+
+    # Anthropic-backed gptme cloud models use the Anthropic SDK (native format);
+    # see the matching note in _chat_complete.
+    if (backend := _gptme_backend(model)) and backend[0] == "anthropic":
+        from .llm_anthropic import stream as stream_anthropic
+
+        gptme_partial: dict = {}
+        gen = stream_anthropic(
+            messages,
+            backend[1],
+            tools,
+            output_schema=output_schema,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
+            _partial=gptme_partial,
+            via_gptme=True,
+        )
+        return _StreamWithMetadata(gen, model, partial=gptme_partial)
+
     # Custom providers and plugin providers are OpenAI-compatible, route through OpenAI path
     if (
         provider in PROVIDERS_OPENAI
@@ -510,6 +599,19 @@ def _stream(
 
         gen = stream_subscription(
             messages, _get_base_model(model), tools, max_tokens=max_tokens
+        )
+        return _StreamWithMetadata(gen, model)
+    if provider == "mock":
+        from .llm_mock import stream as stream_mock
+
+        gen = stream_mock(
+            messages,
+            model,
+            tools,
+            output_schema=output_schema,
+            max_tokens=max_tokens,
+            temperature=temperature,
+            top_p=top_p,
         )
         return _StreamWithMetadata(gen, model)
     # Note: Validation-only fallback for streaming is complex
@@ -924,6 +1026,12 @@ def list_available_providers() -> list[tuple[Provider, str]]:
         if config.get_env(env_var) and plugin_name not in seen:
             available.append((CustomProvider(plugin_name), env_var))
             seen.add(plugin_name)
+
+    # Note: "mock" is intentionally absent here. It requires no credentials and
+    # is always usable when explicitly requested (e.g. "mock/echo"). Surfacing it
+    # in credential discovery would make it a candidate for auto-selection in
+    # environments with no real API keys, which is not the intended use-case.
+    # Users who want mock must specify it explicitly.
 
     return available
 

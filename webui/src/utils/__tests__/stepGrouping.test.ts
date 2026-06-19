@@ -17,9 +17,9 @@ describe('buildStepRoles', () => {
     expect(buildStepRoles(messages, neverHidden).size).toBe(0);
   });
 
-  it('returns empty map when fewer than 2 intermediate steps', () => {
+  it('returns empty map when only an assistant response and no intermediates', () => {
     const messages = [msg('user', 'do something'), msg('assistant', 'done')];
-    // Only 0 intermediate steps (single response) — below threshold
+    // 0 intermediate steps — no grouping needed
     expect(buildStepRoles(messages, neverHidden).size).toBe(0);
   });
 
@@ -104,17 +104,45 @@ describe('buildStepRoles', () => {
     expect(roles.get(4)?.type).toBe('response');
   });
 
-  it('does not group when only 1 visible intermediate step', () => {
+  it('collapses single pre-response system hook (agent_awareness / lessons injection)', () => {
+    // Core issue scenario: a hook fires after the user message and emits a system
+    // message before the assistant reply. It's noise — collapse it.
+    const messages = [
+      msg('user', 'write a fibonacci function'), // 0
+      msg('system', '# Relevant Lessons\n## Testing Patterns'), // 1 - pre-hook (visible)
+      msg('assistant', 'Here is a fibonacci function...'), // 2 - response
+    ];
+
+    const roles = buildStepRoles(messages, neverHidden);
+    expect(roles.get(1)?.type).toBe('group-start');
+    expect(roles.get(2)?.type).toBe('response');
+  });
+
+  it('groups a single visible intermediate system step when assistant step is hidden', () => {
     const messages = [
       msg('user', 'do work'), // 0
       msg('assistant', 'step 1'), // 1 - hidden
-      msg('system', 'saved'), // 2
-      msg('assistant', 'done'), // 3
+      msg('system', 'saved'), // 2 - visible system step
+      msg('assistant', 'done'), // 3 - response
     ];
 
     const isHidden = (idx: number) => idx === 1;
     const roles = buildStepRoles(messages, isHidden);
-    // Only 1 visible intermediate step — below threshold
+    // 1 visible intermediate system message — collapsed as a step group
+    expect(roles.get(2)?.type).toBe('group-start');
+    expect(roles.get(3)?.type).toBe('response');
+  });
+
+  it('does not group when single intermediate step is an assistant message', () => {
+    // A lone intermediate assistant message should stay visible (it is real content)
+    const messages = [
+      msg('user', 'what is X?'), // 0
+      msg('assistant', 'thinking...'), // 1 - intermediate assistant
+      msg('assistant', 'X is Y'), // 2 - response
+    ];
+
+    const roles = buildStepRoles(messages, neverHidden);
+    // Single intermediate assistant — not a hook, do not collapse
     expect(roles.size).toBe(0);
   });
 
@@ -137,7 +165,7 @@ describe('buildStepRoles', () => {
     expect(roles.get(3)?.type).toBe('grouped');
     expect(roles.get(4)?.type).toBe('response');
 
-    // Second turn: only 1 step — no grouping
+    // Second turn: only 1 intermediate assistant step — not a system/hook, no grouping
     expect(roles.has(6)).toBe(false);
     expect(roles.has(7)).toBe(false);
   });
@@ -249,19 +277,20 @@ describe('buildStepRoles', () => {
     expect(roles.get(2)?.type).toBe('grouped');
   });
 
-  it('does not collapse response when runnable fence is followed by non-tool system message', () => {
-    // Regression: assistant message includes a runnable fence (e.g. ```shell) as a
-    // *suggestion* (the user hasn't run it), followed only by a meta system message.
-    // The assistant is the real response and must NOT be absorbed into a step group.
+  it('keeps assistant response visible when a post-hook system message is collapsed', () => {
+    // The assistant response (with a runnable fence as a *suggestion*) must stay visible;
+    // the trailing system message (hook/context) is collapsed into a 1-step group.
     const messages = [
       msg('user', 'how do I init a git repo?'), // 0
       msg('assistant', 'Run:\n\n```shell\ngit init\n```\n\nThen add a README.'), // 1 - response
-      msg('system', '# Relevant Lessons\n## Git Workflow'), // 2 - post-hook, not a tool result
+      msg('system', '# Relevant Lessons\n## Git Workflow'), // 2 - post-hook, collapsed
     ];
 
     const roles = buildStepRoles(messages, neverHidden);
-    // Only 1 step after the response — below threshold, no grouping at all
-    expect(roles.size).toBe(0);
+    // Response is still the assistant message at index 1 — NOT collapsed
+    expect(roles.get(1)?.type).toBe('response');
+    // The trailing system hook becomes a collapsed 1-step group
+    expect(roles.get(2)?.type).toBe('group-start');
   });
 
   it('keeps assistant tool-use messages collapsed when later tool output follows', () => {
@@ -312,5 +341,95 @@ describe('buildStepRoles', () => {
         },
       ]);
     }
+  });
+
+  describe('logOffset', () => {
+    // These tests verify Slice 1 of windowed pagination:
+    // buildStepRoles emits absolute indices (logOffset + localIndex) so that
+    // edit/delete/rerun targeting the correct server-side message position.
+
+    it('defaults to logOffset=0, producing local indices (backward-compat)', () => {
+      const messages = [
+        msg('user', 'do something'), // local 0
+        msg('assistant', 'using tool'), // local 1 - step
+        msg('system', 'saved file'), // local 2 - step
+        msg('assistant', 'done'), // local 3 - response
+      ];
+      const roles = buildStepRoles(messages, neverHidden);
+      // With logOffset=0, absolute == local
+      expect(roles.get(1)?.type).toBe('group-start');
+      expect(roles.get(2)?.type).toBe('grouped');
+      expect(roles.get(3)?.type).toBe('response');
+      // Local indices 0..3 should NOT appear under different keys
+      expect(roles.has(0)).toBe(false);
+    });
+
+    it('offsets all map keys by logOffset', () => {
+      const messages = [
+        msg('user', 'do something'), // local 0, absolute 150
+        msg('assistant', 'using tool'), // local 1, absolute 151 - step
+        msg('system', 'saved file'), // local 2, absolute 152 - step
+        msg('assistant', 'done'), // local 3, absolute 153 - response
+      ];
+      const logOffset = 150;
+      const roles = buildStepRoles(messages, neverHidden, logOffset);
+
+      // Local indices must NOT appear as keys
+      expect(roles.has(1)).toBe(false);
+      expect(roles.has(2)).toBe(false);
+      expect(roles.has(3)).toBe(false);
+
+      // Absolute indices must be present
+      expect(roles.get(151)?.type).toBe('group-start');
+      expect(roles.get(152)?.type).toBe('grouped');
+      expect(roles.get(153)?.type).toBe('response');
+    });
+
+    it('uses absolute index as groupId for stable expansion tracking', () => {
+      const messages = [
+        msg('user', 'do something'), // local 0, absolute 50
+        msg('assistant', 'using tool'), // local 1, absolute 51 - step
+        msg('system', 'saved file'), // local 2, absolute 52 - step
+        msg('assistant', 'done'), // local 3, absolute 53 - response
+      ];
+      const roles = buildStepRoles(messages, neverHidden, 50);
+
+      const start = roles.get(51);
+      expect(start?.type).toBe('group-start');
+      if (start?.type === 'group-start') {
+        // groupId = absolute index of first step (51)
+        expect(start.groupId).toBe(51);
+      }
+
+      const grouped = roles.get(52);
+      expect(grouped?.type).toBe('grouped');
+      if (grouped?.type === 'grouped') {
+        // grouped also references the same absolute groupId
+        expect(grouped.groupId).toBe(51);
+      }
+    });
+
+    it('isHidden receives local indices regardless of logOffset', () => {
+      // isHidden must still work with local array indices (0-based in messages[])
+      const hiddenLocalIdx = new Set([1]); // hide local index 1
+      const isHidden = (idx: number) => hiddenLocalIdx.has(idx);
+
+      const messages = [
+        msg('user', 'do something'), // local 0, absolute 100
+        msg('assistant', 'using tool'), // local 1 — HIDDEN, absolute 101
+        msg('system', 'saved file'), // local 2, absolute 102 - step
+        msg('assistant', 'step 2'), // local 3, absolute 103 - step
+        msg('assistant', 'done'), // local 4, absolute 104 - response
+      ];
+      const roles = buildStepRoles(messages, isHidden, 100);
+
+      // With local idx 1 hidden, only 2 visible intermediate steps remain
+      // (local 2 and 3), so grouping triggers — group-start at absolute 102
+      expect(roles.get(102)?.type).toBe('group-start');
+      expect(roles.get(103)?.type).toBe('grouped');
+      expect(roles.get(104)?.type).toBe('response');
+      // The hidden message at absolute 101 should not appear in the map
+      expect(roles.has(101)).toBe(false);
+    });
   });
 });

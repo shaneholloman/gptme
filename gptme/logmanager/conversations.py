@@ -4,6 +4,7 @@ Provides read-only conversation discovery (get_conversations, list_conversations
 and mutation operations (rename, delete) that work on persisted conversation logs.
 """
 
+import functools
 import json
 import logging
 import re
@@ -157,24 +158,52 @@ def _parse_preview(last_msg_line: bytes) -> tuple[str | None, str | None]:
 _TAIL_BYTES = 8192
 
 
+@functools.lru_cache(maxsize=256)
+def _count_messages(path: str, mtime: float) -> int:
+    """Count non-empty lines in a conversation JSONL file.
+
+    Cached by (path, mtime) — when the file changes (mtime updates), the
+    cache key changes and the next call re-scans. mtime is passed as the
+    cache key component; its value is not used in the counting logic.
+
+    Args:
+        path: The conversation.jsonl file path.
+        mtime: File modification time — used as part of the cache key to
+            auto-invalidate when the conversation is appended to.
+
+    Returns:
+        Number of non-empty JSONL lines.
+    """
+    count = 0
+    with open(path, "rb") as f:
+        for line in f:
+            if line.strip():
+                count += 1
+    return count
+
+
 def _fast_scan_tail(
     conv_fn: Path, file_size: int
 ) -> tuple[int, str | None, bytes | None]:
     """Read only the tail of a JSONL file to extract preview and model.
 
-    For the message count, does a fast newline count over the full file
-    (much cheaper than JSON-parsing every line).
+    For the message count, uses an LRU cache keyed by (path, mtime) to
+    avoid re-scanning the full file when listing conversations. When the
+    file's mtime changes (new messages appended), the cache auto-invalidates
+    on the next miss. Small files (<= _TAIL_BYTES) skip the cache since the
+    full scan is already cheap.
 
     Returns (message_count, model, last_user_or_assistant_line).
     """
-    # Fast line count: count non-empty lines without JSON parsing.
-    # The gain is from avoiding json.loads() on every metadata line;
-    # the full file is still read for the line count (I/O unchanged).
-    len_msgs = 0
-    with open(conv_fn, "rb") as f:
-        for line in f:
-            if line.strip():
-                len_msgs += 1
+    # Count messages — use LRU cache when file is large enough to benefit
+    if file_size > _TAIL_BYTES:
+        len_msgs = _count_messages(str(conv_fn), conv_fn.stat().st_mtime)
+    else:
+        len_msgs = 0
+        with open(conv_fn, "rb") as f:
+            for line in f:
+                if line.strip():
+                    len_msgs += 1
 
     # Read tail for preview + model
     last_msg_line: bytes | None = None
@@ -263,6 +292,117 @@ def _full_scan(
     )
 
 
+def _meta_from_file(conv_fn: Path, *, detail: bool = True) -> ConversationMeta:
+    """Build ConversationMeta from a single conversation file path.
+
+    Reads only that one file — no glob scan over other conversations.
+    Used by get_conversations() and get_conversation_meta_direct().
+    """
+    conv_id = conv_fn.parent.name
+    log = Log.read_jsonl(conv_fn, limit=1)
+
+    conv_stat = conv_fn.stat()
+    file_size = conv_stat.st_size
+
+    if detail or file_size <= _TAIL_BYTES:
+        # Full scan: exact counts + cost/token aggregation
+        (
+            len_msgs,
+            conv_model,
+            conv_cost,
+            conv_input_tokens,
+            conv_output_tokens,
+            conv_cache_read_tokens,
+            last_msg_line,
+        ) = _full_scan(conv_fn)
+    else:
+        # Fast scan: tail-only for preview + model, fast line count
+        len_msgs, conv_model, last_msg_line = _fast_scan_tail(conv_fn, file_size)
+        conv_cost = 0.0
+        conv_input_tokens = 0
+        conv_output_tokens = 0
+        conv_cache_read_tokens = 0
+
+    last_msg_role, last_msg_preview = (
+        _parse_preview(last_msg_line) if last_msg_line else (None, None)
+    )
+
+    assert len(log) <= 1
+    modified = conv_stat.st_mtime
+    first_timestamp = log[0].timestamp.timestamp() if log else modified
+    # Try to get display name from ChatConfig, fallback to folder name
+    chat_config = ChatConfig.from_logdir(conv_fn.parent)
+    display_name = chat_config.name or conv_id
+
+    agent_path = chat_config.agent
+    agent_project_config = (
+        get_project_config(agent_path, quiet=True) if agent_path else None
+    )
+    agent_name = (
+        agent_project_config.agent.name
+        if agent_project_config and agent_project_config.agent
+        else None
+    )
+    agent_avatar = (
+        agent_project_config.agent.avatar
+        if agent_project_config and agent_project_config.agent
+        else None
+    )
+    agent_urls = (
+        agent_project_config.agent.urls
+        if agent_project_config and agent_project_config.agent
+        else None
+    )
+
+    # Count branches only when doing a full detail scan — the fast-scan
+    # path (used by the list/search endpoint) skips this per-directory
+    # glob since the webui list view doesn't display branch counts.
+    n_branches = 1 + len(list(conv_fn.parent.glob("branches/*.jsonl"))) if detail else 1
+    return ConversationMeta(
+        id=conv_id,
+        name=display_name,
+        path=str(conv_fn),
+        created=first_timestamp,
+        modified=modified,
+        messages=len_msgs,
+        branches=n_branches,
+        workspace=str(chat_config.workspace),
+        agent_name=agent_name,
+        agent_path=str(agent_path) if agent_path else None,
+        agent_avatar=agent_avatar,
+        agent_urls=agent_urls,
+        model=conv_model,
+        total_cost=conv_cost,
+        total_input_tokens=conv_input_tokens,
+        total_output_tokens=conv_output_tokens,
+        total_cache_read_tokens=conv_cache_read_tokens,
+        last_message_role=last_msg_role,
+        last_message_preview=last_msg_preview,
+    )
+
+
+def get_conversation_meta_direct(
+    conv_id: str,
+    *,
+    detail: bool = True,
+    logs_dir: Path | None = None,
+) -> ConversationMeta | None:
+    """Get a single conversation's metadata by direct path lookup.
+
+    Bypasses the full glob+stat scan used by get_conversations().  O(1) file
+    access instead of O(N_conversations) — suitable for partial cache updates
+    where only one conversation changed.
+
+    Returns None when the conversation directory or JSONL file does not exist.
+    """
+    if logs_dir is None:
+        logs_dir = get_logs_dir()
+    conv_fn = logs_dir / conv_id / "conversation.jsonl"
+    if not conv_fn.exists():
+        return None
+    return _meta_from_file(conv_fn, detail=detail)
+
+
 def get_conversations(
     *, detail: bool = True, include_test: bool = True
 ) -> Generator[ConversationMeta, None, None]:
@@ -281,82 +421,7 @@ def get_conversations(
         conv_id = conv_fn.parent.name
         if not include_test and _is_test_conversation_id(conv_id):
             continue
-
-        log = Log.read_jsonl(conv_fn, limit=1)
-
-        file_size = conv_fn.stat().st_size
-
-        if detail or file_size <= _TAIL_BYTES:
-            # Full scan: exact counts + cost/token aggregation
-            (
-                len_msgs,
-                conv_model,
-                conv_cost,
-                conv_input_tokens,
-                conv_output_tokens,
-                conv_cache_read_tokens,
-                last_msg_line,
-            ) = _full_scan(conv_fn)
-        else:
-            # Fast scan: tail-only for preview + model, fast line count
-            len_msgs, conv_model, last_msg_line = _fast_scan_tail(conv_fn, file_size)
-            conv_cost = 0.0
-            conv_input_tokens = 0
-            conv_output_tokens = 0
-            conv_cache_read_tokens = 0
-
-        last_msg_role, last_msg_preview = (
-            _parse_preview(last_msg_line) if last_msg_line else (None, None)
-        )
-
-        assert len(log) <= 1
-        modified = conv_fn.stat().st_mtime
-        first_timestamp = log[0].timestamp.timestamp() if log else modified
-        # Try to get display name from ChatConfig, fallback to folder name
-        chat_config = ChatConfig.from_logdir(conv_fn.parent)
-        display_name = chat_config.name or conv_id
-
-        agent_path = chat_config.agent
-        agent_project_config = (
-            get_project_config(agent_path, quiet=True) if agent_path else None
-        )
-        agent_name = (
-            agent_project_config.agent.name
-            if agent_project_config and agent_project_config.agent
-            else None
-        )
-        agent_avatar = (
-            agent_project_config.agent.avatar
-            if agent_project_config and agent_project_config.agent
-            else None
-        )
-        agent_urls = (
-            agent_project_config.agent.urls
-            if agent_project_config and agent_project_config.agent
-            else None
-        )
-
-        yield ConversationMeta(
-            id=conv_id,
-            name=display_name,
-            path=str(conv_fn),
-            created=first_timestamp,
-            modified=modified,
-            messages=len_msgs,
-            branches=1 + len(list(conv_fn.parent.glob("branches/*.jsonl"))),
-            workspace=str(chat_config.workspace),
-            agent_name=agent_name,
-            agent_path=str(agent_path) if agent_path else None,
-            agent_avatar=agent_avatar,
-            agent_urls=agent_urls,
-            model=conv_model,
-            total_cost=conv_cost,
-            total_input_tokens=conv_input_tokens,
-            total_output_tokens=conv_output_tokens,
-            total_cache_read_tokens=conv_cache_read_tokens,
-            last_message_role=last_msg_role,
-            last_message_preview=last_msg_preview,
-        )
+        yield _meta_from_file(conv_fn, detail=detail)
 
 
 def get_user_conversations(
@@ -394,8 +459,10 @@ def list_conversations(
 def get_conversation_by_id(
     conv_id: str, *, detail: bool = True
 ) -> ConversationMeta | None:
-    """
-    Get a conversation by its ID.
+    """Get a conversation by its ID.
+
+    Uses direct path lookup (O(1) file access) rather than scanning all
+    conversations.
 
     Args:
         conv_id: The conversation ID to find
@@ -403,10 +470,7 @@ def get_conversation_by_id(
     Returns:
         ConversationMeta if found, None otherwise
     """
-    for conv in get_conversations(detail=detail):
-        if conv.id == conv_id:
-            return conv
-    return None
+    return get_conversation_meta_direct(conv_id, detail=detail)
 
 
 def rename_conversation(conv_id: str, new_name: str) -> bool:

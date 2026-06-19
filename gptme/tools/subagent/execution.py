@@ -14,17 +14,48 @@ import subprocess
 import sys
 import tempfile
 import threading
+import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from ...message import Message
-from .. import get_tools, set_tools
-from .._allowlist import matching_allowlist_tools, tool_matches_allowlist
+from .. import get_tools, load_tool, set_tools
+from .._allowlist import (
+    is_hint_pattern,
+    matching_allowlist_tools,
+    tool_matches_allowlist,
+)
+from .concurrency import get_slot_sem
 
 if TYPE_CHECKING:
     from .types import ReturnType, Status, Subagent, SubtaskDef
 
 logger = logging.getLogger(__name__)
+
+_SUBAGENT_SIGNAL_TOOLS = ("complete", "clarify", "progress")
+
+# Thread-local storage for subagent context
+# Used by the progress tool to know which agent_id it's running as
+_thread_local = threading.local()
+
+
+def get_current_agent_id() -> str | None:
+    """Return the agent_id of the currently running subagent thread, or None.
+
+    Set by _create_subagent_thread before calling chat(). Used by the progress
+    tool to identify which subagent is sending a progress update.
+    Only populated in thread-mode subagents.
+    """
+    return getattr(_thread_local, "agent_id", None)
+
+
+def _ensure_subagent_signal_tools_loaded() -> None:
+    """Load disabled-by-default signal tools needed by every subagent."""
+    loaded_names = {tool.name for tool in get_tools()}
+    for tool_name in _SUBAGENT_SIGNAL_TOOLS:
+        if tool_name not in loaded_names:
+            load_tool(tool_name)
+            loaded_names.add(tool_name)
 
 
 def _load_agent_memory(profile_name: str | None) -> tuple[str | None, Path | None]:
@@ -105,6 +136,8 @@ def _create_subagent_thread(
     target: str = "parent",
     output_schema: type | None = None,
     profile_name: str | None = None,
+    agent_id: str | None = None,
+    redact_secrets: bool = False,
 ) -> None:
     """Shared function for running subagent threads.
 
@@ -117,7 +150,12 @@ def _create_subagent_thread(
         workspace: Workspace directory
         target: Who will review the results ("parent" or "planner")
         profile_name: Optional agent profile to apply (system prompt + hard tool enforcement)
+        agent_id: Identifier stored in thread-local so the progress tool can self-identify
     """
+    # Store agent_id in thread-local so the progress tool can identify this subagent
+    if agent_id is not None:
+        _thread_local.agent_id = agent_id
+
     # noreorder
     from gptme.chat import chat  # fmt: skip
     from gptme.executor import prepare_execution_environment  # fmt: skip
@@ -142,16 +180,19 @@ def _create_subagent_thread(
         tool_allowlist = profile.tools
 
     prepare_execution_environment(workspace=workspace, tools=None)
+    _ensure_subagent_signal_tools_loaded()
 
     # Get tools, filtered by profile if applicable
     if tool_allowlist is not None:
         loaded_tools = get_tools()
         loaded_names = {t.name for t in loaded_tools}
-        # Warn about unknown tool names in profile (typos, missing extras)
+        # Warn about unknown tool names in profile (typos, missing extras).
+        # Skip hint: patterns — they're always valid (match by capability tag, not name).
         unknown = {
             pattern
             for pattern in tool_allowlist
-            if not matching_allowlist_tools(pattern, loaded_tools)
+            if not is_hint_pattern(pattern)
+            and not matching_allowlist_tools(pattern, loaded_tools)
         }
         if unknown:
             logger.warning(
@@ -163,13 +204,16 @@ def _create_subagent_thread(
         available_tools = [
             tool
             for tool in loaded_tools
-            if tool_matches_allowlist(tool.name, tool_allowlist)
+            if tool_matches_allowlist(tool.name, tool_allowlist, tool.hints)
         ]
-        # Always include the complete tool so subagent can signal completion
-        complete_tools = [t for t in loaded_tools if t.name == "complete"]
-        for ct in complete_tools:
-            if ct not in available_tools:
-                available_tools.append(ct)
+        # Always include completion/clarification signal tools so restricted
+        # subagents can still end cleanly or ask the parent for more context.
+        required_tools = [
+            tool for tool in loaded_tools if tool.name in _SUBAGENT_SIGNAL_TOOLS
+        ]
+        for tool in required_tools:
+            if tool not in available_tools:
+                available_tools.append(tool)
         # Hard enforcement: replace loaded tools so execute_msg() only sees allowed tools
         set_tools(available_tools)
     else:
@@ -199,6 +243,15 @@ def _create_subagent_thread(
         initial_msgs = get_prompt(
             available_tools, interactive=False, workspace=workspace
         )
+
+    # Apply secret redaction to workspace context messages if requested.
+    # This redacts values from lines where the variable name matches common
+    # secret patterns (API_KEY, TOKEN, PASSWORD, etc.) in system messages.
+    # Only redacts the context messages, not the task prompt itself.
+    if redact_secrets:
+        from .context import redact_secrets_from_messages
+
+        initial_msgs = redact_secrets_from_messages(initial_msgs)
 
     # Append profile system prompt if specified
     if profile and profile.system_prompt:
@@ -286,6 +339,19 @@ def _run_subagent_subprocess(
 
     if profile:
         cmd.extend(["--agent-profile", profile])
+        from ...profiles import get_profile
+
+        profile_obj = get_profile(profile)
+        if profile_obj and profile_obj.tools is not None:
+            tool_allowlist = list(profile_obj.tools)
+            for tool_name in ("complete", "clarify"):
+                if tool_name not in tool_allowlist:
+                    tool_allowlist.append(tool_name)
+            cmd.extend(["--tools", ",".join(tool_allowlist)])
+        else:
+            cmd.extend(["--tools", "+clarify"])
+    else:
+        cmd.extend(["--tools", "+clarify"])
 
     # Map context_mode/context_include to the --context CLI flag
     if context_mode == "selective" and context_include:
@@ -328,7 +394,8 @@ def _run_subagent_subprocess(
     # Add completion instruction to the prompt for subprocess mode
     # (In thread mode, this is added as a system message)
     complete_section = (
-        f"\n\n[Completion Instructions]\n{_get_complete_instruction('orchestrator')}\n"
+        "\n\n[Completion Instructions]\n"
+        f"{_get_complete_instruction('orchestrator', supports_progress=False)}\n"
     )
     prompt = prompt + complete_section
 
@@ -405,8 +472,7 @@ def _monitor_subprocess(
     from .hooks import notify_completion
     from .types import (
         ReturnType,
-        _subagent_results,
-        _subagent_results_lock,
+        set_subagent_result_if_absent,
     )
 
     if not subagent.process:
@@ -432,6 +498,8 @@ def _monitor_subprocess(
         # Get result from conversation log (primary source for subprocess mode)
         try:
             log_status = subagent.status()
+            if log_status.status == "clarification_needed":
+                status = "clarification_needed"
             result = log_status.result
         except Exception:
             result = "Task completed (check log for details)"
@@ -444,10 +512,10 @@ def _monitor_subprocess(
         result = f"Process exited with code {subagent.process.returncode}"
 
     # Cache the result in module-level dict (Subagent is frozen)
-    # Use lock for thread-safe access when multiple subagents run in parallel
     final_result = ReturnType(status, result)
-    with _subagent_results_lock:
-        _subagent_results[subagent.agent_id] = final_result
+    if not set_subagent_result_if_absent(subagent.agent_id, final_result):
+        _cleanup_isolation(subagent)
+        return
 
     # Notify via hook system (fire-and-forget-then-get-alerted pattern)
     try:
@@ -484,7 +552,14 @@ def _run_planner(
     """
     from gptme.cli.main import get_logdir
 
-    from .types import Subagent, _subagents, _subagents_lock, resolve_role_defaults
+    from .types import (
+        Subagent,
+        _subagent_results,
+        _subagent_results_lock,
+        _subagents,
+        _subagents_lock,
+        resolve_role_defaults,
+    )
 
     logger.info(
         f"Starting planner {agent_id} with {len(subtasks)} subtasks "
@@ -501,60 +576,236 @@ def _run_planner(
         name = f"subagent-{executor_id}"
         logdir = get_logdir(name + "-" + random_string(4))
 
-        # Resolve role-based profile per subtask if role is set.
+        # Resolve role-based defaults per subtask if role is set.
         # Per-subtask role is more specific than the planner-level profile, so it
         # always wins — even when the planner itself carries a profile.
-        # NOTE(phase2): use_subprocess/isolated from role are not yet forwarded
-        # to individual executors (planner always uses thread mode). Only profile
-        # is applied here. See SubtaskDef.role docstring for the Phase 2 plan.
+        # Role also controls execution mode: role="verify" enables subprocess+isolated
+        # for sandboxed validation; role="explore"/"implement" use thread mode (default).
         subtask_role = subtask.get("role")
         resolved_profile = profile_name
+        resolved_use_subprocess = False
+        resolved_isolated = False
         if subtask_role:
-            _, _, role_profile = resolve_role_defaults(subtask_role, None, None)
+            role_use_sub, role_isolated, role_profile = resolve_role_defaults(
+                subtask_role, None, None
+            )
             if role_profile is not None:
                 resolved_profile = role_profile
-                logger.info(
-                    f"Subtask '{subtask['id']}' resolved profile '{role_profile}' from role='{subtask_role}'"
-                )
+            resolved_use_subprocess = role_use_sub
+            resolved_isolated = role_isolated
+            logger.info(
+                f"Subtask '{subtask['id']}' resolved from role='{subtask_role}': "
+                f"profile={resolved_profile!r}, "
+                f"use_subprocess={resolved_use_subprocess}, "
+                f"isolated={resolved_isolated}"
+            )
 
-        # Capture workspace before spawning thread to avoid FileNotFoundError
+        # Capture workspace before spawning to avoid FileNotFoundError
         # if cwd is deleted (e.g., tmpdir cleanup in tests)
         try:
             workspace = Path.cwd()
         except FileNotFoundError:
             workspace = logdir.parent
 
-        def run_executor(
-            prompt=executor_prompt,
-            log_dir=logdir,
-            ws=workspace,
-            subtask_profile=resolved_profile,
-        ):
-            _create_subagent_thread(
-                prompt=prompt,
-                logdir=log_dir,
-                model=model,
+        # Set up worktree isolation if the resolved role requires it
+        worktree_path: Path | None = None
+        repo_path: Path | None = None
+        if resolved_isolated:
+            from ...util.git_worktree import create_worktree, get_git_root
+
+            git_root = get_git_root(workspace)
+            if git_root:
+                try:
+                    branch_name = f"subagent-{executor_id}-{uuid.uuid4().hex[:8]}"
+                    worktree_path = create_worktree(git_root, branch_name=branch_name)
+                    workspace = worktree_path
+                    repo_path = git_root
+                    logger.info(
+                        f"Executor {executor_id} isolated in worktree: {worktree_path}"
+                    )
+                except Exception as e:
+                    logger.warning(
+                        f"Failed to create worktree for {executor_id}, "
+                        f"falling back to temp dir: {e}"
+                    )
+                    worktree_path = Path(
+                        tempfile.mkdtemp(prefix=f"subagent-{executor_id}-")
+                    )
+                    workspace = worktree_path
+            else:
+                worktree_path = Path(
+                    tempfile.mkdtemp(prefix=f"subagent-{executor_id}-")
+                )
+                workspace = worktree_path
+                logger.info(
+                    f"Not in a git repo, using temp dir for {executor_id}: {worktree_path}"
+                )
+
+        if resolved_use_subprocess:
+            sa = Subagent(
+                executor_id,
+                executor_prompt,
+                None,
+                logdir,
+                model,
                 context_mode=context_mode,
                 context_include=context_include,
-                workspace=ws,
-                target="planner",
-                profile_name=subtask_profile,
+                profile=resolved_profile,
+                process=None,
+                execution_mode="subprocess",
+                isolated=resolved_isolated,
+                worktree_path=worktree_path,
+                repo_path=repo_path,
+                role=subtask_role,
             )
 
-        t = threading.Thread(target=run_executor, daemon=True)
-        # Register subagent BEFORE starting thread to avoid race condition
-        # (matches pattern in api.py — thread closure may look up _subagents)
-        with _subagents_lock:
-            _subagents.append(Subagent(executor_id, executor_prompt, t, logdir, model))
-        t.start()
+            # Subprocess mode: a combined thread acquires the concurrency slot before
+            # Popen, monitors to completion, and releases in finally — same pattern as
+            # api.py _launch_subprocess. Captures all loop vars via default args.
+            def _run_executor_subprocess(
+                _sa: "Subagent" = sa,
+                _workspace=workspace,
+                _profile=resolved_profile,
+            ):
+                _sem = get_slot_sem()
+                _sem.acquire()
+                try:
+                    with _subagent_results_lock:
+                        if _sa.agent_id in _subagent_results:
+                            logger.info(
+                                "Skipping cancelled queued planner subprocess "
+                                f"executor {_sa.agent_id}"
+                            )
+                            _cleanup_isolation(_sa)
+                            return
+                    try:
+                        process = _run_subagent_subprocess(
+                            prompt=_sa.prompt,
+                            logdir=_sa.logdir,
+                            model=_sa.model,
+                            workspace=_workspace,
+                            context_mode=context_mode,
+                            context_include=context_include,
+                            profile=_profile,
+                        )
+                    except Exception as e:
+                        logger.error(
+                            f"Executor {_sa.agent_id} subprocess failed: {e}",
+                            exc_info=True,
+                        )
+                        from .hooks import notify_completion
+                        from .types import ReturnType, set_subagent_result_if_absent
 
-        # Sequential mode: wait for each task to complete before starting next
-        if execution_mode == "sequential":
-            logger.info(f"Waiting for {executor_id} to complete (sequential mode)")
-            t.join()
-            logger.info(f"Executor {executor_id} completed")
+                        if set_subagent_result_if_absent(
+                            _sa.agent_id, ReturnType("failure", str(e))
+                        ):
+                            notify_completion(
+                                _sa.agent_id,
+                                "failure",
+                                f"Executor subprocess failed: {e}",
+                            )
+                        _cleanup_isolation(_sa)
+                        return
+                    object.__setattr__(_sa, "process", process)
+                    _monitor_subprocess(_sa)
+                finally:
+                    _sem.release()
 
-    # Parallel mode: all threads already started
+            monitor_t = threading.Thread(target=_run_executor_subprocess, daemon=True)
+            object.__setattr__(sa, "thread", monitor_t)
+            with _subagents_lock:
+                _subagents.append(sa)
+            monitor_t.start()
+
+            # Sequential mode: wait for this executor before starting the next
+            if execution_mode == "sequential":
+                logger.info(
+                    f"Waiting for {executor_id} subprocess to complete (sequential mode)"
+                )
+                monitor_t.join()
+                logger.info(f"Executor {executor_id} subprocess completed")
+        else:
+            # Thread mode: original behavior for explore/implement roles
+            cleanup_sa = Subagent(
+                executor_id,
+                executor_prompt,
+                None,
+                logdir,
+                model,
+                isolated=resolved_isolated,
+                worktree_path=worktree_path,
+                repo_path=repo_path,
+                role=subtask_role,
+            )
+
+            def run_executor(
+                executor_agent_id=executor_id,
+                prompt=executor_prompt,
+                log_dir=logdir,
+                ws=workspace,
+                subtask_profile=resolved_profile,
+                cleanup_subagent=cleanup_sa,
+            ):
+                _sem = get_slot_sem()
+                _sem.acquire()
+                try:
+                    with _subagent_results_lock:
+                        if executor_agent_id in _subagent_results:
+                            logger.info(
+                                "Skipping cancelled queued planner thread "
+                                f"executor {executor_agent_id}"
+                            )
+                            return
+                    _create_subagent_thread(
+                        prompt=prompt,
+                        logdir=log_dir,
+                        model=model,
+                        context_mode=context_mode,
+                        context_include=context_include,
+                        workspace=ws,
+                        target="planner",
+                        profile_name=subtask_profile,
+                        agent_id=executor_agent_id,
+                    )
+                finally:
+                    try:
+                        _cleanup_isolation(cleanup_subagent)
+                    except Exception:
+                        logger.exception(
+                            "Failed to clean up isolated planner thread executor "
+                            f"{executor_agent_id}"
+                        )
+                    finally:
+                        _sem.release()
+
+            t = threading.Thread(target=run_executor, daemon=True)
+            sa = Subagent(
+                executor_id,
+                executor_prompt,
+                t,
+                logdir,
+                model,
+                context_mode=context_mode,
+                context_include=context_include,
+                profile=resolved_profile,
+                isolated=resolved_isolated,
+                worktree_path=worktree_path,
+                repo_path=repo_path,
+                role=subtask_role,
+            )
+            # Register subagent BEFORE starting thread to avoid race condition
+            # (matches pattern in api.py — thread closure may look up _subagents)
+            with _subagents_lock:
+                _subagents.append(sa)
+            t.start()
+
+            # Sequential mode: wait for each task to complete before starting next
+            if execution_mode == "sequential":
+                logger.info(f"Waiting for {executor_id} to complete (sequential mode)")
+                t.join()
+                logger.info(f"Executor {executor_id} completed")
+
+    # Parallel mode: all executors (threads/subprocesses) already started
     if execution_mode == "parallel":
         logger.info(f"Planner {agent_id} spawned {len(subtasks)} executor subagents")
     else:

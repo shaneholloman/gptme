@@ -12,13 +12,21 @@ Package structure:
 
 # Re-export public API for backward compatibility
 # Re-export ToolUse for examples()
-from ..base import ToolSpec, ToolUse
-from .api import subagent, subagent_read_log, subagent_status, subagent_wait
+from ..base import ToolFunction, ToolSpec, ToolUse
+from .api import (
+    subagent,
+    subagent_cancel,
+    subagent_read_log,
+    subagent_reply,
+    subagent_status,
+    subagent_wait,
+)
 from .batch import BatchJob, subagent_batch
 from .hooks import (
     _get_complete_instruction,
     _subagent_completion_hook,
     notify_completion,
+    notify_progress,
 )
 from .types import (
     ReturnType,
@@ -26,6 +34,7 @@ from .types import (
     Subagent,
     SubtaskDef,
     _completion_queue,
+    _progress_queue,
     _subagent_results,
     _subagent_results_lock,
     _subagents,
@@ -226,8 +235,27 @@ Key features:
 - use_acp=True: Run subagent via ACP protocol (supports any ACP-compatible agent)
 - acp_command="claude-code-acp": Use a different ACP agent (default: gptme-acp)
 - isolated=True: Run subagent in a git worktree for filesystem isolation
+- redact_secrets=True: Redact API keys, tokens, and passwords from workspace context
 - subagent_batch(): Start multiple subagents in parallel
-- Hook-based notifications: Completions delivered as system messages
+- subagent_cancel(): Cancel a running subagent (SIGTERM for subprocess, marks result for threads)
+- subagent_reply(agent_id, reply): Answer a clarification request and re-spawn the subagent
+- Hook-based notifications: Completions (and clarification requests) delivered as system messages
+
+## Context Isolation
+
+Subagents do NOT inherit the parent's conversation history — they always start
+with a fresh context. What subagents DO inherit (in context_mode="full"):
+
+- Workspace files listed in gptme.toml [prompt] files (e.g. AGENTS.md, README)
+- Dynamic context_cmd output (if configured in gptme.toml)
+- User-level config files from ~/.config/gptme
+
+This means secrets stored in workspace config files or produced by context_cmd
+can reach the subagent. Use redact_secrets=True to scrub common secret patterns
+(API_KEY, TOKEN, PASSWORD, etc.) from these inherited context messages.
+
+For stronger isolation, use context_mode="selective" with context_include=["agent"]
+to share only the agent identity (no workspace files or dynamic context).
 
 ## Agent Profiles for Subagents
 
@@ -270,6 +298,23 @@ MUST DO: Use bcrypt for password hashing, return proper HTTP status codes
 MUST NOT DO: Store plaintext passwords, skip input validation
 CONTEXT: This is for the gptme server API, see existing endpoints in server.py
 '''
+
+## Clarification Requests
+
+When a subagent ends with a ``clarify`` block, it signals that it needs more
+information from the parent before it can continue:
+
+```clarify
+Which output format should I use: JSON or CSV?
+```
+
+The parent receives a hook notification:
+  ❓ Subagent 'X' needs clarification: Which output format should I use: JSON or CSV?
+  Call subagent_reply('X', '<your answer>') to continue.
+
+Use ``subagent_reply(agent_id, reply)`` to answer and re-spawn the subagent.
+The re-spawned subagent receives the original prompt plus the Q&A so it can
+complete the task without losing context.
 """.strip()
 
 tool = ToolSpec(
@@ -278,11 +323,16 @@ tool = ToolSpec(
     instructions=instructions,
     examples=examples,
     functions=[
-        subagent,
-        subagent_status,
-        subagent_wait,
-        subagent_read_log,
-        subagent_batch,
+        ToolFunction.from_callable(f)
+        for f in [
+            subagent,
+            subagent_cancel,
+            subagent_reply,
+            subagent_status,
+            subagent_wait,
+            subagent_read_log,
+            subagent_batch,
+        ]
     ],
     disabled_by_default=True,
     hooks={
@@ -298,6 +348,8 @@ __doc__ = tool.get_doc(__doc__)
 __all__ = [
     # Public API
     "subagent",
+    "subagent_cancel",
+    "subagent_reply",
     "subagent_status",
     "subagent_wait",
     "subagent_read_log",
@@ -310,6 +362,7 @@ __all__ = [
     "Status",
     # Hooks
     "notify_completion",
+    "notify_progress",
     "_subagent_completion_hook",
     "_get_complete_instruction",
     # Module-level state (re-exported for backward compatibility)
@@ -318,6 +371,7 @@ __all__ = [
     "_subagent_results",
     "_subagent_results_lock",
     "_completion_queue",
+    "_progress_queue",
     # Tool registration
     "tool",
 ]

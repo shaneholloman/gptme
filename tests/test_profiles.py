@@ -115,6 +115,27 @@ class TestBuiltinProfiles:
         assert "vision" in computer_use.tools
         assert "ipython" in computer_use.tools
         assert "shell" in computer_use.tools
+        # browser included for structured-first web interaction
+        assert "browser" in computer_use.tools
+
+    def test_computer_use_profile_backend_selection_policy(self):
+        """computer-use profile prompt must state the structured-first policy."""
+        computer_use = BUILTIN_PROFILES["computer-use"]
+        prompt = computer_use.system_prompt
+
+        # Policy must exist as a named section and cover all three backends.
+        assert "## Backend selection policy" in prompt
+        assert "**Web targets with Playwright available**" in prompt
+        assert "**Visual verification or non-DOM surfaces**" in prompt
+        assert "**Native desktop / X11 / non-browser apps**" in prompt
+        assert "snapshot_url" in prompt, "must mention structured ARIA snapshot for web"
+        assert "wait_for_change" in prompt, (
+            "must mention wait_for_change for efficiency"
+        )
+        assert "window_focus" in prompt, "must mention window_focus for native desktop"
+        assert "screenshot()" not in prompt, (
+            "computer-use must name real screenshot backends"
+        )
 
     def test_browser_use_profile(self):
         browser_use = BUILTIN_PROFILES["browser-use"]

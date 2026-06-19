@@ -252,6 +252,24 @@ class ArchitectConfig:
 
 
 @dataclass
+class SubagentConfig:
+    """Configuration for subagent execution."""
+
+    max_concurrent: int | None = None
+    """Maximum number of concurrently running subagents.
+
+    Controls how many subagents can run simultaneously. Excess subagents queue
+    and start as slots free up. Resolution order: ``GPTME_SUBAGENT_MAX_CONCURRENT``
+    env var > this field > ``min(8, cpu_count)`` default.
+
+    Example ``gptme.toml``::
+
+        [subagent]
+        max_concurrent = 4
+    """
+
+
+@dataclass
 class ProjectConfig:
     """Project-level configuration, such as which files to include in the context by default.
 
@@ -263,6 +281,7 @@ class ProjectConfig:
     base_prompt: str | None = None
     prompt: str | None = None
     files: list[str] | None = None
+    exclude: list[str] = field(default_factory=list)
     context_cmd: str | None = None
     rag: RagConfig = field(default_factory=RagConfig)
     agent: AgentConfig | None = None
@@ -274,6 +293,8 @@ class ProjectConfig:
     plugins: PluginsConfig = field(default_factory=PluginsConfig)
 
     architect: ArchitectConfig = field(default_factory=ArchitectConfig)
+
+    subagent: SubagentConfig = field(default_factory=SubagentConfig)
 
     # Plugin-specific configuration namespace
     # Allows plugins to have their own config sections like [plugin.retrieval]
@@ -294,12 +315,14 @@ class ProjectConfig:
             prompt = prompt_data.pop("prompt", None)
             base_prompt = prompt_data.pop("base_prompt", None)
             files = prompt_data.pop("files", None)
+            exclude = prompt_data.pop("exclude", [])
             context_cmd = prompt_data.pop("context_cmd", None)
         else:
             # Old format: flat structure, prompt_data contains the prompt string
             prompt = prompt_data
             base_prompt = config_data.pop("base_prompt", None)
             files = config_data.pop("files", None)
+            exclude = []
             context_cmd = config_data.pop("context_cmd", None)
 
         rag = _build_section("rag", RagConfig, _pop_object_section(config_data, "rag"))
@@ -368,6 +391,10 @@ class ProjectConfig:
                 **{k: v for k, v in architect_data.items() if k in known_keys}
             )
 
+        subagent = _build_section(
+            "subagent", SubagentConfig, _pop_object_section(config_data, "subagent")
+        )
+
         # Warn about unknown keys and drop them instead of passing them through
         # as kwargs (which would crash with "unexpected keyword argument").
         if config_data:
@@ -380,6 +407,7 @@ class ProjectConfig:
             prompt=prompt,
             base_prompt=base_prompt,
             files=files,
+            exclude=exclude,
             context_cmd=context_cmd,
             rag=rag,
             agent=agent,
@@ -390,6 +418,7 @@ class ProjectConfig:
             plugin=plugin_config,
             env=env,
             mcp=mcp,
+            subagent=subagent,
         )
 
     def merge(self, other: Self) -> Self:

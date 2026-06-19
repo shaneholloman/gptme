@@ -9,6 +9,8 @@ import shlex
 import shutil
 import signal
 import sys
+import tempfile
+import time
 import traceback
 from datetime import datetime, timezone
 from itertools import islice
@@ -27,7 +29,7 @@ import gptme
 
 from ..chat import chat
 from ..commands import _gen_help
-from ..config import setup_config_from_cli
+from ..config import ensure_workspace_dir, setup_config_from_cli
 from ..constants import MULTIPROMPT_SEPARATOR
 from ..dirs import get_logs_dir
 from ..init import init_logging
@@ -41,7 +43,13 @@ from ..logmanager import (
 )
 from ..message import Message
 from ..profiles import get_profile
-from ..prompts import ContextMode, get_prompt
+from ..prompts import (
+    ContextMode,
+    PromptSectionStat,
+    format_prompt_stats,
+    get_prompt,
+    get_prompt_stats,
+)
 from ..telemetry import init_telemetry, shutdown_telemetry
 from ..tools import ToolFormat, get_available_tools, init_tools
 from ..util import epoch_to_age
@@ -49,6 +57,7 @@ from ..util.auto_naming import generate_conversation_id
 from ..util.context import md_codeblock
 from ..util.interrupt import handle_keyboard_interrupt, set_interruptible
 from ..util.prompt import add_history
+from ..util.tokens import len_tokens
 
 logger = logging.getLogger(__name__)
 
@@ -74,6 +83,12 @@ def _validate_model_param(
 
 script_path = Path(os.path.realpath(__file__))
 _STDIN_PIPE_GRACE_PERIOD = 1.0
+
+# Sub-timeout used by the inner read loop in `_read_stdin` to disambiguate
+# "data ready" from "pipe fd is readable but write end is open and idle".
+# Tuned to 100ms — generous enough to bridge small producer gaps without
+# being so long that an idle pipe stalls the prompt for a noticeable beat.
+_STDIN_PIPE_INTER_CHUNK_TIMEOUT = 0.1
 
 
 class CommaSeparatedChoice(click.ParamType):
@@ -299,6 +314,7 @@ Utilities (gptme-util):
   gptme-util chats send ID MSG Queue a prompt for a running chat from another terminal
   gptme-util chats rename     Rename a conversation
   gptme-util models list      List available models
+  gptme-util snapshot list    List workspace snapshots outside a session
   gptme-util context index    Index project files for RAG
   gptme-util llm generate     Direct LLM generation without chat
 
@@ -420,6 +436,11 @@ Run 'gptme-util --help' for all utility commands."""
     help="Show hidden system messages.",
 )
 @click.option(
+    "--show-prompt-stats",
+    is_flag=True,
+    help="Show startup system-prompt token stats for the current configuration and exit.",
+)
+@click.option(
     "-v",
     "--verbose",
     is_flag=True,
@@ -463,6 +484,12 @@ Run 'gptme-util --help' for all utility commands."""
     multiple=True,
     type=CommaSeparatedChoice(["all", "files", "cmd"], metavar="[all|files|cmd]"),
     hidden=True,
+)
+@click.option(
+    "--no-workspace",
+    "no_workspace",
+    is_flag=True,
+    help="Skip all workspace context (prompt files and context_cmd). Tools and agent config are still included.",
 )
 @click.option(
     "--architect",
@@ -510,6 +537,7 @@ def main(
     non_interactive: bool,
     output_format: str,
     show_hidden: bool,
+    show_prompt_stats: bool,
     version: bool,
     version_json: bool,
     resume: bool,
@@ -522,6 +550,7 @@ def main(
     editor_model: str | None,
     auto_accept_architect: bool,
     context_include: tuple[str, ...],
+    no_workspace: bool,
     output_schema: str | None,
 ):
     """Main entrypoint for the CLI."""
@@ -530,6 +559,12 @@ def main(
     # (observed to occur in some Click versions when --name "" is passed)
     if not name or not name.strip():
         name = "random"
+
+    if no_workspace and context_include:
+        raise click.UsageError(
+            "--no-workspace and --context are mutually exclusive: "
+            "--no-workspace strips all workspace context, so --context values would be silently ignored."
+        )
 
     # Apply agent profile if specified
     selected_profile = None
@@ -774,6 +809,86 @@ def main(
             )
         return prompt_msgs
 
+    if show_prompt_stats:
+        stats_root = Path(tempfile.mkdtemp(prefix="gptme-prompt-stats-"))
+        try:
+            stats_logdir = stats_root / "log"
+            if workspace == "@log":
+                stats_workspace_path = stats_logdir / "workspace"
+                stats_workspace_path.mkdir(parents=True, exist_ok=True)
+            else:
+                stats_workspace_path = Path(workspace) if workspace else Path.cwd()
+
+            try:
+                config = setup_config_from_cli(
+                    workspace=stats_workspace_path,
+                    logdir=stats_logdir,
+                    model=model,
+                    tool_allowlist=tool_allowlist_str,
+                    tool_format=tool_format,
+                    stream=stream,
+                    interactive=interactive,
+                    agent_path=Path(agent_path) if agent_path else None,
+                )
+            except ValueError as e:
+                raise click.UsageError(str(e)) from e
+            assert config.chat and config.chat.tool_format
+
+            logger.debug(f"Using tools: {config.chat.tools}")
+            try:
+                tools = init_tools(config.chat.tools)
+            except ValueError as e:
+                raise click.UsageError(str(e)) from e
+
+            stats_context_mode: ContextMode | None = (
+                "selective" if (context_include or no_workspace) else None
+            )
+            stats_context_include: list[str] | None = (
+                []
+                if no_workspace
+                else (
+                    [item for val in context_include for item in val.split(",")]
+                    if context_include
+                    else None
+                )
+            )
+            stats = get_prompt_stats(
+                tools=tools,
+                prompt=prompt_system,
+                interactive=config.chat.interactive,
+                tool_format=config.chat.tool_format,
+                model=config.chat.model,
+                workspace=stats_workspace_path,
+                agent_path=config.chat.agent,
+                context_mode=stats_context_mode,
+                context_include=stats_context_include,
+            )
+            extra_sections: list[PromptSectionStat] = []
+            if selected_profile and selected_profile.system_prompt:
+                profile_msg = Message(
+                    "system",
+                    f"# Agent Profile: {selected_profile.name}\n\n{selected_profile.system_prompt}",
+                )
+                extra_sections.append(
+                    PromptSectionStat(
+                        name="agent_profile",
+                        messages=1,
+                        chars=len(profile_msg.content),
+                        tokens=len_tokens(profile_msg, config.chat.model or "gpt-4"),
+                    )
+                )
+            header = (
+                "System prompt stats"
+                f" (prompt={prompt_system}, tool_format={config.chat.tool_format}, "
+                f"tools={len(tools)}, interactive={config.chat.interactive})"
+            )
+            click.echo(
+                format_prompt_stats(stats, header=header, extra_sections=extra_sections)
+            )
+            return
+        finally:
+            shutil.rmtree(stats_root, ignore_errors=True)
+
     logdir_preexisting = True
 
     if resume:
@@ -823,9 +938,9 @@ def main(
             )
 
     if workspace == "@log":
-        workspace_path: Path | None = logdir / "workspace"
+        workspace_path = logdir / "workspace"
         assert workspace_path  # mypy not smart enough to see its not None
-        workspace_path.mkdir(parents=True, exist_ok=True)
+        ensure_workspace_dir(workspace_path)
     else:
         workspace_path = Path(workspace) if workspace else Path.cwd()
 
@@ -845,15 +960,6 @@ def main(
         raise click.UsageError(str(e)) from e
     assert config.chat and config.chat.tool_format
 
-    # init telemetry with agent name and interactive mode
-    agent_config = config.chat.agent_config
-    agent_name = agent_config.name if agent_config else None
-    init_telemetry(
-        service_name="gptme-cli",
-        agent_name=agent_name,
-        interactive=interactive,
-    )
-
     # early init tools to generate system prompt
     # We pass the tool_allowlist CLI argument. If it's not provided, init_tools
     # will load it from the environment variable TOOL_ALLOWLIST or the chat config.
@@ -862,6 +968,15 @@ def main(
         tools = init_tools(config.chat.tools)
     except ValueError as e:
         raise click.UsageError(str(e)) from e
+
+    # init telemetry with agent name and interactive mode
+    agent_config = config.chat.agent_config
+    agent_name = agent_config.name if agent_config else None
+    init_telemetry(
+        service_name="gptme-cli",
+        agent_name=agent_name,
+        interactive=interactive,
+    )
 
     # Check if we're opening an existing conversation (via --resume, --name, or pick)
     # If so, skip generating initial messages (including expensive context_cmd)
@@ -891,13 +1006,32 @@ def main(
         )
         sys.exit(1)
 
+    # Validate model early to fail fast before the expensive get_prompt() call.
+    # Only check models with a provider/ prefix; bare provider names (e.g. "anthropic")
+    # and model aliases (e.g. "gpt-4o") are left for init_model() to resolve.
+    if config.chat.model and "/" in config.chat.model:
+        try:
+            get_provider_from_model(config.chat.model)
+        except ValueError as e:
+            _cleanup_aborted_new_logdir(logdir, preexisting=logdir_preexisting)
+            raise click.UsageError(f"--model: {e}") from e
+
     if is_existing_conversation:
         logger.debug("Existing conversation found, skipping initial prompt generation")
         initial_msgs = []
     else:
-        # Infer context mode: --context-include implies selective mode
+        # Infer context mode: --context-include / --no-workspace both imply selective mode
         effective_context_mode: ContextMode | None = (
-            "selective" if context_include else None
+            "selective" if (context_include or no_workspace) else None
+        )
+        effective_context_include: list[str] | None = (
+            []
+            if no_workspace
+            else (
+                [item for val in context_include for item in val.split(",")]
+                if context_include
+                else None
+            )
         )
 
         # get initial system prompt
@@ -910,9 +1044,7 @@ def main(
             workspace=workspace_path,
             agent_path=config.chat.agent,
             context_mode=effective_context_mode,
-            context_include=[item for val in context_include for item in val.split(",")]
-            if context_include
-            else None,
+            context_include=effective_context_include,
         )
 
     # Append profile system prompt if using a profile
@@ -1216,13 +1348,32 @@ def _read_stdin() -> str:
     if not readable:
         return ""
 
-    chunk_size = 1024  # 1 KB
-    all_data = ""
+    # stdin is readable (data available or pipe open but idle).
+    # Use os.read + select with sub-timeouts rather than sys.stdin.read() which
+    # blocks until EOF on a pipe — "readable" from select on a pipe fd can
+    # fire even when the write end is open but idle (e.g. under uv run).
+    try:
+        fd = sys.stdin.fileno()
+    except (OSError, ValueError, AttributeError):
+        # No real fd (e.g. StringIO in tests or piped stdin where fileno fails).
+        # Use blocking read — safe because non-pipe fds return immediately.
+        return sys.stdin.read()
 
-    while True:
-        chunk = sys.stdin.read(chunk_size)
-        if not chunk:
-            break
-        all_data += chunk
+    all_data = ""
+    deadline = time.monotonic() + _STDIN_PIPE_GRACE_PERIOD
+
+    try:
+        while time.monotonic() < deadline:
+            r, _, _ = select.select([fd], [], [], _STDIN_PIPE_INTER_CHUNK_TIMEOUT)
+            if not r:
+                # No data arrived within the sub-timeout — pipe is open but idle.
+                # Don't block on read; return what we have.
+                break
+            chunk = os.read(fd, 4096)
+            if not chunk:
+                break  # EOF
+            all_data += chunk.decode("utf-8", errors="replace")
+    except (OSError, ValueError):
+        pass
 
     return all_data

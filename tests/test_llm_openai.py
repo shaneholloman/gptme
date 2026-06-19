@@ -644,10 +644,8 @@ def test_message_conversion_gpt5_with_tool_results():
     assert first_part_3["text"] == "Saved to file.txt"
 
 
-def test_chat_uses_responses_api_for_gpt5_when_enabled(monkeypatch):
+def test_chat_uses_responses_api_for_gpt5_by_default(monkeypatch):
     from openai.types.responses.response_usage import ResponseUsage
-
-    monkeypatch.setenv("GPTME_OPENAI_RESPONSES_API", "1")
 
     fake_response = SimpleNamespace(
         output=[
@@ -705,8 +703,6 @@ def test_chat_uses_responses_api_for_gpt5_when_enabled(monkeypatch):
 
 
 def test_chat_responses_api_formats_function_calls(monkeypatch):
-    monkeypatch.setenv("GPTME_OPENAI_RESPONSES_API", "1")
-
     fake_response = SimpleNamespace(
         output=[
             SimpleNamespace(
@@ -825,23 +821,38 @@ def test_llm_openai_all_excludes_private_responses_helpers():
     assert "_messages_dicts_to_responses_input" not in llm_openai.__all__
 
 
-def test_should_use_responses_api_requires_direct_openai(monkeypatch):
-    monkeypatch.setenv("GPTME_OPENAI_RESPONSES_API", "1")
+def test_should_use_responses_api_enabled_by_default(monkeypatch):
+    """Responses API is on by default for supported models; off for unsupported or proxy."""
     monkeypatch.setattr(llm_openai, "_is_proxy", lambda client: False)
 
     client = cast(Any, SimpleNamespace())
+    # gpt-5 supports Responses API → enabled by default
     assert (
         _should_use_responses_api("openai", get_model("openai/gpt-5"), client) is True
     )
+    # gpt-4o does not have supports_responses_api=True → Chat Completions
     assert (
         _should_use_responses_api("openai", get_model("openai/gpt-4o"), client) is False
     )
+    # Non-openai provider → Chat Completions
     assert (
         _should_use_responses_api("openrouter", get_model("openai/gpt-5"), client)
         is False
     )
 
+    # Proxy → Chat Completions (proxy may not support Responses API format)
     monkeypatch.setattr(llm_openai, "_is_proxy", lambda client: True)
+    assert (
+        _should_use_responses_api("openai", get_model("openai/gpt-5"), client) is False
+    )
+
+
+def test_should_use_responses_api_can_be_disabled(monkeypatch):
+    """GPTME_OPENAI_RESPONSES_API=0 forces Chat Completions even for supported models."""
+    monkeypatch.setenv("GPTME_OPENAI_RESPONSES_API", "0")
+    monkeypatch.setattr(llm_openai, "_is_proxy", lambda client: False)
+
+    client = cast(Any, SimpleNamespace())
     assert (
         _should_use_responses_api("openai", get_model("openai/gpt-5"), client) is False
     )
@@ -2576,12 +2587,12 @@ class TestGetAvailableModels:
 
     @patch("gptme.llm.llm_openai.requests.get")
     @patch("gptme.llm.llm_openai.get_config")
-    @patch("gptme.llm.llm_gptme.get_base_url")
+    @patch("gptme.llm.llm_gptme.get_models_url")
     @patch("gptme.llm.llm_gptme.get_api_key")
     def test_gptme_provider_uses_authenticated_models_endpoint(
         self,
         mock_get_api_key,
-        mock_get_base_url,
+        mock_get_models_url,
         mock_get_config,
         mock_requests_get,
     ):
@@ -2591,7 +2602,9 @@ class TestGetAvailableModels:
         get_available_models.cache_clear()
         mock_get_config.return_value = MagicMock()
         mock_get_api_key.return_value = "gptme-token"
-        mock_get_base_url.return_value = "https://fleet.gptme.ai/v1"
+        mock_get_models_url.return_value = (
+            "https://kpkxgnfpyntahyhckhgm.supabase.co/functions/v1"
+        )
         mock_response = MagicMock()
         mock_response.json.return_value = {
             "data": [{"id": "openai/gpt-5", "context_length": 256000}]
@@ -2601,7 +2614,7 @@ class TestGetAvailableModels:
         models = get_available_models("gptme")
 
         mock_requests_get.assert_called_once_with(
-            "https://fleet.gptme.ai/v1/models",
+            "https://kpkxgnfpyntahyhckhgm.supabase.co/functions/v1/models",
             headers={"Authorization": "Bearer gptme-token"},
             timeout=10,
         )

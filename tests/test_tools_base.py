@@ -13,8 +13,15 @@ import pytest
 
 from gptme.hooks import HookType
 from gptme.message import Message
+from gptme.tools._allowlist import (
+    allowlist_contains_glob,
+    is_hint_pattern,
+    matching_allowlist_tools,
+    tool_matches_allowlist,
+)
 from gptme.tools.base import (
     Parameter,
+    ToolFunction,
     ToolSpec,
     ToolUse,
     _codeblock_char_ranges,
@@ -202,6 +209,154 @@ class TestCallableSignature:
         assert sig == "bare()"
 
 
+# ── ToolFunction ──────────────────────────────────────────────────
+
+
+class TestToolFunction:
+    def test_from_callable_infers_name(self):
+        def my_func(x: int) -> str:
+            """Does something."""
+            return ""
+
+        tf = ToolFunction.from_callable(my_func)
+        assert tf.name == "my_func"
+
+    def test_from_callable_infers_description(self):
+        def documented(x: int) -> str:
+            """This is a docstring."""
+            return ""
+
+        tf = ToolFunction.from_callable(documented)
+        assert tf.description == "This is a docstring."
+
+    def test_from_callable_no_docstring(self):
+        def nodoc():
+            pass
+
+        tf = ToolFunction.from_callable(nodoc)
+        assert tf.description == ""
+
+    def test_from_callable_group(self):
+        def fn():
+            pass
+
+        tf = ToolFunction.from_callable(fn, group="discord")
+        assert tf.group == "discord"
+
+    def test_default_hints_empty(self):
+        def fn():
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.hints == frozenset()
+
+    def test_explicit_hints(self):
+        def fn():
+            pass
+
+        tf = ToolFunction(name="fn", fn=fn, hints=frozenset({"read-only"}))
+        assert "read-only" in tf.hints
+
+    def test_fn_is_callable(self):
+        def adder(a: int, b: int) -> int:
+            return a + b
+
+        tf = ToolFunction.from_callable(adder)
+        assert tf.fn(2, 3) == 5
+
+    def test_frozen(self):
+        def fn():
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        with pytest.raises((AttributeError, TypeError)):
+            tf.name = "new_name"  # type: ignore[misc]
+
+    def test_functions_description_uses_toolfunction_metadata(self):
+        def helper(name: str) -> bool:
+            """Checks a name."""
+            return True
+
+        tf = ToolFunction.from_callable(helper)
+        spec = ToolSpec(name="t", desc="", functions=[tf])
+        desc = spec.get_functions_description()
+        assert "helper" in desc
+        assert "Checks a name" in desc
+
+    def test_functions_description_explicit_description(self):
+        def helper(name: str) -> bool:
+            return True
+
+        tf = ToolFunction(name="helper", fn=helper, description="Custom description")
+        spec = ToolSpec(name="t", desc="", functions=[tf])
+        desc = spec.get_functions_description()
+        assert "Custom description" in desc
+
+    def test_from_callable_extracts_parameters(self):
+        def greet(name: str, repeat: int) -> str:
+            """Say hello."""
+            return f"hello {name}" * repeat
+
+        tf = ToolFunction.from_callable(greet)
+        assert len(tf.parameters) == 2
+        assert tf.parameters[0].name == "name"
+        assert tf.parameters[0].type == "str"
+        assert tf.parameters[0].required is True
+        assert tf.parameters[1].name == "repeat"
+        assert tf.parameters[1].type == "int"
+
+    def test_from_callable_optional_parameter(self):
+        def fn(path: str, encoding: str = "utf-8") -> str:
+            return ""
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.parameters[0].required is True
+        assert tf.parameters[1].required is False
+
+    def test_from_callable_unannotated_parameter(self):
+        def fn(x) -> None:
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.parameters[0].type == "any"
+
+    def test_from_callable_description_first_paragraph_only(self):
+        def fn() -> None:
+            """First paragraph.
+
+            Second paragraph with details.
+            """
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.description == "First paragraph."
+        assert "Second paragraph" not in tf.description
+
+    def test_from_callable_no_params(self):
+        def fn() -> str:
+            return "ok"
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.parameters == []
+
+    def test_from_callable_skips_variadic(self):
+        def fn(*args: str, **kwargs: str) -> None:
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        assert tf.parameters == []
+
+    def test_from_callable_skips_variadic_mixed(self):
+        def fn(name: str, *args: str, flag: bool = False, **kwargs: str) -> None:
+            pass
+
+        tf = ToolFunction.from_callable(fn)
+        names = [p.name for p in tf.parameters]
+        assert "name" in names
+        assert "flag" in names
+        assert "args" not in names
+        assert "kwargs" not in names
+
+
 # ── ToolSpec ───────────────────────────────────────────────────────
 
 
@@ -289,7 +444,9 @@ class TestToolSpec:
             """Does something."""
             return ""
 
-        tool = ToolSpec(name="t", desc="", functions=[my_func])
+        tool = ToolSpec(
+            name="t", desc="", functions=[ToolFunction.from_callable(my_func)]
+        )
         result = tool.get_instructions("markdown")
         assert "my_func" in result
         assert "Does something" in result
@@ -299,7 +456,9 @@ class TestToolSpec:
             """Checks a name."""
             return True
 
-        tool = ToolSpec(name="t", desc="", functions=[helper])
+        tool = ToolSpec(
+            name="t", desc="", functions=[ToolFunction.from_callable(helper)]
+        )
         desc = tool.get_functions_description()
         assert "helper" in desc
         assert "Checks a name" in desc
@@ -307,6 +466,47 @@ class TestToolSpec:
     def test_get_functions_description_no_functions(self):
         tool = ToolSpec(name="t", desc="")
         assert tool.get_functions_description() == "None"
+
+    def test_bare_callable_functions_normalized(self):
+        # The documented plugin API (docs/plugins.rst) passes bare callables in
+        # `functions`. ToolSpec must normalize them to ToolFunction so consumers
+        # (python.init, get_functions_description, as_function_subtoolspecs) work.
+        def my_func(x: int) -> str:
+            """Does something."""
+            return ""
+
+        tool = ToolSpec(name="t", desc="", functions=[my_func])
+        assert tool.functions is not None
+        assert isinstance(tool.functions[0], ToolFunction)
+        assert tool.functions[0].fn is my_func
+        assert tool.functions[0].name == "my_func"
+
+    def test_mixed_callable_and_toolfunction_normalized(self):
+        def bare(x: int) -> str:
+            return ""
+
+        def wrapped(y: int) -> str:
+            return ""
+
+        tool = ToolSpec(
+            name="t",
+            desc="",
+            functions=[bare, ToolFunction.from_callable(wrapped)],
+        )
+        assert tool.functions is not None
+        assert all(isinstance(f, ToolFunction) for f in tool.functions)
+        assert {f.name for f in tool.functions} == {"bare", "wrapped"}
+
+    def test_bare_callable_functions_work_in_description(self):
+        def helper(name: str) -> bool:
+            """Checks a name."""
+            return True
+
+        # Pass the bare callable, as a plugin would
+        tool = ToolSpec(name="t", desc="", functions=[helper])
+        desc = tool.get_functions_description()
+        assert "helper" in desc
+        assert "Checks a name" in desc
 
     def test_get_examples_string(self):
         tool = ToolSpec(name="t", desc="", examples="example usage")
@@ -341,6 +541,352 @@ class TestToolSpec:
     def test_get_doc_no_existing(self, basic_tool):
         doc = basic_tool.get_doc()
         assert "Instructions" in doc
+
+    def test_hints_default_empty(self):
+        tool = ToolSpec(name="t", desc="")
+        assert tool.hints == frozenset()
+
+    def test_hints_explicit(self):
+        tool = ToolSpec(name="t", desc="", hints=frozenset({"read-only", "idempotent"}))
+        assert "read-only" in tool.hints
+        assert "idempotent" in tool.hints
+
+
+# ── ToolSpec.from_function ─────────────────────────────────────────
+
+
+class TestToolSpecFromFunction:
+    def test_basic_metadata(self):
+        def greet(name: str) -> str:
+            """Greet someone by name."""
+            return f"Hello, {name}!"
+
+        spec = ToolSpec.from_function(greet)
+        assert spec.name == "greet"
+        assert spec.desc == "Greet someone by name."
+
+    def test_parameters_extracted(self):
+        def add(a: int, b: int) -> int:
+            """Add two numbers."""
+            return a + b
+
+        spec = ToolSpec.from_function(add)
+        assert len(spec.parameters) == 2
+        assert spec.parameters[0].name == "a"
+        assert spec.parameters[0].type == "int"
+        assert spec.parameters[0].required is True
+        assert spec.parameters[1].name == "b"
+
+    def test_execute_via_kwargs(self):
+        def add(a: int, b: int) -> int:
+            """Add two numbers."""
+            return int(a) + int(b)
+
+        spec = ToolSpec.from_function(add)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, None, {"a": "3", "b": "4"}))  # type: ignore[arg-type]
+        assert any("7" in m.content for m in msgs)
+
+    def test_execute_via_positional_args(self):
+        def echo(text: str) -> str:
+            """Echo text back."""
+            return text
+
+        spec = ToolSpec.from_function(echo)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, ["hello"], None))  # type: ignore[arg-type]
+        assert any("hello" in m.content for m in msgs)
+
+    def test_execute_returns_none_produces_no_message(self):
+        def noop() -> None:
+            pass
+
+        spec = ToolSpec.from_function(noop)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, None, None))  # type: ignore[arg-type]
+        assert msgs == []
+
+    def test_no_ipython_import(self):
+        """from_function path must not trigger an IPython import."""
+        import sys
+
+        def fn(x: str) -> str:
+            """Returns x."""
+            return x
+
+        before = "IPython" in sys.modules
+        ToolSpec.from_function(fn)
+        after = "IPython" in sys.modules
+        # IPython should not have been newly imported by from_function
+        assert before == after
+
+    def test_is_runnable(self):
+        def fn(x: str) -> str:
+            return x
+
+        spec = ToolSpec.from_function(fn)
+        assert spec.is_runnable
+
+    def test_execute_positional_only_via_kwargs(self):
+        """Positional-only params must not cause TypeError when called via kwargs."""
+
+        def fn(x: str, /) -> str:
+            return f"got:{x}"
+
+        spec = ToolSpec.from_function(fn)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, None, {"x": "hello"}))  # type: ignore[arg-type]
+        assert any("got:hello" in m.content for m in msgs)
+
+    def test_execute_positional_only_via_args(self):
+        """Positional-only params work via the positional-args path too."""
+
+        def fn(x: str, /) -> str:
+            return f"got:{x}"
+
+        spec = ToolSpec.from_function(fn)
+        assert spec.execute is not None
+        msgs = list(spec.execute(None, ["world"], None))  # type: ignore[arg-type]
+        assert any("got:world" in m.content for m in msgs)
+
+
+# ── ToolSpec.as_function_subtoolspecs ─────────────────────────────
+
+
+class TestAsFunctionSubtoolspecs:
+    def test_empty_when_no_functions(self):
+        tool = ToolSpec(name="browser", desc="")
+        assert tool.as_function_subtoolspecs() == []
+
+    def test_one_subtool_per_function(self):
+        def view(url: str) -> str:
+            """View a URL."""
+            return url
+
+        def screenshot() -> str:
+            """Take a screenshot."""
+            return "ok"
+
+        tool = ToolSpec(
+            name="browser",
+            desc="",
+            functions=[
+                ToolFunction.from_callable(view),
+                ToolFunction.from_callable(screenshot),
+            ],
+        )
+        subs = tool.as_function_subtoolspecs()
+        assert len(subs) == 2
+
+    def test_subtool_names_are_qualified(self):
+        def view(url: str) -> str:
+            """View a URL."""
+            return url
+
+        tool = ToolSpec(
+            name="browser",
+            desc="",
+            functions=[ToolFunction.from_callable(view)],
+        )
+        subs = tool.as_function_subtoolspecs()
+        assert subs[0].name == "browser.view"
+
+    def test_subtool_is_runnable(self):
+        def greet(name: str) -> str:
+            """Greet someone."""
+            return f"hi {name}"
+
+        tool = ToolSpec(
+            name="chat",
+            desc="",
+            functions=[ToolFunction.from_callable(greet)],
+        )
+        subs = tool.as_function_subtoolspecs()
+        assert subs[0].is_runnable
+
+    def test_subtool_executes_without_ipython(self):
+        """Functions in sub-toolspecs must run without importing IPython."""
+        import sys
+
+        def double(n: str) -> str:
+            """Double a number string."""
+            return str(int(n) * 2)
+
+        tool = ToolSpec(
+            name="math",
+            desc="",
+            functions=[ToolFunction.from_callable(double)],
+        )
+        before = "IPython" in sys.modules
+        subs = tool.as_function_subtoolspecs()
+        after = "IPython" in sys.modules
+        assert before == after, "IPython must not be imported during subtool expansion"
+
+        sub = subs[0]
+        assert sub.execute is not None
+        msgs = list(sub.execute(None, None, {"n": "6"}))  # type: ignore[arg-type]
+        assert any("12" in m.content for m in msgs)
+
+    def test_subtool_inherits_hints(self):
+        def read_channel() -> str:
+            """Read a channel."""
+            return ""
+
+        tf = ToolFunction(
+            name="read_channel",
+            fn=read_channel,
+            hints=frozenset({"read-only"}),
+        )
+        tool = ToolSpec(name="discord", desc="", functions=[tf])
+        subs = tool.as_function_subtoolspecs()
+        assert "read-only" in subs[0].hints
+
+    def test_subtool_name_allows_glob_allowlist(self):
+        """Sub-tool names like discord.read_channel match 'discord.*' patterns."""
+        from gptme.tools._allowlist import tool_matches_allowlist
+
+        def read_channel() -> str:
+            """Read a channel."""
+            return ""
+
+        tool = ToolSpec(
+            name="discord",
+            desc="",
+            functions=[ToolFunction.from_callable(read_channel)],
+        )
+        subs = tool.as_function_subtoolspecs()
+        assert tool_matches_allowlist(subs[0].name, ["discord.*"])
+
+    def test_subtool_honours_custom_description_and_parameters(self):
+        """Custom description/parameters on ToolFunction must not be discarded."""
+
+        def fn(x: str) -> str:
+            """Auto-derived description (should be overridden)."""
+            return x
+
+        custom_param = Parameter(name="x", type="string", description="The input value")
+        tf = ToolFunction(
+            name="fn",
+            fn=fn,
+            description="Richer prose description",
+            parameters=[custom_param],
+        )
+        tool = ToolSpec(name="mytool", desc="", functions=[tf])
+        subs = tool.as_function_subtoolspecs()
+        sub = subs[0]
+        assert sub.desc == "Richer prose description"
+        assert len(sub.parameters) == 1
+        assert sub.parameters[0].description == "The input value"
+
+    def test_subtool_inherits_parent_availability_guard(self):
+        def read_channel() -> str:
+            """Read a channel."""
+            return ""
+
+        tool = ToolSpec(
+            name="discord",
+            desc="",
+            available=lambda: False,
+            functions=[ToolFunction.from_callable(read_channel)],
+        )
+
+        subs = tool.as_function_subtoolspecs()
+
+        assert subs[0].available is tool.available
+        assert subs[0].is_available is False
+
+
+# ── Hint-based allowlist ───────────────────────────────────────────
+
+
+def _make_tool(name: str, hints: frozenset[str] = frozenset()) -> ToolSpec:
+    return ToolSpec(name=name, desc="", hints=hints)
+
+
+class TestIsHintPattern:
+    def test_hint_prefix_recognized(self):
+        assert is_hint_pattern("hint:read-only")
+
+    def test_bare_name_not_hint(self):
+        assert not is_hint_pattern("shell")
+
+    def test_glob_not_hint(self):
+        assert not is_hint_pattern("discord.*")
+
+
+class TestAllowlistContainsGlob:
+    def test_plain_names_no_glob(self):
+        assert not allowlist_contains_glob(["shell", "save"])
+
+    def test_star_glob(self):
+        assert allowlist_contains_glob(["discord.*"])
+
+    def test_hint_pattern_treated_as_glob(self):
+        # hint patterns implicitly match multiple tools, so suppress MCP warnings
+        assert allowlist_contains_glob(["hint:read-only", "shell"])
+
+    def test_question_mark_glob(self):
+        assert allowlist_contains_glob(["tool?"])
+
+
+class TestMatchingAllowlistToolsHints:
+    def test_hint_pattern_matches_tool_with_hint(self):
+        t = _make_tool("discord.list", frozenset({"read-only"}))
+        result = matching_allowlist_tools("hint:read-only", [t])
+        assert t in result
+
+    def test_hint_pattern_misses_tool_without_hint(self):
+        t = _make_tool("discord.send", frozenset())
+        result = matching_allowlist_tools("hint:read-only", [t])
+        assert result == []
+
+    def test_name_pattern_still_works(self):
+        t = _make_tool("shell")
+        result = matching_allowlist_tools("shell", [t])
+        assert t in result
+
+    def test_glob_pattern_still_works(self):
+        tools = [
+            _make_tool("discord.send"),
+            _make_tool("discord.list"),
+            _make_tool("shell"),
+        ]
+        result = matching_allowlist_tools("discord.*", tools)
+        assert len(result) == 2
+        assert all(t.name.startswith("discord.") for t in result)
+
+
+class TestToolMatchesAllowlistHints:
+    def test_name_match(self):
+        assert tool_matches_allowlist("shell", ["shell"])
+
+    def test_glob_match(self):
+        assert tool_matches_allowlist("discord.send", ["discord.*"])
+
+    def test_hint_match(self):
+        assert tool_matches_allowlist(
+            "discord.list", ["hint:read-only"], frozenset({"read-only"})
+        )
+
+    def test_hint_no_match_wrong_hint(self):
+        assert not tool_matches_allowlist(
+            "discord.send", ["hint:read-only"], frozenset({"destructive"})
+        )
+
+    def test_hint_no_match_no_hints(self):
+        assert not tool_matches_allowlist(
+            "discord.send", ["hint:read-only"], frozenset()
+        )
+
+    def test_hint_match_in_mixed_allowlist(self):
+        # 'hint:read-only' should match even when other entries don't
+        assert tool_matches_allowlist(
+            "some_tool", ["shell", "hint:read-only"], frozenset({"read-only"})
+        )
+
+    def test_name_match_beats_hint_miss(self):
+        # name matches even if hint doesn't
+        assert tool_matches_allowlist("shell", ["shell", "hint:read-only"], frozenset())
 
 
 # ── ToolUse formatting ─────────────────────────────────────────────
@@ -543,6 +1089,15 @@ class TestToolUseToolFormat:
         assert tool_calls[0].tool == "shell"
         assert tool_calls[0].call_id == "call-1"
         assert tool_calls[0].kwargs == {"command": "echo hi"}
+
+    def test_tool_call_parsing_allows_dotted_tool_names(self):
+        content = '@browser.view(call-1): {"url": "https://example.com"}'
+        uses = list(ToolUse.iter_from_content(content, tool_format_override="tool"))
+        tool_calls = [u for u in uses if u._format == "tool"]
+        assert len(tool_calls) == 1
+        assert tool_calls[0].tool == "browser.view"
+        assert tool_calls[0].call_id == "call-1"
+        assert tool_calls[0].kwargs == {"url": "https://example.com"}
 
     def test_tool_call_inside_codeblock_skipped(self):
         content = '```example\n@shell(id-1): {"cmd": "test"}\n```'

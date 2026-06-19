@@ -49,10 +49,19 @@ const TaskListItem: FC<{ task: Task; isSelected: boolean; onClick: () => void }>
 
   return (
     <div
-      className={`mb-1 cursor-pointer rounded-md p-2 text-sm transition-colors hover:bg-accent/50 ${
+      role="button"
+      tabIndex={0}
+      aria-pressed={isSelected}
+      className={`mb-1 cursor-pointer rounded-md p-2 text-sm transition-colors hover:bg-accent/50 focus-visible:outline-none focus-visible:ring-1 focus-visible:ring-ring ${
         isSelected ? 'bg-accent ring-1 ring-primary' : ''
       }`}
       onClick={onClick}
+      onKeyDown={(e) => {
+        if (e.key === 'Enter' || e.key === ' ') {
+          e.preventDefault();
+          onClick();
+        }
+      }}
     >
       <div className="flex items-start gap-2">
         {getStatusIcon(task.status)}
@@ -83,6 +92,9 @@ interface Props {
   // Multi-backend
   showServerLabels?: boolean;
 
+  // Split view
+  onOpenInSplitView?: (conversationId: string) => void;
+
   // Task props
   tasks: Task[];
   selectedTaskId?: string;
@@ -112,6 +124,7 @@ export const UnifiedSidebar: FC<Props> = ({
   tasksLoading = false,
   tasksError = false,
   onTasksRetry,
+  onOpenInSplitView,
 }) => {
   const selectedWorkspace = use$(selectedWorkspace$);
   const selectedAgent = use$(selectedAgent$);
@@ -391,6 +404,7 @@ export const UnifiedSidebar: FC<Props> = ({
               fetchNextPage={fetchNextPage}
               hasNextPage={hasNextPage}
               showServerLabels={showServerLabels}
+              onOpenInSplitView={onOpenInSplitView}
             />
           )}
 

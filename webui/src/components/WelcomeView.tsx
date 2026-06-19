@@ -194,6 +194,7 @@ export const WelcomeView = () => {
     if (
       demoMode ||
       isConnected ||
+      isFirstVisit ||
       !isDefaultLocalServer ||
       !isHostedOrigin ||
       errorBucket !== 'unknown'
@@ -250,6 +251,7 @@ export const WelcomeView = () => {
     errorBucket,
     isConnected,
     isDefaultLocalServer,
+    isFirstVisit,
     isHostedOrigin,
   ]);
 
@@ -431,6 +433,25 @@ export const WelcomeView = () => {
                         Use gptme.ai
                       </Button>{' '}
                       for a managed option — no install required.
+                    </p>
+                  )}
+                  {isHostedOrigin && !demoMode && (
+                    <p className="text-sm text-muted-foreground">
+                      Just want to see what gptme can do?{' '}
+                      <Button
+                        type="button"
+                        variant="link"
+                        size="sm"
+                        className="h-auto p-0 text-sm"
+                        onClick={() => {
+                          const url = new URL(window.location.href);
+                          url.searchParams.set('demo', '1');
+                          window.location.href = url.toString();
+                        }}
+                      >
+                        Try the offline demo
+                      </Button>{' '}
+                      — no install or account required.
                     </p>
                   )}
                   <p className="text-xs text-muted-foreground">

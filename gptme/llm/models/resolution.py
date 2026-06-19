@@ -1,6 +1,7 @@
 import logging
 import threading
 from contextvars import ContextVar
+from dataclasses import replace
 from datetime import datetime, timezone
 from typing import cast
 
@@ -269,6 +270,30 @@ def get_model(model: str) -> ModelMeta:
                                 price_output=model_meta.price_output,
                                 knowledge_cutoff=model_meta.knowledge_cutoff,
                             )
+
+                    # gptme cloud models carry their real backend as a prefix in
+                    # `.model` (e.g. "anthropic/claude-sonnet-4-6"). A 2-segment
+                    # request like "gptme/claude-sonnet-4-6" has no backend, so the
+                    # exact match above fails. Match on the bare (last) segment and
+                    # return the backend-prefixed model so downstream routing knows
+                    # which provider/SDK to use. Deterministic tie-break: fewest
+                    # path segments (prefer a direct backend over an openrouter
+                    # re-export), then anthropic-first, then name.
+                    if provider == "gptme" and "/" not in model_name:
+                        suffix_matches = [
+                            m
+                            for m in models
+                            if m.model.rsplit("/", 1)[-1] == model_name
+                        ]
+                        if suffix_matches:
+                            suffix_matches.sort(
+                                key=lambda m: (
+                                    m.model.count("/"),
+                                    not m.model.startswith("anthropic/"),
+                                    m.model,
+                                )
+                            )
+                            return replace(suffix_matches[0])
                 except Exception as e:
                     # Fall back to unknown model metadata
                     logger.debug(
@@ -307,30 +332,36 @@ def get_model(model: str) -> ModelMeta:
         if model in MODELS[provider]:
             return ModelMeta(provider, model, **MODELS[provider][model])
 
-    # For model name without provider, also try dynamic fetching for openrouter
-    try:
-        from .listing import _get_models_for_provider  # fmt: skip
+    # For model name without provider, also try dynamic fetching for openrouter.
+    # Skip if the model name has no "/" — OpenRouter models are always
+    # provider/model format, so a bare name cannot match. The API timeout
+    # makes this a ~10s hang for every nonexistent bare model name (bad UX).
+    if "/" in model:
+        try:
+            from .listing import _get_models_for_provider  # fmt: skip
 
-        openrouter_models = _get_models_for_provider("openrouter", dynamic_fetch=True)
-        # Strip @ suffix for comparison (e.g., "z-ai/glm-5@z-ai" -> "z-ai/glm-5")
-        base_model = model.split("@")[0] if "@" in model else model
-        for model_meta in openrouter_models:
-            if model_meta.model == model or model_meta.model == base_model:
-                return ModelMeta(
-                    provider=model_meta.provider,
-                    model=model,  # Preserve original name with suffix
-                    context=model_meta.context,
-                    max_output=model_meta.max_output,
-                    supports_streaming=model_meta.supports_streaming,
-                    supports_vision=model_meta.supports_vision,
-                    supports_reasoning=model_meta.supports_reasoning,
-                    supports_responses_api=model_meta.supports_responses_api,
-                    price_input=model_meta.price_input,
-                    price_output=model_meta.price_output,
-                    knowledge_cutoff=model_meta.knowledge_cutoff,
-                )
-    except Exception as e:
-        logger.debug("Failed to fetch OpenRouter models for %s: %s", model, e)
+            openrouter_models = _get_models_for_provider(
+                "openrouter", dynamic_fetch=True
+            )
+            # Strip @ suffix for comparison (e.g., "z-ai/glm-5@z-ai" -> "z-ai/glm-5")
+            base_model = model.split("@")[0] if "@" in model else model
+            for model_meta in openrouter_models:
+                if model_meta.model == model or model_meta.model == base_model:
+                    return ModelMeta(
+                        provider=model_meta.provider,
+                        model=model,  # Preserve original name with suffix
+                        context=model_meta.context,
+                        max_output=model_meta.max_output,
+                        supports_streaming=model_meta.supports_streaming,
+                        supports_vision=model_meta.supports_vision,
+                        supports_reasoning=model_meta.supports_reasoning,
+                        supports_responses_api=model_meta.supports_responses_api,
+                        price_input=model_meta.price_input,
+                        price_output=model_meta.price_output,
+                        knowledge_cutoff=model_meta.knowledge_cutoff,
+                    )
+        except Exception as e:
+            logger.debug("Failed to fetch OpenRouter models for %s: %s", model, e)
 
     log_warn_once(f"Unknown model {model}, using fallback metadata")
     return ModelMeta(provider="unknown", model=model, context=128_000)

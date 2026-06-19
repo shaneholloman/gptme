@@ -1,5 +1,6 @@
 """Tests for MCP adapter functionality."""
 
+from types import SimpleNamespace
 from unittest.mock import MagicMock, patch
 
 import pytest
@@ -73,6 +74,7 @@ def mock_mcp_client():
         },
         "required": ["param1"],
     }
+    mock_tool.annotations = None
 
     # Mock tools object
     mock_tools = MagicMock()
@@ -93,11 +95,40 @@ def test_create_mcp_tools_disabled(mock_disabled_config):
 
 def test_create_mcp_tools_enabled(mock_config, mock_mcp_client):
     """Test create_mcp_tools when MCP is enabled."""
-    with patch("gptme.tools.mcp_adapter.MCPClient", return_value=mock_mcp_client):
+    with patch("gptme.mcp.client.MCPClient", return_value=mock_mcp_client):
         tools = create_mcp_tools(mock_config)
 
         assert len(tools) > 0
         assert any("test-server.test_tool" in tool.name for tool in tools)
+
+
+def test_create_mcp_tools_annotations_default_to_empty_hints(
+    mock_config, mock_mcp_client
+):
+    """Test create_mcp_tools leaves hints empty when annotations are absent."""
+    with patch("gptme.mcp.client.MCPClient", return_value=mock_mcp_client):
+        tools = create_mcp_tools(mock_config)
+
+    assert tools[0].hints == frozenset()
+
+
+def test_create_mcp_tools_extracts_hints_from_annotations(mock_config, mock_mcp_client):
+    """Test create_mcp_tools maps MCP tool annotations into hint tags."""
+    mock_tool = mock_mcp_client.connect.return_value[0].tools[0]
+    mock_tool.annotations = SimpleNamespace(
+        readOnlyHint=True,
+        destructiveHint=None,
+        idempotentHint=True,
+        openWorldHint=False,
+    )
+
+    with patch("gptme.mcp.client.MCPClient", return_value=mock_mcp_client):
+        tools = create_mcp_tools(mock_config)
+
+    # readOnlyHint=True suppresses "destructive" even when destructiveHint is
+    # absent (None would default to True per MCP spec, but a read-only tool
+    # cannot be destructive by definition)
+    assert tools[0].hints == frozenset({"read-only", "idempotent", "closed-world"})
 
 
 def test_create_mcp_tools_connection_error(mock_config):
@@ -105,7 +136,7 @@ def test_create_mcp_tools_connection_error(mock_config):
     mock_client = MagicMock()
     mock_client.connect.side_effect = Exception("Connection failed")
 
-    with patch("gptme.tools.mcp_adapter.MCPClient", return_value=mock_client):
+    with patch("gptme.mcp.client.MCPClient", return_value=mock_client):
         # Should not raise, just skip the failed server
         tools = create_mcp_tools(mock_config)
         # May be empty if connection failed
@@ -149,9 +180,9 @@ def test_search_mcp_servers_all():
         MCPServerInfo(name="server2", description="Second", registry="mcp.so"),
     ]
 
-    with patch(
-        "gptme.tools.mcp_adapter._registry.search_all", return_value=mock_servers
-    ):
+    mock_registry = MagicMock()
+    mock_registry.search_all.return_value = mock_servers
+    with patch("gptme.tools.mcp_adapter._get_registry", return_value=mock_registry):
         result = search_mcp_servers("test", "all", 10)
         assert "server1" in result
         assert "server2" in result
@@ -165,9 +196,11 @@ def test_search_mcp_servers_official():
         ),
     ]
 
+    mock_registry = MagicMock()
+    mock_registry.search_official_registry.return_value = mock_servers
     with patch(
-        "gptme.tools.mcp_adapter._registry.search_official_registry",
-        return_value=mock_servers,
+        "gptme.tools.mcp_adapter._get_registry",
+        return_value=mock_registry,
     ):
         result = search_mcp_servers("test", "official", 10)
         assert "official-server" in result
@@ -179,9 +212,9 @@ def test_search_mcp_servers_mcp_so():
         MCPServerInfo(name="mcpso-server", description="MCP.so", registry="mcp.so"),
     ]
 
-    with patch(
-        "gptme.tools.mcp_adapter._registry.search_mcp_so", return_value=mock_servers
-    ):
+    mock_registry = MagicMock()
+    mock_registry.search_mcp_so.return_value = mock_servers
+    with patch("gptme.tools.mcp_adapter._get_registry", return_value=mock_registry):
         result = search_mcp_servers("test", "mcp.so", 10)
         assert "mcpso-server" in result
 
@@ -200,9 +233,9 @@ def test_get_mcp_server_info_found():
         registry="official",
     )
 
-    with patch(
-        "gptme.tools.mcp_adapter._registry.get_server_details", return_value=mock_server
-    ):
+    mock_registry = MagicMock()
+    mock_registry.get_server_details.return_value = mock_server
+    with patch("gptme.tools.mcp_adapter._get_registry", return_value=mock_registry):
         result = get_mcp_server_info("test-server")
         assert "test-server" in result
         assert "Test server" in result
@@ -210,9 +243,9 @@ def test_get_mcp_server_info_found():
 
 def test_get_mcp_server_info_not_found():
     """Test get_mcp_server_info when server is not found."""
-    with patch(
-        "gptme.tools.mcp_adapter._registry.get_server_details", return_value=None
-    ):
+    mock_registry = MagicMock()
+    mock_registry.get_server_details.return_value = None
+    with patch("gptme.tools.mcp_adapter._get_registry", return_value=mock_registry):
         result = get_mcp_server_info("nonexistent")
         assert "not found" in result
 
@@ -239,7 +272,7 @@ def test_load_mcp_server_in_config(mock_config):
 
     with (
         patch("gptme.tools.mcp_adapter.get_config", return_value=mock_config),
-        patch("gptme.tools.mcp_adapter.MCPClient", return_value=mock_client),
+        patch("gptme.mcp.client.MCPClient", return_value=mock_client),
     ):
         result = load_mcp_server("test-server")
         assert "Successfully loaded" in result or "tools registered" in result
@@ -285,7 +318,7 @@ def test_restart_mcp_client_survives_cleanup_failure_and_reconnects(mock_config)
 
     _mcp_clients["test-server"] = OldClient()  # type: ignore[assignment]
 
-    with patch("gptme.tools.mcp_adapter.MCPClient", return_value=new_client):
+    with patch("gptme.mcp.client.MCPClient", return_value=new_client):
         restarted = _restart_mcp_client("test-server", mock_config)
 
     assert close_calls == ["close"]

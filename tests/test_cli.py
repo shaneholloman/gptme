@@ -6,6 +6,8 @@ import threading
 import time
 from pathlib import Path
 from tempfile import TemporaryDirectory
+from types import SimpleNamespace
+from typing import Any
 
 import click
 import pytest
@@ -89,6 +91,125 @@ def test_version(runner: CliRunner):
     assert "gptme" in result.output
 
 
+def test_show_prompt_stats_exits_before_chat(monkeypatch, tmp_path: Path, runner):
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    fake_config = SimpleNamespace(
+        chat=SimpleNamespace(
+            agent_config=None,
+            tools=["shell", "read"],
+            interactive=False,
+            tool_format="markdown",
+            model="local/test",
+            workspace=tmp_path,
+            stream=False,
+            agent=None,
+        ),
+        project=None,
+    )
+    seen: dict[str, Any] = {}
+
+    monkeypatch.setattr(cli, "setup_config_from_cli", lambda **_: fake_config)
+    monkeypatch.setattr(cli, "init_tools", lambda _: [])
+    monkeypatch.setattr(
+        cli,
+        "get_prompt_stats",
+        lambda **kwargs: (
+            seen.update(kwargs=kwargs)
+            or SimpleNamespace(
+                sections=[],
+                total_messages=0,
+                total_chars=0,
+                total_tokens=0,
+                cacheable_tokens=0,
+                dynamic_tokens=0,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "format_prompt_stats",
+        lambda stats, header=None, extra_sections=None: "prompt-stats-output",
+    )
+    monkeypatch.setattr(cli, "chat", lambda *args, **kwargs: pytest.fail("chat ran"))
+    monkeypatch.setattr(
+        cli,
+        "init_telemetry",
+        lambda **kwargs: pytest.fail("telemetry should not start for prompt stats"),
+    )
+
+    result = runner.invoke(cli.main, ["--show-prompt-stats"], input="")
+
+    assert result.exit_code == 0
+    assert "prompt-stats-output" in result.output
+    assert seen["kwargs"]["workspace"] is not None
+    assert seen["kwargs"]["model"] == "local/test"
+
+
+def test_no_workspace_flag_wires_correctly(monkeypatch, tmp_path: Path, runner):
+    """--no-workspace should pass context_mode=selective, context_include=[] to get_prompt_stats."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    fake_config = SimpleNamespace(
+        chat=SimpleNamespace(
+            agent_config=None,
+            tools=["shell", "read"],
+            interactive=False,
+            tool_format="markdown",
+            model="local/test",
+            workspace=tmp_path,
+            stream=False,
+            agent=None,
+        ),
+        project=None,
+    )
+    seen: dict[str, Any] = {}
+
+    monkeypatch.setattr(cli, "setup_config_from_cli", lambda **_: fake_config)
+    monkeypatch.setattr(cli, "init_tools", lambda _: [])
+    monkeypatch.setattr(
+        cli,
+        "get_prompt_stats",
+        lambda **kwargs: (
+            seen.update(kwargs=kwargs)
+            or SimpleNamespace(
+                sections=[],
+                total_messages=0,
+                total_chars=0,
+                total_tokens=0,
+                cacheable_tokens=0,
+                dynamic_tokens=0,
+            )
+        ),
+    )
+    monkeypatch.setattr(
+        cli,
+        "format_prompt_stats",
+        lambda stats, header=None, extra_sections=None: "prompt-stats-output",
+    )
+    monkeypatch.setattr(cli, "chat", lambda *args, **kwargs: pytest.fail("chat ran"))
+    monkeypatch.setattr(cli, "init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(
+        cli.main, ["--no-workspace", "--show-prompt-stats"], input=""
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen["kwargs"]["context_mode"] == "selective"
+    assert seen["kwargs"]["context_include"] == []
+
+
+def test_no_workspace_and_context_mutually_exclusive(runner):
+    """--no-workspace and --context together should produce a UsageError."""
+    result = runner.invoke(cli.main, ["--no-workspace", "--context", "files", "hello"])
+    assert result.exit_code != 0
+    assert "mutually exclusive" in result.output
+
+
 @pytest.mark.skipif(os.name == "nt", reason="SIGALRM-based pipe guard is POSIX-only")
 def test_read_stdin_open_pipe_without_data_returns_empty(monkeypatch):
     """An idle pipe should not block forever waiting for stdin bytes."""
@@ -139,6 +260,35 @@ def test_read_stdin_waits_briefly_for_slow_pipe_writer(monkeypatch):
     writer.start()
     try:
         assert cli._read_stdin() == "hello after delay"
+    finally:
+        writer.join()
+        read_file.close()
+
+
+def test_read_stdin_does_not_truncate_chunks_separated_by_subtimeout(monkeypatch):
+    """Multiple chunks arriving with inter-chunk gaps > 50ms must not be truncated.
+
+    Regression test for the Greptile-flagged concern: the previous 50ms inner
+    sub-timeout could silently drop chunks from pipelines that write in bursts
+    with inter-chunk gaps slightly above 50ms. The new sub-timeout (100ms via
+    `_STDIN_PIPE_INTER_CHUNK_TIMEOUT`) bridges typical small producer gaps.
+    """
+    read_fd, write_fd = os.pipe()
+    read_file = os.fdopen(read_fd)
+    monkeypatch.setattr(cli.sys, "stdin", read_file)
+
+    chunks = [b"first ", b"second ", b"third"]
+
+    def _writer():
+        for chunk in chunks:
+            time.sleep(0.08)  # > old 50ms, < new 100ms sub-timeout
+            os.write(write_fd, chunk)
+        os.close(write_fd)
+
+    writer = threading.Thread(target=_writer)
+    writer.start()
+    try:
+        assert cli._read_stdin() == "first second third"
     finally:
         writer.join()
         read_file.close()
@@ -245,6 +395,67 @@ def test_model_allows_provider_owned_nested_model_path(runner: CliRunner):
 
     assert result.exit_code == 0, result.output
     assert "gptme v" in result.output
+
+
+def test_model_allows_nested_path_through_validation_block(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+):
+    """A valid nested-path model should pass the early validation block.
+
+    Unlike test_model_allows_provider_owned_nested_model_path which uses
+    --version and exits before the validation block runs, this test
+    actually exercises the early validation code path.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+    # Track that get_prompt was called (means validation passed)
+    called: dict[str, bool] = {"get_prompt": False}
+
+    def _fake_get_prompt(**kwargs):
+        called["get_prompt"] = True
+        return []
+
+    monkeypatch.setattr(cli, "get_prompt", _fake_get_prompt)
+    monkeypatch.setattr(cli, "chat", lambda *args, **kwargs: None)
+    monkeypatch.setattr(cli, "init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(
+        cli.main,
+        [
+            "--model",
+            "openrouter/anthropic/claude-sonnet-4-6",
+            "--non-interactive",
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called["get_prompt"], "execution should reach get_prompt (validation passed)"
+
+
+def test_model_rejects_unknown_provider_before_context_cmd(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+):
+    """--model with an unknown provider prefix should fail fast before running context_cmd."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setattr(
+        cli,
+        "get_prompt",
+        lambda **kwargs: pytest.fail("get_prompt was called before model validation"),
+    )
+    monkeypatch.setattr(cli, "chat", lambda *args, **kwargs: pytest.fail("chat ran"))
+    monkeypatch.setattr(cli, "init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(
+        cli.main,
+        ["--model", "badprovider/some-model", "--non-interactive", "hello"],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Unknown provider: badprovider" in result.output
+    assert "Traceback" not in result.output
 
 
 @pytest.mark.parametrize(

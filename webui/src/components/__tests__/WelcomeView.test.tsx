@@ -226,6 +226,26 @@ describe('WelcomeView', () => {
     expect(screen.queryByRole('button', { name: /use gptme\.ai/i })).not.toBeInTheDocument();
     // Retry connection stays available regardless of onboarding state
     expect(screen.getByRole('button', { name: /retry connection/i })).toBeInTheDocument();
+    expect(
+      screen.queryByText(/appears to be running, but it is not allowing requests from/i)
+    ).not.toBeInTheDocument();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('does not probe loopback for first-time visitors on a hosted origin (regression guard)', () => {
+    // First-time user (no seedReturningUser) on a hosted origin where the probe
+    // would normally fire — only the `isFirstVisit` guard prevents it.
+    setLocation('https://chat.gptme.org/');
+    isConnected$.set(false);
+
+    render(
+      <SettingsProvider>
+        <WelcomeView />
+      </SettingsProvider>
+    );
+
+    // The probe must not fire — the isFirstVisit guard prevents it.
+    expect(mockFetch).not.toHaveBeenCalled();
   });
 
   it('detects a reachable hosted loopback server and shows CORS setup guidance before retry', async () => {
@@ -520,5 +540,74 @@ describe('WelcomeView', () => {
 
     expect(screen.getByText(/connection timed out/i)).toBeInTheDocument();
     expect(screen.queryByText(/Start a local gptme server/i)).not.toBeInTheDocument();
+  });
+
+  describe('demo CTA', () => {
+    beforeEach(() => {
+      seedReturningUser();
+      isConnected$.set(false);
+    });
+
+    it('shows "Try the offline demo" CTA on hosted origin when disconnected', () => {
+      setLocation('https://chat.gptme.org/');
+
+      render(
+        <SettingsProvider>
+          <WelcomeView />
+        </SettingsProvider>
+      );
+
+      expect(screen.getByText(/just want to see what gptme can do/i)).toBeInTheDocument();
+      expect(screen.getByRole('button', { name: /try the offline demo/i })).toBeInTheDocument();
+      expect(screen.getByText(/no install or account required/i)).toBeInTheDocument();
+    });
+
+    it('suppresses demo CTA when already in demo mode', () => {
+      setLocation('https://chat.gptme.org/?demo=1');
+      mockIsDemoMode.mockReturnValue(true);
+
+      render(
+        <SettingsProvider>
+          <WelcomeView />
+        </SettingsProvider>
+      );
+
+      expect(screen.queryByText(/just want to see what gptme can do/i)).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: /try the offline demo/i })
+      ).not.toBeInTheDocument();
+    });
+
+    it('suppresses demo CTA on localhost origin', () => {
+      setLocation('http://localhost/');
+
+      render(
+        <SettingsProvider>
+          <WelcomeView />
+        </SettingsProvider>
+      );
+
+      expect(screen.queryByText(/just want to see what gptme can do/i)).not.toBeInTheDocument();
+      expect(
+        screen.queryByRole('button', { name: /try the offline demo/i })
+      ).not.toBeInTheDocument();
+    });
+
+    it('navigates to ?demo=1 when clicking the demo CTA', () => {
+      setLocation('https://chat.gptme.org/');
+
+      render(
+        <SettingsProvider>
+          <WelcomeView />
+        </SettingsProvider>
+      );
+
+      const btn = screen.getByRole('button', { name: /try the offline demo/i });
+      fireEvent.click(btn);
+
+      // jsdom sets window.location.href on assignment, constructing
+      // a URL with ?demo=1 appended.
+      expect(window.location.href).toContain('demo=1');
+    });
   });
 });

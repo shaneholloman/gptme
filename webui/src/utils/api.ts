@@ -968,7 +968,7 @@ export class ApiClient {
     }
     try {
       return await this.fetchJson<ConversationSummary[]>(
-        `${this.baseUrl}/api/v2/conversations?search=${encodeURIComponent(query)}&limit=${limit}&detail=${detail}`
+        `${this.baseUrl}/api/v2/conversations?q=${encodeURIComponent(query)}&limit=${limit}&detail=${detail}`
       );
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -979,33 +979,37 @@ export class ApiClient {
   }
 
   async getConversationsPaginated(
-    pageParam: number = 0,
-    pageSize: number = 20,
+    cursor: string | undefined = undefined,
+    pageSize: number = 50,
     detail: boolean = false
   ): Promise<{
     conversations: ConversationSummary[];
-    nextCursor: number | undefined;
+    nextCursor: string | undefined;
   }> {
     if (!this.isConnected) {
       throw new ApiClientError('Not connected to API');
     }
     try {
-      // Fetch one more than needed to detect if there are more conversations
-      const fetchLimit = pageParam + pageSize + 1;
-      const allConversations = await this.fetchJson<ConversationSummary[]>(
-        `${this.baseUrl}/api/v2/conversations?limit=${fetchLimit}&detail=${detail}`
-      );
+      let url = `${this.baseUrl}/api/v2/conversations?limit=${pageSize}&paginated=1&detail=${detail}`;
+      if (cursor !== undefined) {
+        url += `&cursor=${encodeURIComponent(cursor)}`;
+      }
+      // Tolerate both the paginated shape ({ conversations, next_cursor })
+      // and a legacy bare-list shape ([...]) returned by servers older than #2860.
+      const response = await this.fetchJson<
+        | {
+            conversations: ConversationSummary[];
+            next_cursor: string | null;
+          }
+        | ConversationSummary[]
+      >(url);
 
-      // Slice to get only the requested page
-      const conversations = allConversations.slice(pageParam, pageParam + pageSize);
-
-      // Check if there are more conversations by seeing if we got the extra one
-      const hasMore = allConversations.length > pageParam + pageSize;
-      const nextCursor = hasMore ? pageParam + pageSize : undefined;
-
-      console.log(
-        `[API] Pagination: pageParam=${pageParam}, pageSize=${pageSize}, fetched=${allConversations.length}, returning=${conversations.length}, hasMore=${hasMore}`
-      );
+      const conversations = Array.isArray(response)
+        ? response
+        : Array.isArray(response?.conversations)
+          ? response.conversations
+          : [];
+      const nextCursor = Array.isArray(response) ? undefined : (response.next_cursor ?? undefined);
 
       return { conversations, nextCursor };
     } catch (error) {
@@ -1033,6 +1037,38 @@ export class ApiClient {
         throw new ApiClientError('Request aborted', 499);
       }
       console.log('[ApiClient] getConversation error:', error);
+      throw error;
+    }
+  }
+
+  async forkConversation(
+    logfile: string,
+    afterMessage: number,
+    branch: string = 'main'
+  ): Promise<string> {
+    if (!this.isConnected) {
+      throw new ApiClientError('Not connected to API');
+    }
+    try {
+      const params = new URLSearchParams({
+        after_message: String(afterMessage),
+      });
+      if (branch && branch !== 'main') {
+        params.set('branch', branch);
+      }
+      const response = await this.fetchJson<{
+        status: string;
+        session_id: string;
+        conversation_id: string;
+      }>(`${this.baseUrl}/api/v2/conversations/${logfile}/fork?${params.toString()}`, {
+        method: 'POST',
+      });
+      this.sessions$.set(response.conversation_id, response.session_id);
+      return response.conversation_id;
+    } catch (error) {
+      if (error instanceof DOMException && error.name === 'AbortError') {
+        throw new ApiClientError('Request aborted', 499);
+      }
       throw error;
     }
   }
@@ -1511,6 +1547,37 @@ export class ApiClient {
         signal: this.controller?.signal,
       }
     );
+  }
+
+  async patchConversationMetadata(
+    conversationId: string,
+    metadata: { starred?: boolean; description?: string | null; tags?: string[] | null }
+  ): Promise<void> {
+    if (!this.isConnected) {
+      throw new ApiClientError('Not connected to API');
+    }
+
+    await this.fetchJson<{ starred: boolean; description?: string | null; tags?: string[] }>(
+      `${this.baseUrl}/api/v2/conversations/${conversationId}/metadata`,
+      {
+        method: 'PATCH',
+        body: JSON.stringify(metadata),
+        signal: this.controller?.signal,
+      }
+    );
+  }
+
+  async getConversationMetadata(conversationId: string): Promise<{
+    starred: boolean;
+    description?: string | null;
+    tags?: string[];
+    pinned_order?: number | null;
+  }> {
+    if (!this.isConnected) {
+      throw new ApiClientError('Not connected to API');
+    }
+
+    return this.fetchJson(`${this.baseUrl}/api/v2/conversations/${conversationId}/metadata`);
   }
 
   async deleteConversation(logfile: string): Promise<void> {

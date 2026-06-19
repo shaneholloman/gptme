@@ -1,6 +1,7 @@
 import { useState, useRef, useCallback, useEffect } from 'react';
 import { useApi } from '@/contexts/ApiContext';
 import { useUserSettings } from '@/hooks/useUserSettings';
+import { useSettings } from '@/contexts/SettingsContext';
 
 export type STTState = 'idle' | 'listening' | 'transcribing' | 'error';
 
@@ -80,9 +81,44 @@ function getLanguageCode(): string | undefined {
   return locale.split('-', 1)[0]?.toLowerCase() || undefined;
 }
 
+/**
+ * Transcribe audio via a same-origin cloud endpoint (e.g. a Cloudflare Pages
+ * Function proxy to the billing-aware llm-proxy). Used when `sttAuthToken` is
+ * set by a cloud host (e.g. gptme.ai) so STT is billed to the user's account.
+ */
+async function transcribeViaCloudEndpoint(
+  audio: Blob,
+  authToken: string,
+  options?: { language?: string; signal?: AbortSignal }
+): Promise<string> {
+  const format = audio.type.split(';', 1)[0].split('/')[1] || 'webm';
+  const formData = new FormData();
+  formData.append('file', audio, `speech.${format}`);
+  formData.append('format', format);
+  if (options?.language) {
+    formData.append('language', options.language);
+  }
+  const response = await fetch('/api/v2/audio/transcriptions', {
+    method: 'POST',
+    headers: { Authorization: `Bearer ${authToken}` },
+    body: formData,
+    signal: options?.signal,
+  });
+  if (!response.ok) {
+    const err = await response.json().catch(() => ({}));
+    throw new Error(
+      (err as { error?: { message?: string } }).error?.message ??
+        `Transcription failed: ${response.status}`
+    );
+  }
+  const data = (await response.json()) as { text: string };
+  return data.text;
+}
+
 export function useSpeechToText(): UseSpeechToTextReturn {
   const { api } = useApi();
-  const { settings } = useUserSettings();
+  const { settings: userSettings } = useUserSettings();
+  const { settings: clientSettings } = useSettings();
   const [state, setState] = useState<STTState>('idle');
   const [interimTranscript, setInterimTranscript] = useState('');
   // eslint-disable-next-line @typescript-eslint/no-explicit-any
@@ -91,20 +127,32 @@ export function useSpeechToText(): UseSpeechToTextReturn {
   const fallbackSetupGenRef = useRef(0);
   const finalHandlerRef = useRef<((text: string) => void) | null>(null);
   const abortControllerRef = useRef<AbortController | null>(null);
+  const sttAuthTokenRef = useRef(clientSettings.sttAuthToken);
   const SpeechRecognitionClass = getSpeechRecognitionClass();
   const browserSupported = SpeechRecognitionClass !== null;
-  const serverFallbackSupported =
-    !browserSupported &&
-    settings?.providers_configured.includes('openrouter') === true &&
+  // Cloud hosts set sttAuthToken so the same-origin /api/v2/audio/transcriptions
+  // proxy (e.g. Cloudflare Pages Function) handles billing — no OpenRouter key needed.
+  const cloudSttConfigured = !!clientSettings.sttAuthToken && canUseRecordedFallback();
+  const serverConfigured =
+    (userSettings?.providers_configured.includes('openrouter') === true || cloudSttConfigured) &&
     canUseRecordedFallback();
-  const isSupported = browserSupported || serverFallbackSupported;
+  const prefersServerStt = clientSettings.sttProvider === 'server';
+  const serverFallbackSupported = !browserSupported && serverConfigured;
+  // When user explicitly chooses server mode, use server STT even if browser supports it
+  const serverEnabled = serverConfigured && (prefersServerStt || serverFallbackSupported);
+  const isSupported = browserSupported || serverConfigured;
+
+  useEffect(() => {
+    sttAuthTokenRef.current = clientSettings.sttAuthToken;
+  }, [clientSettings.sttAuthToken]);
 
   const releaseRecordingSession = useCallback((session: RecordingSession | null) => {
     session?.stream.getTracks().forEach((track) => track.stop());
   }, []);
 
   const startListening = useCallback(() => {
-    if (SpeechRecognitionClass) {
+    // When user explicitly chooses server STT, skip browser path
+    if (SpeechRecognitionClass && !prefersServerStt) {
       if (recognitionRef.current) return;
 
       const recognition = new SpeechRecognitionClass();
@@ -158,7 +206,12 @@ export function useSpeechToText(): UseSpeechToTextReturn {
       return;
     }
 
-    if (!serverFallbackSupported || recordingRef.current) return;
+    if (recordingRef.current) return;
+    if (!serverEnabled) {
+      // User explicitly chose server mode but server is not configured
+      if (prefersServerStt) setState('error');
+      return;
+    }
 
     setInterimTranscript('');
     setState('listening');
@@ -224,12 +277,23 @@ export function useSpeechToText(): UseSpeechToTextReturn {
           abortControllerRef.current = controller;
 
           setState('transcribing');
-          void api
-            .transcribeAudio(audio, { language: getLanguageCode(), signal: controller.signal })
-            .then((result) => {
-              const text = result.text.trim();
-              if (text && finalHandlerRef.current) {
-                finalHandlerRef.current(text);
+          const sttAuthToken = sttAuthTokenRef.current;
+          const transcribePromise: Promise<string> = sttAuthToken
+            ? transcribeViaCloudEndpoint(audio, sttAuthToken, {
+                language: getLanguageCode() ?? undefined,
+                signal: controller.signal,
+              })
+            : api
+                .transcribeAudio(audio, {
+                  language: getLanguageCode(),
+                  signal: controller.signal,
+                })
+                .then((r) => r.text);
+          void transcribePromise
+            .then((text) => {
+              const trimmed = text.trim();
+              if (trimmed && finalHandlerRef.current) {
+                finalHandlerRef.current(trimmed);
               }
               setState('idle');
             })
@@ -250,7 +314,7 @@ export function useSpeechToText(): UseSpeechToTextReturn {
         }
       }
     })();
-  }, [SpeechRecognitionClass, api, releaseRecordingSession, serverFallbackSupported]);
+  }, [SpeechRecognitionClass, api, releaseRecordingSession, serverEnabled, prefersServerStt]);
 
   const stopListening = useCallback(() => {
     if (recognitionRef.current) {

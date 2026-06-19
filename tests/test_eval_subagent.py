@@ -1,4 +1,8 @@
 from gptme.eval.suites.subagent import (
+    check_clarification_hook_notification,
+    check_clarification_reply_called,
+    check_clarification_reply_with_language,
+    check_clarification_spawned,
     check_subagent_complete_hook_notification,
     check_subagent_complete_parent_result,
     check_subagent_complete_roundtrip_marker,
@@ -152,3 +156,52 @@ def test_waited_before_result_rejects_fabricate_then_repeat():
     ]
 
     assert not check_subagent_complete_waited_before_result(messages)
+
+
+def test_clarification_checks_pass_for_full_roundtrip():
+    """Clarification eval: spawn → hook notification → subagent_reply → completion."""
+    messages = [
+        Message(
+            "assistant",
+            '```ipython\nsubagent("greeter", "Write a greeting. Ask for language via clarify.")\n```',
+        ),
+        Message("assistant", "I will read task.txt while waiting."),
+        Message(
+            "system",
+            "❓ Subagent 'greeter' needs clarification: Which language should I use?\n"
+            "Call subagent_reply('greeter', '<your answer>') to continue.",
+        ),
+        Message(
+            "assistant",
+            "```ipython\nsubagent_reply('greeter', 'English')\n```",
+        ),
+        Message(
+            "system",
+            "✅ Subagent 'greeter' completed: Hello, world!",
+        ),
+        Message("assistant", "GREETING=Hello, world!"),
+    ]
+
+    assert check_clarification_spawned(messages)
+    assert check_clarification_hook_notification(messages)
+    assert check_clarification_reply_called(messages)
+    assert check_clarification_reply_with_language(messages)
+
+
+def test_clarification_checks_fail_without_reply():
+    """Missing subagent_reply should fail the reply check."""
+    messages = [
+        Message(
+            "assistant",
+            '```ipython\nsubagent("greeter", "Write a greeting.")\n```',
+        ),
+        Message(
+            "system",
+            "❓ Subagent 'greeter' needs clarification: Which language?\n"
+            "Call subagent_reply('greeter', '<your answer>') to continue.",
+        ),
+        # Parent ignores the clarification and just writes the answer itself
+        Message("assistant", "GREETING=Hello!"),
+    ]
+
+    assert not check_clarification_reply_called(messages)

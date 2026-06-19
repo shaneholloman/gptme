@@ -230,29 +230,123 @@ describe('ApiClient conversation list detail flag', () => {
     jest.restoreAllMocks();
   });
 
-  it('requests paginated conversation lists with detail=false by default', async () => {
+  it('requests paginated conversation lists with cursor pagination', async () => {
+    const mockResponse = { conversations: [], next_cursor: null };
     global.fetch = jest.fn().mockResolvedValue({
       ok: true,
       status: 200,
-      json: async () => [],
+      json: async () => mockResponse,
     } as Response);
 
     const client = new ApiClient('http://127.0.0.1:5700');
     client.setConnected(true);
 
-    await client.getConversationsPaginated(0, 50);
-    await client.getConversationsPaginated(0, 50, true);
+    // First page (no cursor)
+    await client.getConversationsPaginated(undefined, 50);
+    // First page with detail
+    await client.getConversationsPaginated(undefined, 50, true);
+    // Second page with cursor
+    await client.getConversationsPaginated('1717500000|conv-123', 50);
 
     expect(global.fetch).toHaveBeenNthCalledWith(
       1,
-      'http://127.0.0.1:5700/api/v2/conversations?limit=51&detail=false',
+      'http://127.0.0.1:5700/api/v2/conversations?limit=50&paginated=1&detail=false',
       expect.any(Object)
     );
     expect(global.fetch).toHaveBeenNthCalledWith(
       2,
-      'http://127.0.0.1:5700/api/v2/conversations?limit=51&detail=true',
+      'http://127.0.0.1:5700/api/v2/conversations?limit=50&paginated=1&detail=true',
       expect.any(Object)
     );
+    expect(global.fetch).toHaveBeenNthCalledWith(
+      3,
+      'http://127.0.0.1:5700/api/v2/conversations?limit=50&paginated=1&detail=false&cursor=1717500000%7Cconv-123',
+      expect.any(Object)
+    );
+  });
+
+  it('tolerates a legacy bare-list response from servers older than #2860', async () => {
+    const legacyList = [
+      { id: 'conv-a', name: 'conv-a' },
+      { id: 'conv-b', name: 'conv-b' },
+    ];
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => legacyList,
+    } as Response);
+
+    const client = new ApiClient('http://127.0.0.1:5700');
+    client.setConnected(true);
+
+    const result = await client.getConversationsPaginated(undefined, 50);
+
+    expect(result.conversations).toEqual(legacyList);
+    expect(result.nextCursor).toBeUndefined();
+  });
+
+  it('returns an empty list when the paginated response is missing the conversations field', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({ next_cursor: null }),
+    } as Response);
+
+    const client = new ApiClient('http://127.0.0.1:5700');
+    client.setConnected(true);
+
+    const result = await client.getConversationsPaginated(undefined, 50);
+
+    expect(result.conversations).toEqual([]);
+    expect(result.nextCursor).toBeUndefined();
+  });
+});
+
+describe('ApiClient forkConversation', () => {
+  const originalFetch = global.fetch;
+  const originalCrypto = global.crypto;
+
+  beforeEach(() => {
+    Object.defineProperty(global, 'crypto', {
+      value: {
+        ...originalCrypto,
+        randomUUID: jest.fn(() => 'test-client-id'),
+      },
+      configurable: true,
+    });
+  });
+
+  afterEach(() => {
+    global.fetch = originalFetch;
+    Object.defineProperty(global, 'crypto', {
+      value: originalCrypto,
+      configurable: true,
+    });
+    jest.restoreAllMocks();
+  });
+
+  it('forks a conversation at the selected message index', async () => {
+    global.fetch = jest.fn().mockResolvedValue({
+      ok: true,
+      status: 200,
+      json: async () => ({
+        status: 'ok',
+        conversation_id: 'forked-conv',
+        session_id: 'fork-session',
+      }),
+    } as Response);
+
+    const client = new ApiClient('http://127.0.0.1:5700');
+    client.setConnected(true);
+
+    const forkedId = await client.forkConversation('conv-1', 7, 'main-edit-0');
+
+    expect(forkedId).toBe('forked-conv');
+    expect(global.fetch).toHaveBeenCalledWith(
+      'http://127.0.0.1:5700/api/v2/conversations/conv-1/fork?after_message=7&branch=main-edit-0',
+      expect.objectContaining({ method: 'POST' })
+    );
+    expect(client.sessions$.get('forked-conv').get()).toBe('fork-session');
   });
 });
 

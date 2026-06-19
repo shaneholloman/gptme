@@ -33,8 +33,6 @@ from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING
 
-import bashlex
-
 from ..message import Message
 from ..util import get_installed_programs
 from ..util.ask_execute import execute_with_confirmation
@@ -665,7 +663,9 @@ class ShellSession:
                             rc_matches = re_returncode.findall(line)
                             if rc_matches:
                                 return_code = int(rc_matches[-1])
-                            if command.startswith("cd ") and return_code == 0:
+                            if (command == "cd" or command.startswith("cd ")) and (
+                                return_code == 0
+                            ):
                                 ex, pwd, _ = self._run("pwd", output=False)
                                 if ex == 0:
                                     os.chdir(pwd.strip())
@@ -844,7 +844,9 @@ class ShellSession:
                             if rc_matches:
                                 return_code = int(rc_matches[-1])
                             # if command is cd, update working directory
-                            if command.startswith("cd ") and return_code == 0:
+                            if (
+                                command == "cd" or command.startswith("cd ")
+                            ) and return_code == 0:
                                 ex, pwd, _ = self._run("pwd", output=False)
                                 if ex != 0:
                                     logger.warning(
@@ -1416,6 +1418,43 @@ def execute_shell_impl(
     if interrupted:
         raise KeyboardInterrupt from None
 
+    # Workspace-awareness: notify when cd enters a directory with gptme.toml
+    if returncode == 0:
+        cmd_stripped = cmd.strip()
+        if cmd_stripped.startswith("cd ") or cmd_stripped == "cd":
+            workspace_hint = _check_workspace_config()
+            if workspace_hint:
+                yield workspace_hint
+
+
+def _check_workspace_config() -> Message | None:
+    """Return a hint message if the current directory has a gptme.toml config.
+
+    Called after a successful ``cd`` to let the agent know it can spawn a
+    workspace-aware subagent instead of running in a generic context.
+    Returns None if no gptme.toml is found (or CWD lookup fails).
+    """
+    try:
+        cwd = Path.cwd()
+    except (FileNotFoundError, OSError):
+        return None
+
+    config_file = cwd / "gptme.toml"
+    if not config_file.exists():
+        return None
+
+    workspace_name = cwd.name
+    return Message(
+        "system",
+        f"📂 Workspace detected: `{cwd}` has a `gptme.toml` config.\n"
+        f"To work within this workspace context (custom tools, files, prompt), "
+        f"spawn a subagent here:\n"
+        f"```ipython\n"
+        f'subagent("{workspace_name}", "Your task here", use_subprocess=True)\n'
+        f"```\n"
+        f"The subagent will inherit the workspace config from `{config_file}`.",
+    )
+
 
 def _terminate_interrupted_shell(
     shell: ShellSession, log_context: str = "Shell command"
@@ -1828,6 +1867,8 @@ def _find_max_heredoc_pos(node, current_max: int = 0) -> int:
 
 
 def split_commands(script: str) -> list[str]:
+    import bashlex
+
     # Preprocess script to handle quoted heredoc delimiters that bashlex can't parse
     processed_script = _preprocess_quoted_heredocs(script)
 

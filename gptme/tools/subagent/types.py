@@ -29,7 +29,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-Status = Literal["running", "success", "failure"]
+Status = Literal["running", "success", "failure", "clarification_needed"]
 Role = Literal["general", "explore", "implement", "verify"]
 
 # Role → profile name mapping
@@ -90,8 +90,10 @@ class SubtaskDef(TypedDict):
 
     id: str
     description: str
-    # NOTE(phase2): role sets the executor profile but subprocess/isolated defaults
-    # are not yet forwarded — planner always spawns executors in thread mode.
+    # role sets both the executor profile AND execution mode defaults:
+    # - "verify" → verifier profile + subprocess + isolated (sandboxed validation)
+    # - "explore" → explorer profile + thread mode (read-only analysis)
+    # - "implement" → developer profile + thread mode (full capability)
     role: NotRequired[Role]
 
 
@@ -111,6 +113,20 @@ _subagent_results_lock = threading.Lock()
 # Each entry is (agent_id, status, summary)
 _completion_queue: queue.Queue[tuple[str, Status, str]] = queue.Queue()
 
+# Thread-safe queue for intermediate progress notifications from subagents
+# Each entry is (agent_id, message) — delivered as ⏳ system messages via LOOP_CONTINUE
+# Only populated in thread-mode subagents (subprocess mode cannot share in-process queues)
+_progress_queue: queue.Queue[tuple[str, str]] = queue.Queue()
+
+
+def set_subagent_result_if_absent(agent_id: str, result: "ReturnType") -> bool:
+    """Cache a subagent result unless another terminal result already exists."""
+    with _subagent_results_lock:
+        if agent_id in _subagent_results:
+            return False
+        _subagent_results[agent_id] = result
+        return True
+
 
 # ---------------------------------------------------------------------------
 # Data classes
@@ -123,6 +139,22 @@ class ReturnType:
     result: str | None = None
 
 
+def clarification_result_from_content(content: str) -> ReturnType | None:
+    """Return a clarification result if content contains a clarify block."""
+    if "```clarify" not in content:
+        return None
+
+    match = re.search(r"```clarify\s*\n(.*?)\n```", content, re.DOTALL)
+    if not match:
+        return None
+
+    question = match.group(1).strip()
+    return ReturnType(
+        "clarification_needed",
+        question or "Subagent needs clarification (no question provided)",
+    )
+
+
 @dataclass(frozen=True)
 class Subagent:
     """Represents a running or completed subagent.
@@ -130,15 +162,12 @@ class Subagent:
     Supports both thread-based (default) and subprocess-based execution modes.
     Subprocess mode provides better output isolation.
 
-    Communication Model (Phase 1):
-        - One-way: Parent sends prompt, child executes independently
-        - No runtime updates from child to parent
+    Communication Model:
+        - Parent sends prompt, child executes independently
         - Results retrieved after completion via status()/subagent_wait()
-
-    Future (Phase 2/3):
-        - Support for progress notifications from child → parent
-        - Clarification requests when child encounters ambiguity
-        - See module docstring for full design intent
+        - Subagents can use the ``clarify`` code block to signal ambiguity;
+          the parent receives a hook notification and can call subagent_reply()
+          to re-spawn with the question answered.
     """
 
     agent_id: str
@@ -146,7 +175,11 @@ class Subagent:
     thread: threading.Thread | None
     logdir: Path
     model: str | None
+    context_mode: Literal["full", "selective"] = "full"
+    context_include: list[str] | None = None
+    profile: str | None = None
     output_schema: type | None = None
+    use_acp: bool = False
     # Subprocess mode fields
     process: subprocess.Popen | None = None
     execution_mode: Literal["thread", "subprocess", "acp"] = "thread"
@@ -158,6 +191,10 @@ class Subagent:
     repo_path: Path | None = None
     # Maximum time (seconds) the subprocess monitor will wait before killing
     timeout: int = 1800  # 30 minutes
+    role: Role | None = None
+    # Secret redaction: when True, common secret patterns (API keys, tokens, passwords)
+    # are redacted from workspace context messages before they are seen by the subagent.
+    redact_secrets: bool = False
 
     def get_log(self) -> "LogManager":
         # noreorder
@@ -177,13 +214,20 @@ class Subagent:
         return False
 
     def status(self) -> ReturnType:
-        # Return cached result if available (subprocess mode)
+        if self.is_running():
+            return ReturnType("running")
+        return self._read_log()
+
+    def _read_log(self) -> ReturnType:
+        """Read result from cache or conversation log, bypassing thread-liveness check.
+
+        Safe to call from within a completion handler (e.g. the run_subagent thread),
+        where status() would incorrectly return "running" because the thread is alive.
+        """
+        # Return cached result if available (set by cancel or subprocess completion)
         with _subagent_results_lock:
             if self.agent_id in _subagent_results:
                 return _subagent_results[self.agent_id]
-
-        if self.is_running():
-            return ReturnType("running")
 
         # Check if executor used the complete tool
         try:
@@ -197,6 +241,12 @@ class Subagent:
             return ReturnType("failure", "No messages in log")
 
         last_msg = log[-1]
+
+        # Check for clarify code block — subagent is asking the parent for more info.
+        # Must be checked before the complete block so a "clarify" isn't misread as failure.
+        clarification_result = clarification_result_from_content(last_msg.content)
+        if clarification_result:
+            return clarification_result
 
         # Check for complete tool call in last message
         # Try parsing as ToolUse first

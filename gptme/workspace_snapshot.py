@@ -19,6 +19,7 @@ from __future__ import annotations
 import logging
 import os
 import subprocess
+import time
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -53,11 +54,18 @@ class Shadow:
         return e
 
     def run(
-        self, *args: str, check: bool = True, capture: bool = True
+        self,
+        *args: str,
+        check: bool = True,
+        capture: bool = True,
+        env: dict[str, str] | None = None,
     ) -> subprocess.CompletedProcess:
+        run_env = self.env()
+        if env:
+            run_env.update(env)
         return subprocess.run(
             ["git", *args],
-            env=self.env(),
+            env=run_env,
             cwd=self.workspace,
             check=check,
             text=True,
@@ -147,12 +155,23 @@ def init_shadow(workspace: Path) -> Shadow:
     return shadow
 
 
-def snapshot(shadow: Shadow, label: str = "snapshot", stage: bool = True) -> str | None:
-    """Create a snapshot. Returns short SHA, or ``None`` on failure."""
+def snapshot(
+    shadow: Shadow,
+    label: str = "snapshot",
+    stage: bool = True,
+    n_msgs: int | None = None,
+) -> str | None:
+    """Create a snapshot. Returns short SHA, or ``None`` on failure.
+
+    When *n_msgs* is provided it is embedded in the commit message so that
+    :func:`get_snapshot_n_msgs` can later reconstruct the conversation size at
+    snapshot time for the ``/snapshot diff`` conversation-summary feature.
+    """
     if not shadow.initialized():
         return None
     if stage:
         shadow.run("add", "-A")
+    commit_msg = label if n_msgs is None else f"{label}\nn_msgs={n_msgs}"
     # Allow empty so consecutive identical snapshots still record a ref.
     # Bypass user hooks: internal bookkeeping, not a social commit.
     result = shadow.run(
@@ -161,7 +180,7 @@ def snapshot(shadow: Shadow, label: str = "snapshot", stage: bool = True) -> str
         "--no-verify",
         "--no-gpg-sign",
         "-m",
-        label,
+        commit_msg,
         check=False,
     )
     if result.returncode != 0:
@@ -169,6 +188,20 @@ def snapshot(shadow: Shadow, label: str = "snapshot", stage: bool = True) -> str
         return None
     sha = shadow.run("rev-parse", "--short", "HEAD").stdout.strip()
     return sha
+
+
+def get_snapshot_n_msgs(shadow: Shadow, sha: str) -> int | None:
+    """Return the conversation message count embedded in a snapshot, or ``None``."""
+    result = shadow.run("log", "--format=%B", "-1", sha, check=False)
+    if result.returncode != 0:
+        return None
+    for line in result.stdout.splitlines()[1:]:
+        if line.startswith("n_msgs="):
+            try:
+                return int(line.split("=", 1)[1].strip())
+            except ValueError:
+                pass
+    return None
 
 
 def list_snapshots(shadow: Shadow, limit: int = 20) -> list[tuple[str, str]]:
@@ -190,6 +223,99 @@ def list_snapshots(shadow: Shadow, limit: int = 20) -> list[tuple[str, str]]:
             sha, label = line.split("\t", 1)
             out.append((sha, label))
     return out
+
+
+def list_snapshots_rich(shadow: Shadow, limit: int = 20) -> list[dict]:
+    """Return rich snapshot metadata for CLI display.
+
+    Each entry has: ``sha``, ``label``, ``timestamp`` (unix int), ``n_msgs`` (int|None).
+    Entries are ordered newest first.
+    """
+    if not shadow.initialized():
+        return []
+    # Use ASCII unit-separator (0x1f) to delimit fields and record-separator
+    # (0x1e) to delimit entries, so labels with tabs/newlines are safe.
+    # Use %B (full raw body) rather than %s so the first line is the clean
+    # label, unaffected by git joining lines when there's no blank-line separator.
+    result = shadow.run(
+        "log",
+        "--pretty=format:%h%x1f%ct%x1f%B%x1e",
+        "--no-decorate",
+        f"-{limit}",
+        check=False,
+    )
+    if result.returncode != 0 or not result.stdout:
+        return []
+    out: list[dict] = []
+    for record in result.stdout.split("\x1e"):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split("\x1f", 2)
+        if len(parts) < 3:
+            continue
+        sha = parts[0].strip()
+        try:
+            ts: int | None = int(parts[1].strip())
+        except ValueError:
+            ts = None
+        lines = parts[2].splitlines()
+        label = lines[0].strip() if lines else ""
+        n_msgs: int | None = None
+        for line in lines[1:]:
+            if line.startswith("n_msgs="):
+                try:
+                    n_msgs = int(line.split("=", 1)[1].strip())
+                except ValueError:
+                    pass
+                break
+        out.append({"sha": sha, "label": label, "timestamp": ts, "n_msgs": n_msgs})
+    return out
+
+
+def _git_date_env(timestamp: int) -> dict[str, str]:
+    git_date = f"{timestamp} +0000"
+    return {
+        "GIT_AUTHOR_DATE": git_date,
+        "GIT_COMMITTER_DATE": git_date,
+    }
+
+
+def _rebuild_snapshot_chain(
+    shadow: Shadow, entries: list[tuple[str, str, int]]
+) -> str | None:
+    """Replay kept snapshot commits while preserving their original timestamps."""
+    if not entries:
+        return None
+
+    entries.reverse()
+    first_tree, first_msg, first_ts = entries[0]
+    res = shadow.run(
+        "commit-tree",
+        first_tree,
+        "-m",
+        first_msg,
+        check=False,
+        env=_git_date_env(first_ts),
+    )
+    if res.returncode != 0:
+        return None
+    parent = res.stdout.strip()
+    for tree, msg, ts in entries[1:]:
+        res = shadow.run(
+            "commit-tree",
+            tree,
+            "-p",
+            parent,
+            "-m",
+            msg,
+            check=False,
+            env=_git_date_env(ts),
+        )
+        if res.returncode != 0:
+            return None
+        parent = res.stdout.strip()
+    return parent
 
 
 def restore(shadow: Shadow, snapshot_id: str) -> bool:
@@ -220,12 +346,17 @@ def restore(shadow: Shadow, snapshot_id: str) -> bool:
     return True
 
 
-def prune(shadow: Shadow, keep: int = DEFAULT_MAX_SNAPSHOTS) -> int:
+def prune(
+    shadow: Shadow, keep: int = DEFAULT_MAX_SNAPSHOTS, dry_run: bool = False
+) -> int:
     """Keep newest ``keep`` snapshots; drop the rest. Returns dropped count.
 
     Implementation: collect the ``keep`` newest (tree, message) pairs, replay
     them as a fresh orphan chain, and point SNAPSHOT_REF at the new tip.
     Older commits become unreachable and ``git gc`` can reclaim them.
+
+    When ``dry_run=True``, compute and return the would-be dropped count
+    without modifying the snapshot history.
     """
     if not shadow.initialized() or keep <= 0:
         return 0
@@ -239,34 +370,120 @@ def prune(shadow: Shadow, keep: int = DEFAULT_MAX_SNAPSHOTS) -> int:
     if total <= keep:
         return 0
     to_drop = total - keep
-    # Collect (tree, subject) for the ``keep`` newest commits, newest-first.
-    log = shadow.run(
-        "log", "--pretty=format:%T\t%s", f"-{keep}", SNAPSHOT_REF, check=False
+    if dry_run:
+        return to_drop
+    # Collect (tree, full body) for the ``keep`` newest commits in one pass.
+    # Use ASCII control characters as record/field separators so commit bodies
+    # can still contain ordinary newlines.
+    log_output = shadow.run(
+        "log",
+        "--format=%H%x1f%T%x1f%ct%x1f%B%x1e",
+        f"-{keep}",
+        SNAPSHOT_REF,
+        check=False,
     )
-    if log.returncode != 0 or not log.stdout.strip():
+    if log_output.returncode != 0 or not log_output.stdout.strip():
         return 0
-    entries = []
-    for line in log.stdout.splitlines():
-        if "\t" in line:
-            tree, msg = line.split("\t", 1)
-            entries.append((tree.strip(), msg.strip()))
+    entries: list[tuple[str, str, int]] = []
+    for record in log_output.stdout.split("\x1e"):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split("\x1f", 3)
+        if len(parts) != 4:
+            continue
+        _, tree, ts_str, body = parts
+        tree = tree.strip()
+        body = body.strip()
+        try:
+            ts = int(ts_str.strip())
+        except ValueError:
+            continue
+        if tree and body:
+            entries.append((tree, body, ts))
     if not entries:
         return 0
-    # Reverse so we build oldest-of-kept → newest (oldest is entries[-1]).
-    entries.reverse()
-    # Create an orphan root from the oldest kept commit.
-    first_tree, first_msg = entries[0]
-    res = shadow.run("commit-tree", first_tree, "-m", first_msg, check=False)
-    if res.returncode != 0:
+    parent = _rebuild_snapshot_chain(shadow, entries)
+    if parent is None:
         return 0
-    parent = res.stdout.strip()
-    # Chain remaining commits onto the orphan root.
-    for tree, msg in entries[1:]:
-        res = shadow.run("commit-tree", tree, "-p", parent, "-m", msg, check=False)
-        if res.returncode != 0:
-            return 0
-        parent = res.stdout.strip()
     # Point the ref at the new tip.
+    reset = shadow.run("update-ref", SNAPSHOT_REF, parent, check=False)
+    if reset.returncode != 0:
+        return 0
+    return to_drop
+
+
+def prune_by_age(shadow: Shadow, days: int = 30, dry_run: bool = False) -> int:
+    """Drop snapshots older than ``days`` days. Returns dropped count.
+
+    Always keeps at least one snapshot (the most recent) regardless of age.
+    Implementation mirrors :func:`prune`: collect entries to keep, replay as a
+    fresh orphan chain, and point SNAPSHOT_REF at the new tip.
+
+    When ``dry_run=True``, compute and return the would-be dropped count
+    without modifying the snapshot history.
+    """
+    if not shadow.initialized() or days <= 0:
+        return 0
+    cutoff = int(time.time()) - days * 86400
+    total = shadow.run("rev-list", "--count", SNAPSHOT_REF, check=False)
+    if total.returncode != 0:
+        return 0
+    try:
+        total_count = int(total.stdout.strip())
+    except ValueError:
+        return 0
+    recent = shadow.run(
+        "rev-list",
+        "--count",
+        f"--since=@{cutoff}",
+        SNAPSHOT_REF,
+        check=False,
+    )
+    if recent.returncode != 0:
+        return 0
+    try:
+        keep_count = int(recent.stdout.strip())
+    except ValueError:
+        return 0
+    keep_count = keep_count or 1
+    to_drop = total_count - keep_count
+    if to_drop <= 0:
+        return 0
+    if dry_run:
+        return to_drop
+    # Fetch only the survivors we need to replay.
+    log_output = shadow.run(
+        "log",
+        f"-{keep_count}",
+        "--format=%H%x1f%T%x1f%ct%x1f%B%x1e",
+        SNAPSHOT_REF,
+        check=False,
+    )
+    if log_output.returncode != 0 or not log_output.stdout.strip():
+        return 0
+    all_entries: list[tuple[str, str, int]] = []  # (tree, body, timestamp)
+    for record in log_output.stdout.split("\x1e"):
+        record = record.strip()
+        if not record:
+            continue
+        parts = record.split("\x1f", 3)
+        if len(parts) != 4:
+            continue
+        _, tree, ts_str, body = parts
+        tree = tree.strip()
+        body = body.strip()
+        try:
+            ts = int(ts_str.strip())
+        except ValueError:
+            continue
+        if tree and body:
+            all_entries.append((tree, body, ts))
+    if len(all_entries) != keep_count:
+        return 0
+    parent = _rebuild_snapshot_chain(shadow, all_entries)
+    if parent is None:
+        return 0
     reset = shadow.run("update-ref", SNAPSHOT_REF, parent, check=False)
     if reset.returncode != 0:
         return 0

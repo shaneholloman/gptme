@@ -9,6 +9,7 @@ import { use$ } from '@legendapp/state/react';
 import {
   conversations$,
   updateConversation,
+  updateConversationData,
   setGenerating,
   setConnected,
   setConnectionStatus,
@@ -118,13 +119,17 @@ export function useConversation(conversationId: string, serverId?: string) {
           return;
         }
 
-        // Check if conversation already has data (e.g., from placeholder)
-        const hasExistingMessages = conversation$?.data.log.peek()?.length > 0;
+        // Only fetch from API when the window has not been properly hydrated.
+        // A non-zero log.length is not sufficient: a windowed prefetch or
+        // a placeholder conversation with injected messages would bypass the
+        // real API load and leave indices wrong. isWindowHydrated is set by
+        // updateConversationData() and initConversation(data).
+        const isWindowHydrated = conversation$?.isWindowHydrated?.peek() === true;
         console.log('[useConversation] Loading conversation', {
           conversationId,
-          hasExistingMessages,
+          isWindowHydrated,
         });
-        if (!hasExistingMessages) {
+        if (!isWindowHydrated) {
           // Only load from API if we don't already have conversation data
           try {
             const data = await api.getConversation(conversationId);
@@ -132,7 +137,8 @@ export function useConversation(conversationId: string, serverId?: string) {
             // Also load the chat config
             try {
               const chatConfig = await api.getChatConfig(conversationId);
-              updateConversation(conversationId, { data, chatConfig, loadError: null });
+              updateConversationData(conversationId, data);
+              updateConversation(conversationId, { chatConfig, loadError: null });
               console.log(`[useConversation] Loaded conversation and config for ${conversationId}`);
             } catch (error) {
               console.warn(
@@ -140,7 +146,8 @@ export function useConversation(conversationId: string, serverId?: string) {
                 error
               );
               // Still update with conversation data even if config fails
-              updateConversation(conversationId, { data, loadError: null });
+              updateConversationData(conversationId, data);
+              updateConversation(conversationId, { loadError: null });
             }
           } catch (error) {
             console.warn(
@@ -729,7 +736,8 @@ export function useConversation(conversationId: string, serverId?: string) {
   const rerunFromMessage = async (index: number) => {
     if (!conversation$) return;
     const log = conversation$.data.log.get();
-    const isLastMessage = index === log.length - 1;
+    const localIndex = index - conversation$.logOffset.get();
+    const isLastMessage = localIndex === log.length - 1;
 
     try {
       if (!isLastMessage) {
@@ -776,6 +784,18 @@ export function useConversation(conversationId: string, serverId?: string) {
     }
   };
 
+  const forkConversation = async (index: number) => {
+    try {
+      const branch = conversation$?.currentBranch.get() ?? 'main';
+      return await api.forkConversation(conversationId, index, branch);
+    } catch (error) {
+      console.error('Error forking conversation:', error);
+      const errorMsg = error instanceof Error ? error.message : 'Failed to fork conversation';
+      toast({ variant: 'destructive', title: 'Fork failed', description: errorMsg });
+      return null;
+    }
+  };
+
   const switchBranch = (branchName: string) => {
     setCurrentBranch(conversationId, branchName);
   };
@@ -798,6 +818,7 @@ export function useConversation(conversationId: string, serverId?: string) {
     deleteMessage,
     rerunFromMessage,
     regenerateMessage,
+    forkConversation,
     switchBranch,
     confirmTool,
     interruptGeneration,

@@ -31,10 +31,9 @@ from .openai_responses import (
     ToolCallFunction,
     _content_to_responses_input,  # noqa: F401
     _extract_usage_token_counts,
-    _filter_duplicate_thinking_text,
-    _longest_suffix_prefix,
     _messages_dicts_to_responses_input,
     _obj_get,
+    _stream_responses_events,
     _tool_spec_to_responses_tool,
 )
 from .utils import (
@@ -128,12 +127,17 @@ def _record_usage(usage, model: str) -> MessageMetadata | None:
     # Determine the provider for telemetry
     # For OpenRouter models, detect the underlying provider from the model string
     # e.g., "openrouter/anthropic/claude-sonnet-4.5" -> "anthropic"
+    # gptme cloud models embed the real backend (gptme/openai/gpt-5,
+    # gptme/openrouter/...), so strip the gptme/ prefix before detecting.
     provider = "openai"
-    if model.startswith("openrouter/"):
-        parts = model.split("/")
+    detect = model.removeprefix("gptme/")
+    if detect.startswith("openrouter/"):
+        parts = detect.split("/")
         if len(parts) >= 2:
             # openrouter/anthropic/... -> anthropic
             provider = parts[1]
+    elif detect.startswith("anthropic/"):
+        provider = "anthropic"
 
     # Record the LLM request with token usage
     record_llm_request(
@@ -207,10 +211,15 @@ def _make_response_format(output_schema):
 
 
 def _responses_api_enabled() -> bool:
+    """Check whether the Responses API is enabled.
+
+    Enabled by default for models that support it (gpt-5 class, o-series).
+    Set GPTME_OPENAI_RESPONSES_API=0 to force Chat Completions for debugging.
+    """
     value = os.environ.get("GPTME_OPENAI_RESPONSES_API")
     if value is None:
-        return False
-    return value.strip().lower() in {"1", "true", "yes", "on"}
+        return True  # default-on for supported models
+    return value.strip().lower() not in {"0", "false", "no", "off"}
 
 
 def _should_use_responses_api(
@@ -772,6 +781,50 @@ def _maybe_apply_verbosity(body: dict[str, Any], model_meta: ModelMeta) -> None:
     body["verbosity"] = OPENAI_VERBOSITY
 
 
+def _gptme_api_model(
+    provider: Provider,
+    model_meta: ModelMeta,
+    is_proxy: bool,
+    model: str,
+    base_model: str,
+) -> str:
+    """Model name to send on the wire.
+
+    For gptme cloud models, send the backend-prefixed id (e.g. "openai/gpt-5",
+    "openrouter/openai/gpt-5.4") so the gateway routes to the right backend.
+    Otherwise keep the existing behaviour: provider-prefixed under LLM_PROXY,
+    bare model name otherwise.
+    """
+    if provider == "gptme" and "/" in model_meta.model:
+        return model_meta.model
+    return model if is_proxy else base_model
+
+
+# OpenAI's reasoning-era models reject `max_tokens` and require
+# `max_completion_tokens`: the o-series (o1, o3, o4, o5, ...) and gpt-5 and
+# later (gpt-5..gpt-9, gpt-10+). Matched by family so new releases in these
+# lines keep working without a code change; older models (gpt-4o, etc.) keep
+# `max_tokens`.
+_OPENAI_MAX_COMPLETION_RE = re.compile(r"^(?:o\d|gpt-(?:[5-9]|\d\d))")
+
+
+def _max_tokens_param_name(provider: Provider, api_model: str) -> str:
+    """Choose between ``max_tokens`` and ``max_completion_tokens``.
+
+    Applies only when the request actually targets OpenAI's API: the native
+    ``openai`` provider, or a gptme cloud model whose backend is openai.
+    OpenRouter (including openrouter-backed gptme models) keeps ``max_tokens``.
+    """
+    targets_openai = provider == "openai" or (
+        provider == "gptme" and api_model.startswith("openai/")
+    )
+    if targets_openai:
+        bare = api_model.rsplit("/", 1)[-1].split("@")[0].lower()
+        if _OPENAI_MAX_COMPLETION_RE.match(bare):
+            return "max_completion_tokens"
+    return "max_tokens"
+
+
 @retry_on_openai_error()
 def chat(
     messages: list[Message],
@@ -797,7 +850,7 @@ def chat(
     is_reasoner = model_meta.supports_reasoning
 
     # make the model name prefix with the provider if using LLM_PROXY, to make proxy aware of the provider
-    api_model = model if is_proxy else base_model
+    api_model = _gptme_api_model(provider, model_meta, is_proxy, model, base_model)
 
     if _should_use_responses_api(provider, model_meta, client):
         instructions, input_items, responses_tools = (
@@ -870,7 +923,7 @@ def chat(
     if response_format is not None:
         optional_kwargs["response_format"] = response_format
     if max_tokens is not None:
-        optional_kwargs["max_tokens"] = max_tokens
+        optional_kwargs[_max_tokens_param_name(provider, api_model)] = max_tokens
 
     response = client.chat.completions.create(
         model=api_model.split("@")[0],
@@ -1063,100 +1116,14 @@ def _stream_responses(
         if top_p_value is not None:
             kwargs["top_p"] = top_p_value
 
-    # Track function-call items: output_index -> (item_id, name, call_id)
-    func_call_items: dict[int, tuple[str, str, str]] = {}
-    header_emitted: set[int] = set()
-    # Guard against double-wrapping: some models emit BOTH structured
-    # reasoning deltas AND raw <thinking> tags in output_text.delta.
-    # If structured reasoning was seen, skip text-tag conversion so
-    # the output doesn't become <think><think>...</think></think>.
-    seen_reasoning_delta = False
-    in_reasoning_block = False
-    in_duplicate_thinking_block = False
-    # Buffer for detecting <thinking> / </thinking> tags split across
-    # SSE chunks (max tag length is ~11 characters).
-    pending = ""
     captured_metadata: MessageMetadata | None = None
 
+    def _capture_usage(usage: Any) -> None:
+        nonlocal captured_metadata
+        captured_metadata = _record_usage(usage, model)
+
     stream = client.responses.create(**kwargs)
-
-    for event in stream:
-        if event.type == "response.output_item.added":
-            item = event.item
-            if _obj_get(item, "type") == "function_call":
-                func_call_items[event.output_index] = (
-                    _obj_get(item, "id") or _obj_get(item, "call_id") or "",
-                    _obj_get(item, "name", ""),
-                    _obj_get(item, "call_id", ""),
-                )
-
-        elif event.type == "response.reasoning_text.delta":
-            if not in_reasoning_block:
-                # Flush any partial-tag buffer before opening think block
-                if pending:
-                    yield pending.replace("<thinking>", "<think>").replace(
-                        "</thinking>", "</think>"
-                    )
-                    pending = ""
-                yield "<think>\n"
-                in_reasoning_block = True
-                seen_reasoning_delta = True
-            yield event.delta
-
-        elif event.type == "response.output_text.delta":
-            if in_reasoning_block:
-                yield "\n</think>\n"
-                in_reasoning_block = False
-
-            delta_text = event.delta
-            if delta_text:
-                # Combine with any previous partial-tag buffer
-                text = pending + delta_text
-                pending = ""
-
-                if seen_reasoning_delta:
-                    text, pending, in_duplicate_thinking_block = (
-                        _filter_duplicate_thinking_text(
-                            text, in_thinking_block=in_duplicate_thinking_block
-                        )
-                    )
-                else:
-                    # Hold back potential partial tag suffix to check in
-                    # next chunk. A trailing `<` is buffered because it
-                    # could be the start of either <thinking> or
-                    # </thinking>.
-                    for tag in ("<thinking>", "</thinking>"):
-                        pending = _longest_suffix_prefix(text, tag)
-                        if pending:
-                            text = text[: -len(pending)]
-                            break
-
-                    # Convert <thinking>/</thinking> to <think>/</think>
-                    text = text.replace("<thinking>", "<think>").replace(
-                        "</thinking>", "</think>"
-                    )
-                if text:
-                    yield text
-
-        elif event.type == "response.function_call_arguments.delta":
-            output_index = event.output_index
-            if output_index not in header_emitted:
-                _, name, call_id = func_call_items.get(output_index, ("", "", ""))
-                yield f"\n@{name}({call_id}): "
-                header_emitted.add(output_index)
-            yield event.delta
-
-        elif event.type == "response.completed":
-            if event.response.usage:
-                captured_metadata = _record_usage(event.response.usage, model)
-
-    # Flush any remaining state.
-    if in_reasoning_block:
-        yield "\n</think>\n"
-    if pending and not in_duplicate_thinking_block:
-        yield pending.replace("<thinking>", "<think>").replace(
-            "</thinking>", "</think>"
-        )
+    yield from _stream_responses_events(stream, usage_callback=_capture_usage)
 
     return captured_metadata
 
@@ -1186,7 +1153,7 @@ def stream(
     is_reasoner = model_meta.supports_reasoning
 
     # make the model name prefix with the provider if using LLM_PROXY, to make proxy aware of the provider
-    api_model = model if is_proxy else base_model
+    api_model = _gptme_api_model(provider, model_meta, is_proxy, model, base_model)
 
     # Dispatch to Responses API streaming when enabled for GPT-5 class models
     if _should_use_responses_api(provider, model_meta, client):
@@ -1221,7 +1188,7 @@ def stream(
     if response_format is not None:
         optional_kwargs["response_format"] = response_format
     if max_tokens is not None:
-        optional_kwargs["max_tokens"] = max_tokens
+        optional_kwargs[_max_tokens_param_name(provider, api_model)] = max_tokens
 
     for chunk_raw in client.chat.completions.create(
         model=api_model.split("@")[0],
@@ -1693,12 +1660,12 @@ def get_available_models(provider: Provider) -> list[ModelMeta]:
         return _get_openai_compatible_models(config, provider)
 
     if provider == "gptme":
-        from .llm_gptme import get_api_key, get_base_url
+        from .llm_gptme import get_api_key, get_models_url
 
         return _get_openai_compatible_models(
             config,
             provider,
-            base_url=get_base_url(config),
+            base_url=get_models_url(config),
             api_key=get_api_key(config),
         )
 
@@ -1812,14 +1779,16 @@ def _openai_compatible_model_to_modelmeta(
         input_side = modality.split("->")[0] if "->" in modality else ""
         supports_vision = "image" in input_side
 
+    max_output = model_data.get("max_completion_tokens")
+
     return ModelMeta(
         provider=provider,
         model=model_id,
         context=context,
-        max_output=None,
-        supports_streaming=True,
+        max_output=max_output,
+        supports_streaming=model_data.get("supports_streaming", True),
         supports_vision=supports_vision,
-        supports_reasoning=False,
+        supports_reasoning=model_data.get("supports_reasoning", False),
         price_input=0,  # pricing unknown for dynamically discovered models
         price_output=0,
     )

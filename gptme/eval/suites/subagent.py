@@ -108,6 +108,35 @@ def check_subagent_complete_waited_before_result(messages: list[Message]) -> boo
     return completion_idx <= result_idx
 
 
+def check_clarification_spawned(messages: list[Message]) -> bool:
+    """Parent log should show the clarification subagent being started."""
+    return _any_message_contains(
+        messages, "assistant", 'subagent("greeter"'
+    ) or _any_message_contains(messages, "assistant", "subagent('greeter'")
+
+
+def check_clarification_hook_notification(messages: list[Message]) -> bool:
+    """Parent should receive the clarification hook notification."""
+    return _any_message_contains(messages, "system", "❓") and _any_message_contains(
+        messages, "system", "greeter"
+    )
+
+
+def check_clarification_reply_called(messages: list[Message]) -> bool:
+    """Parent must call subagent_reply to resume the clarifying subagent."""
+    return _any_message_contains(messages, "assistant", "subagent_reply(")
+
+
+def check_clarification_reply_with_language(messages: list[Message]) -> bool:
+    """The subagent_reply call must supply a language answer."""
+    return any(
+        m.role == "assistant"
+        and "subagent_reply(" in m.content
+        and "English" in m.content
+        for m in messages
+    )
+
+
 _PARALLEL_A = "alpha beta gamma delta epsilon zeta\n"
 _PARALLEL_B = "one\ntwo\nthree\nfour\n"
 _NOTES = "Keep this brief. The parent can read this between spawn and wait.\n"
@@ -175,6 +204,36 @@ tests: list["EvalSpec"] = [
             "roundtrip returned complete marker": check_subagent_complete_roundtrip_marker,
             "parent used delegated result": check_subagent_complete_parent_result,
             "waited before stating result": check_subagent_complete_waited_before_result,
+        },
+    },
+    {
+        "name": "subagent-clarification-roundtrip",
+        "files": {
+            "task.txt": "Write a greeting in the requested language.\n",
+        },
+        "run": "cat answer.txt",
+        "prompt": (
+            "Spawn a subagent with agent_id 'greeter' to write a greeting. "
+            "The subagent's prompt must instruct it to use a `clarify` block "
+            "asking which language to use (not `complete` — it genuinely does not know). "
+            "After spawning, do a brief parent-side step (read task.txt) so the hook "
+            "can deliver the clarification notification. "
+            "When you receive the ❓ system message, call "
+            "subagent_reply('greeter', 'English') to resume the subagent with the answer. "
+            "Wait for the resumed subagent to finish. "
+            "Write answer.txt containing the greeting the subagent produced, "
+            "and include the word GREETING= followed by the greeting in your final message."
+        ),
+        "tools": ["read", "save", "shell", "ipython", "subagent"],
+        "expect": {
+            "writes GREETING marker": lambda ctx: "GREETING=" in ctx.stdout,
+            "clean exit": lambda ctx: ctx.exit_code == 0,
+        },
+        "check_log": {
+            "spawned greeter subagent": check_clarification_spawned,
+            "received clarification hook notification": check_clarification_hook_notification,
+            "called subagent_reply": check_clarification_reply_called,
+            "replied with English": check_clarification_reply_with_language,
         },
     },
 ]

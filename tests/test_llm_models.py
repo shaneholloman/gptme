@@ -1,9 +1,12 @@
 import json
+import logging
 from unittest.mock import patch
 
 import pytest
 
+from gptme.llm import PROVIDER_DEFAULT_MODELS
 from gptme.llm.models import (
+    MODEL_ALIASES,
     MODELS,
     ModelMeta,
     _find_closest_model_properties,
@@ -27,6 +30,31 @@ def test_get_model_provider_only():
     model = get_model("openai")
     assert model.provider == "openai"
     assert model.model == "gpt-5"  # current recommended model
+
+
+@pytest.mark.parametrize(
+    ("provider", "full_model"),
+    sorted(PROVIDER_DEFAULT_MODELS.items()),
+)
+def test_provider_default_models_resolve_without_unknown_fallback(
+    provider, full_model, caplog
+):
+    """Provider default models should stay synced with the model registry."""
+    with caplog.at_level(logging.WARNING):
+        model = get_model(full_model)
+
+    assert model.full == full_model
+    assert model.provider_key == provider
+    assert not any("Unknown model" in record.message for record in caplog.records)
+
+    # openrouter models are dynamic (fetched from the API at runtime) and are not
+    # in the static MODELS registry. _find_closest_model_properties also suppresses
+    # log_warn_once for openrouter, so the caplog assertion above is the only live
+    # check for that provider — the MODELS[provider] lookup would always be skipped.
+    if provider != "openrouter":
+        _, model_name = full_model.split("/", 1)
+        model_name = MODEL_ALIASES.get(provider, {}).get(model_name, model_name)
+        assert model_name in MODELS[provider]
 
 
 def test_get_model_unknown_provider_model():
@@ -132,17 +160,38 @@ def test_get_models_for_provider_gptme_dynamic_fetch(mock_get_available_models):
 
 
 @patch("gptme.llm.models.listing._get_models_for_provider")
+def test_get_model_name_only_dynamic_fetch_skipped_without_slash(mock_get_models):
+    """Test that OpenRouter dynamic fetch is skipped for bare model names without '/'.
+
+    OpenRouter models are always provider/model format, so a bare name without '/'
+    cannot match. The API timeout makes this a ~10s hang for nonexistent models.
+    """
+    model = get_model("test-model")
+    assert model.provider == "unknown"
+    assert model.model == "test-model"
+    assert model.context == 128_000
+
+    # Should NOT try OpenRouter dynamic fetch (no "/" in model name)
+    mock_get_models.assert_not_called()
+
+
+@patch("gptme.llm.models.listing._get_models_for_provider")
 def test_get_model_name_only_with_dynamic_fetch(mock_get_models):
-    """Test model lookup by name only with dynamic fetching from OpenRouter."""
-    # Mock OpenRouter dynamic model
+    """Test model lookup by name only with dynamic fetching from OpenRouter.
+
+    Dynamic fetch is only attempted when the model name contains '/' (OpenRouter
+    format: provider/model).
+    """
+    # Mock OpenRouter dynamic model — model name includes "/"
     dynamic_model = ModelMeta(
-        provider="openrouter", model="test-model", context=100_000
+        provider="openrouter", model="test-provider/test-model", context=100_000
     )
     mock_get_models.return_value = [dynamic_model]
 
-    model = get_model("test-model")
+    # The name includes "/" so it could be an OpenRouter model
+    model = get_model("test-provider/test-model")
     assert model.provider == "openrouter"
-    assert model.model == "test-model"
+    assert model.model == "test-provider/test-model"
     assert model.context == 100_000
 
     # Should have tried OpenRouter dynamic fetch

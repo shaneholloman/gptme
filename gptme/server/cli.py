@@ -20,6 +20,28 @@ from .constants import _pick_fallback_model
 logger = logging.getLogger(__name__)
 
 
+def _parse_tools_allowlist(tools: str | None) -> list[str] | None:
+    """Parse the --tools value into an allowlist for init().
+
+    Mirrors the main `gptme` CLI semantics:
+    - ``None`` (flag not passed) -> ``None`` ("use default tools").
+    - ``"none"`` -> ``[]`` (disable all tools). Cannot be combined with
+      other tool names.
+    - otherwise -> the comma-separated list of tool names.
+    """
+    if tools is None:
+        return None
+    names = [t.strip() for t in tools.split(",") if t.strip()]
+    if any(t.lower() == "none" for t in names):
+        non_none = [t for t in names if t.lower() != "none"]
+        if non_none:
+            raise click.UsageError(
+                f"Cannot combine 'none' with other tools: {', '.join(non_none)}"
+            )
+        return []
+    return names
+
+
 def _pid_alive(pid: int) -> bool:
     """Check if a PID is still alive on this host.
 
@@ -79,6 +101,33 @@ def _start_parent_death_watcher(
     thread.start()
 
 
+def _install_sigterm_handler() -> None:
+    """Make SIGTERM trigger the same graceful shutdown path as Ctrl+C (SIGINT).
+
+    Werkzeug's dev server (`app.run()`) catches `KeyboardInterrupt` in its
+    serve loop and exits cleanly, which lets the `finally: shutdown_telemetry()`
+    block run. Python only raises `KeyboardInterrupt` for SIGINT, though — the
+    default SIGTERM handler terminates the process immediately without unwinding
+    the stack, so on `systemctl stop`, container scale-down, or a rolling
+    restart the cleanup block never runs and any in-flight SSE stream is cut
+    mid-token.
+
+    Re-raising SIGTERM as `KeyboardInterrupt` routes it through the existing
+    clean-shutdown path. This also makes the parent-death watcher's self-SIGTERM
+    (see `_start_parent_death_watcher`) actually shut the server down gracefully,
+    as its comment already assumes.
+
+    Signal handlers can only be installed from the main thread; this is called
+    from the `serve` command before `app.run()`, which runs there.
+    """
+
+    def _handle_sigterm(signum, frame):
+        logger.info("Received SIGTERM, shutting down gracefully")
+        raise KeyboardInterrupt
+
+    signal.signal(signal.SIGTERM, _handle_sigterm)
+
+
 @click.group(cls=DefaultGroup, default="serve", default_if_no_args=True)
 def main():
     """gptme server commands."""
@@ -114,7 +163,11 @@ def main():
     envvar="GPTME_SERVER_PORT",
     help="Port to run the server on.",
 )
-@click.option("--tools", default=None, help="Tools to enable, comma separated.")
+@click.option(
+    "--tools",
+    default=None,
+    help="Tools to enable (comma separated). Use 'none' to disable all tools.",
+)
 @click.option(
     "--cors-origin",
     default=None,
@@ -186,7 +239,7 @@ def serve(
         init(
             model,
             interactive=False,
-            tool_allowlist=None if tools is None else tools.split(","),
+            tool_allowlist=_parse_tools_allowlist(tools),
             tool_format="markdown",
             server=True,
         )
@@ -215,7 +268,7 @@ def serve(
         init(
             fallback_model,
             interactive=False,
-            tool_allowlist=None if tools is None else tools.split(","),
+            tool_allowlist=_parse_tools_allowlist(tools),
             tool_format="markdown",
             server=True,
             require_llm=False,
@@ -234,6 +287,10 @@ def serve(
     init_auth(host=host, display=True)
 
     app = create_app(cors_origin=cors_origin, host=host, webui_dir=webui_dir)
+
+    # Route SIGTERM through the same clean-shutdown path as Ctrl+C so the
+    # `finally` block below runs on `systemctl stop` / container scale-down.
+    _install_sigterm_handler()
 
     try:
         app.run(debug=debug, host=host, port=port)

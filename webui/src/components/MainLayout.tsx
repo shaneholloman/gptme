@@ -31,12 +31,7 @@ import { Loader2, GitBranch, Columns2 } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 import type { ConversationSummary } from '@/types/conversation';
 import type { Task, CreateTaskRequest } from '@/types/task';
-import {
-  initializeConversations,
-  selectedConversation$,
-  initConversation,
-  conversations$,
-} from '@/stores/conversations';
+import { selectedConversation$, initConversation, conversations$ } from '@/stores/conversations';
 import {
   leftSidebarVisible$,
   rightSidebarVisible$,
@@ -182,8 +177,8 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
     const primaryServer = registry.servers.find((s) => s.id === registry.activeServerId);
     const all =
       data?.pages.flatMap(
-        (page: { conversations: ConversationSummary[]; nextCursor: number | undefined }) =>
-          page.conversations.map((conv) => ({
+        (page: { conversations: ConversationSummary[]; nextCursor: string | undefined }) =>
+          (page.conversations ?? []).map((conv) => ({
             ...conv,
             serverId: registry.activeServerId,
             serverName: primaryServer?.name,
@@ -218,17 +213,6 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
     if (!isConnected) return [];
     return apiConversations;
   }, [isConnected, apiConversations]);
-
-  useEffect(() => {
-    if (isConnected && apiConversations.length) {
-      console.log('[MainLayout] Initializing API conversations');
-      void initializeConversations(
-        api,
-        apiConversations.map((c) => c.id),
-        10
-      );
-    }
-  }, [isConnected, apiConversations, api]);
 
   // Reactive computation for store conversations using Legend State
   const storeConversations$ = useObservable(() => {
@@ -430,6 +414,76 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
     }
   }, [isMobile]);
 
+  // Handle navigating a split pane to a different conversation
+  const handleNavigatePane = useCallback(
+    (paneIndex: 0 | 1, newId: string, _newServerId?: string) => {
+      if (!splitIds) return;
+      const ids = [...splitIds];
+      ids[paneIndex] = newId;
+      const params = new URLSearchParams(searchParams);
+      params.set('split', `${ids[0]},${ids[1]}`);
+      // NOTE: We intentionally do not update the shared server= param here.
+      // Both panes share one server= URL param; updating it for one pane silently
+      // breaks the other. Per-pane server tracking is tracked for a future slice.
+      navigate(`?${params.toString()}`);
+    },
+    [splitIds, searchParams, navigate]
+  );
+
+  // Handle "Open in split view" from a conversation list context menu
+  const handleOpenInSplitView = useCallback(
+    (conversationId: string) => {
+      const params = new URLSearchParams(searchParams);
+      if (splitIds) {
+        // Already in split view: put clicked conversation in right pane, keep left
+        params.set('split', `${splitIds[0]},${conversationId}`);
+      } else {
+        const currentId = selectedConversation$.get();
+        if (currentId) {
+          params.set('split', `${currentId},${conversationId}`);
+        } else {
+          params.set('split', `${conversationId},${conversationId}`);
+        }
+      }
+      navigate(`?${params.toString()}`);
+    },
+    [splitIds, searchParams, navigate]
+  );
+
+  // Keyboard shortcut: Ctrl+Shift+\ (Cmd+Shift+\ on Mac) to toggle split view
+  useEffect(() => {
+    const toggleSplit = (e: KeyboardEvent) => {
+      if (e.code !== 'Backslash' || !e.shiftKey || !(e.ctrlKey || e.metaKey)) return;
+      const target = e.target as HTMLElement | null;
+      if (
+        target instanceof HTMLInputElement ||
+        target instanceof HTMLTextAreaElement ||
+        target?.isContentEditable
+      ) {
+        return;
+      }
+      if (splitIds) {
+        // Close split view
+        e.preventDefault();
+        const params = new URLSearchParams(searchParams);
+        params.delete('split');
+        const qs = params.toString();
+        navigate(chatRoute(splitIds[0], qs));
+      } else {
+        // Open split view
+        const conversation = conversation$.get();
+        if (!conversation) return;
+        e.preventDefault();
+        const params = new URLSearchParams(searchParams);
+        params.set('split', `${conversation.id},${conversation.id}`);
+        navigate(`?${params.toString()}`);
+      }
+    };
+
+    document.addEventListener('keydown', toggleSplit);
+    return () => document.removeEventListener('keydown', toggleSplit);
+  }, [splitIds, navigate, searchParams, conversation$]);
+
   // Render main content based on current section
   const renderMainContent = () => {
     if (currentSection === 'agents') {
@@ -474,10 +528,13 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
         <SplitConversationView
           leftId={splitIds[0]}
           rightId={splitIds[1]}
+          allConversations={allConversations}
           serverId={serverParam || undefined}
           leftIsReadOnly={leftConversation.readonly}
           rightIsReadOnly={rightConversation.readonly}
           vertical={isMobile}
+          onNavigateLeft={(id, serverId) => handleNavigatePane(0, id, serverId)}
+          onNavigateRight={(id, serverId) => handleNavigatePane(1, id, serverId)}
           onClose={() => {
             const params = new URLSearchParams(searchParams);
             params.delete('split');
@@ -547,7 +604,7 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
             <SheetHeader className="flex-shrink-0 border-b p-4">
               <SheetTitle className="text-left text-base font-semibold">Navigation</SheetTitle>
             </SheetHeader>
-            <div className="min-h-0 flex-1">
+            <nav aria-label="Conversations" className="min-h-0 flex-1">
               <UnifiedSidebar
                 conversations={allConversations}
                 selectedConversationId$={selectedConversation$}
@@ -573,13 +630,16 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
                 tasksLoading={tasksLoading}
                 tasksError={!!tasksError}
                 onTasksRetry={() => refetchTasks()}
+                onOpenInSplitView={handleOpenInSplitView}
               />
-            </div>
+            </nav>
           </SheetContent>
         </Sheet>
 
         {/* Main Content */}
-        <div className="flex-1 overflow-hidden">{renderMainContent()}</div>
+        <main role="main" aria-label="Chat content" className="flex-1 overflow-hidden">
+          {renderMainContent()}
+        </main>
 
         {/* Right Sidebar - Sheet for mobile */}
         {currentSection === 'chat' && (
@@ -664,32 +724,37 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
             leftSidebarCollapsed$.set(false);
           }}
         >
-          <UnifiedSidebar
-            conversations={allConversations}
-            selectedConversationId$={selectedConversation$}
-            onSelectConversation={handleSelectConversation}
-            conversationsLoading={isLoading}
-            conversationsFetching={isFetching}
-            conversationsError={isError}
-            conversationsErrorObj={error as Error}
-            onConversationsRetry={() => refetch()}
-            fetchNextPage={fetchNextPage}
-            hasNextPage={hasNextPage}
-            showServerLabels={showServerLabels}
-            tasks={tasks}
-            selectedTaskId={selectedTaskId || undefined}
-            onSelectTask={handleSelectTask}
-            onCreateTask={() => setShowCreateTaskDialog(true)}
-            tasksLoading={tasksLoading}
-            tasksError={!!tasksError}
-            onTasksRetry={() => refetchTasks()}
-          />
+          <nav aria-label="Conversations" className="h-full">
+            <UnifiedSidebar
+              conversations={allConversations}
+              selectedConversationId$={selectedConversation$}
+              onSelectConversation={handleSelectConversation}
+              conversationsLoading={isLoading}
+              conversationsFetching={isFetching}
+              conversationsError={isError}
+              conversationsErrorObj={error as Error}
+              onConversationsRetry={() => refetch()}
+              fetchNextPage={fetchNextPage}
+              hasNextPage={hasNextPage}
+              showServerLabels={showServerLabels}
+              tasks={tasks}
+              selectedTaskId={selectedTaskId || undefined}
+              onSelectTask={handleSelectTask}
+              onCreateTask={() => setShowCreateTaskDialog(true)}
+              tasksLoading={tasksLoading}
+              tasksError={!!tasksError}
+              onTasksRetry={() => refetchTasks()}
+              onOpenInSplitView={handleOpenInSplitView}
+            />
+          </nav>
         </ResizablePanel>
 
         <ResizableHandle />
 
         <ResizablePanel defaultSize={60} minSize={30} className="overflow-hidden">
-          {renderMainContent()}
+          <main role="main" aria-label="Chat content" className="h-full overflow-hidden">
+            {renderMainContent()}
+          </main>
         </ResizablePanel>
 
         {/* Conditional right sidebar for chat */}

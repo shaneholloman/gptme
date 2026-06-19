@@ -6,17 +6,37 @@ or falls back to a ``GPTME_CLOUD_API_KEY`` environment variable.
 
 Usage:
     1. Authenticate: ``gptme-auth login``
-    2. Use models:   ``gptme -m gptme/claude-sonnet-4-6``
+    2. List models:  ``gptme --list-models`` (shows ``gptme/anthropic/MODEL`` etc.)
+    3. Use models:   ``gptme -m gptme/anthropic/claude-sonnet-4-6``
+
+    Model IDs from the gptme cloud service include a provider prefix (e.g.
+    ``anthropic/``, ``openai/``). The full model spec for gptme is therefore
+    ``gptme/<provider>/<model>`` — e.g. ``gptme/anthropic/claude-sonnet-4-6``.
 
 Token priority:
     1. Device Flow token from ``~/.config/gptme/auth/gptme-cloud-<hash>.json``
     2. ``GPTME_CLOUD_API_KEY`` environment variable
     3. Error with instructions
 
-Base URL priority:
-    1. Token's ``server_url`` field
+Base URL priority (chat completions):
+    1. Token's ``base_url`` field (explicit, Supabase-aware)
     2. ``GPTME_CLOUD_BASE_URL`` environment variable
-    3. Default: ``https://fleet.gptme.ai/v1``
+    3. Default: Supabase messages edge function
+
+Models URL priority:
+    1. Token's ``server_url`` field for custom-server tokens (no base_url)
+    2. ``GPTME_CLOUD_MODELS_URL`` environment variable
+    3. ``GPTME_CLOUD_BASE_URL`` for non-Supabase custom servers (env-var-only)
+    4. Default: Supabase functions/v1 base
+
+URL architecture:
+    - LLM API calls go to Supabase edge functions, NOT fleet.gptme.ai.
+    - fleet.gptme.ai only routes /api/v1/instances/ (traefik) and
+      /api/v1/operator/ (fleet-operator). It has no /v1/chat/completions or
+      /v1/models routes.
+    - Chat completions: DEFAULT_BASE_URL (messages edge function)
+    - Model listing:    DEFAULT_MODELS_BASE_URL (functions/v1 base)
+    - Device auth:      DEFAULT_DEVICE_AUTH_URL (device-auth edge function)
 """
 
 import hashlib
@@ -35,21 +55,34 @@ class GptmeAuthError(KeyError):
     """Raised when no valid gptme.ai credentials are found."""
 
 
-# Default base URL for the gptme cloud API proxy
-DEFAULT_BASE_URL = "https://fleet.gptme.ai/v1"
-
-# Default service URL (for auth endpoints, without /v1)
-DEFAULT_SERVICE_URL = "https://fleet.gptme.ai"
-
-# Device auth has moved off fleet-operator and onto Supabase edge functions.
-# The CLI polls these two endpoints during the RFC 8628 device authorization flow.
+# All gptme cloud API traffic goes through Supabase edge functions.
+# fleet.gptme.ai is for user instance routing only (/api/v1/instances/, /api/v1/operator/).
 _SUPABASE_URL = "https://kpkxgnfpyntahyhckhgm.supabase.co"
-DEFAULT_DEVICE_AUTH_URL = f"{_SUPABASE_URL}/functions/v1/device-auth"
+_SUPABASE_FUNCTIONS_V1 = f"{_SUPABASE_URL}/functions/v1"
+
+# Chat completions endpoint — the messages function ignores sub-path, so the
+# OpenAI SDK's /chat/completions suffix lands here without issue.
+DEFAULT_BASE_URL = f"{_SUPABASE_FUNCTIONS_V1}/messages"
+
+# Base for model listing — OpenAI SDK appends /models → /functions/v1/models ✓
+DEFAULT_MODELS_BASE_URL = _SUPABASE_FUNCTIONS_V1
+
+# Service URL used for token storage keying (not for API calls).
+DEFAULT_SERVICE_URL = _SUPABASE_URL
+
+# Device auth edge function.
+DEFAULT_DEVICE_AUTH_URL = f"{_SUPABASE_FUNCTIONS_V1}/device-auth"
 
 # Token storage directory
 _TOKEN_DIR = (
     Path(os.environ.get("XDG_CONFIG_HOME", Path.home() / ".config")) / "gptme" / "auth"
 )
+
+# Legacy service URLs whose token files should be checked as a migration fallback
+# when no token exists at the current DEFAULT_SERVICE_URL path.
+_LEGACY_SERVICE_URLS = [
+    "https://fleet.gptme.ai",
+]
 
 
 def _get_token_path(service_url: str | None = None) -> Path:
@@ -69,7 +102,20 @@ def _load_token(service_url: str | None = None) -> dict | None:
     """
     token_path = _get_token_path(service_url)
     if not token_path.exists():
-        return None
+        # Migration: if using the default URL and no new token exists, check
+        # legacy service URL paths so users authenticated before the Supabase
+        # migration can still be found (their token has a server_url field
+        # that get_base_url() uses to reconstruct the old-style URL).
+        if service_url is None:
+            for legacy_url in _LEGACY_SERVICE_URLS:
+                legacy_path = _get_token_path(legacy_url)
+                if legacy_path.exists():
+                    token_path = legacy_path
+                    break
+            else:
+                return None
+        else:
+            return None
 
     try:
         data = json.loads(token_path.read_text())
@@ -116,30 +162,72 @@ def get_api_key(config: Config) -> str:
 
 
 def get_base_url(config: Config) -> str:
-    """Get the base URL for the gptme cloud API.
+    """Get the base URL for gptme cloud chat completions.
 
     Checks (in order):
-    1. Token file's ``server_url`` field
+    1. Token file's ``base_url`` field (explicit, set by device_flow_authenticate)
     2. ``GPTME_CLOUD_BASE_URL`` environment variable
-    3. Default: https://fleet.gptme.ai/v1
-    """
-    # Check token file for server URL
-    token_data = _load_token()
-    if token_data and token_data.get("server_url"):
-        server_url = token_data["server_url"].rstrip("/")
-        if not server_url.endswith("/v1"):
-            server_url += "/v1"
-        return server_url
+    3. Default: Supabase messages edge function
 
-    # Check env var (normalize /v1 suffix)
+    The returned URL is used as the OpenAI SDK base_url. For chat completions,
+    this points at the Supabase messages function. For model listing, use
+    get_models_url() instead.
+    """
+    token_data = _load_token()
+    if token_data:
+        # New explicit base_url field (Supabase-aware, set by device_flow_authenticate)
+        if token_data.get("base_url"):
+            return token_data["base_url"].rstrip("/")
+        # Legacy: token has server_url but no base_url — reconstruct old-style
+        # (e.g. tokens saved before this fix, pointing at fleet.gptme.ai)
+        if token_data.get("server_url"):
+            server_url = token_data["server_url"].rstrip("/")
+            if not server_url.endswith("/v1"):
+                server_url += "/v1"
+            return server_url
+
     env_url = config.get_env("GPTME_CLOUD_BASE_URL")
     if env_url:
-        env_url = env_url.rstrip("/")
-        if not env_url.endswith("/v1"):
-            env_url += "/v1"
-        return env_url
+        return env_url.rstrip("/")
 
     return DEFAULT_BASE_URL
+
+
+def get_models_url(config: Config) -> str:
+    """Get the base URL for gptme cloud model listing.
+
+    The OpenAI SDK appends /models to the returned URL.
+    Checks (in order):
+    1. Token file's ``server_url`` field (custom-server token without base_url)
+       → uses server_url + /v1 as the models base
+    2. ``GPTME_CLOUD_MODELS_URL`` environment variable
+    3. ``GPTME_CLOUD_BASE_URL`` env var when pointing at a non-Supabase server
+       → env-var-only users with custom OpenAI-compatible APIs
+    4. Default: Supabase functions/v1 base
+    """
+    token_data = _load_token()
+    if token_data:
+        # Custom-server token (server_url without explicit base_url)
+        if not token_data.get("base_url") and token_data.get("server_url"):
+            server_url = token_data["server_url"].rstrip("/")
+            if not server_url.endswith("/v1"):
+                server_url += "/v1"
+            return server_url
+        # Default (Supabase) token with base_url — use the default models URL
+        # which is the functions/v1 base the SDK needs for /models.
+
+    env_url = config.get_env("GPTME_CLOUD_MODELS_URL")
+    if env_url:
+        return env_url.rstrip("/")
+
+    # For env-var-only users with a custom server (GPTME_CLOUD_BASE_URL not pointing
+    # at Supabase), use the same base URL for model listing — standard OpenAI-compatible
+    # APIs serve both /chat/completions and /models from the same base.
+    base_url = config.get_env("GPTME_CLOUD_BASE_URL")
+    if base_url and DEFAULT_SERVICE_URL not in base_url:
+        return base_url.rstrip("/")
+
+    return DEFAULT_MODELS_BASE_URL
 
 
 def device_flow_authenticate(
@@ -210,12 +298,16 @@ def device_flow_authenticate(
             except (json.JSONDecodeError, KeyError) as e:
                 raise RuntimeError(f"Invalid token response: {e}") from e
 
-            # Save token; keyed by service URL (fleet), not auth URL (supabase)
-            result = {
+            # Save token; keyed by service URL.
+            # base_url is only set for the default Supabase service — custom servers
+            # use the server_url+/v1 fallback in get_base_url() instead.
+            result: dict = {
                 "access_token": access_token,
                 "expires_at": time.time() + token_data.get("expires_in", 86400),
                 "server_url": service_base,
             }
+            if service_base == DEFAULT_SERVICE_URL:
+                result["base_url"] = DEFAULT_BASE_URL
             _save_token(result, service_base)
             return result
 

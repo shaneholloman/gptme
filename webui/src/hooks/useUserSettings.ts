@@ -1,5 +1,6 @@
 import { useState, useEffect, useCallback } from 'react';
 import { useApi } from '@/contexts/ApiContext';
+import { isDemoMode } from '@/utils/connectionConfig';
 
 export type UserSettingSource = 'env' | 'config.local.toml' | 'config.toml' | 'oauth';
 
@@ -24,6 +25,11 @@ export interface UserSettings {
   config_files?: UserSettingsConfigFiles;
 }
 
+const DEMO_USER_SETTINGS: UserSettings = {
+  providers_configured: [],
+  default_model: null,
+};
+
 export function useUserSettings() {
   const { api } = useApi();
   const [settings, setSettings] = useState<UserSettings | null>(null);
@@ -32,6 +38,12 @@ export function useUserSettings() {
   const [refetchKey, setRefetchKey] = useState(0);
 
   useEffect(() => {
+    if (isDemoMode()) {
+      setSettings(DEMO_USER_SETTINGS);
+      setError(null);
+      setIsLoading(false);
+      return;
+    }
     const controller = new AbortController();
 
     const fetchSettings = async () => {

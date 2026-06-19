@@ -2,6 +2,7 @@
 
 import logging
 import os
+import re
 from collections.abc import Generator
 from typing import TYPE_CHECKING, Any
 
@@ -193,9 +194,14 @@ def auto_reply_hook(
         return  # Has tools, no need to prompt
 
     # Count consecutive auto-replies
+    # Both auto-reply variants share this prefix:
+    # "No tool call detected in last message. You have incomplete todos:\n..."
+    # "No tool call detected in last message. Did you mean to finish? ..."
+    _AUTO_REPLY_MARKER = "No tool call detected in last message"
+
     auto_reply_count = 0
     for msg in reversed(manager.log.messages):
-        if msg.role == "user" and "use the `complete` tool" in msg.content:
+        if msg.role == "user" and _AUTO_REPLY_MARKER in msg.content:
             auto_reply_count += 1
         elif msg.role == "assistant":
             # Stop counting when we hit an assistant message with tools
@@ -266,6 +272,90 @@ def _turn_fingerprint(msg: "Message") -> tuple | None:
             (u.tool or "", tuple(u.args or ()), (u.content or "").strip()) for u in uses
         )
     )
+
+
+# Module-level regex constants for _classify_stuck_reason.
+_PERM_RE = re.compile(
+    r"[Pp]ermission denied"
+    r"|[Aa]ccess denied"
+    r"|[Oo]peration not permitted"
+    r"|EACCES"
+    r"|[Nn]ot (?:allowed|authorized|permitted)"
+    r"|[Uu]nauthorized",
+)
+_ERR_RE = re.compile(
+    r"Traceback \(most recent call"
+    r"|(?:Error|Exception):"
+    r"|exit (?:code|status)[:\s]+[1-9]"
+    r"|returncode[=\s]+[1-9]"
+    r"|Error executing tool"
+    r"|[Cc]ommand not found"
+    r"|[Nn]o such file or directory"
+    r"|[Nn]o module named"
+    r"|SyntaxError"
+    r"|TypeError"
+    r"|ValueError"
+    r"|AttributeError"
+    r"|KeyError"
+    r"|ImportError",
+)
+_EMPTY_RE = re.compile(
+    r"[Nn]o (?:output|results?|matches?|files?) found"
+    r"|0 (?:results?|matches?|files?)"
+    r"|[Nn]othing (?:found|returned)",
+)
+
+
+def _classify_stuck_reason(
+    messages: list["Message"],
+) -> tuple[str, str]:
+    """Classify why the agent is stuck by inspecting tool result messages.
+
+    Collects system messages (tool results) after the last assistant turn
+    and looks for recognizable failure signals.
+
+    Returns ``(classification, evidence)`` where classification is one of:
+    - ``"tool-error"``       — non-zero exit, traceback, or error message
+    - ``"empty-result"``     — tool produced no output or reported no matches
+    - ``"permission-denied"``— access/auth/permission failure
+    - ``"unknown"``          — no recognizable signal found
+    """
+    # Gather tool-result (system) messages since the last assistant turn.
+    result_texts: list[str] = []
+    for msg in reversed(messages):
+        if msg.role == "assistant":
+            break
+        if msg.role == "system":
+            result_texts.append(msg.content or "")
+
+    if not result_texts:
+        # No tool results between turns — absence of evidence is not classifiable.
+        return "unknown", ""
+
+    combined = "\n".join(result_texts)
+
+    # Permission-denied (check first — more specific than generic errors).
+    m = _PERM_RE.search(combined)
+    if m:
+        snippet = combined[max(0, m.start() - 20) : m.end() + 60].strip()
+        return "permission-denied", snippet[:120]
+
+    # Tool error — exit codes, tracebacks, error/exception text.
+    m = _ERR_RE.search(combined)
+    if m:
+        snippet = combined[max(0, m.start() - 10) : m.end() + 80].strip()
+        return "tool-error", snippet[:120]
+
+    # Empty result — tool ran but produced nothing useful.
+    if not combined.strip() or len(combined.strip()) < 5:
+        return "empty-result", "(no output)"
+
+    m = _EMPTY_RE.search(combined)
+    if m:
+        evidence = m.group(0).strip() or "(empty output)"
+        return "empty-result", evidence[:80]
+
+    return "unknown", ""
 
 
 def stuck_detect_hook(
@@ -353,17 +443,38 @@ def stuck_detect_hook(
             f"Stuck loop not broken after {escalate_max} escalations"
         )
 
+    # Classify the root cause (always on; disable everything with GPTME_STUCK_DETECT=0).
+    classification, evidence = _classify_stuck_reason(manager.log.messages)
+
     logger.warning(
-        "Stuck detected: `%s` repeated %d times without progress. Nudging.",
+        "Stuck detected: `%s` repeated %d times without progress (rca=%s). Nudging.",
         repeated_tool_str,
         repeats,
+        classification,
+        extra={
+            "tool": repeated_tool_str,
+            "classification": classification,
+            "evidence": evidence,
+        },
     )
+
+    if classification != "unknown":
+        rca_hint = f" Likely cause: {classification}"
+        if evidence:
+            # Sanitize evidence before embedding in the <system> XML tag to prevent
+            # tool output containing </system> from prematurely closing the tag.
+            safe_evidence = evidence.replace("<", "[").replace(">", "]")
+            rca_hint += f" — {safe_evidence}"
+        rca_hint += "."
+    else:
+        rca_hint = ""
+
     yield Message(
         "user",
         (
             f"<system>You appear stuck: the same tool call (`{repeated_tool_str}`) was "
-            f"repeated {repeats} times without progress. Try a different approach, "
-            f"fix the underlying error, or use the `complete` tool if you are "
+            f"repeated {repeats} times without progress.{rca_hint} Try a different "
+            f"approach, fix the underlying error, or use the `complete` tool if you are "
             f"genuinely blocked.</system>"
         ),
         quiet=False,

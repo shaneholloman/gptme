@@ -20,7 +20,8 @@ from gptme.init import init
 from gptme.tools import clear_tools
 from gptme.tools import shell as shell_module
 from gptme.tools.rag import _has_gptme_rag
-from gptme.tools.subagent import _subagents
+from gptme.tools.subagent import _subagent_results, _subagent_results_lock, _subagents
+from gptme.tools.subagent.concurrency import _reset_slot_sem
 
 logger = logging.getLogger(__name__)
 
@@ -248,21 +249,39 @@ def cleanup_subagents_after():
     Subprocesses in subprocess mode need explicit termination.
     """
     yield
-    # Wait briefly for any running subagent threads to complete
-    for subagent in _subagents:
-        # Clean up threads
-        if subagent.thread is not None and subagent.thread.is_alive():
-            subagent.thread.join(timeout=5.0)
-        # Clean up subprocesses (subprocess mode)
-        if subagent.process is not None and subagent.process.poll() is None:
-            subagent.process.terminate()
-            try:
-                subagent.process.wait(timeout=5.0)
-            except Exception:
-                # Force kill if graceful termination fails
-                subagent.process.kill()
-    # Clear the subagents list
-    _subagents.clear()
+    # Use try/finally so _subagents.clear() and _reset_slot_sem() always run
+    # even if pytest-timeout interrupts the join/terminate phase.  The 5s
+    # timeouts used here (thread join + process wait) together with pytest's
+    # 10s teardown limit left no room — if the thread was still alive the full
+    # sequence could take exactly 10s, triggering the timeout and leaving shared
+    # globals dirty for the next test.  Shorter timeouts give headroom.
+    try:
+        for subagent in _subagents:
+            # Clean up threads (2s cap — well under the 10s teardown limit)
+            if subagent.thread is not None and subagent.thread.is_alive():
+                subagent.thread.join(timeout=2.0)
+            # Clean up subprocesses (subprocess mode)
+            if subagent.process is not None and subagent.process.poll() is None:
+                subagent.process.terminate()
+                try:
+                    subagent.process.wait(timeout=2.0)
+                except Exception:
+                    # Force kill if graceful termination fails
+                    subagent.process.kill()
+    finally:
+        # Always reset shared state so subsequent tests start clean,
+        # even if the join/terminate phase above was interrupted.
+        _subagents.clear()
+        # Clear cached terminal results too; many tests intentionally reuse agent IDs
+        # like "explorer"/"checker", and the queued-cancel guards now treat a stale
+        # cached result as "already completed" and skip the new launch.
+        with _subagent_results_lock:
+            _subagent_results.clear()
+        # Reset the concurrency semaphore so monitor threads from this test
+        # don't starve the next test when running under xdist.  Monitor threads
+        # capture the old semaphore object in their closure, so they release the
+        # old sem (harmless) while the next test gets a fresh one.
+        _reset_slot_sem()
 
 
 @pytest.fixture
@@ -285,13 +304,18 @@ def temp_file():
 
 
 @pytest.fixture(autouse=True)
-def init_():
+def init_(monkeypatch):
     # Pass MODEL from env explicitly to avoid picking up stale config.chat.model
     # values left by server tests. When _init_done is reset per-test, init_model()
     # re-runs and would otherwise read the contaminated config instead of the test
     # environment's MODEL. Server tests now use fully-qualified model names
     # (e.g. "openai/gpt-4o-mini") to prevent provider validation errors.
     model = os.environ.get("MODEL")
+    # Ensure OPENAI_BASE_URL is set when using local/test model.
+    # Use monkeypatch so the env var is reverted after each test and doesn't
+    # leak into subsequent tests that use a non-local provider.
+    if model and model.startswith("local/") and not os.environ.get("OPENAI_BASE_URL"):
+        monkeypatch.setenv("OPENAI_BASE_URL", "http://localhost:666")
     init(model, interactive=False, tool_allowlist=None, tool_format="markdown")
 
 

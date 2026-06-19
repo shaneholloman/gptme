@@ -5,17 +5,17 @@ import json
 from logging import getLogger
 from typing import TYPE_CHECKING, Literal, cast
 
-import mcp.types as mcp_types
-
 if TYPE_CHECKING:
     from collections.abc import Callable, Generator
 
+    import mcp.types as mcp_types
+
     from ..hooks.elicitation import ElicitationRequest, ElicitationResponse
+    from ..mcp.client import MCPClient
+    from ..mcp.registry import MCPRegistry
 
 from gptme.config import Config, MCPServerConfig, get_config, set_config
 
-from ..mcp.client import MCPClient, MCPInterruptedError
-from ..mcp.registry import MCPRegistry, format_server_details, format_server_list
 from ..message import Message
 from ..util.ask_execute import execute_with_confirmation
 from .base import (
@@ -36,11 +36,21 @@ _mcp_clients: dict[str, MCPClient] = {}
 # Add type annotation for tool_specs
 tool_specs: list[ToolSpec] = []
 
-# Global registry instance
-_registry = MCPRegistry()
+# Lazy-initialized registry instance (loaded on first MCP registry call)
+_registry_instance: MCPRegistry | None = None
 
 # Cache of dynamically loaded servers
 _dynamic_servers: dict[str, MCPClient] = {}
+
+
+def _get_registry() -> MCPRegistry:
+    """Lazy getter for MCPRegistry — defers the import until first MCP registry call."""
+    global _registry_instance
+    if _registry_instance is None:
+        from ..mcp.registry import MCPRegistry
+
+        _registry_instance = MCPRegistry()
+    return _registry_instance
 
 
 def get_mcp_clients() -> dict[str, MCPClient]:
@@ -71,6 +81,8 @@ def _extract_content_text(
     Per MCP spec, content items can be TextContent, ImageContent, AudioContent,
     ResourceLink, or EmbeddedResource. This function handles all types gracefully.
     """
+    import mcp.types as mcp_types
+
     if isinstance(item, str):
         return item
     if isinstance(item, mcp_types.TextContent):
@@ -93,6 +105,8 @@ def _extract_content_text(
 
 def _restart_mcp_client(server_name: str, config: Config) -> MCPClient:
     """Restart an MCP client by reconnecting to the server"""
+    from ..mcp.client import MCPClient
+
     logger.info(f"Restarting MCP client for server: {server_name}")
 
     # Get existing client if any
@@ -161,6 +175,7 @@ def _call_mcp_tool_with_retry(
 # Function to create MCP tools
 def create_mcp_tools(config: Config) -> list[ToolSpec]:
     """Create tool specs for all MCP tools from the config"""
+    from ..mcp.client import MCPClient
 
     tool_specs: list[ToolSpec] = []
 
@@ -214,6 +229,21 @@ def create_mcp_tools(config: Config) -> list[ToolSpec]:
                         tool_name, [], example_content
                     ).to_output(cast(ToolFormat, tool_format))
 
+                # Extract MCP ToolAnnotations into hint tags
+                hints: frozenset[str] = frozenset()
+                if mcp_tool.annotations:
+                    ann = mcp_tool.annotations
+                    hint_set: set[str] = set()
+                    if ann.readOnlyHint:
+                        hint_set.add("read-only")
+                    if ann.destructiveHint is not False and not ann.readOnlyHint:
+                        hint_set.add("destructive")
+                    if ann.idempotentHint:
+                        hint_set.add("idempotent")
+                    if ann.openWorldHint is False:
+                        hint_set.add("closed-world")
+                    hints = frozenset(hint_set)
+
                 tool_spec = ToolSpec(
                     name=name,
                     desc=f"[{server_config.name}] {mcp_tool.description}",
@@ -225,6 +255,7 @@ def create_mcp_tools(config: Config) -> list[ToolSpec]:
                     examples=make_examples(name, example_str),
                     block_types=[name],
                     is_mcp=True,
+                    hints=hints,
                 )
 
                 tool_specs.append(tool_spec)
@@ -261,6 +292,8 @@ def create_mcp_execute_function(
         content: str, tool_name: str
     ) -> Generator[Message, None, None]:
         """Actual MCP tool implementation."""
+        from ..mcp.client import MCPInterruptedError
+
         try:
             # Get the client for getting tool definition
             tool_def = None
@@ -359,12 +392,15 @@ def search_mcp_servers(query: str = "", registry: str = "all", limit: int = 10) 
     Returns:
         Formatted list of servers
     """
+    from ..mcp.registry import format_server_list
+
+    registry_obj = _get_registry()
     if registry == "all":
-        results = _registry.search_all(query, limit)
+        results = registry_obj.search_all(query, limit)
     elif registry == "official":
-        results = _registry.search_official_registry(query, limit)
+        results = registry_obj.search_official_registry(query, limit)
     elif registry == "mcp.so":
-        results = _registry.search_mcp_so(query, limit)
+        results = registry_obj.search_mcp_so(query, limit)
     else:
         return f"Unknown registry: {registry}. Use 'all', 'official', or 'mcp.so'."
 
@@ -381,7 +417,9 @@ def get_mcp_server_info(name: str) -> str:
     Returns:
         Formatted server details
     """
-    server = _registry.get_server_details(name)
+    from ..mcp.registry import format_server_details
+
+    server = _get_registry().get_server_details(name)
     if not server:
         return f"Server '{name}' not found in any registry."
 
@@ -410,7 +448,7 @@ def load_mcp_server(name: str, config_override: dict | None = None) -> str:
 
     # If not in config, try to find in registry
     if not server_config:
-        server_info = _registry.get_server_details(name)
+        server_info = _get_registry().get_server_details(name)
         if not server_info:
             return f"Server '{name}' not found in config or registries."
 
@@ -442,6 +480,8 @@ def load_mcp_server(name: str, config_override: dict | None = None) -> str:
         config_added = True
 
     try:
+        from ..mcp.client import MCPClient
+
         # Create client and connect
         client = MCPClient(config=config)
         tools, session = client.connect(name)
@@ -530,6 +570,8 @@ def list_mcp_resources(server_name: str) -> str:
             f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
         )
 
+    from ..mcp.client import MCPInterruptedError
+
     try:
         result = client.list_resources()
         resources = result.resources
@@ -572,7 +614,11 @@ def read_mcp_resource(server_name: str, uri: str) -> str:
             f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
         )
 
+    from ..mcp.client import MCPInterruptedError
+
     try:
+        import mcp.types as mcp_types
+
         result = client.read_resource(uri)
         contents = result.contents
 
@@ -615,6 +661,8 @@ def list_mcp_resource_templates(server_name: str) -> str:
             f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
         )
 
+    from ..mcp.client import MCPInterruptedError
+
     try:
         result = client.list_resource_templates()
         templates = result.resourceTemplates
@@ -655,6 +703,8 @@ def list_mcp_prompts(server_name: str) -> str:
         return (
             f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
         )
+
+    from ..mcp.client import MCPInterruptedError
 
     try:
         result = client.list_prompts()
@@ -703,6 +753,8 @@ def get_mcp_prompt(
         return (
             f"Server '{server_name}' is not loaded. Use `mcp load {server_name}` first."
         )
+
+    from ..mcp.client import MCPInterruptedError
 
     try:
         result = client.get_prompt(name, arguments)
@@ -905,6 +957,8 @@ def _elicitation_response_to_mcp_result(
     response: ElicitationResponse,
 ) -> mcp_types.ElicitResult:
     """Convert gptme's ElicitationResponse to MCP's ElicitResult."""
+    import mcp.types as mcp_types
+
     if response.cancelled:
         return mcp_types.ElicitResult(action="cancel", content=None)
 
@@ -937,6 +991,8 @@ def _create_elicitation_handler(server_name: str):
         params: mcp_types.ElicitRequestParams,
     ) -> mcp_types.ElicitResult | mcp_types.ErrorData:
         """Handle elicitation request from MCP server via shared hook system."""
+        import mcp.types as mcp_types
+
         from ..hooks.elicitation import elicit
 
         logger.info(f"Elicitation request from {server_name}: {params.message}")

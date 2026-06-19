@@ -542,6 +542,124 @@ def _check_version(verbose: bool = False) -> list[CheckResult]:
     return results
 
 
+def _check_computer(verbose: bool = False) -> list[CheckResult]:
+    """Check computer tool prerequisites (xdotool on Linux, cliclick on macOS)."""
+    results: list[CheckResult] = []
+
+    if sys.platform == "darwin":
+        # screencapture should always be present on macOS — verify for consistency
+        screencapture_path = shutil.which("screencapture")
+        if screencapture_path:
+            results.append(
+                CheckResult(
+                    name="Computer: screencapture",
+                    status=CheckStatus.OK,
+                    message="macOS screenshot tool (built-in)",
+                    details=screencapture_path if verbose else None,
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    name="Computer: screencapture",
+                    status=CheckStatus.WARNING,
+                    message="Not found — screencapture should be built-in on macOS",
+                )
+            )
+        # cliclick is required for mouse/keyboard control on macOS
+        cliclick_path = shutil.which("cliclick")
+        if cliclick_path:
+            results.append(
+                CheckResult(
+                    name="Computer: cliclick",
+                    status=CheckStatus.OK,
+                    message="macOS mouse/keyboard control",
+                    details=cliclick_path if verbose else None,
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    name="Computer: cliclick",
+                    status=CheckStatus.WARNING,
+                    message="Not found — required for mouse/keyboard control on macOS",
+                    fix_hint="brew install cliclick",
+                )
+            )
+    elif sys.platform.startswith("linux"):
+        # Linux: X11 tools
+        xdotool_path = shutil.which("xdotool")
+        if xdotool_path:
+            results.append(
+                CheckResult(
+                    name="Computer: xdotool",
+                    status=CheckStatus.OK,
+                    message="X11 mouse/keyboard automation",
+                    details=xdotool_path if verbose else None,
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    name="Computer: xdotool",
+                    status=CheckStatus.WARNING,
+                    message="Not found — required for computer tool on Linux/X11",
+                    fix_hint="sudo apt install xdotool  or  sudo pacman -S xdotool",
+                )
+            )
+
+        scrot_path = shutil.which("scrot")
+        if scrot_path:
+            results.append(
+                CheckResult(
+                    name="Computer: scrot",
+                    status=CheckStatus.OK,
+                    message="X11 screenshot tool",
+                    details=scrot_path if verbose else None,
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    name="Computer: scrot",
+                    status=CheckStatus.WARNING,
+                    message="Not found — screenshot fallback (gnome-screenshot also works)",
+                    fix_hint="sudo apt install scrot  or  sudo pacman -S scrot",
+                )
+            )
+
+        # Check DISPLAY
+        display = os.environ.get("DISPLAY")
+        if display:
+            results.append(
+                CheckResult(
+                    name="Computer: DISPLAY",
+                    status=CheckStatus.OK,
+                    message=f"X11 display available ({display})",
+                )
+            )
+        else:
+            results.append(
+                CheckResult(
+                    name="Computer: DISPLAY",
+                    status=CheckStatus.WARNING,
+                    message="DISPLAY not set — computer tool requires an X11 display",
+                    fix_hint="export DISPLAY=:1  or run inside Xvfb: xvfb-run gptme ...",
+                )
+            )
+    else:
+        # Unsupported platform (Windows, FreeBSD, etc.) — no checks available
+        results.append(
+            CheckResult(
+                name="Computer: platform",
+                status=CheckStatus.WARNING,
+                message=f"Computer tool is only supported on Linux and macOS (current: {sys.platform})",
+            )
+        )
+
+    return results
+
+
 def _check_browser(verbose: bool = False) -> list[CheckResult]:
     """Check Playwright browser installation if browser extra is installed."""
     results: list[CheckResult] = []
@@ -749,6 +867,7 @@ def run_diagnostics(verbose: bool = False) -> tuple[list[CheckResult], dict]:
     all_results.extend(_check_api_keys(verbose))
     all_results.extend(_check_tools(verbose))
     all_results.extend(_check_python_deps(verbose))
+    all_results.extend(_check_computer(verbose))
     all_results.extend(_check_browser(verbose))
     all_results.extend(_check_mcp(verbose))
     all_results.extend(_check_permissions(verbose))

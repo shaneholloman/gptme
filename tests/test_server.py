@@ -2,6 +2,7 @@ import copy
 import random
 import threading
 import time
+from dataclasses import replace
 from pathlib import Path
 
 import pytest
@@ -11,6 +12,8 @@ flask = pytest.importorskip(
 )
 
 from flask.testing import FlaskClient  # fmt: skip
+
+from gptme.server.openapi_docs import API_VERSION, CONTRACT_REVISION
 
 
 @pytest.fixture
@@ -31,6 +34,9 @@ def test_api_root(client: FlaskClient):
     assert response.status_code == 200
     data = response.get_json()
     assert "message" in data
+    assert data["api_version"] == API_VERSION
+    assert data["contract_revision"] == CONTRACT_REVISION
+    assert response.headers.get("X-API-Version") == str(API_VERSION)
 
 
 def test_api_config_no_project(client: FlaskClient, monkeypatch):
@@ -101,6 +107,64 @@ def test_api_conversation_list_with_limit(client: FlaskClient):
     assert len(data) <= 5
 
 
+def test_api_conversation_list_paginated_cursor_preserves_equal_timestamps(
+    client: FlaskClient, monkeypatch
+):
+    """Composite cursors must not drop conversations at equal-timestamp page boundaries."""
+    import gptme.server.api_v2 as api_v2_module
+    from gptme.logmanager import ConversationMeta
+
+    api_v2_module._invalidate_conversations_cache()
+
+    base = ConversationMeta(
+        id="seed",
+        name="seed",
+        path="/tmp/seed/conversation.jsonl",
+        created=0.0,
+        modified=0.0,
+        messages=1,
+        branches=1,
+        workspace="",
+        agent_name=None,
+        agent_path=None,
+        agent_avatar=None,
+        agent_urls=None,
+        model=None,
+        total_cost=0.0,
+        total_input_tokens=0,
+        total_output_tokens=0,
+        total_cache_read_tokens=0,
+        last_message_role="user",
+        last_message_preview="preview",
+    )
+    conversations = [
+        replace(base, id="c", name="c", modified=99.0),
+        replace(base, id="b", name="b", modified=99.0),
+        replace(base, id="a", name="a", modified=99.0),
+        replace(base, id="d", name="d", modified=98.0),
+    ]
+
+    monkeypatch.setattr(
+        api_v2_module,
+        "get_user_conversations",
+        lambda detail=False: iter(conversations),
+    )
+
+    page1 = client.get("/api/v2/conversations?paginated=1&limit=2")
+    assert page1.status_code == 200
+    page1_data = page1.get_json()
+    assert [item["id"] for item in page1_data["conversations"]] == ["c", "b"]
+    assert page1_data["next_cursor"] == "99|b"
+
+    page2 = client.get(
+        f"/api/v2/conversations?paginated=1&limit=2&cursor={page1_data['next_cursor']}"
+    )
+    assert page2.status_code == 200
+    page2_data = page2.get_json()
+    assert [item["id"] for item in page2_data["conversations"]] == ["a", "d"]
+    assert page2_data["next_cursor"] is None
+
+
 def test_api_conversation_search(client: FlaskClient, tmp_path, monkeypatch):
     """Test that search parameter filters conversations by name."""
 
@@ -167,11 +231,97 @@ def test_api_conversation_search_case_insensitive(
     assert data[0]["id"] == "MySearchConversation"
 
 
+def test_api_conversation_search_q_param(client: FlaskClient, tmp_path, monkeypatch):
+    """Test that the ?q= param filters conversations (primary alias for ?search=)."""
+    monkeypatch.setattr("gptme.logmanager.conversations.get_logs_dir", lambda: tmp_path)
+
+    conv_dir = tmp_path / "q-param-target"
+    conv_dir.mkdir()
+    (conv_dir / "conversation.jsonl").write_text(
+        '{"role": "system", "content": "hello", "timestamp": "2026-01-01T00:00:00"}\n'
+    )
+    other_dir = tmp_path / "other-conversation"
+    other_dir.mkdir()
+    (other_dir / "conversation.jsonl").write_text(
+        '{"role": "system", "content": "hello", "timestamp": "2026-01-01T00:00:00"}\n'
+    )
+
+    response = client.get("/api/v2/conversations?q=q-param-target")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["id"] == "q-param-target"
+
+
+def test_api_conversation_search_q_param_takes_precedence(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """Test that ?q= takes precedence over ?search= when both are provided."""
+    monkeypatch.setattr("gptme.logmanager.conversations.get_logs_dir", lambda: tmp_path)
+
+    conv_dir = tmp_path / "q-wins"
+    conv_dir.mkdir()
+    (conv_dir / "conversation.jsonl").write_text(
+        '{"role": "system", "content": "hello", "timestamp": "2026-01-01T00:00:00"}\n'
+    )
+
+    # q= matches; search= does not — q= should win
+    response = client.get("/api/v2/conversations?q=q-wins&search=no-match-here")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["id"] == "q-wins"
+
+
+def test_api_conversation_search_empty_q_overrides_search(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """Test that explicit empty ?q= overrides ?search= (not a falsy-or fallthrough)."""
+    monkeypatch.setattr("gptme.logmanager.conversations.get_logs_dir", lambda: tmp_path)
+
+    conv_dir = tmp_path / "search-only"
+    conv_dir.mkdir()
+    (conv_dir / "conversation.jsonl").write_text(
+        '{"role": "system", "content": "hello", "timestamp": "2026-01-01T00:00:00"}\n'
+    )
+
+    # ?q= explicitly empty + ?search=search-only: empty q= should win → no filter → returns all
+    response = client.get("/api/v2/conversations?q=&search=search-only")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert isinstance(data, list)
+    # empty q= means "no filter", so all conversations are returned (not just search-only match)
+    assert len(data) >= 1
+
+
 def test_api_conversation_list_detail_flag(client: FlaskClient, tmp_path, monkeypatch):
     """Test that detail=true returns cost/token stats while default (false) zeroes them."""
     import json
 
+    import gptme.server.api_v2 as api_v2_module
+
+    api_v2_module._invalidate_conversations_cache()
+
+    empty_logs_dir = tmp_path / "empty-logs"
+    empty_logs_dir.mkdir()
+
+    # Prime the list cache against a different logs dir first. Without scoping
+    # the cache to the active logs dir, the second request below reuses the
+    # stale empty result instead of scanning the populated tmp_path.
+    monkeypatch.setattr(
+        "gptme.logmanager.conversations.get_logs_dir", lambda: empty_logs_dir
+    )
+    response = client.get("/api/v2/conversations")
+    assert response.status_code == 200
+    assert response.get_json() == []
+
     monkeypatch.setattr("gptme.logmanager.conversations.get_logs_dir", lambda: tmp_path)
+    # Also patch api_v2's own get_logs_dir import used for the conversations cache key.
+    # Without this, prior-test cache data (keyed on the real logs dir) hits when
+    # api_v2.get_logs_dir() still returns the real path even though the scanner uses tmp_path.
+    monkeypatch.setattr("gptme.server.api_v2.get_logs_dir", lambda: tmp_path)
 
     # Create a conversation with an assistant message that carries usage info
     conv_dir = tmp_path / "stats-conversation"
@@ -208,31 +358,390 @@ def test_api_conversation_list_detail_flag(client: FlaskClient, tmp_path, monkey
         "fixture must be > _TAIL_BYTES to trigger fast path"
     )
 
-    # Default (detail=false) should return zeroed stats and omit the message count
+    # Default (detail=false) should return zeroed cost/token stats but keep
+    # the message count and `last_updated` (both come from the cheap tail scan).
     response = client.get("/api/v2/conversations")
     assert response.status_code == 200
     data = response.get_json()
     assert isinstance(data, list)
     assert len(data) == 1
-    assert "messages" not in data[0]
+    # `messages` and `message_count` are stable aliases for the count and are
+    # always populated by the tail scan, regardless of `detail`.
+    assert data[0]["messages"] == len(messages)
+    assert data[0]["message_count"] == len(messages)
+    # `last_updated` is the stable alias for `modified`.
+    assert data[0]["last_updated"] == data[0]["modified"]
+    # Cost/token stats are zeroed in fast mode.
     assert data[0]["total_cost"] == 0.0
     assert data[0]["total_input_tokens"] == 0
+    assert data[0]["total_output_tokens"] == 0
 
-    # detail=true should return actual stats and include the message count
+    # detail=true should return actual cost/token stats alongside the count.
     response = client.get("/api/v2/conversations?detail=true")
     assert response.status_code == 200
     data = response.get_json()
     assert isinstance(data, list)
     assert len(data) == 1
     assert data[0]["messages"] == len(messages)
+    assert data[0]["message_count"] == len(messages)
     assert data[0]["total_cost"] > 0
     assert data[0]["total_input_tokens"] > 0
     assert data[0]["total_output_tokens"] > 0
 
 
+def test_api_conversation_list_cache_tracks_patched_logs_dir(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """Changing the conversations logs dir should bypass stale cached list responses."""
+    import gptme.server.api_v2 as api_v2_module
+
+    first_logs_dir = tmp_path / "logs-a"
+    second_logs_dir = tmp_path / "logs-b"
+    first_logs_dir.mkdir()
+    second_logs_dir.mkdir()
+
+    api_v2_module._invalidate_conversations_cache()
+
+    monkeypatch.setattr(
+        "gptme.logmanager.conversations.get_logs_dir", lambda: first_logs_dir
+    )
+    response = client.get("/api/v2/conversations")
+    assert response.status_code == 200
+    assert response.get_json() == []
+
+    conv_dir = second_logs_dir / "cache-target"
+    conv_dir.mkdir()
+    (conv_dir / "conversation.jsonl").write_text(
+        '{"role": "system", "content": "hello", "timestamp": "2026-01-01T00:00:00"}\n'
+    )
+
+    monkeypatch.setattr(
+        "gptme.logmanager.conversations.get_logs_dir", lambda: second_logs_dir
+    )
+    response = client.get("/api/v2/conversations")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert isinstance(data, list)
+    assert len(data) == 1
+    assert data[0]["id"] == "cache-target"
+
+
+def test_update_conversation_in_cache_partial_update(tmp_path):
+    """_update_conversation_in_cache must refresh one entry without touching others.
+
+    During LLM streaming (many rapid message additions to one conversation),
+    each POST must not wipe the full cache.  The partial-update helper must:
+    1. Keep _conversations_cache not None.
+    2. Update the modified conversation's message count and preview.
+    3. Leave other conversation entries unchanged.
+    """
+    import time
+
+    import gptme.server.api_v2 as api_v2_module
+    from gptme.logmanager import ConversationMeta
+
+    # Set up two minimal conversation files
+    active_dir = tmp_path / "active-conv"
+    other_dir = tmp_path / "other-conv"
+    active_dir.mkdir()
+    other_dir.mkdir()
+    active_file = active_dir / "conversation.jsonl"
+    other_file = other_dir / "conversation.jsonl"
+    active_file.write_text(
+        '{"role": "system", "content": "sys", "timestamp": "2026-01-01T00:00:00"}\n'
+    )
+    other_file.write_text(
+        '{"role": "system", "content": "other", "timestamp": "2026-01-01T00:00:00"}\n'
+    )
+
+    def _make_meta(conv_id: str, conv_file, n_msgs: int) -> ConversationMeta:
+        return ConversationMeta(
+            id=conv_id,
+            name=conv_id,
+            path=str(conv_file),
+            created=0.0,
+            modified=0.0,
+            messages=n_msgs,
+            branches=1,
+            workspace="",
+            agent_name=None,
+            agent_path=None,
+            agent_avatar=None,
+            agent_urls=None,
+            model=None,
+        )
+
+    # Seed the cache as if a GET just happened
+    api_v2_module._conversations_cache = [
+        _make_meta("active-conv", active_file, 1),
+        _make_meta("other-conv", other_file, 1),
+    ]
+    api_v2_module._conversations_cache_logs_dir = tmp_path
+    api_v2_module._conversations_cache_time = time.monotonic()
+
+    # Append a message to the active conversation on disk
+    with active_file.open("a") as f:
+        f.write(
+            '{"role": "user", "content": "streaming msg", "timestamp": "2026-01-01T00:00:01"}\n'
+        )
+
+    # Partial update
+    api_v2_module._update_conversation_in_cache("active-conv")
+
+    # Cache must remain warm
+    assert api_v2_module._conversations_cache is not None
+
+    # Active conv entry must be updated
+    updated_active = next(
+        c for c in api_v2_module._conversations_cache if c.id == "active-conv"
+    )
+    assert updated_active.messages == 2
+    assert updated_active.last_message_role == "user"
+    assert updated_active.last_message_preview is not None
+    assert "streaming msg" in (updated_active.last_message_preview or "")
+
+    # Other conv entry must be untouched
+    other = next(c for c in api_v2_module._conversations_cache if c.id == "other-conv")
+    assert other.messages == 1
+
+
+def test_update_conversation_in_cache_missing_conv_invalidates(tmp_path):
+    """If the conversation is deleted, partial update must fall back to full invalidation."""
+    import time
+
+    import gptme.server.api_v2 as api_v2_module
+    from gptme.logmanager import ConversationMeta
+
+    gone_dir = tmp_path / "gone-conv"
+    gone_dir.mkdir()
+    gone_file = gone_dir / "conversation.jsonl"
+    gone_file.write_text(
+        '{"role": "system", "content": "sys", "timestamp": "2026-01-01T00:00:00"}\n'
+    )
+
+    api_v2_module._conversations_cache = [
+        ConversationMeta(
+            id="gone-conv",
+            name="gone-conv",
+            path=str(gone_file),
+            created=0.0,
+            modified=0.0,
+            messages=1,
+            branches=1,
+            workspace="",
+            agent_name=None,
+            agent_path=None,
+            agent_avatar=None,
+            agent_urls=None,
+            model=None,
+        )
+    ]
+    api_v2_module._conversations_cache_logs_dir = tmp_path
+    api_v2_module._conversations_cache_time = time.monotonic()
+
+    # Delete the conversation file before partial update
+    gone_file.unlink()
+    gone_dir.rmdir()
+
+    api_v2_module._update_conversation_in_cache("gone-conv")
+
+    # Cache must be invalidated so next GET rebuilds without the deleted conv
+    assert api_v2_module._conversations_cache is None
+
+
 def test_api_conversation_get(conv, client: FlaskClient):
     response = client.get(f"/api/v2/conversations/{conv}")
     assert response.status_code == 200
+
+
+def test_api_conversation_get_limit(conv, client: FlaskClient):
+    # Populate with some messages
+    for i in range(5):
+        client.post(
+            f"/api/v2/conversations/{conv}",
+            json={"role": "user", "content": f"msg {i}"},
+        )
+    # Get full count first (no limit)
+    full = client.get(f"/api/v2/conversations/{conv}").get_json()
+    total = len(full["log"])
+    assert total >= 5  # at least our 5 messages
+
+    # Fetch last 2
+    response = client.get(f"/api/v2/conversations/{conv}?limit=2")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data["log"]) == 2
+    assert data["total_messages"] == total
+    assert data["has_more"] is True
+    assert data["before"] == total - 2  # cursor for next older page
+    # Last message must be the last one we posted
+    assert data["log"][-1]["content"] == "msg 4"
+
+
+def test_api_conversation_get_limit_no_more(conv, client: FlaskClient):
+    # Fetch with limit larger than total — gets everything
+    full = client.get(f"/api/v2/conversations/{conv}").get_json()
+    total = len(full["log"])
+
+    response = client.get(f"/api/v2/conversations/{conv}?limit=10000")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data["log"]) == total
+    assert data["total_messages"] == total
+    assert data["has_more"] is False
+    assert "before" not in data
+
+
+def test_api_conversation_get_before_cursor(conv, client: FlaskClient):
+    # Populate with enough messages that we need at least 3 pages of 2
+    for i in range(10):
+        client.post(
+            f"/api/v2/conversations/{conv}",
+            json={"role": "user", "content": f"msg {i}"},
+        )
+    # First page: last 2
+    r1 = client.get(f"/api/v2/conversations/{conv}?limit=2")
+    data1 = r1.get_json()
+    assert data1["has_more"] is True
+    cursor = data1["before"]
+    assert cursor > 0
+
+    # Second page: 2 older messages
+    r2 = client.get(f"/api/v2/conversations/{conv}?limit=2&before={cursor}")
+    data2 = r2.get_json()
+    assert len(data2["log"]) == 2
+    # Page-2 messages must be entirely before page-1 messages (non-overlapping).
+    # Content is deterministic (we posted "msg 0"…"msg 9"), so compare by content.
+    page1_contents = {m["content"] for m in data1["log"]}
+    page2_contents = {m["content"] for m in data2["log"]}
+    assert page1_contents.isdisjoint(page2_contents)
+
+
+def test_api_conversation_get_limit_invalid(conv, client: FlaskClient):
+    for bad in ["notanumber", "0", "-5", "-1"]:
+        response = client.get(f"/api/v2/conversations/{conv}?limit={bad}")
+        assert response.status_code == 400, f"expected 400 for limit={bad}"
+
+
+def test_api_conversation_get_before_invalid(conv, client: FlaskClient):
+    # negative before
+    response = client.get(f"/api/v2/conversations/{conv}?limit=5&before=-1")
+    assert response.status_code == 400
+    # before without limit is not allowed
+    response = client.get(f"/api/v2/conversations/{conv}?before=5")
+    assert response.status_code == 400
+
+
+def test_api_conversation_get_no_pagination_fields_without_limit(
+    conv, client: FlaskClient
+):
+    # Without limit, response must not include pagination fields (backwards compat)
+    client.post(
+        f"/api/v2/conversations/{conv}",
+        json={"role": "user", "content": "hello"},
+    )
+    response = client.get(f"/api/v2/conversations/{conv}")
+    data = response.get_json()
+    assert "has_more" not in data
+    assert "total_messages" not in data
+    assert "before" not in data
+
+
+def test_api_conversation_get_etag_pagination_isolation(conv, client: FlaskClient):
+    # Populate messages
+    for i in range(5):
+        client.post(
+            f"/api/v2/conversations/{conv}",
+            json={"role": "user", "content": f"msg {i}"},
+        )
+
+    full_r = client.get(f"/api/v2/conversations/{conv}")
+    full_etag = full_r.headers["ETag"]
+
+    page1_r = client.get(f"/api/v2/conversations/{conv}?limit=2")
+    page1_etag = page1_r.headers["ETag"]
+
+    cursor = page1_r.get_json()["before"]
+    page2_r = client.get(f"/api/v2/conversations/{conv}?limit=2&before={cursor}")
+    page2_etag = page2_r.headers["ETag"]
+
+    # All three ETags must be distinct — different slices, different validators.
+    assert full_etag != page1_etag
+    assert page1_etag != page2_etag
+
+    # Repeating the same paginated request with its own ETag must return 304.
+    r304 = client.get(
+        f"/api/v2/conversations/{conv}?limit=2",
+        headers={"If-None-Match": page1_etag},
+    )
+    assert r304.status_code == 304
+
+    # Using the full-response ETag for a paginated request must NOT return 304.
+    r200 = client.get(
+        f"/api/v2/conversations/{conv}?limit=2",
+        headers={"If-None-Match": full_etag},
+    )
+    assert r200.status_code == 200
+
+    # Using the full-response ETag for a paginated request must NOT return 304.
+    r200 = client.get(
+        f"/api/v2/conversations/{conv}?limit=2",
+        headers={"If-None-Match": full_etag},
+    )
+    assert r200.status_code == 200
+
+
+def test_api_conversation_get_limit_capped(conv, client: FlaskClient):
+    """limit > 10000 is silently capped to 10000."""
+    for i in range(5):
+        client.post(
+            f"/api/v2/conversations/{conv}",
+            json={"role": "user", "content": f"msg {i}"},
+        )
+    full = client.get(f"/api/v2/conversations/{conv}").get_json()
+    total = len(full["log"])
+
+    # Request limit=99999 — must be capped to 10000 (effectively unlimited for this test)
+    response = client.get(f"/api/v2/conversations/{conv}?limit=99999")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert len(data["log"]) == total  # all messages returned (limit >> total)
+    assert data["total_messages"] == total
+    assert data["has_more"] is False
+
+
+def test_api_conversation_get_before_larger_than_total(conv, client: FlaskClient):
+    """before > total is clamped to total, returning messages before cursor."""
+    for i in range(5):
+        client.post(
+            f"/api/v2/conversations/{conv}",
+            json={"role": "user", "content": f"msg {i}"},
+        )
+    full = client.get(f"/api/v2/conversations/{conv}").get_json()
+    total = len(full["log"])
+
+    # Request limit=2, before=99999 (way past the end)
+    response = client.get(f"/api/v2/conversations/{conv}?limit=2&before=99999")
+    assert response.status_code == 200
+    data = response.get_json()
+    # Should return 2 messages (the last 2, since before clamped to total)
+    assert len(data["log"]) == 2
+    assert data["total_messages"] == total
+    assert data["has_more"] is True  # there ARE older messages
+    cursor = data["before"]
+    assert cursor == total - 2  # total - limit
+
+    # Page back from that cursor — should get 2 more
+    r2 = client.get(f"/api/v2/conversations/{conv}?limit=2&before={cursor}")
+    data2 = r2.get_json()
+    assert len(data2["log"]) == 2
+
+
+def test_api_conversation_get_before_invalid_non_integer(conv, client: FlaskClient):
+    """Non-integer before returns 400."""
+    for bad in ["notanumber", "1.5", ""]:
+        response = client.get(f"/api/v2/conversations/{conv}?limit=5&before={bad}")
+        assert response.status_code == 400, f"expected 400 for before={bad}"
 
 
 def test_api_conversation_post(conv, client: FlaskClient):
@@ -830,3 +1339,163 @@ def test_spa_fallback_api_returns_json(tmp_path: Path):
         # non-api path → SPA fallback serves index.html
         response = c.get("/some/deep/link")
         assert response.status_code == 200
+
+
+# --- Message edit (PATCH) and delete (DELETE) edge cases ---
+
+
+@pytest.fixture
+def conv_with_messages(client: FlaskClient):
+    """Create a conversation with a system message and a user message.
+
+    Returns (convname, user_msg_index) since the server prepends its own
+    system messages so the client-supplied messages don't start at index 0.
+    """
+    convname = f"test-edit-{random.randint(0, 1000000)}"
+    response = client.put(
+        f"/api/v2/conversations/{convname}",
+        json={
+            "messages": [
+                {"role": "system", "content": "you are a test assistant"},
+                {"role": "user", "content": "hello world"},
+            ]
+        },
+    )
+    assert response.status_code == 200
+
+    # Discover the actual index of the first user message (server prepends
+    # its own system messages so the index is not always 0 or 1).
+    r = client.get(f"/api/v2/conversations/{convname}")
+    log = r.get_json().get("log", [])
+    user_indices = [i for i, m in enumerate(log) if m["role"] == "user"]
+    assert user_indices, f"No user message found in log: {log!r}"
+    return convname, user_indices[0]
+
+
+def test_api_v2_edit_message_nonexistent_conversation(client: FlaskClient):
+    """PATCH on a conversation that does not exist returns 404, not 500."""
+    response = client.patch(
+        "/api/v2/conversations/does-not-exist-xyz/messages/0",
+        json={"content": "updated"},
+    )
+    assert response.status_code == 404
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+
+def test_api_v2_edit_message_out_of_range(conv_with_messages, client: FlaskClient):
+    """PATCH with an index beyond the message count returns 404."""
+    convname, _ = conv_with_messages
+    response = client.patch(
+        f"/api/v2/conversations/{convname}/messages/999",
+        json={"content": "updated"},
+    )
+    assert response.status_code == 404
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+
+def test_api_v2_edit_message_no_content_no_truncate(
+    conv_with_messages, client: FlaskClient
+):
+    """PATCH with neither content nor truncate=1 returns 400."""
+    convname, user_idx = conv_with_messages
+    response = client.patch(
+        f"/api/v2/conversations/{convname}/messages/{user_idx}",
+        json={},
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+
+def test_api_v2_edit_message_non_user_message(conv_with_messages, client: FlaskClient):
+    """PATCH to edit a system message (index 0) returns 400."""
+    convname, _ = conv_with_messages
+    response = client.patch(
+        f"/api/v2/conversations/{convname}/messages/0",
+        json={"content": "trying to edit system message"},
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+
+def test_api_v2_edit_message_success(conv_with_messages, client: FlaskClient):
+    """PATCH editing a user message returns 200 with updated content."""
+    convname, user_idx = conv_with_messages
+    response = client.patch(
+        f"/api/v2/conversations/{convname}/messages/{user_idx}",
+        json={"content": "updated message content"},
+    )
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    # Response should contain the updated log
+    assert "log" in data
+
+
+def test_api_v2_delete_message_nonexistent_conversation(client: FlaskClient):
+    """DELETE on a conversation that does not exist returns 404, not 500."""
+    response = client.delete(
+        "/api/v2/conversations/does-not-exist-xyz/messages/0",
+    )
+    assert response.status_code == 404
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+
+def test_api_v2_delete_message_out_of_range(conv_with_messages, client: FlaskClient):
+    """DELETE with an index beyond the message count returns 404."""
+    convname, _ = conv_with_messages
+    response = client.delete(
+        f"/api/v2/conversations/{convname}/messages/999",
+    )
+    assert response.status_code == 404
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+
+def test_api_v2_delete_message_system_message(conv_with_messages, client: FlaskClient):
+    """DELETE of a system message (index 0) returns 400."""
+    convname, _ = conv_with_messages
+    response = client.delete(
+        f"/api/v2/conversations/{convname}/messages/0",
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "error" in data
+
+
+def test_api_v2_delete_message_success(conv_with_messages, client: FlaskClient):
+    """DELETE of a user message returns 200 and removes the message."""
+    convname, user_idx = conv_with_messages
+
+    # Get initial message count
+    r = client.get(f"/api/v2/conversations/{convname}")
+    initial_count = len(r.get_json().get("log", []))
+
+    # Delete the user message
+    response = client.delete(
+        f"/api/v2/conversations/{convname}/messages/{user_idx}",
+    )
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert "log" in data
+
+    # Verify the message was removed
+    r = client.get(f"/api/v2/conversations/{convname}")
+    final_log = r.get_json().get("log", [])
+    assert len(final_log) == initial_count - 1
+    # Verify no message at the deleted index has the original user content
+    assert not any(
+        m["role"] == "user" and m["content"] == "hello world" for m in final_log
+    )

@@ -1,9 +1,11 @@
-import { render, screen, fireEvent } from '@testing-library/react';
+import { render, screen, fireEvent, act } from '@testing-library/react';
 import { ConversationList } from '../ConversationList';
 import '@testing-library/jest-dom';
 import { observable } from '@legendapp/state';
 import type { ConversationSummary } from '@/types/conversation';
 import { TooltipProvider } from '@/components/ui/tooltip';
+import { MemoryRouter } from 'react-router-dom';
+import { conversations$ } from '@/stores/conversations';
 
 // Mock the ApiContext
 const mockDeleteConversation = jest.fn().mockResolvedValue(undefined);
@@ -76,8 +78,13 @@ const createConversation = (overrides: Partial<ConversationSummary> = {}): Conve
 });
 
 // Helper to render with required providers
-const renderWithProviders = (ui: React.ReactElement) => {
-  return render(<TooltipProvider>{ui}</TooltipProvider>);
+const renderWithProviders = (ui: React.ReactElement, { initialSearch = '' } = {}) => {
+  const initialEntries = initialSearch ? [`/?search=${encodeURIComponent(initialSearch)}`] : ['/'];
+  return render(
+    <MemoryRouter initialEntries={initialEntries}>
+      <TooltipProvider>{ui}</TooltipProvider>
+    </MemoryRouter>
+  );
 };
 
 describe('ConversationList', () => {
@@ -89,6 +96,7 @@ describe('ConversationList', () => {
 
   beforeEach(() => {
     jest.clearAllMocks();
+    conversations$.set(new Map());
   });
 
   it('renders conversation items', () => {
@@ -145,6 +153,128 @@ describe('ConversationList', () => {
     expect(titles).toHaveLength(2);
   });
 
+  it('uses list summary counts instead of scanning loaded conversation logs', () => {
+    const conv = createConversation({ id: 'loaded-conv', name: 'Summary Name', messages: 5 });
+    conversations$.set('loaded-conv', {
+      data: {
+        id: 'loaded-conv',
+        name: 'Loaded Name',
+        log: Array.from({ length: 100 }, (_, index) => ({
+          role: 'user',
+          content: `message ${index}`,
+        })),
+        logfile: 'loaded-conv',
+        branches: {},
+        workspace: '/tmp',
+      },
+      isGenerating: false,
+      isConnected: false,
+      connectionStatus: 'disconnected',
+      reconnectAttempt: null,
+      reconnectMaxAttempts: null,
+      reconnectRetryInMs: null,
+      reconnectRetryStartedAt: null,
+      connectionError: null,
+      loadError: null,
+      pendingTool: null,
+      executingTool: null,
+      lastCompletedTool: null,
+      showInitialSystem: false,
+      chatConfig: null,
+      needsInitialStep: false,
+      currentBranch: 'main',
+      logOffset: 0,
+      hasMoreBefore: false,
+      isWindowHydrated: true,
+    });
+
+    renderWithProviders(<ConversationList {...defaultProps} conversations={[conv]} />);
+
+    expect(screen.getByTestId('conversation-title')).toHaveTextContent('Loaded Name');
+    expect(screen.getByText('5')).toBeInTheDocument();
+    expect(screen.queryByText('100')).not.toBeInTheDocument();
+  });
+
+  it('filters conversations by name', () => {
+    const convs = [
+      createConversation({ id: 'conv-1', name: 'Alpha Project' }),
+      createConversation({ id: 'conv-2', name: 'Beta Notes' }),
+    ];
+    renderWithProviders(<ConversationList {...defaultProps} conversations={convs} />);
+    fireEvent.change(screen.getByLabelText('Search conversations'), {
+      target: { value: 'alpha' },
+    });
+
+    // getByText can't find text split across <mark> nodes; use testid + textContent instead
+    const titles = screen.getAllByTestId('conversation-title');
+    expect(titles).toHaveLength(1);
+    expect(titles[0]).toHaveTextContent('Alpha Project');
+    expect(screen.queryByText('Beta Notes')).not.toBeInTheDocument();
+  });
+
+  it('shows an empty state when no conversations match the filter', () => {
+    renderWithProviders(<ConversationList {...defaultProps} />);
+    fireEvent.change(screen.getByLabelText('Search conversations'), {
+      target: { value: 'missing' },
+    });
+
+    expect(screen.getByText('No conversations match your search.')).toBeInTheDocument();
+    expect(screen.queryByTestId('conversation-title')).not.toBeInTheDocument();
+  });
+
+  it('clears the conversation filter', () => {
+    const convs = [
+      createConversation({ id: 'conv-1', name: 'Alpha Project' }),
+      createConversation({ id: 'conv-2', name: 'Beta Notes' }),
+    ];
+    renderWithProviders(<ConversationList {...defaultProps} conversations={convs} />);
+    const searchInput = screen.getByLabelText('Search conversations');
+
+    fireEvent.change(searchInput, { target: { value: 'alpha' } });
+    fireEvent.click(screen.getByLabelText('Clear conversation search'));
+
+    expect(searchInput).toHaveValue('');
+    expect(screen.getByText('Alpha Project')).toBeInTheDocument();
+    expect(screen.getByText('Beta Notes')).toBeInTheDocument();
+  });
+
+  it('focuses the conversation search with Alt+F', () => {
+    renderWithProviders(<ConversationList {...defaultProps} />);
+    const searchInput = screen.getByLabelText('Search conversations');
+
+    fireEvent.keyDown(window, { key: 'f', altKey: true });
+
+    expect(searchInput).toHaveFocus();
+  });
+
+  it('focuses the conversation search with /', () => {
+    renderWithProviders(<ConversationList {...defaultProps} />);
+    const searchInput = screen.getByLabelText('Search conversations');
+
+    fireEvent.keyDown(window, { key: '/' });
+
+    expect(searchInput).toHaveFocus();
+  });
+
+  it('does not focus search when / is pressed while a different input is focused', () => {
+    renderWithProviders(<ConversationList {...defaultProps} />);
+    const searchInput = screen.getByLabelText('Search conversations');
+
+    // Simulate a message input (not the search box) being focused
+    const messageInput = document.createElement('input');
+    document.body.appendChild(messageInput);
+    messageInput.focus();
+    expect(document.activeElement).toBe(messageInput);
+
+    fireEvent.keyDown(window, { key: '/' });
+
+    // Guard must fire: search should not steal focus
+    expect(searchInput).not.toHaveFocus();
+    expect(messageInput).toHaveFocus();
+
+    document.body.removeChild(messageInput);
+  });
+
   it('shows end-of-list message when no more pages', () => {
     renderWithProviders(<ConversationList {...defaultProps} hasNextPage={false} />);
     expect(screen.getByText("You've reached the end of your conversations.")).toBeInTheDocument();
@@ -182,10 +312,105 @@ describe('ConversationList', () => {
     expect(screen.getByText('server-1')).toBeInTheDocument();
   });
 
+  describe('URL search state persistence', () => {
+    it('populates filter from ?search= URL param on mount', () => {
+      const convs = [
+        createConversation({ id: 'conv-1', name: 'Alpha Project' }),
+        createConversation({ id: 'conv-2', name: 'Beta Notes' }),
+      ];
+      renderWithProviders(<ConversationList {...defaultProps} conversations={convs} />, {
+        initialSearch: 'alpha',
+      });
+
+      expect(screen.getByLabelText('Search conversations')).toHaveValue('alpha');
+      // getByText fails when highlightText splits 'Alpha' into a <mark> element;
+      // toHaveTextContent checks the full textContent including child nodes.
+      expect(screen.getByTestId('conversation-title')).toHaveTextContent('Alpha Project');
+      expect(screen.queryByText('Beta Notes')).not.toBeInTheDocument();
+    });
+
+    it('clears URL search when clear button is clicked', async () => {
+      jest.useFakeTimers();
+      const convs = [
+        createConversation({ id: 'conv-1', name: 'Alpha Project' }),
+        createConversation({ id: 'conv-2', name: 'Beta Notes' }),
+      ];
+      renderWithProviders(<ConversationList {...defaultProps} conversations={convs} />, {
+        initialSearch: 'alpha',
+      });
+
+      // Verify initial filter active
+      expect(screen.queryByText('Beta Notes')).not.toBeInTheDocument();
+
+      fireEvent.click(screen.getByLabelText('Clear conversation search'));
+
+      // Local state clears immediately
+      expect(screen.getByLabelText('Search conversations')).toHaveValue('');
+      expect(screen.getByText('Beta Notes')).toBeInTheDocument();
+
+      // Flush the 300ms debounce — verifies the URL param write fires and doesn't corrupt state
+      act(() => jest.runAllTimers());
+      expect(screen.getByLabelText('Search conversations')).toHaveValue('');
+      expect(screen.getByText('Beta Notes')).toBeInTheDocument();
+
+      jest.useRealTimers();
+    });
+  });
+
   // Note: Radix UI ContextMenu requires pointer events that JSDOM doesn't fully support.
   // Context menu functionality (rename, delete, export) is tested via the ConversationSettings
   // component tests and manual testing. The context menu wraps existing functionality that
   // is already tested elsewhere (DeleteConversationConfirmationDialog, exportConversation utils).
+
+  describe('keyboard accessibility', () => {
+    // Resolve the clickable row (role="button") from the nested title element.
+    const getRow = () => {
+      const row = screen.getByTestId('conversation-title').closest('[role="button"]');
+      expect(row).not.toBeNull();
+      return row as HTMLElement;
+    };
+
+    it('exposes the conversation row as a focusable button', () => {
+      renderWithProviders(<ConversationList {...defaultProps} />);
+      const row = getRow();
+      expect(row).toHaveAttribute('role', 'button');
+      expect(row).toHaveAttribute('tabindex', '0');
+    });
+
+    it('selects the conversation on Enter', () => {
+      renderWithProviders(<ConversationList {...defaultProps} />);
+      const row = getRow();
+      fireEvent.keyDown(row, { key: 'Enter' });
+      expect(defaultProps.onSelect).toHaveBeenCalledWith('test-conv-1', undefined);
+    });
+
+    it('selects the conversation on Space', () => {
+      renderWithProviders(<ConversationList {...defaultProps} />);
+      const row = getRow();
+      fireEvent.keyDown(row, { key: ' ' });
+      expect(defaultProps.onSelect).toHaveBeenCalledWith('test-conv-1', undefined);
+    });
+
+    it('reflects selection state via aria-pressed', () => {
+      const selectedId$ = observable<string | null>('test-conv-1');
+      renderWithProviders(<ConversationList {...defaultProps} selectedId$={selectedId$} />);
+      expect(getRow()).toHaveAttribute('aria-pressed', 'true');
+    });
+
+    it('does not select when Enter is pressed on a nested child element', () => {
+      renderWithProviders(<ConversationList {...defaultProps} />);
+      const title = screen.getByTestId('conversation-title');
+      fireEvent.keyDown(title, { key: 'Enter' });
+      expect(defaultProps.onSelect).not.toHaveBeenCalled();
+    });
+
+    it('does not select when Space is pressed on a nested child element', () => {
+      renderWithProviders(<ConversationList {...defaultProps} />);
+      const title = screen.getByTestId('conversation-title');
+      fireEvent.keyDown(title, { key: ' ' });
+      expect(defaultProps.onSelect).not.toHaveBeenCalled();
+    });
+  });
 
   describe('date group headers', () => {
     it('renders date group headers for conversations', () => {

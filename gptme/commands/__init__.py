@@ -19,11 +19,13 @@ from .. import llm as _llm  # noqa: F401
 # Import command modules to register their commands
 from . import (  # noqa: F401
     account,
+    backtrack,
     checkpoint,
     export,
     llm,
     meta,
     session,
+    snapshot,
 )
 
 # Re-export core types and functions from base

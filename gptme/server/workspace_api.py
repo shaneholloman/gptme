@@ -2,6 +2,7 @@
 Workspace API endpoints for browsing files in conversation workspaces.
 """
 
+import errno
 import logging
 import mimetypes
 from dataclasses import dataclass
@@ -158,11 +159,21 @@ def safe_workspace_path(workspace: Path, path: str | None = None) -> Path:
         Resolved absolute path, guaranteed to be within workspace
 
     Raises:
-        ValueError: If path would escape workspace
+        ValueError: If path would escape workspace, or if path is too long
     """
     workspace = workspace.resolve()
     if not path:
         return workspace
+
+    # Validate path length to prevent ENAMETOOLONG (OSError 36) crashes
+    # NAME_MAX is typically 255 bytes per component on Linux
+    for component in path.split("/"):
+        if len(component.encode()) > 255:
+            raise ValueError(f"Path component too long: '{component[:50]}...'")
+
+    # Also check total path length against PATH_MAX (4096 typical)
+    if len(path.encode()) > 4096:
+        raise ValueError(f"Path too long ({len(path.encode())} bytes)")
 
     # Resolve the full path
     full_path = (workspace / path).resolve()
@@ -305,6 +316,11 @@ def browse_workspace(conversation_id: str, subpath: str | None = None):
         return flask.jsonify({"error": str(e)}), 400
     except FileNotFoundError:
         return flask.jsonify({"error": "File not found"}), 404
+    except OSError as e:
+        if e.errno == errno.ENAMETOOLONG:
+            return flask.jsonify({"error": str(e)}), 400
+        logger.exception("Error browsing workspace")
+        return flask.jsonify({"error": "Internal server error"}), 500
     except Exception as e:
         logger.exception("Error browsing workspace")
         return flask.jsonify({"error": str(e)}), 500
@@ -481,6 +497,11 @@ def serve_conversation_file(conversation_id: str, filepath: str):
         return flask.jsonify({"error": "File not found"}), 404
     except ValueError as e:
         return flask.jsonify({"error": str(e)}), 400
+    except OSError as e:
+        if e.errno == errno.ENAMETOOLONG:
+            return flask.jsonify({"error": str(e)}), 400
+        logger.exception("Error serving conversation file")
+        return flask.jsonify({"error": "Internal server error"}), 500
     except Exception as e:
         logger.exception("Error serving conversation file")
         return flask.jsonify({"error": str(e)}), 500
@@ -563,6 +584,11 @@ def preview_file(conversation_id: str, filepath: str):
         return flask.jsonify({"error": str(e)}), 400
     except FileNotFoundError:
         return flask.jsonify({"error": "File not found"}), 404
+    except OSError as e:
+        if e.errno == errno.ENAMETOOLONG:
+            return flask.jsonify({"error": str(e)}), 400
+        logger.exception("Error previewing file")
+        return flask.jsonify({"error": "Internal server error"}), 500
     except Exception as e:
         logger.exception("Error previewing file")
         return flask.jsonify({"error": str(e)}), 500
@@ -625,6 +651,11 @@ def download_file(conversation_id: str, filepath: str):
         return flask.jsonify({"error": str(e)}), 400
     except FileNotFoundError:
         return flask.jsonify({"error": "File not found"}), 404
+    except OSError as e:
+        if e.errno == errno.ENAMETOOLONG:
+            return flask.jsonify({"error": str(e)}), 400
+        logger.exception("Error downloading file")
+        return flask.jsonify({"error": "Internal server error"}), 500
     except Exception as e:
         logger.exception("Error downloading file")
         return flask.jsonify({"error": str(e)}), 500

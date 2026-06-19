@@ -3,6 +3,7 @@ import { use$ } from '@legendapp/state/react';
 import { useApi } from '@/contexts/ApiContext';
 import { providerHealth$ } from '@/stores/providerHealth';
 import type { ProviderHealthResponse } from '@/stores/providerHealth';
+import { isDemoMode } from '@/utils/connectionConfig';
 
 export const POLL_INTERVAL_MS = 30_000;
 
@@ -14,9 +15,16 @@ export const POLL_INTERVAL_MS = 30_000;
 export function useProviderHealth(poll = false) {
   const { api } = useApi();
   const intervalRef = useRef<ReturnType<typeof setInterval> | null>(null);
+  const demoMode = isDemoMode();
 
   const fetchHealth = useCallback(
     async (force = false) => {
+      if (demoMode) {
+        providerHealth$.data.set({ providers: {} });
+        providerHealth$.isLoading.set(false);
+        providerHealth$.error.set(null);
+        return;
+      }
       providerHealth$.isLoading.set(true);
       providerHealth$.error.set(null);
       try {
@@ -39,12 +47,12 @@ export function useProviderHealth(poll = false) {
         providerHealth$.isLoading.set(false);
       }
     },
-    [api.authHeader, api.baseUrl]
+    [api.authHeader, api.baseUrl, demoMode]
   );
 
   useEffect(() => {
     void fetchHealth();
-    if (poll) {
+    if (!demoMode && poll) {
       intervalRef.current = setInterval(() => void fetchHealth(), POLL_INTERVAL_MS);
     }
     return () => {
@@ -53,7 +61,7 @@ export function useProviderHealth(poll = false) {
         intervalRef.current = null;
       }
     };
-  }, [fetchHealth, poll]);
+  }, [demoMode, fetchHealth, poll]);
 
   const data = use$(providerHealth$.data);
   const isLoading = use$(providerHealth$.isLoading);

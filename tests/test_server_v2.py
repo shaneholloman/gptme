@@ -3,6 +3,7 @@ import json
 import random
 import time
 import unittest.mock
+import uuid
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Any, cast
@@ -36,7 +37,13 @@ def create_conversation(client: FlaskClient, config: ChatConfig | None = None):
     }
 
     if config:
-        json["config"] = config.to_dict()
+        config_dict = config.to_dict()
+        # Strip workspace from the serialized config: the server security check
+        # rejects external workspace paths (path traversal fix). Tests that pass
+        # a config only care about model/tools/system_prompt, not the workspace;
+        # the server will apply the safe @log default.
+        config_dict.get("chat", {}).pop("workspace", None)
+        json["config"] = config_dict
 
     response = client.put(
         f"/api/v2/conversations/{convname}",
@@ -1248,6 +1255,106 @@ def test_v2_conversations_list(client: FlaskClient):
     assert isinstance(data, list)
 
 
+def test_v2_conversations_list_exposes_message_count_and_last_updated(
+    client: FlaskClient,
+):
+    """Fast-mode (default) list response must include ``message_count`` and
+    ``last_updated`` aliases for the webui stats badge. Both come from the
+    cheap tail-only scan and are stable aliases for the legacy ``messages``
+    and ``modified`` fields.
+    """
+    # Create a conversation with a non-test prefix so it isn't filtered out
+    # by the user-facing list endpoint (which skips ``test-`` and ``tmp`` prefixes).
+    convname = f"msglist-shape-{random.randint(0, 1000000)}"
+    put_response = client.put(
+        f"/api/v2/conversations/{convname}",
+        json={"prompt": "You are an AI assistant for testing."},
+    )
+    assert put_response.status_code == 200
+
+    response = client.get("/api/v2/conversations")
+    assert response.status_code == 200
+    data = response.get_json()
+    assert isinstance(data, list)
+    matching = [c for c in data if c["id"] == convname]
+    assert matching, f"created conversation {convname} not in list"
+    for item in matching:
+        assert "message_count" in item
+        assert "last_updated" in item
+        assert isinstance(item["message_count"], int)
+        assert isinstance(item["last_updated"], int | float)
+        # Stable aliases mirror the legacy fields.
+        assert item["message_count"] == item["messages"]
+        assert item["last_updated"] == item["modified"]
+
+
+def test_v2_conversations_list_keeps_messages_in_fast_mode(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """Regression: ``messages`` (the count) must remain in the fast-mode
+    response. A previous bug stripped it via ``item.pop("messages", None)``,
+    which broke webui stats that read either ``messages`` or the new
+    ``message_count`` alias.
+    """
+    # Create a real conversation with a non-test prefix so it isn't filtered
+    # out by ``_is_test_conversation_id`` (``test-`` and ``tmp`` prefixes are
+    # skipped by the user-facing list endpoint).
+    convname = f"msglist-{random.randint(0, 1000000)}"
+    response = client.put(
+        f"/api/v2/conversations/{convname}",
+        json={"prompt": "You are an AI assistant for testing."},
+    )
+    assert response.status_code == 200
+
+    response = client.get("/api/v2/conversations")
+    assert response.status_code == 200
+    data = response.get_json()
+    matching = [c for c in data if c["id"] == convname]
+    assert matching, f"created conversation {convname} not in list"
+    item = matching[0]
+    assert "messages" in item, "fast-mode response must keep `messages` (count)"
+    assert "message_count" in item, (
+        "fast-mode response must include `message_count` alias"
+    )
+    assert "last_updated" in item, (
+        "fast-mode response must include `last_updated` alias"
+    )
+    assert "modified" in item, "fast-mode response must keep `modified`"
+    assert item["messages"] == item["message_count"]
+    assert item["modified"] == item["last_updated"]
+    assert item["message_count"] >= 1  # at least the system prompt
+
+
+def test_v2_conversations_list_keeps_messages_on_cache_hit(client: FlaskClient):
+    """Regression: cached fast-mode responses must preserve ``messages``."""
+    convname = f"msglist-cache-hit-{random.randint(0, 1000000)}"
+    response = client.put(
+        f"/api/v2/conversations/{convname}",
+        json={"prompt": "You are an AI assistant for testing."},
+    )
+    assert response.status_code == 200
+
+    response = client.get("/api/v2/conversations")
+    assert response.status_code == 200
+
+    response = client.get("/api/v2/conversations")
+    assert response.status_code == 200
+    data = response.get_json()
+    matching = [c for c in data if c["id"] == convname]
+    assert matching, f"created conversation {convname} not in cached list"
+    item = matching[0]
+    assert "messages" in item, "cached fast-mode response must keep `messages`"
+    assert "message_count" in item, (
+        "cached fast-mode response must include `message_count` alias"
+    )
+    assert "last_updated" in item, (
+        "cached fast-mode response must include `last_updated` alias"
+    )
+    assert "modified" in item, "cached fast-mode response must keep `modified`"
+    assert item["messages"] == item["message_count"]
+    assert item["modified"] == item["last_updated"]
+
+
 def test_v2_conversation_get(v2_conv, client: FlaskClient):
     """Test getting a V2 conversation."""
     conversation_id = v2_conv["conversation_id"]
@@ -1307,10 +1414,12 @@ def test_v2_create_conversation_default_system_prompt(
     )
 
     convname = f"test-server-v2-{random.randint(0, 1000000)}"
+    # Use the default @log workspace (workspace containment requires workspace
+    # to be inside the conversation logdir; external paths like tmp_path are
+    # rejected since the security fix for path traversal via config).
     response = client.put(
         f"/api/v2/conversations/{convname}",
         json={
-            "config": {"chat": {"workspace": str(tmp_path)}},
             "messages": [
                 {
                     "role": "user",
@@ -1322,6 +1431,14 @@ def test_v2_create_conversation_default_system_prompt(
     )
     assert response.status_code == 200
     conversation_id = response.get_json()["conversation_id"]
+
+    # Fetch the config to learn the actual resolved workspace path (@log -> logdir/workspace)
+    config_resp = client.get(f"/api/v2/conversations/{conversation_id}/config")
+    assert config_resp.status_code == 200
+    from gptme.config.chat import ChatConfig  # fmt: skip
+
+    conv_config = ChatConfig.from_dict(config_resp.get_json())
+    actual_workspace = conv_config.workspace
 
     response = client.get(f"/api/v2/conversations/{conversation_id}")
     assert response.status_code == 200
@@ -1343,7 +1460,7 @@ def test_v2_create_conversation_default_system_prompt(
         tool_format="markdown",
         model=None,
         prompt="full",
-        workspace=tmp_path,
+        workspace=actual_workspace,
     )
     assert data["log"][0]["content"] == prompt_msgs[0].content
 
@@ -1737,8 +1854,11 @@ def test_v2_chat_config_update_works(client: FlaskClient):
     ) == _normalize_config_for_comparison(input_config.to_dict())
 
     input_config.model = "openai/gpt-4o-mini"
+    updated_config_dict = input_config.to_dict()
+    # Strip workspace: server security check rejects external paths (path traversal fix).
+    updated_config_dict.get("chat", {}).pop("workspace", None)
     response = client.patch(
-        f"/api/v2/conversations/{conversation_id}/config", json=input_config.to_dict()
+        f"/api/v2/conversations/{conversation_id}/config", json=updated_config_dict
     )
     assert response.status_code == 200
 
@@ -1928,6 +2048,26 @@ def test_v2_chat_config_patch_validates_tools_before_init(
     assert response.status_code == 400
     data = response.get_json()
     assert expected_error in data["error"]
+
+
+@pytest.mark.parametrize(
+    "bad_model",
+    [12345, 3.14, True, ["gpt-4"], {"name": "gpt-4"}],
+)
+def test_v2_chat_config_patch_rejects_non_string_model(
+    client: FlaskClient, bad_model: object
+):
+    """Config PATCH should reject non-string model values with 400 not 500."""
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+
+    response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/config",
+        json={"chat": {"model": bad_model}},
+    )
+
+    assert response.status_code == 400
+    assert "model must be a string" in response.get_json()["error"]
 
 
 def test_v2_chat_config_patch_rejected_during_generation(client: FlaskClient):
@@ -2197,6 +2337,84 @@ def test_v2_message_file_uris_reject_file_scheme(client: FlaskClient, endpoint_b
     conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
     assert conversation is not None
     assert conversation["log"][user_index].get("files") is None
+
+
+def test_v2_fork_conversation_from_message(client: FlaskClient):
+    """Forking should create a new conversation with messages up to the selected index."""
+    conversation_id = create_conversation(client)["conversation_id"]
+    client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "user", "content": "First question"},
+    )
+    client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "assistant", "content": "First answer"},
+    )
+    client.post(
+        f"/api/v2/conversations/{conversation_id}",
+        json={"role": "user", "content": "Second question"},
+    )
+
+    source = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    assert source is not None
+    fork_index = len(source["log"]) - 2
+
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}/fork?after_message={fork_index}"
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["status"] == "ok"
+    assert data["conversation_id"] != conversation_id
+    assert data["session_id"]
+
+    forked = client.get(f"/api/v2/conversations/{data['conversation_id']}").get_json()
+    assert forked is not None
+    assert forked["name"] == f"Fork of {conversation_id} @ msg {fork_index + 1}"
+    assert [msg["content"] for msg in forked["log"]] == [
+        msg["content"] for msg in source["log"][: fork_index + 1]
+    ]
+    assert [msg["role"] for msg in forked["log"]] == [
+        msg["role"] for msg in source["log"][: fork_index + 1]
+    ]
+
+
+def test_v2_fork_conversation_rejects_out_of_range_index(client: FlaskClient):
+    """Out-of-range fork indexes are bad requests, not missing conversations."""
+    conversation_id = create_conversation(client)["conversation_id"]
+
+    response = client.post(
+        f"/api/v2/conversations/{conversation_id}/fork?after_message=999"
+    )
+
+    assert response.status_code == 400
+    assert "out of range" in response.get_json()["error"]
+
+
+def test_copy_messages_for_fork_copies_only_referenced_attachments(tmp_path: Path):
+    """Forking should not copy attachments excluded from the retained message slice."""
+    from gptme.message import Message  # fmt: skip
+    from gptme.server.api_v2 import _copy_messages_for_fork  # fmt: skip
+
+    source_logdir = tmp_path / "source"
+    dest_logdir = tmp_path / "fork"
+    source_attachments = source_logdir / "attachments"
+    source_attachments.mkdir(parents=True)
+    (source_attachments / "keep.txt").write_text("keep", encoding="utf-8")
+    (source_attachments / "skip.txt").write_text("skip", encoding="utf-8")
+
+    copied = _copy_messages_for_fork(
+        [Message("user", "Keep this file", files=[Path("attachments/keep.txt")])],
+        source_logdir,
+        dest_logdir,
+    )
+
+    assert copied[0].files == [dest_logdir / "attachments" / "keep.txt"]
+    fork_attachments = dest_logdir / "attachments"
+    assert (fork_attachments / "keep.txt").read_text(encoding="utf-8") == "keep"
+    assert not (fork_attachments / "skip.txt").exists()
 
 
 def test_v2_edit_message_rejects_non_string_content(client: FlaskClient):
@@ -2610,6 +2828,48 @@ def test_v2_create_conversation_message_not_object(client: FlaskClient):
     data = response.get_json()
     assert data is not None
     assert "object" in data["error"].lower()
+
+
+def test_v2_create_conversation_preserves_message_files(client: FlaskClient):
+    """PUT /conversations/<id> must preserve the 'files' field in initial messages."""
+    conv_id = f"test-msg-files-{uuid.uuid4().hex[:8]}"
+    uri = "https://example.com/image.png"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={
+            "prompt": "none",
+            "messages": [{"role": "user", "content": "hello", "files": [uri]}],
+        },
+    )
+    assert response.status_code == 200
+
+    conversation = client.get(f"/api/v2/conversations/{conv_id}").get_json()
+    assert conversation is not None
+    user_msgs = [m for m in conversation["log"] if m["role"] == "user"]
+    assert len(user_msgs) == 1
+    assert user_msgs[0]["files"] == [uri]
+
+
+@pytest.mark.parametrize(
+    "files_payload",
+    ["not-a-list", 42, {"key": "val"}, [1, 2, 3], [None]],
+)
+def test_v2_create_conversation_rejects_invalid_message_files(
+    client: FlaskClient, files_payload: object
+):
+    """PUT /conversations/<id> must reject non-list or non-string-list 'files' with 400."""
+    conv_id = f"test-msg-bad-files-{uuid.uuid4().hex[:8]}"
+    response = client.put(
+        f"/api/v2/conversations/{conv_id}",
+        json={
+            "prompt": "none",
+            "messages": [{"role": "user", "content": "hello", "files": files_payload}],
+        },
+    )
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "files" in data["error"].lower()
 
 
 @pytest.mark.parametrize("body", [[], [1, 2, 3], "string", 42])

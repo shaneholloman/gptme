@@ -8,6 +8,7 @@ Command groups are split into separate modules for maintainability:
 - cmd_mcp.py: MCP server management (list, test, info, search)
 - cmd_batch.py: Batch runner for stdin prompts as fresh non-interactive sessions
 - cmd_skills.py: Skills and lessons (list, show, search, install, validate, etc.)
+- cmd_snapshot.py: Workspace snapshot management (list snapshots outside a session)
 
 Inline command groups (smaller, live in this file):
 - context: RAG index/retrieve plus workspace/git/journal context generation
@@ -48,7 +49,9 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
     "chats": (".cmd_chats", "chats"),
     "hooks": (".cmd_hooks", "hooks"),
     "mcp": (".cmd_mcp", "mcp"),
+    "resume": (".cmd_resume", "resume"),
     "skills": (".cmd_skills", "skills"),
+    "snapshot": (".cmd_snapshot", "snapshot"),
     "status": (".cmd_status", "status"),
 }
 
@@ -262,17 +265,20 @@ def tokens():
 @click.option(
     "-f",
     "--file",
-    type=click.Path(exists=True, dir_okay=False),
-    help="File to count tokens in.",
+    type=click.Path(exists=True, dir_okay=False, allow_dash=True),
+    help="File to count tokens in. Use '-' to read from stdin.",
 )
 def tokens_count(text: str | None, model: str, file: str | None):
     """Count tokens in text or file."""
     import tiktoken  # fmt: skip
 
-    # Get text from file if specified
+    # Get text from file if specified (or stdin via "-")
     if file:
-        with open(file) as f:
-            text = f.read()
+        if file == "-":
+            text = sys.stdin.read()
+        else:
+            with open(file) as f:
+                text = f.read()
     elif text == "-":
         text = sys.stdin.read()
 
@@ -594,8 +600,33 @@ def llm():
     show_default=True,
     help="System message to prepend.",
 )
+@click.option(
+    "--max-tokens",
+    type=int,
+    default=None,
+    help="Maximum number of tokens to generate.",
+)
+@click.option(
+    "--temperature",
+    type=float,
+    default=None,
+    help="Sampling temperature (0.0=deterministic, higher=more creative). Range: 0.0–2.0.",
+)
+@click.option(
+    "--output-format",
+    type=click.Choice(["text", "json"], case_sensitive=False),
+    default="text",
+    show_default=True,
+    help="Output format: 'text' (default) or 'json' (includes model and usage metadata). Incompatible with --stream.",
+)
 def llm_generate(
-    prompt: str | None, model: str | None, stream: bool, system_prompt: str
+    prompt: str | None,
+    model: str | None,
+    stream: bool,
+    system_prompt: str,
+    max_tokens: int | None,
+    temperature: float | None,
+    output_format: str,
 ):
     """Generate a response from an LLM without any formatting."""
 
@@ -616,10 +647,16 @@ def llm_generate(
         print("Error: Empty prompt provided.", file=sys.stderr)
         sys.exit(1)
 
-    # Validate empty model before initialization (before redirect_stderr
-    # so Click can print the UsageError to real stderr, not the captured sink)
+    # Validate parameters before initialization (before redirect_stderr
+    # so Click can print errors to real stderr, not the captured sink)
     if model is not None and not model.strip():
         raise click.UsageError("Model name cannot be empty.")
+    if max_tokens is not None and max_tokens <= 0:
+        raise click.UsageError("--max-tokens must be a positive integer.")
+    if temperature is not None and not (0.0 <= temperature <= 2.0):
+        raise click.UsageError("--temperature must be between 0.0 and 2.0.")
+    if output_format == "json" and stream:
+        raise click.UsageError("--output-format json is incompatible with --stream.")
 
     # Capture stderr to suppress console output during initialization
     stderr_capture = io.StringIO()
@@ -667,12 +704,29 @@ def llm_generate(
     try:
         if stream:
             # Stream response directly to stdout
-            for chunk in _stream(messages, model, None):
+            for chunk in _stream(
+                messages, model, None, max_tokens=max_tokens, temperature=temperature
+            ):
                 print(chunk, end="", flush=True)
             print()  # Final newline
+        elif output_format == "json":
+            # Return structured JSON with content and metadata
+            response, metadata = _chat_complete(
+                messages, model, None, max_tokens=max_tokens, temperature=temperature
+            )
+            result: dict = {
+                "content": response,
+                "model": (metadata.get("model") if metadata else None) or model,
+                "usage": dict(metadata["usage"])
+                if metadata and "usage" in metadata
+                else None,
+            }
+            print(json.dumps(result))
         else:
-            # Get complete response and print it
-            response, _ = _chat_complete(messages, model, None)
+            # Get complete response and print it (plain text)
+            response, _ = _chat_complete(
+                messages, model, None, max_tokens=max_tokens, temperature=temperature
+            )
             print(response)
     except Exception as e:
         print(f"Error generating response: {e}", file=sys.stderr)
@@ -838,7 +892,7 @@ def tools_call(tool_name: str, function_name: str, arg: list[str]):
         sys.exit(1)
 
     function = (
-        [f for f in tool.functions if f.__name__ == function_name] or None
+        [f for f in tool.functions if f.name == function_name] or None
         if tool.functions
         else None
     )
@@ -861,7 +915,7 @@ def tools_call(tool_name: str, function_name: str, arg: list[str]):
         print(f"Function '{function_name}' not found in tool '{tool_name}'.")
         print("Available functions:")
         for f in tool.functions:
-            print(f"- {f.__name__}")
+            print(f"- {f.name}")
         sys.exit(1)
     else:
         # Parse arguments into a dictionary, ensuring proper typing
@@ -876,7 +930,7 @@ def tools_call(tool_name: str, function_name: str, arg: list[str]):
             key, value = arg_str.split("=", 1)
             kwargs[key] = value
         try:
-            return_val = function[0](**kwargs)
+            return_val = function[0].fn(**kwargs)
             print(return_val)
         except TypeError as e:
             click.echo(f"Error calling function: {e}", err=True)
@@ -958,24 +1012,31 @@ def models_list(
 
     if as_json:
         # Keep JSON output machine-readable even if provider discovery logs warnings.
-        with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
-            from ..llm import list_available_providers  # fmt: skip
+        # redirect_stdout/redirect_stderr suppresses print() noise; logging.disable
+        # suppresses Rich-formatted log output (httpx retry messages etc.) that escapes
+        # through Rich's pre-captured file handle and is not affected by sys.stderr redirect.
+        logging.disable(logging.INFO)
+        try:
+            with redirect_stdout(io.StringIO()), redirect_stderr(io.StringIO()):
+                from ..llm import list_available_providers  # fmt: skip
 
-            configured = (
-                {
-                    configured_provider
-                    for configured_provider, _ in list_available_providers()
-                }
-                if available
-                else None
-            )
-            models = get_model_list(
-                provider_filter=provider,
-                vision_only=vision,
-                reasoning_only=reasoning,
-                include_deprecated=include_deprecated,
-                dynamic_fetch=True,
-            )
+                configured = (
+                    {
+                        configured_provider
+                        for configured_provider, _ in list_available_providers()
+                    }
+                    if available
+                    else None
+                )
+                models = get_model_list(
+                    provider_filter=provider,
+                    vision_only=vision,
+                    reasoning_only=reasoning,
+                    include_deprecated=include_deprecated,
+                    dynamic_fetch=True,
+                )
+        finally:
+            logging.disable(logging.NOTSET)
         if configured is not None:
             models = [model for model in models if model.provider_key in configured]
         click.echo(json.dumps([model_to_dict(model) for model in models], indent=2))

@@ -286,6 +286,33 @@ export function SettingsContent({
               </div>
             )}
 
+            <Separator />
+
+            <div className="space-y-2">
+              <Label htmlFor="stt-engine" className="text-sm">
+                Speech-to-text engine
+              </Label>
+              <p className="text-xs text-muted-foreground">
+                Choose which engine transcribes your microphone input for dictation.
+              </p>
+              <Select
+                value={settings.sttProvider}
+                onValueChange={(value: 'browser' | 'server') =>
+                  updateSettings({ sttProvider: value })
+                }
+              >
+                <SelectTrigger id="stt-engine" className="w-full">
+                  <SelectValue placeholder="Select STT engine" />
+                </SelectTrigger>
+                <SelectContent>
+                  <SelectItem value="browser">Browser (SpeechRecognition API)</SelectItem>
+                  <SelectItem value="server">Server (OpenRouter / API)</SelectItem>
+                </SelectContent>
+              </Select>
+            </div>
+
+            <Separator />
+
             <div className="space-y-2">
               <Label htmlFor="voice-server-url" className="text-sm">
                 Voice server URL
@@ -319,10 +346,11 @@ export function SettingsContent({
             <div className="flex items-center justify-between">
               <div className="space-y-0.5">
                 <Label htmlFor="blocks-toggle" className="text-sm">
-                  Code blocks open by default
+                  Expand tool blocks by default
                 </Label>
                 <p className="text-xs text-muted-foreground">
-                  Whether code blocks are expanded when first shown
+                  By default, tool-use and output blocks are collapsed and code is shown. Enable to
+                  expand every block.
                 </p>
               </div>
               <Switch
@@ -330,6 +358,29 @@ export function SettingsContent({
                 checked={settings.blocksDefaultOpen}
                 onCheckedChange={(checked) => updateSettings({ blocksDefaultOpen: checked })}
               />
+            </div>
+
+            <Separator />
+
+            <div className="space-y-4">
+              <h4 className="text-sm font-medium">Tool Execution</h4>
+
+              <div className="flex items-center justify-between">
+                <div className="space-y-0.5">
+                  <Label htmlFor="no-confirm-toggle" className="text-sm">
+                    No-confirm mode
+                  </Label>
+                  <p className="text-xs text-muted-foreground">
+                    Auto-confirm all tool execution prompts without asking (equivalent to{' '}
+                    <code className="font-mono">--no-confirm</code> in the CLI)
+                  </p>
+                </div>
+                <Switch
+                  id="no-confirm-toggle"
+                  checked={settings.noConfirmMode}
+                  onCheckedChange={(checked) => updateSettings({ noConfirmMode: checked })}
+                />
+              </div>
             </div>
 
             <Separator />

@@ -3,6 +3,8 @@ import { useSpeechToText } from '../useSpeechToText';
 
 const transcribeAudio = jest.fn();
 const useUserSettingsMock = jest.fn();
+const useSettingsMock = jest.fn();
+const fetchMock = jest.fn();
 
 jest.mock('@/contexts/ApiContext', () => ({
   useApi: () => ({
@@ -14,6 +16,10 @@ jest.mock('@/contexts/ApiContext', () => ({
 
 jest.mock('@/hooks/useUserSettings', () => ({
   useUserSettings: () => useUserSettingsMock(),
+}));
+
+jest.mock('@/contexts/SettingsContext', () => ({
+  useSettings: () => useSettingsMock(),
 }));
 
 class MockMediaStream {
@@ -66,9 +72,25 @@ beforeEach(() => {
     error: null,
     refetch: jest.fn(),
   });
+  useSettingsMock.mockReset();
+  useSettingsMock.mockReturnValue({
+    settings: { sttProvider: 'browser' },
+    updateSettings: jest.fn(),
+    resetSettings: jest.fn(),
+  });
   transcribeAudio.mockResolvedValue({
     text: 'server transcript',
     model: 'openai/whisper-1',
+  });
+  fetchMock.mockReset();
+  fetchMock.mockResolvedValue({
+    ok: true,
+    json: jest.fn().mockResolvedValue({ text: 'cloud transcript' }),
+  });
+  Object.defineProperty(globalThis, 'fetch', {
+    configurable: true,
+    writable: true,
+    value: fetchMock,
   });
 
   Object.defineProperty(window, 'MediaRecorder', {
@@ -109,6 +131,122 @@ describe('useSpeechToText', () => {
     expect(result.current.isSupported).toBe(false);
   });
 
+  it('reports supported when browser STT is available and server mode is configured', () => {
+    useSettingsMock.mockReturnValue({
+      settings: { sttProvider: 'server' },
+      updateSettings: jest.fn(),
+      resetSettings: jest.fn(),
+    });
+    // Simulate SpeechRecognition being available
+    class MockSpeechRecognition {
+      continuous = false;
+      interimResults = false;
+      lang = '';
+      onstart: (() => void) | null = null;
+      onresult: ((event: unknown) => void) | null = null;
+      onerror: ((event: unknown) => void) | null = null;
+      onend: (() => void) | null = null;
+      start = jest.fn();
+      stop = jest.fn();
+      abort = jest.fn();
+    }
+    (window as Window & { SpeechRecognition?: unknown }).SpeechRecognition = MockSpeechRecognition;
+
+    const { result } = renderHook(() => useSpeechToText());
+
+    // isSupported should be true because browser STT is available (even though user prefers server)
+    expect(result.current.isSupported).toBe(true);
+  });
+
+  it('uses server STT when sttProvider is set to server and browser STT is available', async () => {
+    useSettingsMock.mockReturnValue({
+      settings: { sttProvider: 'server' },
+      updateSettings: jest.fn(),
+      resetSettings: jest.fn(),
+    });
+    // Make SpeechRecognition available (normally would use browser path)
+    class MockSpeechRecognition {
+      continuous = false;
+      interimResults = false;
+      lang = '';
+      onstart: (() => void) | null = null;
+      onresult: ((event: unknown) => void) | null = null;
+      onerror: ((event: unknown) => void) | null = null;
+      onend: (() => void) | null = null;
+      start = jest.fn();
+      stop = jest.fn();
+      abort = jest.fn();
+    }
+    (window as Window & { SpeechRecognition?: unknown }).SpeechRecognition = MockSpeechRecognition;
+
+    const handler = jest.fn();
+    const { result } = renderHook(() => useSpeechToText());
+
+    act(() => {
+      result.current.onFinalResult(handler);
+      result.current.startListening();
+    });
+
+    // Should use the server recording path despite browser STT being available
+    expect(result.current.state).toBe('listening');
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      result.current.stopListening();
+    });
+
+    await waitFor(() => {
+      expect(transcribeAudio).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => {
+      expect(result.current.state).toBe('idle');
+    });
+
+    expect(handler).toHaveBeenCalledWith('server transcript');
+  });
+
+  it('sets error state when server mode is selected but OpenRouter is not configured', async () => {
+    // User explicitly chose server but hasn't configured OpenRouter
+    useUserSettingsMock.mockReturnValue({
+      settings: { providers_configured: [] },
+      isLoading: false,
+      error: null,
+      refetch: jest.fn(),
+    });
+    useSettingsMock.mockReturnValue({
+      settings: { sttProvider: 'server' },
+      updateSettings: jest.fn(),
+      resetSettings: jest.fn(),
+    });
+    // Browser STT is also available (the problematic scenario)
+    class MockSpeechRecognition {
+      continuous = false;
+      interimResults = false;
+      lang = '';
+      onstart: (() => void) | null = null;
+      onresult: ((event: unknown) => void) | null = null;
+      onerror: ((event: unknown) => void) | null = null;
+      onend: (() => void) | null = null;
+      start = jest.fn();
+      stop = jest.fn();
+      abort = jest.fn();
+    }
+    (window as Window & { SpeechRecognition?: unknown }).SpeechRecognition = MockSpeechRecognition;
+
+    const { result } = renderHook(() => useSpeechToText());
+
+    act(() => {
+      result.current.startListening();
+    });
+
+    // Should surface an error instead of silently doing nothing
+    expect(result.current.state).toBe('error');
+    expect(transcribeAudio).not.toHaveBeenCalled();
+  });
+
   it('records and transcribes through the server fallback when browser STT is unavailable', async () => {
     const handler = jest.fn();
     const { result } = renderHook(() => useSpeechToText());
@@ -135,9 +273,57 @@ describe('useSpeechToText', () => {
       expect(result.current.state).toBe('idle');
     });
 
-    expect(transcribeAudio.mock.calls[0]?.[1]).toEqual(
-      expect.objectContaining({ language: 'en' })
-    );
+    expect(transcribeAudio.mock.calls[0]?.[1]).toEqual(expect.objectContaining({ language: 'en' }));
     expect(handler).toHaveBeenCalledWith('server transcript');
+  });
+
+  it('uses the refreshed sttAuthToken for cloud transcription without recreating the callback', async () => {
+    const handler = jest.fn();
+    useUserSettingsMock.mockReturnValue({
+      settings: { providers_configured: [] },
+      isLoading: false,
+      error: null,
+      refetch: jest.fn(),
+    });
+
+    let settings = { sttProvider: 'server', sttAuthToken: 'token-1' };
+    useSettingsMock.mockImplementation(() => ({
+      settings,
+      updateSettings: jest.fn(),
+      resetSettings: jest.fn(),
+    }));
+
+    const { result, rerender } = renderHook(() => useSpeechToText());
+
+    settings = { ...settings, sttAuthToken: 'token-2' };
+    rerender();
+
+    act(() => {
+      result.current.onFinalResult(handler);
+      result.current.startListening();
+    });
+
+    await act(async () => {
+      await Promise.resolve();
+    });
+
+    act(() => {
+      result.current.stopListening();
+    });
+
+    await waitFor(() => {
+      expect(fetchMock).toHaveBeenCalledTimes(1);
+    });
+    await waitFor(() => {
+      expect(result.current.state).toBe('idle');
+    });
+
+    expect(fetchMock.mock.calls[0]?.[1]).toEqual(
+      expect.objectContaining({
+        headers: expect.objectContaining({ Authorization: 'Bearer token-2' }),
+      })
+    );
+    expect(handler).toHaveBeenCalledWith('cloud transcript');
+    expect(transcribeAudio).not.toHaveBeenCalled();
   });
 });

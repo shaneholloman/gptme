@@ -21,6 +21,12 @@ from pydantic import BaseModel, Field
 
 from gptme.__version__ import __version__
 
+# API versioning: the URL-prefix is the major version (/api/v2).
+# Increment CONTRACT_REVISION for additive (backward-compatible) changes;
+# increment API_VERSION and update the URL prefix for breaking changes.
+API_VERSION = 2
+CONTRACT_REVISION = 1
+
 logger = logging.getLogger(__name__)
 
 # Pydantic Models (auto-generate OpenAPI schemas)
@@ -30,10 +36,39 @@ logger = logging.getLogger(__name__)
 class ConversationListItem(BaseModel):
     """A conversation list item."""
 
+    id: str = Field(..., description="Conversation ID")
     name: str = Field(..., description="Conversation name")
     path: str = Field(..., description="Conversation path")
-    created: str = Field(..., description="Creation timestamp")
-    modified: str = Field(..., description="Last modified timestamp")
+    created: float = Field(..., description="Creation timestamp (Unix epoch)")
+    modified: float = Field(..., description="Last-modified timestamp (Unix epoch)")
+    last_updated: float = Field(
+        ...,
+        description="Alias for `modified` — last-updated timestamp (Unix epoch). Stable, webui-facing alias.",
+    )
+    messages: int = Field(..., description="Message count (legacy alias)")
+    message_count: int = Field(
+        ...,
+        description="Message count — stable, webui-facing alias for `messages`.",
+    )
+    branches: int = Field(..., description="Branch count")
+    workspace: str = Field(..., description="Workspace path")
+    agent_name: str | None = Field(None, description="Agent name")
+    agent_path: str | None = Field(None, description="Agent config path")
+    agent_avatar: str | None = Field(None, description="Agent avatar filename")
+    agent_urls: dict[str, str] | None = Field(
+        None, description="Agent URLs (e.g. web, api)"
+    )
+    model: str | None = Field(None, description="Model name")
+    total_cost: float = Field(0.0, description="Total cost")
+    total_input_tokens: int = Field(0, description="Total input tokens")
+    total_output_tokens: int = Field(0, description="Total output tokens")
+    total_cache_read_tokens: int = Field(0, description="Total cache read tokens")
+    last_message_role: str | None = Field(
+        None, description="Last message role (user/assistant/system)"
+    )
+    last_message_preview: str | None = Field(
+        None, description="Preview of the last message"
+    )
 
 
 class Message(BaseModel):
@@ -156,6 +191,13 @@ class ApiRootResponse(BaseModel):
     message: str = Field(..., description="API description")
     documentation: str = Field(..., description="Documentation URL")
     version: str = Field(..., description="gptme server version")
+    api_version: int = Field(
+        ..., description="API contract major version (URL-prefix axis)"
+    )
+    contract_revision: int = Field(
+        ...,
+        description="Additive contract revision; increments for backward-compatible changes",
+    )
     capabilities: ApiCapabilities = Field(
         ..., description="Advertised optional server capabilities"
     )

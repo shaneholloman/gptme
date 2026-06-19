@@ -1,5 +1,7 @@
 import type { FC } from 'react';
 import { useRef, useEffect, useCallback, useState } from 'react';
+import { useNavigate } from 'react-router-dom';
+import { useQueryClient } from '@tanstack/react-query';
 import { ChatMessage } from './ChatMessage';
 import { ChatInput, type ChatOptions } from './ChatInput';
 import { CollapsedStepGroup } from './CollapsedStepGroup';
@@ -7,6 +9,7 @@ import { useConversation } from '@/hooks/useConversation';
 import { BranchIndicator } from './BranchIndicator';
 import { computeForkPoints } from '@/utils/branchUtils';
 import { buildStepRoles, type StepRole } from '@/utils/stepGrouping';
+import type { Message } from '@/types/conversation';
 
 import { InlineToolConfirmation } from './InlineToolConfirmation';
 import { MessageSearchBar } from './MessageSearchBar';
@@ -17,6 +20,7 @@ import { getObservableIndex } from '@legendapp/state';
 import { useApi } from '@/contexts/ApiContext';
 import { useSettings } from '@/contexts/SettingsContext';
 import { useModels } from '@/hooks/useModels';
+import { chatRoute } from '@/utils/routes';
 import { AlertTriangle, ArrowDown, RefreshCw, WifiOff } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
@@ -36,10 +40,13 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
     deleteMessage,
     rerunFromMessage,
     regenerateMessage,
+    forkConversation,
     switchBranch,
     confirmTool,
     interruptGeneration,
   } = useConversation(conversationId, serverId);
+  const navigate = useNavigate();
+  const queryClient = useQueryClient();
   const loadError = use$(() => conversation$?.loadError.get() ?? null);
   const messageCount = use$(() => conversation$?.data.log.get()?.length ?? 0);
   const connectionStatus = use$(() => conversation$?.connectionStatus.get() ?? 'disconnected');
@@ -227,7 +234,8 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
 
   // Recompute step roles when messages or visibility settings change.
   // All .get() calls inside are auto-tracked, so this re-runs when any of
-  // conversation log, showHiddenMessages, showInitialSystem, or firstNonSystemIndex changes.
+  // conversation log, showHiddenMessages, showInitialSystem, firstNonSystemIndex,
+  // or logOffset changes.
   useObserveEffect(() => {
     const messages = conversation$?.data.log.get();
     if (!messages?.length) {
@@ -235,10 +243,12 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
       return;
     }
 
+    const logOffset = conversation$?.logOffset?.get() ?? 0;
     const firstNonSystem = firstNonSystemIndex$.get();
     const showInitial = showInitialSystem$.get();
     const showHidden = showHiddenMessages$.get();
 
+    // isHidden receives LOCAL indices (array positions in messages[]).
     const isHidden = (idx: number) => {
       const msg = messages[idx];
       if (!msg) return false;
@@ -248,7 +258,8 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
       return false;
     };
 
-    stepRoles$.set(buildStepRoles(messages, isHidden));
+    // buildStepRoles emits absolute-indexed keys (localIdx + logOffset).
+    stepRoles$.set(buildStepRoles(messages as Message[], isHidden, logOffset));
   });
 
   // Create a ref for the scroll container
@@ -314,6 +325,7 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
 
   const isMessageHidden = useCallback(
     (idx: number) => {
+      // idx is a LOCAL index (array position in the current log window).
       const messages = conversation$.data.log.get();
       const msg = messages?.[idx];
       if (!msg) return false;
@@ -324,7 +336,9 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
       if (isInitialSystem && !showInitialSystem$.get()) return true;
       if (msg.hide && !showHiddenMessages$.get()) return true;
 
-      const stepRole = stepRoles$.get().get(idx);
+      // stepRoles$ is keyed by ABSOLUTE index.
+      const logOffset = conversation$?.logOffset?.get() ?? 0;
+      const stepRole = stepRoles$.get().get(logOffset + idx);
       if (
         (stepRole?.type === 'group-start' || stepRole?.type === 'grouped') &&
         !expandedGroups$.get().has(stepRole.groupId)
@@ -366,10 +380,13 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
       const q = query.toLowerCase();
       const messages = conversation$.data.log.get();
       if (!messages) return [];
+      // Read logOffset inside the callback so it's always fresh.
+      const logOffset = conversation$?.logOffset?.get() ?? 0;
       return messages
         .map((msg, i) => {
           const content = typeof msg.content === 'string' ? msg.content.toLowerCase() : '';
-          return !isMessageHidden(i) && content.includes(q) ? i : -1;
+          // Return ABSOLUTE index so highlightSearchMatch finds the right data-message-index.
+          return !isMessageHidden(i) && content.includes(q) ? logOffset + i : -1;
         })
         .filter((i) => i >= 0);
     },
@@ -450,6 +467,18 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
     await confirmTool('auto', { count });
   };
 
+  // When no-confirm mode is on, silently auto-confirm any pending tool without showing the dialog.
+  const AUTO_CONFIRM_ALL = 999999;
+  const pendingToolId = use$(() => conversation$?.pendingTool.get()?.id ?? null);
+  useEffect(() => {
+    if (pendingToolId && settings.noConfirmMode) {
+      void handleAutoConfirmTool(AUTO_CONFIRM_ALL);
+    }
+    // Safe to omit handleAutoConfirmTool: confirmTool reads pendingTool fresh from the
+    // observable store on each call, so a stale closure does not cause incorrect behaviour.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [pendingToolId, settings.noConfirmMode]);
+
   const handleScrollToBottom = () => {
     const container = scrollContainerRef.current;
     if (container) {
@@ -465,6 +494,30 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
     autoScrollAborted$.set(false);
     isScrolledUp$.set(false);
   };
+
+  const handleForkMessage = useCallback(
+    async (index: number) => {
+      const forkedConversationId = await forkConversation(index);
+      if (!forkedConversationId) return;
+
+      await queryClient.invalidateQueries({
+        predicate: (query) => {
+          const key = query.queryKey[0];
+          return typeof key === 'string' && key.startsWith('conversation');
+        },
+      });
+
+      const params = new URLSearchParams(window.location.search);
+      params.delete('split');
+      if (serverId) {
+        params.set('server', serverId);
+      } else {
+        params.delete('server');
+      }
+      navigate(chatRoute(forkedConversationId, params.toString()));
+    },
+    [forkConversation, navigate, queryClient, serverId]
+  );
 
   const showConnectionBanner =
     !isReadOnly && (connectionStatus === 'reconnecting' || connectionStatus === 'disconnected');
@@ -587,23 +640,30 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
 
         <For each={conversation$?.data.log ?? []}>
           {(msg$) => {
+            // index is the LOCAL array position in the current log window.
             const index = getObservableIndex(msg$);
+            // absoluteIndex is the position in the full conversation (server-space).
+            // All server-bound operations and index-keyed maps use absoluteIndex.
+            const logOffset = conversation$?.logOffset?.get() ?? 0;
+            const absoluteIndex = logOffset + index;
+
             // Hide all system messages before the first non-system message by default
             const firstNonSystemIndex = firstNonSystemIndex$.get();
             const isInitialSystem =
               msg$.role.get() === 'system' &&
               (firstNonSystemIndex === -1 || index < firstNonSystemIndex);
             if (isInitialSystem && !showInitialSystem$.get()) {
-              return <div key={`${index}-${msg$.timestamp.get()}`} />;
+              return <div key={`${absoluteIndex}-${msg$.timestamp.get()}`} />;
             }
 
             // Hide messages with hide=true (e.g., auto-included lessons)
             if (msg$.hide?.get() && !showHiddenMessages$.get()) {
-              return <div key={`${index}-${msg$.timestamp.get()}`} />;
+              return <div key={`${absoluteIndex}-${msg$.timestamp.get()}`} />;
             }
 
             // Get the previous and next *visible* messages for chain context
             // (skip hidden messages so they don't break chain grouping)
+            // prevIdx/nextIdx are LOCAL for array traversal.
             let prevIdx = index - 1;
             while (prevIdx >= 0 && isMessageHidden(prevIdx)) prevIdx--;
             const previousMessage$ = prevIdx >= 0 ? conversation$.data.log[prevIdx] : undefined;
@@ -614,12 +674,12 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
               ? conversation$.data.log[nextIdx]
               : undefined;
 
-            // Step grouping: check if this message should be collapsed
-            const stepRole = stepRoles$.get().get(index);
+            // Step grouping: stepRoles$ is keyed by ABSOLUTE index.
+            const stepRole = stepRoles$.get().get(absoluteIndex);
 
             // If this is a grouped message and the group is collapsed, hide it
             if (stepRole?.type === 'grouped' && !expandedGroups$.get().has(stepRole.groupId)) {
-              return <div key={`${index}-${msg$.timestamp.get()}`} />;
+              return <div key={`${absoluteIndex}-${msg$.timestamp.get()}`} />;
             }
 
             // If this is a group-start, render the summary bar
@@ -637,7 +697,7 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
 
             // When group is collapsed and this is group-start, show only the summary bar
             if (stepRole?.type === 'group-start' && !expandedGroups$.get().has(stepRole.groupId)) {
-              return <div key={`${index}-${msg$.timestamp.get()}`}>{groupSummary}</div>;
+              return <div key={`${absoluteIndex}-${msg$.timestamp.get()}`}>{groupSummary}</div>;
             }
 
             // Construct agent avatar URL if agent has avatar configured
@@ -649,7 +709,10 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
             const agentName = conversation$.data.agent?.name?.get();
 
             return (
-              <div key={`${index}-${msg$.timestamp.get()}`} data-message-index={index}>
+              <div
+                key={`${absoluteIndex}-${msg$.timestamp.get()}`}
+                data-message-index={absoluteIndex}
+              >
                 {/* Show summary bar above first message when group is expanded */}
                 {groupSummary}
                 <ChatMessage
@@ -664,12 +727,14 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
                   onDelete={isReadOnly ? undefined : deleteMessage}
                   onRerun={isReadOnly ? undefined : rerunFromMessage}
                   onRegenerate={isReadOnly ? undefined : regenerateMessage}
-                  messageIndex={index}
+                  onFork={isReadOnly ? undefined : handleForkMessage}
+                  messageIndex={absoluteIndex}
                 />
                 {/* Branch indicator at fork points */}
                 <Memo>
                   {() => {
-                    const forkInfo = forkPoints$.get().get(index);
+                    // forkPoints$ is computed from branches and keyed by absolute index.
+                    const forkInfo = forkPoints$.get().get(absoluteIndex);
                     if (!forkInfo) return null;
                     return (
                       <div className="mx-auto max-w-3xl">
@@ -685,14 +750,16 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
           }}
         </For>
 
-        {/* Inline Tool Confirmation */}
-        <InlineToolConfirmation
-          pendingTool$={conversation$?.pendingTool}
-          onConfirm={handleConfirmTool}
-          onEdit={handleEditTool}
-          onSkip={handleSkipTool}
-          onAuto={handleAutoConfirmTool}
-        />
+        {/* Inline Tool Confirmation — hidden when no-confirm mode is active */}
+        {!settings.noConfirmMode && (
+          <InlineToolConfirmation
+            pendingTool$={conversation$?.pendingTool}
+            onConfirm={handleConfirmTool}
+            onEdit={handleEditTool}
+            onSkip={handleSkipTool}
+            onAuto={handleAutoConfirmTool}
+          />
+        )}
 
         {/* Inline Tool Execution */}
         <InlineToolExecution executingTool$={conversation$?.executingTool} />

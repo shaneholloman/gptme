@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import Literal
 
 from . import execution as _exec
+from .concurrency import get_slot_sem
 from .hooks import notify_completion
 from .types import (
     ReturnType,
@@ -25,7 +26,9 @@ from .types import (
     _subagent_results_lock,
     _subagents,
     _subagents_lock,
+    clarification_result_from_content,
     resolve_role_defaults,
+    set_subagent_result_if_absent,
 )
 
 logger = logging.getLogger(__name__)
@@ -48,6 +51,7 @@ def subagent(
     isolated: bool | None = None,
     timeout: int = 1800,
     role: Role | None = None,
+    redact_secrets: bool = False,
 ):
     """Starts an asynchronous subagent. Returns None immediately.
 
@@ -110,6 +114,20 @@ def subagent(
             Falls back to a temporary directory if not in a git repo.
         timeout: Maximum seconds before the subprocess monitor kills the
             subagent (default 1800 = 30 min). Only applies to subprocess mode.
+        redact_secrets: If True, scrub common secret patterns from workspace
+            context messages before they are passed to the subagent.
+            Redacts values from lines where the variable name matches patterns
+            like API_KEY, TOKEN, PASSWORD, PRIVATE_KEY, etc.
+
+            Note: subagents do NOT inherit the parent's conversation history —
+            they always start with a fresh context containing only the task
+            prompt and workspace context (files from gptme.toml [prompt] files,
+            and context_cmd output when context_mode="full"). This option
+            sanitizes that inherited workspace context.
+
+            Only applies to thread-mode subagents (subprocess and ACP modes
+            run as a separate gptme process and handle their own context).
+            Default: False (no redaction).
 
     Returns:
         None: Starts asynchronous execution.
@@ -250,6 +268,13 @@ def subagent(
                 f"Not in a git repo, using temp dir for {agent_id}: {worktree_path}"
             )
 
+    if redact_secrets and (use_acp or use_subprocess):
+        exec_mode = "ACP" if use_acp else "subprocess"
+        logger.warning(
+            f"Subagent {agent_id}: 'redact_secrets=True' has no effect in {exec_mode} mode "
+            "(only thread-mode subagents inherit workspace context from the parent process)"
+        )
+
     if use_acp:
         # ACP mode: multi-harness support via Agent Client Protocol
         if use_subprocess:
@@ -279,66 +304,102 @@ def subagent(
             )
 
         def run_acp_subagent():
-            import asyncio
-
-            async def _acp_run():
-                from ...acp.client import GptmeAcpClient
-
-                collected_text: list[str] = []
-
-                def on_update(session_id: str, update) -> None:
-                    """Collect text from session updates."""
-                    # Extract text from agent_message_chunk updates
-                    update_type = getattr(update, "type", None)
-                    if update_type == "agent_message_chunk":
-                        chunk = getattr(update, "chunk", None)
-                        if chunk:
-                            text = getattr(chunk, "text", None) or (
-                                chunk.get("text") if isinstance(chunk, dict) else None
-                            )
-                            if text:
-                                collected_text.append(text)
-
-                async with GptmeAcpClient(
-                    workspace=workspace,
-                    command=acp_command,
-                    auto_confirm=True,
-                    on_update=on_update,
-                ) as client:
-                    result = await client.run(prompt, cwd=workspace)
-                    stop_reason = getattr(result, "stop_reason", "unknown")
-                    result_text = "".join(collected_text) if collected_text else None
-
-                    status = "success" if stop_reason == "end_turn" else "failure"
-                    summary = (
-                        result_text[:500]
-                        if result_text
-                        else f"ACP stop_reason={stop_reason}"
-                    )
-                    return status, summary
-
+            _sem = get_slot_sem()
+            _sem.acquire()
             try:
-                status, summary = asyncio.run(_acp_run())
+                with _subagent_results_lock:
+                    if agent_id in _subagent_results:
+                        logger.info(
+                            f"Skipping cancelled queued ACP subagent {agent_id}"
+                        )
+                        with _subagents_lock:
+                            sa = next(
+                                (s for s in _subagents if s.agent_id == agent_id), None
+                            )
+                        if sa:
+                            _exec._cleanup_isolation(sa)
+                        return
 
-                with _subagent_results_lock:
-                    _subagent_results[agent_id] = ReturnType(status, summary)
-                notify_completion(
-                    agent_id,
-                    status,
-                    _exec._summarize_result(ReturnType(status, summary), max_chars=200),
-                )
-            except Exception as e:
-                logger.error(f"ACP subagent {agent_id} failed: {e}", exc_info=True)
-                with _subagent_results_lock:
-                    _subagent_results[agent_id] = ReturnType("failure", str(e))
-                notify_completion(agent_id, "failure", f"ACP error: {e}")
-            finally:
-                with _subagents_lock:
-                    sa_ref = next(
-                        (s for s in _subagents if s.agent_id == agent_id), None
+                import asyncio
+
+                async def _acp_run():
+                    from ...acp.client import GptmeAcpClient
+
+                    collected_text: list[str] = []
+
+                    def on_update(session_id: str, update) -> None:
+                        """Collect text from session updates."""
+                        # Extract text from agent_message_chunk updates
+                        update_type = getattr(update, "type", None)
+                        if update_type == "agent_message_chunk":
+                            chunk = getattr(update, "chunk", None)
+                            if chunk:
+                                text = getattr(chunk, "text", None) or (
+                                    chunk.get("text")
+                                    if isinstance(chunk, dict)
+                                    else None
+                                )
+                                if text:
+                                    collected_text.append(text)
+
+                    async with GptmeAcpClient(
+                        workspace=workspace,
+                        command=acp_command,
+                        auto_confirm=True,
+                        on_update=on_update,
+                    ) as client:
+                        result = await client.run(prompt, cwd=workspace)
+                        stop_reason = getattr(result, "stop_reason", "unknown")
+                        result_text = (
+                            "".join(collected_text) if collected_text else None
+                        )
+
+                        clarification_result = (
+                            clarification_result_from_content(result_text)
+                            if result_text
+                            else None
+                        )
+                        if clarification_result:
+                            status = clarification_result.status
+                            summary = clarification_result.result
+                        else:
+                            status = (
+                                "success" if stop_reason == "end_turn" else "failure"
+                            )
+                            summary = (
+                                result_text[:500]
+                                if result_text
+                                else f"ACP stop_reason={stop_reason}"
+                            )
+                        return status, summary
+
+                try:
+                    status, summary = asyncio.run(_acp_run())
+
+                    result = ReturnType(status, summary)
+                    if not set_subagent_result_if_absent(agent_id, result):
+                        return
+                    notify_completion(
+                        agent_id,
+                        status,
+                        _exec._summarize_result(result, max_chars=200),
                     )
-                if sa_ref:
-                    _exec._cleanup_isolation(sa_ref)
+                except Exception as e:
+                    logger.error(f"ACP subagent {agent_id} failed: {e}", exc_info=True)
+                    if not set_subagent_result_if_absent(
+                        agent_id, ReturnType("failure", str(e))
+                    ):
+                        return
+                    notify_completion(agent_id, "failure", f"ACP error: {e}")
+                finally:
+                    with _subagents_lock:
+                        sa_ref = next(
+                            (s for s in _subagents if s.agent_id == agent_id), None
+                        )
+                    if sa_ref:
+                        _exec._cleanup_isolation(sa_ref)
+            finally:
+                _sem.release()
 
         t = threading.Thread(target=run_acp_subagent, daemon=True)
 
@@ -348,13 +409,18 @@ def subagent(
             thread=t,
             logdir=logdir,
             model=model_name,
+            context_mode=context_mode,
+            context_include=context_include,
+            profile=profile,
             output_schema=output_schema,
+            use_acp=True,
             process=None,
             execution_mode="acp",
             acp_command=acp_command,
             isolated=isolated,
             worktree_path=worktree_path,
             repo_path=repo_path,
+            role=role,
         )
         # Append sa before starting the thread so the finally block can find it
         # (avoids race condition where fast completion can't locate sa in _subagents)
@@ -363,7 +429,9 @@ def subagent(
         t.start()
 
     elif use_subprocess:
-        # Subprocess mode: better output isolation
+        # Subprocess mode: better output isolation, gated by the concurrency semaphore.
+        # A launcher thread acquires the slot before starting the OS process so that
+        # excess agents queue (rather than all starting at once).
         logger.info(f"Starting subagent {agent_id} in subprocess mode")
         if profile:
             logger.info(f"  with profile: {profile}")
@@ -379,85 +447,149 @@ def subagent(
                 # TypedDict or dataclass - create simple schema
                 output_schema_str = json.dumps({"type": "object"})
 
-        process = _exec._run_subagent_subprocess(
-            prompt=prompt,
-            logdir=logdir,
-            model=model_name,
-            workspace=workspace,
-            context_mode=context_mode,
-            context_include=context_include,
-            output_schema=output_schema_str,
-            profile=profile,
-        )
+        def _launch_subprocess():
+            _sem = get_slot_sem()
+            _sem.acquire()
+            try:
+                with _subagent_results_lock:
+                    if agent_id in _subagent_results:
+                        logger.info(
+                            f"Skipping cancelled queued subprocess subagent {agent_id}"
+                        )
+                        _exec._cleanup_isolation(sa)
+                        return
+                process = _exec._run_subagent_subprocess(
+                    prompt=prompt,
+                    logdir=logdir,
+                    model=model_name,
+                    workspace=workspace,
+                    context_mode=context_mode,
+                    context_include=context_include,
+                    output_schema=output_schema_str,
+                    profile=profile,
+                )
+                # Subagent is a frozen dataclass; install the live process on the
+                # pre-registered object so queued agents become inspectable once
+                # they leave the semaphore.
+                object.__setattr__(sa, "process", process)
+                # Monitor blocks until the process finishes (slot stays acquired)
+                _exec._monitor_subprocess(sa)
+            except Exception as e:
+                logger.error(
+                    f"Subagent {agent_id} subprocess failed: {e}", exc_info=True
+                )
+                if set_subagent_result_if_absent(
+                    agent_id, ReturnType("failure", str(e))
+                ):
+                    notify_completion(agent_id, "failure", f"Subprocess failed: {e}")
+                _exec._cleanup_isolation(sa)
+            finally:
+                _sem.release()
 
-        # Create Subagent with subprocess reference
+        launcher = threading.Thread(target=_launch_subprocess, daemon=True)
+
+        # Pre-register with launcher thread so status/wait/cancel work while queued.
+        # process=None here; is_running() falls through to thread.is_alive().
         sa = Subagent(
             agent_id=agent_id,
             prompt=prompt,
-            thread=None,
+            thread=launcher,
             logdir=logdir,
             model=model_name,
+            context_mode=context_mode,
+            context_include=context_include,
+            profile=profile,
             output_schema=output_schema,
-            process=process,
+            process=None,
             execution_mode="subprocess",
             isolated=isolated,
             worktree_path=worktree_path,
             repo_path=repo_path,
             timeout=timeout,
+            role=role,
         )
         with _subagents_lock:
             _subagents.append(sa)
-
-        # Start monitor thread for hook-based completion notification
-        monitor_thread = threading.Thread(
-            target=_exec._monitor_subprocess,
-            args=(sa,),
-            daemon=True,
-        )
-        monitor_thread.start()
+        launcher.start()
     else:
-        # Thread mode: original behavior
+        # Thread mode: original behavior, gated by the concurrency semaphore.
+        # The semaphore is acquired before starting LLM work and released in
+        # finally so excess agents queue until a slot opens.
         def run_subagent():
+            _sem = get_slot_sem()
+            _sem.acquire()
             try:
-                _exec._create_subagent_thread(
-                    prompt=prompt,
-                    logdir=logdir,
-                    model=model_name,
-                    context_mode=context_mode,
-                    context_include=context_include,
-                    workspace=workspace,
-                    target="parent",
-                    output_schema=output_schema,
-                    profile_name=profile,
-                )
-            except Exception as e:
-                # If subagent creation fails, notify with error status
-                logger.error(f"Subagent {agent_id} failed during execution: {e}")
                 with _subagent_results_lock:
-                    _subagent_results[agent_id] = ReturnType("failure", str(e))
+                    if agent_id in _subagent_results:
+                        logger.info(
+                            f"Skipping cancelled queued thread subagent {agent_id}"
+                        )
+                        with _subagents_lock:
+                            sa = next(
+                                (s for s in _subagents if s.agent_id == agent_id), None
+                            )
+                        if sa:
+                            _exec._cleanup_isolation(sa)
+                        return
                 try:
-                    notify_completion(agent_id, "failure", f"Execution failed: {e}")
-                except Exception as notify_err:
-                    logger.warning(f"Failed to notify subagent error: {notify_err}")
-                # Clean up worktree isolation even on failure
+                    _exec._create_subagent_thread(
+                        prompt=prompt,
+                        logdir=logdir,
+                        model=model_name,
+                        context_mode=context_mode,
+                        context_include=context_include,
+                        workspace=workspace,
+                        target="parent",
+                        output_schema=output_schema,
+                        profile_name=profile,
+                        agent_id=agent_id,
+                        redact_secrets=redact_secrets,
+                    )
+                except Exception as e:
+                    # If subagent creation fails, notify with error status
+                    logger.error(f"Subagent {agent_id} failed during execution: {e}")
+                    if not set_subagent_result_if_absent(
+                        agent_id, ReturnType("failure", str(e))
+                    ):
+                        with _subagents_lock:
+                            sa = next(
+                                (s for s in _subagents if s.agent_id == agent_id), None
+                            )
+                        if sa:
+                            _exec._cleanup_isolation(sa)
+                        return
+                    try:
+                        notify_completion(agent_id, "failure", f"Execution failed: {e}")
+                    except Exception as notify_err:
+                        logger.warning(f"Failed to notify subagent error: {notify_err}")
+                    # Clean up worktree isolation even on failure
+                    with _subagents_lock:
+                        sa = next(
+                            (s for s in _subagents if s.agent_id == agent_id), None
+                        )
+                    if sa:
+                        _exec._cleanup_isolation(sa)
+                    return
+
+                # Notify via hook system when complete (only if successful)
                 with _subagents_lock:
                     sa = next((s for s in _subagents if s.agent_id == agent_id), None)
                 if sa:
+                    # Use _read_log() instead of status(): the thread is still alive here,
+                    # so status() would return "running" and poison the result cache.
+                    result = sa._read_log()
+                    if not set_subagent_result_if_absent(agent_id, result):
+                        _exec._cleanup_isolation(sa)
+                        return
+                    try:
+                        summary = _exec._summarize_result(result, max_chars=200)
+                        notify_completion(agent_id, result.status, summary)
+                    except Exception as e:
+                        logger.warning(f"Failed to notify subagent completion: {e}")
+                    # Clean up worktree isolation
                     _exec._cleanup_isolation(sa)
-                return
-
-            # Notify via hook system when complete (only if successful)
-            with _subagents_lock:
-                sa = next((s for s in _subagents if s.agent_id == agent_id), None)
-            if sa:
-                result = sa.status()
-                try:
-                    summary = _exec._summarize_result(result, max_chars=200)
-                    notify_completion(agent_id, result.status, summary)
-                except Exception as e:
-                    logger.warning(f"Failed to notify subagent completion: {e}")
-                # Clean up worktree isolation
-                _exec._cleanup_isolation(sa)
+            finally:
+                _sem.release()
 
         # Create thread (don't start yet)
         t = threading.Thread(
@@ -474,16 +606,154 @@ def subagent(
             thread=t,
             logdir=logdir,
             model=model_name,
+            context_mode=context_mode,
+            context_include=context_include,
+            profile=profile,
             output_schema=output_schema,
             process=None,
             execution_mode="thread",
             isolated=isolated,
             worktree_path=worktree_path,
             repo_path=repo_path,
+            role=role,
+            redact_secrets=redact_secrets,
         )
         with _subagents_lock:
             _subagents.append(sa)
         t.start()
+
+
+def subagent_cancel(agent_id: str) -> str:
+    """Cancel a running subagent.
+
+    For subprocess-mode subagents, sends SIGTERM (then SIGKILL after 5s) to the
+    process. For thread-mode subagents, marks the result as cancelled — the thread
+    continues until its next natural checkpoint but the result is already recorded
+    as failure so callers won't block waiting for it.
+
+    Args:
+        agent_id: The subagent to cancel
+
+    Returns:
+        A human-readable status message
+    """
+    with _subagents_lock:
+        sa = next((s for s in _subagents if s.agent_id == agent_id), None)
+
+    if sa is None:
+        raise ValueError(f"Subagent with ID {agent_id} not found.")
+
+    if not sa.is_running():
+        return f"Subagent '{agent_id}' is not running (already finished)."
+
+    cancelled_result = ReturnType("failure", "Cancelled by orchestrator")
+
+    if sa.execution_mode == "subprocess" and sa.process:
+        if not set_subagent_result_if_absent(agent_id, cancelled_result):
+            return f"Subagent '{agent_id}' already finished before cancellation."
+        sa.process.terminate()
+        try:
+            sa.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            sa.process.kill()
+            sa.process.wait()
+        logger.info(f"Subagent '{agent_id}' subprocess terminated.")
+        return f"Subagent '{agent_id}' cancelled."
+    # Thread/ACP mode: threads cannot be forcefully stopped in Python.
+    # Mark the result so the orchestrator sees it as cancelled immediately.
+    if not set_subagent_result_if_absent(agent_id, cancelled_result):
+        return f"Subagent '{agent_id}' already finished before cancellation."
+    logger.info(
+        f"Subagent '{agent_id}' marked cancelled (thread will stop at next checkpoint)."
+    )
+    return (
+        f"Subagent '{agent_id}' marked as cancelled. "
+        "The background thread will stop at its next natural checkpoint."
+    )
+
+
+def subagent_reply(agent_id: str, reply: str) -> None:
+    """Re-spawn a subagent that requested clarification.
+
+    When a subagent ends with a ``clarify`` block, it stops and asks the
+    parent a question. Call this function with your answer to re-start the
+    subagent. The new run receives the original prompt plus an appended
+    Q&A block so it has full context.
+
+    Args:
+        agent_id: The subagent that raised the clarification request.
+        reply: Your answer to the subagent's question.
+    """
+    with _subagents_lock:
+        sa = next((s for s in _subagents if s.agent_id == agent_id), None)
+
+    if sa is None:
+        raise ValueError(f"Subagent with ID {agent_id!r} not found.")
+
+    result = sa.status()
+    if result.status == "running":
+        raise ValueError(
+            f"Subagent '{agent_id}' is still running. Wait for it to finish first."
+        )
+    if result.status != "clarification_needed":
+        raise ValueError(
+            f"Subagent '{agent_id}' has status '{result.status}', not 'clarification_needed'. "
+            "Only subagents that ended with a `clarify` block can be resumed."
+        )
+
+    # Guard against unbounded clarification loops
+    _MAX_CLARIFICATIONS = 5
+    clarification_count = sa.prompt.count("[Clarification from previous attempt]")
+    if clarification_count >= _MAX_CLARIFICATIONS:
+        raise ValueError(
+            f"Subagent '{agent_id}' has requested clarification {clarification_count} times "
+            f"(limit is {_MAX_CLARIFICATIONS}). "
+            "Resolve the ambiguity in the task prompt instead of relying on further clarification."
+        )
+
+    question = result.result or "(no question)"
+    augmented_prompt = (
+        f"{sa.prompt}\n\n"
+        f"[Clarification from previous attempt]\n"
+        f"Q: {question}\n"
+        f"A: {reply}"
+    )
+
+    # Atomically clear old state: save first so we can restore on failure.
+    with _subagent_results_lock:
+        old_result = _subagent_results.pop(agent_id, None)
+
+    with _subagents_lock:
+        _subagents[:] = [
+            existing for existing in _subagents if existing.agent_id != agent_id
+        ]
+
+    # Re-spawn with the same parameters, augmented prompt.
+    # On failure, restore the old state so the caller can retry.
+    try:
+        subagent(
+            agent_id=agent_id,
+            prompt=augmented_prompt,
+            model=sa.model,
+            context_mode=sa.context_mode,
+            context_include=list(sa.context_include) if sa.context_include else None,
+            output_schema=sa.output_schema,
+            use_subprocess=sa.execution_mode == "subprocess",
+            use_acp=sa.use_acp,
+            acp_command=sa.acp_command or "gptme-acp",
+            profile=sa.profile,
+            isolated=sa.isolated,
+            timeout=sa.timeout,
+            role=sa.role,
+            redact_secrets=sa.redact_secrets,
+        )
+    except Exception:
+        with _subagents_lock:
+            _subagents.append(sa)
+        if old_result is not None:
+            with _subagent_results_lock:
+                _subagent_results[agent_id] = old_result
+        raise
 
 
 def subagent_status(agent_id: str) -> dict:

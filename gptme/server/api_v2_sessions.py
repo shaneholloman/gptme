@@ -24,6 +24,7 @@ from ..message import Message
 from .api_v2_common import _validate_branch, _validate_conversation_id
 from .auth import require_auth
 from .constants import DEFAULT_FALLBACK_MODEL
+from .metrics import sse_connection_close, sse_connection_open
 from .openapi_docs import (
     CONVERSATION_ID_PARAM,
     ElicitRespondRequest,
@@ -194,6 +195,7 @@ def api_conversation_events(conversation_id: str):
     # Generate event stream
     def generate_events() -> Generator[str, None, None]:
         client_id = str(uuid.uuid4())
+        sse_connection_open()
         try:
             # Add this client to the session
             session.clients.add(client_id)
@@ -251,13 +253,14 @@ def api_conversation_events(conversation_id: str):
                 session.event_flag.wait(timeout=15)
 
         except GeneratorExit:
-            # Client disconnected
+            raise
+        finally:
+            sse_connection_close()
             if session:
                 session.clients.discard(client_id)
                 if not session.clients:
                     # If no clients are connected, mark the session for cleanup
                     session.active = False
-            raise
 
     return flask.Response(
         generate_events(),

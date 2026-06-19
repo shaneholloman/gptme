@@ -5,6 +5,7 @@ This module contains the main conversation CRUD endpoints for the V2 API.
 Session management, tool execution, and agent creation are handled by separate modules.
 """
 
+import hashlib
 import json
 import logging
 import os
@@ -62,7 +63,14 @@ from ..config.user import (
     get_user_config_runtime_info,
 )
 from ..dirs import get_logs_dir
-from ..logmanager import Log, LogManager, get_user_conversations
+from ..logmanager import (
+    ConversationMeta,
+    Log,
+    LogManager,
+    get_conversation_meta_direct,
+    get_user_conversations,
+)
+from ..logmanager import conversations as conversations_module
 from ..message import Message
 from ..tools import get_toolchain, get_tools, init_tools
 from ..util.content import is_message_command
@@ -77,7 +85,10 @@ from .api_v2_common import (
 from .api_v2_sessions import SessionManager, sessions_api
 from .auth import require_auth
 from .external_sessions import get_external_session_provider
+from .metrics import record_cache_result, update_conversation_metrics
 from .openapi_docs import (
+    API_VERSION,
+    CONTRACT_REVISION,
     CONVERSATION_ID_PARAM,
     ApiRootResponse,
     AudioTranscriptionResponse,
@@ -117,6 +128,27 @@ _ALLOWED_AVATAR_EXTS = {".jpg", ".jpeg", ".png", ".gif", ".webp", ".ico"}
 # - edit: launches an interactive $EDITOR subprocess, blocking the worker thread
 # - delete (without --force): calls input() waiting for stdin that never arrives
 _SERVER_BLOCKED_COMMANDS = {"exit", "restart", "edit", "delete"}
+
+
+def _parse_conversation_cursor(raw: str) -> tuple[float, str | None]:
+    """Parse a conversation pagination cursor.
+
+    Supports both the legacy numeric timestamp cursor and the opaque composite
+    cursor returned by the paginated API: ``<modified>|<quoted-conversation-id>``.
+    """
+    if "|" not in raw:
+        return float(raw), None
+
+    modified_raw, quoted_conv_id = raw.split("|", 1)
+    if not quoted_conv_id:
+        raise ValueError("missing conversation id")
+    return float(modified_raw), urllib.parse.unquote(quoted_conv_id)
+
+
+def _encode_conversation_cursor(conv: ConversationMeta) -> str:
+    """Encode a stable pagination cursor for a conversation."""
+    return f"{conv.modified:.17g}|{urllib.parse.quote(conv.id, safe='')}"
+
 
 _TRUTHY_ENV_VALUES = {"1", "true", "yes", "on"}
 _DEFAULT_OPENROUTER_STT_MODEL = "openai/whisper-1"
@@ -280,6 +312,74 @@ def _append_conversation_system_prompt(
         messages.append(Message("system", system_prompt))
 
 
+def _generate_fork_conversation_id() -> str:
+    """Generate a reasonably unique conversation id for forked copies."""
+    timestamp = datetime.now(tz=timezone.utc).isoformat().replace(":", "-")
+    return f"chat-{timestamp}-{time.time_ns() % 1_000_000_000:09d}"
+
+
+def _fork_message_file_reference(
+    file_ref: FilePath, source_attachments: Path, dest_attachments: Path
+) -> tuple[FilePath, bool]:
+    """Re-root attachment file paths into the forked conversation when needed."""
+    if isinstance(file_ref, URI):
+        return file_ref, False
+
+    path = Path(file_ref)
+    try:
+        rel = path.relative_to(source_attachments)
+        return dest_attachments / rel, True
+    except ValueError:
+        pass
+
+    if path.parts[:1] == ("attachments",):
+        return dest_attachments / Path(*path.parts[1:]), True
+
+    return path, False
+
+
+def _copy_messages_for_fork(
+    messages: list[Message], source_logdir: Path, dest_logdir: Path
+) -> list[Message]:
+    """Copy a message slice into a new conversation, preserving attachments."""
+    source_attachments = source_logdir / "attachments"
+    dest_attachments = dest_logdir / "attachments"
+    attachment_copies: set[tuple[Path, Path]] = set()
+    copied_messages: list[Message] = []
+
+    for msg in messages:
+        new_files: list[FilePath] = []
+        path_map: dict[str, str] = {}
+        for file_ref in msg.files:
+            new_ref, copied = _fork_message_file_reference(
+                file_ref, source_attachments, dest_attachments
+            )
+            new_files.append(new_ref)
+            if copied:
+                assert isinstance(new_ref, Path)
+                path_map[str(file_ref)] = str(new_ref)
+                source_path = source_attachments / new_ref.relative_to(dest_attachments)
+                attachment_copies.add((source_path, new_ref))
+
+        new_file_hashes = {
+            path_map.get(path, path): digest for path, digest in msg.file_hashes.items()
+        }
+        copied_messages.append(
+            replace(msg, files=new_files, file_hashes=new_file_hashes)
+        )
+
+    for source_path, dest_path in attachment_copies:
+        if not source_path.exists():
+            continue
+        if source_path.is_dir():
+            shutil.copytree(source_path, dest_path, dirs_exist_ok=True)
+        else:
+            dest_path.parent.mkdir(parents=True, exist_ok=True)
+            shutil.copy2(source_path, dest_path)
+
+    return copied_messages
+
+
 def _get_optional_string_list_field(
     req_json: dict, field: str
 ) -> list[str] | None | tuple[flask.Response, int]:
@@ -393,6 +493,30 @@ def _validate_config_key_path(key: str) -> str:
     if any(not segment.strip() for segment in trimmed.split(".")):
         raise ValueError("key must be a dotted path with non-empty segments")
     return trimmed
+
+
+def _etag_conversations(conversations: "list[ConversationMeta]") -> str:
+    """Compute a stable ETag from conversation IDs and modification times."""
+    h = hashlib.md5()
+    for c in conversations:
+        h.update(f"{c.id}:{c.modified}\n".encode())
+    return h.hexdigest()[:16]
+
+
+def _etag_conversation(logdir: "Path") -> str:
+    """Compute ETag from the conversation log file's mtime and size.
+
+    Including size prevents stale 304s on filesystems with 1-second mtime
+    granularity where two writes within the same tick leave mtime unchanged.
+    """
+    logfile = logdir / "conversation.jsonl"
+    try:
+        stat = logfile.stat()
+        mtime = stat.st_mtime
+        size = stat.st_size
+    except OSError:
+        return ""
+    return hashlib.md5(f"{mtime}:{size}".encode()).hexdigest()[:16]
 
 
 v2_api = flask.Blueprint("v2_api", __name__)
@@ -557,15 +681,18 @@ def api_root():
 
     provider_configured = get_default_model() is not None
 
-    return flask.jsonify(
-        {
-            "message": "gptme v2 API",
-            "documentation": "https://gptme.org/docs/server.html",
-            "version": __version__,
-            "capabilities": capabilities,
-            "provider_configured": provider_configured,
-        }
-    )
+    body = {
+        "message": "gptme v2 API",
+        "documentation": "https://gptme.org/docs/server.html",
+        "version": __version__,
+        "api_version": API_VERSION,
+        "contract_revision": CONTRACT_REVISION,
+        "capabilities": capabilities,
+        "provider_configured": provider_configured,
+    }
+    response = flask.jsonify(body)
+    response.headers["X-API-Version"] = str(API_VERSION)
+    return response
 
 
 @v2_api.route("/api/v2/config")
@@ -764,7 +891,7 @@ def api_dev_deploy_staging_trigger():
         {
             "name": "days",
             "in": "query",
-            "schema": {"type": "integer", "default": 30},
+            "schema": {"type": "integer", "default": 7},
             "description": "How many recent days of session history to scan",
         },
     ],
@@ -777,12 +904,16 @@ def api_external_sessions():
 
     try:
         limit = int(request.args.get("limit", 100))
-        days = int(request.args.get("days", 30))
+        days = int(request.args.get("days", 7))
     except (ValueError, TypeError):
         return flask.jsonify({"error": "limit and days must be integers"}), 400
 
-    limit = max(1, min(limit, 1000))
-    days = max(1, min(days, 3650))
+    if limit <= 0:
+        return flask.jsonify({"error": "limit must be a positive integer"}), 400
+    limit = min(limit, 1000)
+    if days <= 0:
+        return flask.jsonify({"error": "days must be a positive integer"}), 400
+    days = min(days, 365)
 
     sessions = [
         item.to_dict() for item in provider.list_sessions(limit=limit, days=days)
@@ -806,22 +937,24 @@ def api_external_sessions():
         {
             "name": "days",
             "in": "query",
-            "schema": {"type": "integer", "default": 30},
+            "schema": {"type": "integer", "default": 7},
             "description": "How many recent days of session history to scan",
         },
     ],
 )
 def api_external_session(external_session_id: str):
     """Get a normalized read-only external session transcript."""
+    try:
+        days = int(request.args.get("days", 7))
+    except (ValueError, TypeError):
+        return flask.jsonify({"error": "days must be an integer"}), 400
+    if days <= 0:
+        return flask.jsonify({"error": "days must be a positive integer"}), 400
+    days = min(days, 365)
+
     provider = get_external_session_provider()
     if provider is None:
         return flask.jsonify({"error": "external session provider unavailable"}), 503
-
-    try:
-        days = int(request.args.get("days", 30))
-    except (ValueError, TypeError):
-        return flask.jsonify({"error": "days must be an integer"}), 400
-    days = max(1, min(days, 3650))
 
     session = provider.get_session(external_session_id, days=days)
     if session is None:
@@ -844,16 +977,28 @@ def api_external_session(external_session_id: str):
             "description": "Maximum number of conversations to return",
         },
         {
-            "name": "search",
+            "name": "q",
             "in": "query",
             "schema": {"type": "string"},
-            "description": "Filter conversations by name, id, or last message preview (case-insensitive substring match)",
+            "description": "Filter conversations by name, id, or last message preview (case-insensitive substring match). Alias: search.",
         },
         {
             "name": "detail",
             "in": "query",
             "schema": {"type": "boolean", "default": False},
             "description": "If true, perform a full scan to populate cost and token stats. Slower but returns accurate total_cost, total_input_tokens, and total_output_tokens fields. Suitable for paginated views; avoid on large collections. When combined with search, every conversation is fully scanned before the limit is applied — avoid on large deployments.",
+        },
+        {
+            "name": "cursor",
+            "in": "query",
+            "schema": {"type": "string"},
+            "description": "Opaque pagination cursor returned by the previous paginated response. New clients should pass it through unchanged; legacy numeric Unix timestamp cursors are still accepted.",
+        },
+        {
+            "name": "paginated",
+            "in": "query",
+            "schema": {"type": "boolean", "default": False},
+            "description": "If true, return a paginated response object {conversations: [...], next_cursor: string|null} instead of a bare list. Use cursor param for page 2+.",
         },
     ],
 )
@@ -863,15 +1008,156 @@ def api_conversations():
     Get a list of user conversations with metadata using the V2 API.
     Supports optional search filtering by conversation name, id, or last message preview.
     Pass ``detail=true`` to include cost/token stats (slower full scan).
+
+    Each item exposes ``id``, ``name``, ``created``, ``modified``,
+    ``message_count`` (alias of ``messages``), ``last_updated`` (alias of
+    ``modified``), and a ``last_message_preview`` for the most recent
+    user/assistant turn. ``message_count`` and ``last_updated`` are always
+    populated (cheap fast-tail scan), so list-level UIs can render a stats
+    badge without per-row detail fetches.
+
+    Pass ``paginated=1`` to opt into cursor pagination: the response becomes
+    ``{conversations: [...], next_cursor: string|null}``. Pass the returned
+    cursor back unchanged on page 2+.
     """
     try:
         limit = int(request.args.get("limit", 100))
     except (ValueError, TypeError):
         return flask.jsonify({"error": "limit must be an integer"}), 400
-    limit = max(1, min(limit, 1000))
-    search = request.args.get("search", "").strip().lower()
+    if limit <= 0:
+        return flask.jsonify({"error": "limit must be a positive integer"}), 400
+    limit = min(limit, 1000)
+    # ?q= is the primary filter param; ?search= is accepted as a backward-compat alias
+    # Use None-check so explicit ?q= (even empty) takes precedence over ?search=
+    q = request.args.get("q")
+    search = (q if q is not None else request.args.get("search", "")).strip().lower()
     detail_val = request.args.get("detail")
     detail = detail_val is not None and detail_val.lower() in ("", "1", "true", "yes")
+    paginated_val = request.args.get("paginated")
+    paginated = paginated_val is not None and paginated_val.lower() in (
+        "",
+        "1",
+        "true",
+        "yes",
+    )
+    cursor_raw = request.args.get("cursor")
+    cursor_ts: float | None = None
+    cursor_id: str | None = None
+    if cursor_raw:
+        try:
+            cursor_ts, cursor_id = _parse_conversation_cursor(cursor_raw)
+        except (ValueError, TypeError):
+            return flask.jsonify(
+                {
+                    "error": "cursor must be a numeric Unix timestamp or opaque cursor token"
+                }
+            ), 400
+
+    global \
+        _conversations_cache, \
+        _conversations_cache_logs_dir, \
+        _conversations_cache_time
+    logs_dir = conversations_module.get_logs_dir()
+
+    # Cursor pagination path — returns {conversations: [...], next_cursor: string|null}
+    if paginated:
+        # Load full list (use cache when possible for the common non-search, non-detail case)
+        full_list: list[ConversationMeta]
+        if not search and not detail:
+            _cached = _conversations_cache
+            if (
+                _cached is not None
+                and _conversations_cache_logs_dir == logs_dir
+                and (time.monotonic() - _conversations_cache_time)
+                < _CONVERSATIONS_CACHE_TTL
+            ):
+                full_list = _cached
+                record_cache_result(hit=True)
+            else:
+                full_list = list(get_user_conversations(detail=False))
+                _conversations_cache = full_list
+                _conversations_cache_logs_dir = logs_dir
+                _conversations_cache_time = time.monotonic()
+                record_cache_result(hit=False)
+                n_msgs = sum(c.messages for c in full_list)
+                update_conversation_metrics(len(full_list), n_msgs)
+        elif search:
+            full_list = [
+                conv
+                for conv in get_user_conversations(detail=detail)
+                if (
+                    search in conv.name.lower()
+                    or search in conv.id.lower()
+                    or search in (conv.last_message_preview or "").lower()
+                )
+            ]
+        else:
+            full_list = list(get_user_conversations(detail=detail))
+
+        # Keep pagination deterministic even when multiple conversations share
+        # the same modified timestamp.
+        full_list = sorted(
+            full_list, key=lambda conv: (conv.modified, conv.id), reverse=True
+        )
+
+        # Apply cursor filter: composite cursors paginate on (modified, id),
+        # legacy numeric cursors fall back to timestamp-only filtering.
+        if cursor_ts is not None:
+            if cursor_id is None:
+                paged = [c for c in full_list if c.modified < cursor_ts]
+            else:
+                paged = [
+                    c for c in full_list if (c.modified, c.id) < (cursor_ts, cursor_id)
+                ]
+        else:
+            paged = full_list
+
+        # Fetch limit+1 to detect whether a next page exists
+        probe = paged[: limit + 1]
+        has_more = len(probe) > limit
+        page = probe[:limit]
+
+        page_items = []
+        for conv in page:
+            item = asdict(conv)
+            item["message_count"] = conv.messages
+            item["last_updated"] = conv.modified
+            page_items.append(item)
+
+        next_cursor: str | None = (
+            _encode_conversation_cursor(page[-1]) if has_more and page else None
+        )
+
+        return flask.jsonify({"conversations": page_items, "next_cursor": next_cursor})
+
+    # Legacy path — returns bare list (backward compatible)
+    # Use cached list for the common case (no search, no detail).
+    # Cache is invalidated on conversation create/update/delete and scoped to
+    # the current logs dir so test/workspace swaps do not reuse stale results.
+    if (
+        not search
+        and not detail
+        and _conversations_cache is not None
+        and _conversations_cache_logs_dir == logs_dir
+    ):
+        elapsed = time.monotonic() - _conversations_cache_time
+        if elapsed < _CONVERSATIONS_CACHE_TTL:
+            cached = _conversations_cache
+            record_cache_result(hit=True)
+            etag = _etag_conversations(cached[:limit])
+            if request.if_none_match.contains_weak(etag):
+                resp = flask.make_response("", 304)
+                resp.set_etag(etag, weak=True)
+                resp.cache_control.no_cache = True
+                return resp
+            response_items = [asdict(c) for c in cached[:limit]]
+            for item in response_items:
+                item["message_count"] = item["messages"]
+                item["last_updated"] = item["modified"]
+            resp = flask.make_response(flask.jsonify(response_items))
+            resp.set_etag(etag, weak=True)
+            resp.cache_control.no_cache = True
+            return resp
 
     # Use fast tail-only scan for list/search by default — reads last 8KB for
     # preview/model, skips json.loads() on every metadata line.
@@ -888,13 +1174,39 @@ def api_conversations():
                 if len(conversations) >= limit:
                     break
     else:
-        conversations = list(islice(get_user_conversations(detail=detail), limit))
+        # The API limit is capped at 1000, so a cold-cache fill does not need
+        # to scan beyond that bound.
+        all_conversations = list(islice(get_user_conversations(detail=detail), 1000))
+        conversations = all_conversations[:limit]
     response_items = []
     for conv in conversations:
         item = asdict(conv)
-        if not detail:
-            item.pop("messages", None)
+        # `messages` is the message count (int), not message content — both
+        # the fast tail-scan and full scan populate it, so it is safe to keep
+        # in the response regardless of `detail`.
+        # Add stable webui-facing aliases: `message_count` and `last_updated`.
+        item["message_count"] = conv.messages
+        item["last_updated"] = conv.modified
         response_items.append(item)
+
+    if not search and not detail:
+        _conversations_cache = all_conversations
+        _conversations_cache_logs_dir = logs_dir
+        _conversations_cache_time = time.monotonic()
+        record_cache_result(hit=False)
+        n_msgs = sum(c.messages for c in all_conversations)
+        update_conversation_metrics(len(all_conversations), n_msgs)
+        etag = _etag_conversations(conversations)
+        if request.if_none_match.contains_weak(etag):
+            resp = flask.make_response("", 304)
+            resp.set_etag(etag, weak=True)
+            resp.cache_control.no_cache = True
+            return resp
+        resp = flask.make_response(flask.jsonify(response_items))
+        resp.set_etag(etag, weak=True)
+        resp.cache_control.no_cache = True
+        return resp
+
     return flask.jsonify(response_items)
 
 
@@ -907,10 +1219,46 @@ def api_conversation(conversation_id: str):
     """Get conversation (V2).
 
     Retrieve a conversation with all its messages and metadata using the V2 API.
+
+    Supports optional message pagination:
+    - ``limit=N`` returns only the last N messages (default: all messages).
+    - ``before=<index>`` combined with ``limit`` returns the N messages ending at
+      ``<index>`` (exclusive), enabling "load older" pagination.  When ``limit``
+      is set, the response includes ``total_messages``, ``has_more``, and
+      ``before`` (the cursor for the next older page when ``has_more`` is true).
     """
     # Validate conversation_id to prevent path traversal
     if error := _validate_conversation_id(conversation_id):
         return error
+
+    # Parse pagination params early for fast-fail on bad input
+    try:
+        limit = int(request.args["limit"]) if "limit" in request.args else None
+    except (ValueError, TypeError):
+        return flask.jsonify({"error": "limit must be a positive integer"}), 400
+    if limit is not None and limit <= 0:
+        return flask.jsonify({"error": "limit must be a positive integer"}), 400
+    if limit is not None:
+        limit = min(limit, 10000)
+
+    try:
+        before = int(request.args["before"]) if "before" in request.args else None
+    except (ValueError, TypeError):
+        return flask.jsonify({"error": "before must be a non-negative integer"}), 400
+    if before is not None and before < 0:
+        return flask.jsonify({"error": "before must be a non-negative integer"}), 400
+    if before is not None and limit is None:
+        return flask.jsonify({"error": "before requires limit to be set"}), 400
+
+    logdir = get_logs_dir() / conversation_id
+    etag = _etag_conversation(logdir)
+    # Pagination params change the response body, so incorporate them into the ETag.
+    etag_paged = f"{etag}-{limit}-{before}" if (etag and limit is not None) else etag
+    if etag_paged and request.if_none_match.contains_weak(etag_paged):
+        resp = flask.make_response("", 304)
+        resp.set_etag(etag_paged, weak=True)
+        resp.cache_control.no_cache = True
+        return resp
 
     try:
         manager = LogManager.load(conversation_id, lock=False)
@@ -920,7 +1268,6 @@ def api_conversation(conversation_id: str):
         ), 404
 
     # Create and set config
-    logdir = get_logs_dir() / conversation_id
     chat_config = ChatConfig.load_or_create(logdir, ChatConfig()).save()
     log_dict = manager.to_dict(branches=True)
     log_dict["logdir"] = str(logdir)
@@ -932,6 +1279,21 @@ def api_conversation(conversation_id: str):
                 _abs_to_rel_workspace(f, chat_config.workspace, manager.logdir)
                 for f in files
             ]
+
+    # Apply message pagination when limit is specified.
+    # Only the active-branch log is paginated; branches dict is left intact
+    # (used for branch switching, not message display).
+    if limit is not None:
+        all_messages = log_dict["log"]
+        total = len(all_messages)
+        end = min(before, total) if before is not None else total
+        end = max(0, end)
+        start = max(0, end - limit)
+        log_dict["log"] = all_messages[start:end]
+        log_dict["total_messages"] = total
+        log_dict["has_more"] = start > 0
+        if start > 0:
+            log_dict["before"] = start  # cursor for the next older page
 
     # Include agent info if available
     agent_config = chat_config.agent_config
@@ -960,7 +1322,11 @@ def api_conversation(conversation_id: str):
             "last_error": latest.last_error,
         }
 
-    return flask.jsonify(log_dict)
+    resp = flask.make_response(flask.jsonify(log_dict))
+    if etag_paged:
+        resp.set_etag(etag_paged, weak=True)
+        resp.cache_control.no_cache = True
+    return resp
 
 
 @v2_api.route("/api/v2/conversations/<string:conversation_id>", methods=["PUT"])
@@ -1020,7 +1386,7 @@ def api_conversation_put(conversation_id: str):
         return flask.jsonify({"error": "'messages' must be a list"}), 400
     _RoleType = Literal["system", "user", "assistant"]
     valid_roles = ("system", "user", "assistant")
-    validated_msgs: list[tuple[_RoleType, str, datetime]] = []
+    validated_msgs: list[tuple[_RoleType, str, datetime, list[str]]] = []
     for msg in messages_raw:
         if not isinstance(msg, dict):
             return flask.jsonify({"error": "Each message must be an object"}), 400
@@ -1048,7 +1414,16 @@ def api_conversation_put(conversation_id: str):
                 ), 400
         else:
             ts = datetime.now(tz=timezone.utc)
-        validated_msgs.append((cast(_RoleType, msg["role"]), msg["content"], ts))
+        files_raw = msg.get("files", [])
+        if not isinstance(files_raw, list) or not all(
+            isinstance(f, str) for f in files_raw
+        ):
+            return flask.jsonify(
+                {"error": "Message 'files' must be a list of strings"}
+            ), 400
+        validated_msgs.append(
+            (cast(_RoleType, msg["role"]), msg["content"], ts, files_raw)
+        )
 
     config_raw = req_json.get("config", {})
     if not isinstance(config_raw, dict):
@@ -1071,6 +1446,12 @@ def api_conversation_put(conversation_id: str):
         request_config = ChatConfig.from_dict(config_dict, create_workspace=False)
     except ValueError as exc:
         return flask.jsonify({"error": str(exc)}), 400
+
+    # Enforce workspace containment: server clients must not direct the agent
+    # outside the conversation's logdir (path traversal / SSRF via workspace).
+    # Resolve logdir to handle symlinks (e.g. macOS /tmp -> /private/tmp).
+    if not request_config.workspace.is_relative_to(logdir.resolve()):
+        return flask.jsonify({"error": "workspace escapes conversation logdir"}), 400
 
     # Create the log directory atomically to avoid TOCTOU race
     try:
@@ -1115,8 +1496,17 @@ def api_conversation_put(conversation_id: str):
 
     _append_conversation_system_prompt(msgs, chat_config.system_prompt)
 
-    for role, content, timestamp in validated_msgs:
-        msgs.append(Message(role, content, timestamp=timestamp))
+    for role, content, timestamp, files_raw in validated_msgs:
+        file_paths: list[FilePath] = []
+        if files_raw:
+            validated_files = _validate_message_file_references(
+                files_raw, chat_config.workspace
+            )
+            if isinstance(validated_files, tuple):
+                shutil.rmtree(logdir, ignore_errors=True)
+                return validated_files
+            file_paths = validated_files
+        msgs.append(Message(role, content, timestamp=timestamp, files=file_paths))  # type: ignore[arg-type]  # list[Path] is valid for list[FilePath]
 
     log = LogManager.load(logdir=logdir, initial_msgs=msgs, create=True)
     log.write()
@@ -1143,6 +1533,7 @@ def api_conversation_put(conversation_id: str):
     elif auto_confirm > 0:
         session.auto_confirm_count = auto_confirm
 
+    _invalidate_conversations_cache()
     return flask.jsonify(
         {"status": "ok", "conversation_id": conversation_id, "session_id": session.id}
     )
@@ -1294,6 +1685,9 @@ def api_conversation_post(conversation_id: str):
         },
     )
 
+    # Partial cache update: only refresh this conversation's entry so the
+    # conversations-list endpoint can keep serving from cache during streaming.
+    _update_conversation_in_cache(conversation_id)
     return flask.jsonify({"status": "ok"})
 
 
@@ -1432,6 +1826,7 @@ def api_conversation_edit_message(conversation_id: str, index: int):
         },
     )
 
+    _invalidate_conversations_cache()
     return flask.jsonify(log_dict)
 
 
@@ -1535,7 +1930,96 @@ def api_conversation_delete_message(conversation_id: str, index: int):
         },
     )
 
+    _invalidate_conversations_cache()
     return flask.jsonify(log_dict)
+
+
+@v2_api.route("/api/v2/conversations/<string:conversation_id>/fork", methods=["POST"])
+@require_auth
+@api_doc_simple(
+    responses={
+        200: SessionResponse,
+        400: ErrorResponse,
+        404: ErrorResponse,
+        409: ErrorResponse,
+    },
+    tags=["conversations-v2"],
+)
+def api_conversation_fork(conversation_id: str):
+    """Create a forked copy of a conversation from a specific message index."""
+    if error := _validate_conversation_id(conversation_id):
+        return error
+
+    after_message_raw = request.args.get("after_message")
+    if after_message_raw is None:
+        return flask.jsonify(
+            {"error": "after_message query parameter is required"}
+        ), 400
+    try:
+        after_message = int(after_message_raw)
+    except ValueError:
+        return flask.jsonify({"error": "after_message must be an integer"}), 400
+
+    branch = request.args.get("branch", "main")
+    if error := _validate_branch(branch):
+        return error
+
+    sessions = SessionManager.get_sessions_for_conversation(conversation_id)
+    for sess in sessions:
+        if sess.generating:
+            return (
+                flask.jsonify({"error": "Cannot fork while generation is in progress"}),
+                409,
+            )
+
+    try:
+        manager = LogManager.load(conversation_id, branch=branch, lock=False)
+    except FileNotFoundError:
+        if branch == "main":
+            return (
+                flask.jsonify({"error": f"Conversation not found: {conversation_id}"}),
+                404,
+            )
+        return (
+            flask.jsonify({"error": f"Branch not found: {branch}"}),
+            404,
+        )
+
+    source_messages = list(manager.log.messages)
+    if after_message < 0 or after_message >= len(source_messages):
+        return (
+            flask.jsonify(
+                {
+                    "error": f"Message index {after_message} out of range (0-{len(source_messages) - 1})"
+                }
+            ),
+            400,
+        )
+
+    new_conversation_id = _generate_fork_conversation_id()
+    new_logdir = get_logs_dir() / new_conversation_id
+
+    forked_messages = _copy_messages_for_fork(
+        source_messages[: after_message + 1], manager.logdir, new_logdir
+    )
+    fork_manager = LogManager.load(
+        logdir=new_logdir, initial_msgs=forked_messages, create=True, lock=False
+    )
+    fork_manager.write()
+
+    source_config = ChatConfig.from_logdir(manager.logdir)
+    fork_name = f"Fork of {manager.name} @ msg {after_message + 1}"
+    replace(source_config, _logdir=new_logdir, name=fork_name).save()
+
+    session = SessionManager.create_session(new_conversation_id)
+    _invalidate_conversations_cache()
+    return flask.jsonify(
+        {
+            "status": "ok",
+            "conversation_id": new_conversation_id,
+            "session_id": session.id,
+        }
+    )
 
 
 @v2_api.route("/api/v2/conversations/<string:conversation_id>", methods=["DELETE"])
@@ -1587,6 +2071,7 @@ def api_conversation_delete(conversation_id: str):
 
     SessionManager.remove_all_sessions_for_conversation(conversation_id)
 
+    _invalidate_conversations_cache()
     return flask.jsonify({"status": "ok"})
 
 
@@ -1899,16 +2384,25 @@ def api_conversation_config_patch(conversation_id: str):
     if not isinstance(req_json, dict):
         return flask.jsonify({"error": "JSON body must be an object"}), 400
 
-    # Extract tool allowlist early for type-checking (no side effects).
+    # Extract and type-check fields early (no side effects).
     # init_tools validation is deferred to after the 404/409 guards because it
     # mutates process-wide state (loaded_tools, _tools_init_lock).
     tool_allowlist: list[str] | None = None
     chat_patch = req_json.get("chat")
-    if isinstance(chat_patch, dict) and "tools" in chat_patch:
-        raw_allowlist = _get_optional_string_list_field(chat_patch, "tools")
-        if isinstance(raw_allowlist, tuple):
-            return raw_allowlist  # 400: bad type, no side effects
-        tool_allowlist = raw_allowlist  # narrowed to list[str] | None
+    if isinstance(chat_patch, dict):
+        if "tools" in chat_patch:
+            raw_allowlist = _get_optional_string_list_field(chat_patch, "tools")
+            if isinstance(raw_allowlist, tuple):
+                return raw_allowlist  # 400: bad type, no side effects
+            tool_allowlist = raw_allowlist  # narrowed to list[str] | None
+        if "model" in chat_patch and not isinstance(
+            chat_patch["model"], str | type(None)
+        ):
+            return flask.jsonify(
+                {
+                    "error": "model must be a string (e.g. 'gpt-4', 'claude-sonnet-4-5-20250929')"
+                }
+            ), 400
 
     logdir = get_logs_dir() / conversation_id
 
@@ -1954,10 +2448,32 @@ def api_conversation_config_patch(conversation_id: str):
         except Exception as exc:
             return flask.jsonify({"error": f"Failed to load tool: {exc}"}), 400
 
+    # Determine if workspace was explicitly provided in the request body.
+    # This check must happen BEFORE ChatConfig.from_dict, which mutates the
+    # chat_patch dict by inferring workspace from the existing logdir/workspace
+    # path when workspace is absent (adding it as a side effect via the
+    # `elif _logdir and (_logdir / "workspace").exists()` branch).
+    workspace_in_patch = isinstance(chat_patch, dict) and "workspace" in chat_patch
+
     # Create and set config
     req_json["_logdir"] = logdir  # Pass logdir for "@log" workspace resolution
     try:
         request_config = ChatConfig.from_dict(req_json)
+    except ValueError as exc:
+        return flask.jsonify({"error": str(exc)}), 400
+
+    # Enforce workspace containment: server clients must not direct the agent
+    # outside the conversation's logdir (path traversal / SSRF via workspace).
+    # Only enforce when workspace was explicitly provided — when absent, from_dict
+    # infers it from the existing logdir/workspace symlink (which may legitimately
+    # point outside logdir for CLI-created conversations).
+    if workspace_in_patch:
+        if not request_config.workspace.is_relative_to(logdir.resolve()):
+            return flask.jsonify(
+                {"error": "workspace escapes conversation logdir"}
+            ), 400
+
+    try:
         chat_config = ChatConfig.load_or_create(logdir, request_config).save()
     except ValueError as exc:
         return flask.jsonify({"error": str(exc)}), 400
@@ -1994,6 +2510,7 @@ def api_conversation_config_patch(conversation_id: str):
         manager.log = Log(new_system_msgs + remaining_msgs)
     manager.write()
 
+    _invalidate_conversations_cache()
     return flask.jsonify(
         {
             "status": "ok",
@@ -2225,7 +2742,11 @@ def api_user_api_key():
     if not isinstance(api_key, str):
         return flask.jsonify({"error": "api_key must be a string"}), 400
     if model is not None and not isinstance(model, str):
-        return flask.jsonify({"error": "model must be a string"}), 400
+        return flask.jsonify(
+            {
+                "error": "model must be a string (e.g. 'gpt-4', 'claude-sonnet-4-5-20250929')"
+            }
+        ), 400
     if provider not in PROVIDER_API_KEYS:
         return flask.jsonify({"error": f"Unknown provider: {provider}"}), 400
 
@@ -2286,7 +2807,11 @@ def api_user_default_model():
 
     model = req_json.get("model")
     if not isinstance(model, str):
-        return flask.jsonify({"error": "model must be a string"}), 400
+        return flask.jsonify(
+            {
+                "error": "model must be a string (e.g. 'gpt-4', 'claude-sonnet-4-5-20250929')"
+            }
+        ), 400
 
     try:
         trimmed_model = _validate_model_input(model)
@@ -2634,3 +3159,61 @@ def api_user_settings():
             "config_files": get_user_config_runtime_info(),
         }
     )
+
+
+# In-memory conversations list cache.
+# Caches the full list (no search, no detail) for _CONVERSATIONS_CACHE_TTL seconds.
+# Invalidated on conversation create/update/delete via _invalidate_conversations_cache().
+_CONVERSATIONS_CACHE_TTL = (
+    30.0  # seconds — covers page navigation refresh within a session
+)
+_conversations_cache: list[ConversationMeta] | None = None
+_conversations_cache_logs_dir: Path | None = None
+_conversations_cache_time: float = 0.0
+
+
+def _invalidate_conversations_cache() -> None:
+    """Invalidate the conversations list cache."""
+    global \
+        _conversations_cache, \
+        _conversations_cache_logs_dir, \
+        _conversations_cache_time
+    _conversations_cache = None
+    _conversations_cache_logs_dir = None
+    _conversations_cache_time = 0.0
+
+
+def _update_conversation_in_cache(conv_id: str) -> None:
+    """Refresh one conversation in the list cache without a full rescan.
+
+    When a message is appended to an existing conversation, we only need to
+    update that conversation's entry (last_message_preview, messages count,
+    modified time). This avoids the O(N_conversations) filesystem scan that a
+    full cache invalidation would trigger on the next conversations-list GET.
+
+    Falls back to full invalidation if:
+    - The cache is already stale (TTL expired) — next GET will rebuild anyway.
+    - The conversation no longer exists on disk (e.g., concurrent deletion).
+    """
+    global _conversations_cache
+    # Snapshot once to avoid TOCTOU: a concurrent _invalidate_conversations_cache()
+    # can set the global to None between our is-None guard and the any()/comprehension
+    # reads, which would raise TypeError on iteration.
+    cache = _conversations_cache
+    if cache is None:
+        return
+    if (time.monotonic() - _conversations_cache_time) >= _CONVERSATIONS_CACHE_TTL:
+        return  # already stale; next GET will trigger a full rebuild
+    logs_dir = _conversations_cache_logs_dir
+    updated = get_conversation_meta_direct(conv_id, detail=False, logs_dir=logs_dir)
+    if updated is None:
+        # Conversation not found — fall back to full invalidation so the
+        # stale entry is removed on the next list request.
+        _invalidate_conversations_cache()
+        return
+    if not any(c.id == conv_id for c in cache):
+        # Entry not in cached list (e.g., concurrent external filesystem write).
+        # Fall back to full invalidation so the list gets rebuilt correctly.
+        _invalidate_conversations_cache()
+        return
+    _conversations_cache = [updated if c.id == conv_id else c for c in cache]

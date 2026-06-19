@@ -33,7 +33,9 @@ function detectTool(content: string): string | null {
   const first = content.toLowerCase().trimStart();
   if (first.startsWith('saved')) return 'save';
   if (first.startsWith('appended')) return 'append';
-  if (first.startsWith('patch applied') || first.startsWith('patched')) return 'patch';
+  // gptme emits "Patch successfully applied to <file>" (and variants)
+  if (first.startsWith('patched') || (first.startsWith('patch') && first.includes('appl')))
+    return 'patch';
   if (first.startsWith('error')) return 'error';
   if (first.startsWith('$') || first.startsWith('```') || first.includes('exit code'))
     return 'shell';
@@ -104,10 +106,15 @@ function extractToolSteps(content: string): ToolStepDetail[] {
  * Groups intermediate messages in each turn (between user messages),
  * keeping the last assistant message visible as the "response".
  * A "step" = one tool-use cycle (assistant action + system result).
+ *
+ * @param logOffset Absolute index of messages[0] in the full conversation.
+ *   All map keys are emitted as absolute indices (logOffset + localIndex).
+ *   isHidden is always called with LOCAL indices (array positions).
  */
 export function buildStepRoles(
   messages: Message[],
-  isHidden: (idx: number) => boolean
+  isHidden: (idx: number) => boolean,
+  logOffset: number = 0
 ): Map<number, StepRole> {
   const roles = new Map<number, StepRole>();
 
@@ -163,8 +170,14 @@ export function buildStepRoles(
     // Intermediate steps: everything except the response
     const stepIndices = visibleIndices.filter((idx) => idx !== responseIdx);
 
-    // Only group if there are 2+ intermediate steps (e.g. assistant tool call + system output)
-    if (stepIndices.length >= 2) {
+    // Group when:
+    // - 2+ intermediate steps (the common multi-tool-call case), OR
+    // - exactly 1 intermediate step that is a system message (hook/context injection
+    //   like "# Relevant Lessons" or agent_awareness, which are noise to the user)
+    const shouldGroup =
+      stepIndices.length >= 2 ||
+      (stepIndices.length === 1 && messages[stepIndices[0]].role === 'system');
+    if (shouldGroup) {
       // Detect tools used and count tool-call steps (system messages = tool results)
       const toolSet = new Set<string>();
       let toolCallCount = 0;
@@ -183,10 +196,11 @@ export function buildStepRoles(
         }
       }
 
-      // Use message index of first step as stable group ID
+      // Use absolute index of first step as stable group ID.
       // (incrementing counters shift when messages change, breaking expanded state)
       const firstIdx = stepIndices[0];
-      const stableGroupId = firstIdx;
+      const absFirstIdx = logOffset + firstIdx;
+      const stableGroupId = absFirstIdx; // absolute for stable identity across prepends
 
       // count = tool-call steps (not raw messages); fall back to message count if no system msgs
       const groupStart: Extract<StepRole, { type: 'group-start' }> = {
@@ -201,16 +215,16 @@ export function buildStepRoles(
         groupStart.steps = allSteps;
       }
 
-      roles.set(firstIdx, groupStart);
+      roles.set(absFirstIdx, groupStart);
 
       // Mark the rest as grouped (hidden when collapsed)
       for (let k = 1; k < stepIndices.length; k++) {
-        roles.set(stepIndices[k], { type: 'grouped', groupId: stableGroupId });
+        roles.set(logOffset + stepIndices[k], { type: 'grouped', groupId: stableGroupId });
       }
 
       // Mark response
       if (responseIdx >= 0) {
-        roles.set(responseIdx, { type: 'response' });
+        roles.set(logOffset + responseIdx, { type: 'response' });
       }
     }
 

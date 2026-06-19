@@ -42,6 +42,7 @@ function getSettings(): {
   ttsEnabled: boolean;
   ttsServerUrl: string;
   ttsProvider: TtsProvider;
+  ttsAuthToken: string;
 } {
   try {
     const saved = localStorage.getItem('gptme-settings');
@@ -56,12 +57,13 @@ function getSettings(): {
         ttsEnabled: s.ttsEnabled === true,
         ttsServerUrl: typeof s.ttsServerUrl === 'string' ? s.ttsServerUrl.trim() : '',
         ttsProvider: provider,
+        ttsAuthToken: typeof s.ttsAuthToken === 'string' ? s.ttsAuthToken.trim() : '',
       };
     }
   } catch {
     // ignore
   }
-  return { ttsEnabled: false, ttsServerUrl: '', ttsProvider: 'auto' };
+  return { ttsEnabled: false, ttsServerUrl: '', ttsProvider: 'auto', ttsAuthToken: '' };
 }
 
 /** Strip markdown so the spoken text sounds natural. */
@@ -130,9 +132,14 @@ async function speakViaLocalEndpoint(text: string, key: string): Promise<void> {
   const controller = new AbortController();
   currentFetchController = controller;
   try {
+    const { ttsAuthToken } = getSettings();
+    const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+    if (ttsAuthToken) {
+      headers['Authorization'] = `Bearer ${ttsAuthToken}`;
+    }
     const response = await fetch('/api/v2/audio/speech', {
       method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
+      headers,
       body: JSON.stringify({ text }),
       signal: controller.signal,
     });
@@ -231,7 +238,9 @@ async function speak(rawText: string, key: string): Promise<void> {
         console.warn('External gptme-tts server unavailable, falling back to browser:', err);
       }
     } else {
-      console.warn('TTS engine "external" selected but no gptme-tts server URL set; using browser.');
+      console.warn(
+        'TTS engine "external" selected but no gptme-tts server URL set; using browser.'
+      );
     }
     if (!speakViaBrowser(spoken, key)) clearIfStill(key);
     return;

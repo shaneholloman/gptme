@@ -12,6 +12,17 @@ export interface Settings {
    * - 'external': a standalone gptme-tts server at `ttsServerUrl`
    */
   ttsProvider: TtsProvider;
+  /**
+   * Which STT engine to use:
+   * - 'browser': use the browser's built-in SpeechRecognition API (fall back to server if unavailable)
+   * - 'server': always use the server-side transcription via MediaRecorder + /api/v2/audio/transcriptions
+   */
+  sttProvider: 'browser' | 'server';
+  /**
+   * Override that force-expands tool-use/output blocks. When false (default),
+   * tool blocks are collapsed and agent code examples stay open (smart behavior).
+   * When true, every code block is expanded.
+   */
   blocksDefaultOpen: boolean;
   showHiddenMessages: boolean;
   showInitialSystem: boolean;
@@ -25,10 +36,37 @@ export interface Settings {
    */
   ttsServerUrl: string;
   /**
+   * Bearer token sent with /api/v2/audio/speech requests.
+   * Set by cloud hosts (e.g. gptme.ai) so TTS can be billed to the user's account.
+   * Leave empty for self-hosted / unauthenticated endpoints.
+   *
+   * Token lifecycle: cloud hosts MUST call `updateSettings({ ttsAuthToken: '' })` on
+   * logout to clear this from localStorage. The token persists across page reloads
+   * intentionally (to avoid re-authentication overhead), so explicit logout cleanup is
+   * required.
+   */
+  ttsAuthToken: string;
+  /**
+   * Bearer token sent with /api/v2/audio/transcriptions requests.
+   * Set by cloud hosts (e.g. gptme.ai) so STT can be billed to the user's account.
+   * When set, STT uses the same-origin /api/v2/audio/transcriptions endpoint
+   * (e.g. a Cloudflare Pages Function proxy) instead of the connected gptme server.
+   * Leave empty for self-hosted / unauthenticated endpoints.
+   *
+   * Token lifecycle: cloud hosts MUST call `updateSettings({ sttAuthToken: '' })` on
+   * logout to clear this from localStorage.
+   */
+  sttAuthToken: string;
+  /**
    * WebSocket URL for the gptme-voice-server /voice endpoint, e.g. ws://localhost:5700/voice.
    * Leave empty to hide the VoiceButton.
    */
   voiceServerUrl: string;
+  /**
+   * When true, tool execution prompts are skipped and all tools are auto-confirmed.
+   * Equivalent to --no-confirm in the CLI (also known as "YOLO mode").
+   */
+  noConfirmMode: boolean;
 }
 
 interface SettingsContextType {
@@ -41,13 +79,17 @@ const defaultSettings: Settings = {
   chimeEnabled: true,
   ttsEnabled: false,
   ttsProvider: 'auto',
-  blocksDefaultOpen: true,
+  sttProvider: 'browser',
+  blocksDefaultOpen: false,
   showHiddenMessages: false,
   showInitialSystem: false,
   hasCompletedSetup: false,
   welcomeBackground: '',
   ttsServerUrl: '',
+  ttsAuthToken: '',
+  sttAuthToken: '',
   voiceServerUrl: '',
+  noConfirmMode: false,
 };
 
 function loadSettingsFromStorage(): Settings {

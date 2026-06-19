@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+import dataclasses
 import importlib
 import importlib.util
 import inspect
@@ -7,7 +8,7 @@ import json
 import logging
 import re
 import types
-from collections.abc import Callable, Generator
+from collections.abc import Callable, Generator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -47,7 +48,9 @@ ToolFormat: TypeAlias = Literal["markdown", "xml", "tool"]
 tool_format: ToolFormat = "markdown"
 
 # Match tool name and start of JSON
-toolcall_re = re.compile(r"^@(\w+)\(([\w\-:\.]+)\):\s*({.*)", re.MULTILINE | re.DOTALL)
+toolcall_re = re.compile(
+    r"^@([\w.]+)\(([\w\-:\.]+)\):\s*({.*)", re.MULTILINE | re.DOTALL
+)
 
 
 def find_json_end(s: str, start: int) -> int | None:
@@ -176,6 +179,64 @@ class Parameter:
     required: bool = False
 
 
+@dataclass(frozen=True)
+class ToolFunction:
+    """A structured callable exposed as a tool function, independent of execution runtime.
+
+    Replaces bare ``Callable`` entries in ``ToolSpec.functions`` with explicit
+    metadata so prompt rendering, IPython registration, and future runtimes all
+    consume the same description instead of introspecting raw Python objects.
+
+    Args:
+        name: Function name used in prompts and lookups.
+        fn: The actual callable to invoke.
+        description: Human-readable description shown in the tool prompt.
+        group: Logical grouping (e.g. "discord", "github") for allowlist patterns.
+        parameters: Explicit parameter schema; if empty, derived from fn's annotations.
+        hints: Capability tags (e.g. ``{"read-only"}``, ``{"destructive"}``).
+    """
+
+    name: str
+    fn: Callable
+    description: str = ""
+    group: str | None = None
+    parameters: list[Parameter] = field(default_factory=list)
+    hints: frozenset[str] = field(default_factory=frozenset)
+
+    @classmethod
+    def from_callable(cls, fn: Any, group: str | None = None) -> ToolFunction:
+        """Construct a ToolFunction from a plain callable, inferring metadata.
+
+        Populates name, description (first docstring paragraph), and parameters
+        (from type annotations + inspect.signature). No IPython import required.
+        """
+        sig = inspect.signature(fn)
+        doc = inspect.getdoc(fn) or ""
+        description = doc.split("\n\n")[0] if doc else ""
+
+        _SKIP_KINDS = {inspect.Parameter.VAR_POSITIONAL, inspect.Parameter.VAR_KEYWORD}
+        params: list[Parameter] = []
+        for param_name, param in sig.parameters.items():
+            if param.kind in _SKIP_KINDS:
+                continue
+            annotation = param.annotation
+            type_str = (
+                "any"
+                if annotation is inspect.Parameter.empty
+                else derive_type(annotation)
+            )
+            required = param.default is inspect.Parameter.empty
+            params.append(Parameter(name=param_name, type=type_str, required=required))
+
+        return cls(
+            name=fn.__name__,
+            fn=fn,
+            description=description,
+            group=group,
+            parameters=params,
+        )
+
+
 def derive_type(t) -> str:
     """Convert a type annotation to a human-readable string for tool signatures.
 
@@ -236,7 +297,12 @@ def callable_signature(func: Callable) -> str:
     return f"{func.__name__}({args}){ret}"
 
 
-@dataclass(frozen=True, eq=False)
+ToolFunctionInput: TypeAlias = ToolFunction | Callable[..., Any]
+
+
+# init=False is intentional: ToolSpec needs a wide constructor input type while
+# storing normalized fields. Dataclasses will not call __post_init__ here.
+@dataclass(frozen=True, eq=False, init=False)
 class ToolSpec:
     """
     Tool specification. Defines a tool that can be used by the agent.
@@ -266,7 +332,10 @@ class ToolSpec:
     instructions: str = ""
     instructions_format: dict[str, str] = field(default_factory=dict)
     examples: str | Callable[[str], str] = ""
-    functions: list[Callable] | None = None
+    # Stored as ToolFunction, but bare callables are also accepted at runtime and
+    # normalized in __init__ — the documented plugin API (docs/plugins.rst)
+    # passes plain functions here.
+    functions: list[ToolFunction] | None = None
     init: InitFunc | None = None
     execute: ExecuteFunc | None = None
     block_types: list[str] = field(default_factory=list)
@@ -276,8 +345,69 @@ class ToolSpec:
     load_priority: int = 0
     disabled_by_default: bool = False
     is_mcp: bool = False
+    hints: frozenset[str] = field(default_factory=frozenset)
     hooks: dict[str, tuple[str, HookFunc, int]] = field(default_factory=dict)
     commands: dict[str, Callable] = field(default_factory=dict)
+
+    def __init__(
+        self,
+        name: str,
+        desc: str,
+        instructions: str = "",
+        instructions_format: dict[str, str] | None = None,
+        examples: str | Callable[[str], str] = "",
+        functions: Sequence[ToolFunctionInput] | None = None,
+        init: InitFunc | None = None,
+        execute: ExecuteFunc | None = None,
+        block_types: list[str] | None = None,
+        available: bool | Callable[[], bool] = True,
+        available_hint: str | None = None,
+        parameters: list[Parameter] | None = None,
+        load_priority: int = 0,
+        disabled_by_default: bool = False,
+        is_mcp: bool = False,
+        hints: frozenset[str] | None = None,
+        hooks: dict[str, tuple[str, HookFunc, int]] | None = None,
+        commands: dict[str, Callable] | None = None,
+    ):
+        object.__setattr__(self, "name", name)
+        object.__setattr__(self, "desc", desc)
+        object.__setattr__(self, "instructions", instructions)
+        object.__setattr__(
+            self,
+            "instructions_format",
+            instructions_format or {},
+        )
+        object.__setattr__(self, "examples", examples)
+        object.__setattr__(self, "functions", self._normalize_functions(functions))
+        object.__setattr__(self, "init", init)
+        object.__setattr__(self, "execute", execute)
+        object.__setattr__(self, "block_types", block_types or [])
+        object.__setattr__(self, "available", available)
+        object.__setattr__(self, "available_hint", available_hint)
+        object.__setattr__(self, "parameters", parameters or [])
+        object.__setattr__(self, "load_priority", load_priority)
+        object.__setattr__(self, "disabled_by_default", disabled_by_default)
+        object.__setattr__(self, "is_mcp", is_mcp)
+        object.__setattr__(self, "hints", hints or frozenset())
+        object.__setattr__(self, "hooks", hooks or {})
+        object.__setattr__(self, "commands", commands or {})
+
+    @staticmethod
+    def _normalize_functions(
+        functions: Sequence[ToolFunctionInput] | None,
+    ) -> list[ToolFunction] | None:
+        # Normalize bare callables in `functions` to ToolFunction. The public
+        # plugin API (docs/plugins.rst) lets tools pass plain functions, while
+        # consumers (python.init, get_functions_description, as_function_subtoolspecs)
+        # expect ToolFunction. Without this, any plugin using the documented API
+        # crashes gptme at startup with "'function' object has no attribute 'fn'".
+        if functions:
+            return [
+                fn if isinstance(fn, ToolFunction) else ToolFunction.from_callable(fn)
+                for fn in functions
+            ]
+        return None
 
     def __repr__(self):
         return f"ToolSpec({self.name})"
@@ -431,16 +561,101 @@ class ToolSpec:
     def get_functions_description(self) -> str:
         # return a prompt with a brief description of the available functions
         if self.functions:
-            description = "The following Python functions are available using the `ipython` tool:\n\n```txt\n"
-            return (
-                description
-                + "\n".join(
-                    f"{callable_signature(func)}: {func.__doc__ or 'No description'}"
-                    for func in self.functions
-                )
-                + "\n```"
-            )
+            description = "The following Python functions are available:\n\n```txt\n"
+            lines = []
+            for tf in self.functions:
+                sig = callable_signature(tf.fn)
+                doc = tf.description or "No description"
+                lines.append(f"{sig}: {doc}")
+            return description + "\n".join(lines) + "\n```"
         return "None"
+
+    def as_function_subtoolspecs(self) -> list[ToolSpec]:
+        """Expand each ToolFunction into its own independently invocable ToolSpec.
+
+        Returns one ToolSpec per ToolFunction, each with a direct ``execute``
+        handler that calls ``fn(**kwargs)`` without requiring IPython.
+        Sub-spec names follow the ``<parent>.<function_name>`` pattern, which
+        mirrors the MCP tool naming convention (e.g. ``discord.send_message``).
+
+        This allows agents to invoke helper functions even when the IPython
+        tool is not loaded.
+
+        Example::
+
+            for sub in browser_tool.as_function_subtoolspecs():
+                if sub.name == "browser.view_image":
+                    list(sub.execute(None, None, {"path": "screenshot.png"}))
+        """
+        if not self.functions:
+            return []
+        specs = []
+        for tf in self.functions:
+            sub = ToolSpec.from_function(tf.fn)
+            specs.append(
+                dataclasses.replace(
+                    sub,
+                    name=f"{self.name}.{tf.name}",
+                    hints=tf.hints,
+                    desc=tf.description or sub.desc,
+                    parameters=list(tf.parameters) if tf.parameters else sub.parameters,
+                    available=self.available,
+                )
+            )
+        return specs
+
+    @classmethod
+    def from_function(cls, fn: Callable) -> ToolSpec:
+        """Create a ToolSpec from a plain Python function.
+
+        Auto-generates name, description, and parameters from the function
+        signature and docstring. The returned ToolSpec has an execute handler
+        that calls ``fn(**kwargs)`` directly — no IPython required.
+
+        Note: All values received via the ``kwargs`` channel are strings
+        (``dict[str, str]``). Functions whose parameters require non-string
+        types (``int``, ``float``, ``bool``, etc.) must perform their own
+        coercion inside the function body.
+        """
+        tf = ToolFunction.from_callable(fn)
+        captured_params = tf.parameters
+        sig = inspect.signature(fn)
+        pos_only_names = [
+            name
+            for name, p in sig.parameters.items()
+            if p.kind == inspect.Parameter.POSITIONAL_ONLY
+        ]
+
+        def execute(
+            code: str | None,
+            args: list[str] | None,
+            kwargs: dict[str, str] | None,
+        ) -> Generator[Message, None, None]:
+            call_kwargs: dict[str, Any] = {}
+            if kwargs:
+                call_kwargs = dict(kwargs)
+            elif args:
+                for i, param in enumerate(captured_params):
+                    if i < len(args):
+                        call_kwargs[param.name] = args[i]
+            if pos_only_names:
+                pos_vals = [
+                    call_kwargs.pop(name)
+                    for name in pos_only_names
+                    if name in call_kwargs
+                ]
+                result = fn(*pos_vals, **call_kwargs)
+            else:
+                result = fn(**call_kwargs)
+            if result is not None:
+                yield Message("system", str(result))
+
+        return cls(
+            name=tf.name,
+            desc=tf.description,
+            parameters=list(captured_params),
+            execute=execute,
+        )
 
 
 @dataclass(frozen=True)
