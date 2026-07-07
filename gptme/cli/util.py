@@ -4,6 +4,7 @@ CLI for gptme utility commands.
 Command groups are split into separate modules for maintainability:
 - cmd_agents.py: Live agent scanning (scan for gptme/claude/codex/… processes)
 - cmd_chats.py: Chat/conversation management (list, search, export, clean, stats)
+- cmd_computer.py: Computer-use tooling (audit-log extracts actions from trajectories)
 - cmd_hooks.py: Claude Code hook installation and execution
 - cmd_mcp.py: MCP server management (list, test, info, search)
 - cmd_batch.py: Batch runner for stdin prompts as fresh non-interactive sessions
@@ -45,8 +46,10 @@ if TYPE_CHECKING:
 
 _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
     "agents": (".cmd_agents", "agents"),
+    "attest": (".cmd_attest", "attest"),
     "batch": (".cmd_batch", "batch_cmd"),
     "chats": (".cmd_chats", "chats"),
+    "computer": (".cmd_computer", "computer"),
     "hooks": (".cmd_hooks", "hooks"),
     "mcp": (".cmd_mcp", "mcp"),
     "resume": (".cmd_resume", "resume"),
@@ -54,6 +57,15 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
     "snapshot": (".cmd_snapshot", "snapshot"),
     "status": (".cmd_status", "status"),
 }
+
+# Inline groups defined via @main.group() in this file
+_INLINE_COMMANDS = frozenset(
+    {"providers", "tokens", "context", "llm", "tools", "prompts", "models", "profile"}
+)
+
+# All top-level subcommand names for gptme-util — exported for the gptme main CLI
+# to enable dynamic dispatch without importing the full util module at startup.
+UTIL_SUBCOMMANDS: list[str] = sorted(set(_LAZY_COMMANDS) | _INLINE_COMMANDS)
 
 
 def get_model_list(*args, **kwargs):
@@ -270,7 +282,7 @@ def tokens():
 )
 def tokens_count(text: str | None, model: str, file: str | None):
     """Count tokens in text or file."""
-    import tiktoken  # fmt: skip
+    from ..util.tokens import len_tokens  # fmt: skip
 
     # Get text from file if specified (or stdin via "-")
     if file:
@@ -289,16 +301,11 @@ def tokens_count(text: str | None, model: str, file: str | None):
         )
         sys.exit(1)
 
-    # Validate model
-    try:
-        enc = tiktoken.encoding_for_model(model)
-    except KeyError:
-        print(f"Error: Model '{model}' not supported by tiktoken.")
-        sys.exit(1)
-
-    # Count tokens
-    tokens = enc.encode(text)
-    print(f"Token count ({model}): {len(tokens)}")
+    # Count tokens via gptme's shared tokenizer helper. It handles gptme's
+    # canonical "provider/model" names (e.g. "openai/gpt-4o" -> o200k_base),
+    # and falls back to a cl100k_base / character estimate for models tiktoken
+    # doesn't natively recognize, instead of erroring out. Counts are estimates.
+    print(f"Token count ({model}): {len_tokens(text, model)}")
 
 
 @main.group()
@@ -344,6 +351,48 @@ def context_retrieve(query: str, full: bool):
 
     # Search for the query
     results = rag_search(query, return_full=full)
+    print(results)
+
+
+@context.command("search-conversations")
+@click.argument("query")
+@click.option(
+    "--top-k",
+    default=3,
+    show_default=True,
+    type=int,
+    help="Number of results to return",
+)
+def context_search_conversations(query: str, top_k: int):
+    """Search indexed conversations for relevant context.
+
+    Returns the most relevant past conversation snippets for the given query.
+    Requires conversations to be indexed first with `rag_index_conversations`
+    (use `rag_index_conversations()` via the ipython tool, or `gptme context index` on a directory).
+    """
+    from ..tools.rag import _has_gptme_rag, init, rag_search  # fmt: skip
+
+    if not _has_gptme_rag():
+        print(
+            "Error: gptme-rag is not installed. Please install it to use this feature."
+        )
+        sys.exit(1)
+
+    # Initialize RAG
+    init()
+
+    # Search for the query
+    results = rag_search(query, return_full=True, top_k=top_k)
+
+    if not results.strip():
+        print(
+            "No relevant conversations found. "
+            "Try indexing conversations first with `rag_index_conversations()` "
+            "via the ipython tool."
+        )
+        return
+
+    print(f"Top {top_k} relevant conversations:\n")
     print(results)
 
 

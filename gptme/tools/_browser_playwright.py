@@ -24,10 +24,12 @@ from playwright.sync_api import (
 
 from ._browser_format import format_snapshot as _format_snapshot
 from ._browser_thread import (
-    DEFAULT_CONTEXT_OPTIONS,
     BrowserThread,
     _is_connection_error,
+    get_context_options,
+    set_storage_state_override,
 )
+from ._computer_gate import sensitive_action_gate
 
 _browser: BrowserThread | None = None
 _last_logs: dict = {"logs": [], "errors": [], "url": None}
@@ -161,7 +163,7 @@ def _load_page(browser: Browser, url: str) -> str:
 
     managed = _create_page(
         browser,
-        **DEFAULT_CONTEXT_OPTIONS,
+        **get_context_options(),
         extra_http_headers={
             # Prefer markdown and plaintext over HTML for better LLM consumption
             # Quality values (q) indicate preference order
@@ -362,7 +364,7 @@ def _search_google(browser: Browser, query: str) -> str:
     query = urllib.parse.quote(query)
     url = f"https://www.google.com/search?q={query}&hl=en"
 
-    managed = _create_page(browser, **DEFAULT_CONTEXT_OPTIONS)
+    managed = _create_page(browser, **get_context_options())
     page = managed.page
     try:
         page.goto(url)
@@ -391,7 +393,7 @@ def search_google(query: str) -> str:
 def _search_duckduckgo(browser: Browser, query: str) -> str:
     url = f"https://html.duckduckgo.com/html?q={query}"
 
-    managed = _create_page(browser, **DEFAULT_CONTEXT_OPTIONS)
+    managed = _create_page(browser, **get_context_options())
     page = managed.page
     try:
         page.goto(url)
@@ -604,7 +606,7 @@ def _open_page(browser: Browser, url: str) -> str:
 
     managed = _create_page(
         browser,
-        **DEFAULT_CONTEXT_OPTIONS,
+        **get_context_options(),
         extra_http_headers={
             "Accept": "text/markdown, text/plain, text/html;q=0.9, */*;q=0.8"
         },
@@ -633,6 +635,134 @@ def close_page() -> str:
     if _current_page is None:
         return "No page is currently open."
     return _execute_with_retry(_do_close_page)
+
+
+def _do_save_browser_state(browser: Browser, path: str) -> str:
+    """Save current browser session state (cookies + localStorage) to a JSON file."""
+    ctx: BrowserContext | None = _current_context
+    if ctx is None and _browser is not None and _browser._session_context is not None:
+        # CDP mode — the active context is the shared session context.
+        ctx = _browser._session_context
+    if ctx is None:
+        raise RuntimeError(
+            "No browser context is active. Call open_page(url) first to open a page "
+            "and authenticate, then save the session state."
+        )
+    resolved = Path(path).expanduser()
+    resolved.parent.mkdir(parents=True, exist_ok=True)
+    ctx.storage_state(path=str(resolved))
+    os.chmod(resolved, 0o600)
+    return f"Browser session state saved to {resolved}"
+
+
+def save_browser_state(path: str) -> str:
+    """Save the current browser session state (cookies, localStorage) to a file.
+
+    Captures the full authentication state of the active browser context so it can
+    be restored in a future session via ``GPTME_BROWSER_STORAGE_STATE``.
+
+    Typical workflow::
+
+        # 1. Open the page and log in manually or via fill_element/click_element:
+        open_page("https://x.com/login")
+        fill_element("#username", "you@example.com")
+        fill_element("#password", "hunter2")
+        click_element("text=Log in")
+
+        # 2. Verify you're logged in, then save the session:
+        save_browser_state("~/.config/gptme/twitter-session.json")
+
+        # 3. Future sessions load it automatically:
+        #    export GPTME_BROWSER_STORAGE_STATE=~/.config/gptme/twitter-session.json
+        # OR call load_browser_state() programmatically without a restart.
+
+    Args:
+        path: File path to write the session JSON. Parent directories are
+              created automatically. ``~`` is expanded.
+
+    Returns:
+        Confirmation string with the absolute path where the state was saved.
+    """
+    logger.info("Saving browser session state to %s", path)
+    return _execute_with_retry(_do_save_browser_state, path)
+
+
+def _do_load_browser_state(browser: Browser, path: str) -> str:
+    """Load a previously saved browser session state for use in the next open_page()."""
+    resolved = Path(path).expanduser()
+    if not resolved.exists():
+        raise FileNotFoundError(
+            f"Browser state file not found: {resolved}\n"
+            "Save a session first with save_browser_state(path), then reload."
+        )
+
+    # Close the current page + context so the next open_page() creates a fresh
+    # context that will pick up the loaded storage state.
+    _close_current_page()
+
+    # Register the override so get_context_options() uses it on the next context.
+    set_storage_state_override(resolved)
+
+    if _is_cdp_connection() and _browser is not None:
+        if _browser._session_context is not None:
+            try:
+                _browser._session_context.close()
+            except Exception:
+                pass
+            _browser._session_context = None
+
+        # CDP mode reuses a session context for future tabs; refresh it now so
+        # the next open_page() does not keep using the pre-load cookies.
+        _browser._session_context = browser.new_context(**get_context_options())
+        return (
+            f"Browser state loaded from {resolved}; CDP session context refreshed. "
+            "Call open_page(url) to start a session with the restored cookies and localStorage."
+        )
+
+    return (
+        f"Browser state loaded from {resolved}. "
+        "Call open_page(url) to start a session with the restored cookies and localStorage."
+    )
+
+
+def load_browser_state(path: str) -> str:
+    """Load a previously saved browser session (cookies, localStorage) from a file.
+
+    This is the in-session complement to ``save_browser_state()``.  Instead of
+    restarting gptme with ``GPTME_BROWSER_STORAGE_STATE``, call this function
+    directly to restore authentication state without a process restart.
+
+    After calling ``load_browser_state()``, call ``open_page(url)`` to start a
+    new browser session with the restored cookies and localStorage.
+
+    Typical workflow::
+
+        # Session A — log in and save state:
+        open_page("https://x.com/login")
+        fill_element("#username", "you@example.com")
+        fill_element("#password", "hunter2")
+        click_element("text=Log in")
+        save_browser_state("~/.config/gptme/twitter-session.json")
+
+        # Session B (same process, or a new one) — restore state and tweet:
+        load_browser_state("~/.config/gptme/twitter-session.json")
+        open_page("https://x.com")           # opens already logged in
+        click_element("text=What is happening?!")
+        fill_element('[data-testid="tweetTextarea_0"]', "hello from gptme!")
+        click_element('[data-testid="tweetButtonInline"]')
+
+    Args:
+        path: Path to the session JSON previously written by ``save_browser_state()``.
+              ``~`` is expanded to the home directory.
+
+    Returns:
+        Confirmation string. The next ``open_page()`` will use the restored state.
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+    """
+    logger.info("Loading browser session state from %s", path)
+    return _execute_with_retry(_do_load_browser_state, path)
 
 
 def open_page(url: str) -> str:
@@ -698,6 +828,7 @@ def fill_element(selector: str, value: str) -> str:
     """
     if _current_page is None:
         raise RuntimeError("No page is open. Call open_page(url) first.")
+    sensitive_action_gate("fill_element", value, is_browser=True)
     logger.info(f"Filling element '{selector}' with value")
     return _execute_with_retry(_fill, selector, value)
 
@@ -732,6 +863,232 @@ def scroll_page(direction: str = "down", amount: int = 500) -> str:
         raise RuntimeError("No page is open. Call open_page(url) first.")
     logger.info(f"Scrolling {direction} by {amount}px")
     return _execute_with_retry(_scroll, direction, amount)
+
+
+def _press_key(browser: Browser, key: str) -> str:
+    """Press a keyboard key or shortcut in the current page."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    _current_page.keyboard.press(key)
+    try:
+        _current_page.wait_for_load_state("domcontentloaded", timeout=5000)
+    except PlaywrightTimeoutError:
+        pass  # Timeout is fine — key press may not navigate
+    return _page_snapshot()
+
+
+def press_key(key: str) -> str:
+    """Press a keyboard key or shortcut in the current browser page.
+
+    Dispatches the key event to the active focused element, or the document if
+    nothing is focused. Useful for submitting forms (``Enter``), navigating
+    autocomplete menus (``ArrowDown``), dismissing modals (``Escape``), and
+    triggering keyboard shortcuts (e.g. ``Control+a`` to select all).
+
+    Args:
+        key: Playwright key name. Examples: ``"Enter"``, ``"Tab"``,
+             ``"Escape"``, ``"ArrowDown"``, ``"Control+a"``, ``"Meta+k"``.
+
+    Returns:
+        Updated ARIA snapshot of the page after the key press.
+
+    Example::
+
+        open_page("https://example.com/search")
+        fill_element("[name='q']", "gptme")
+        press_key("Enter")   # submit the search form
+    """
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    logger.info("Pressing key: '%s'", key)
+    return _execute_with_retry(_press_key, key)
+
+
+def _select_option(browser: Browser, selector: str, value: str) -> str:
+    """Select an option from a <select> element on the current page."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    locator = _current_page.locator(selector)
+    # The removed label= fallback was unreachable: PlaywrightTimeoutError is
+    # raised when the locator cannot resolve (element absent), in which case
+    # label= on the same locator would also time out.  A no-option-match
+    # raises a different error that the except clause never caught.
+    # Drop the dead fallback to surface failures in 10 s instead of 20 s.
+    locator.select_option(value=value, timeout=10000)
+    return _page_snapshot()
+
+
+def select_option(selector: str, value: str) -> str:
+    """Select an option from a <select> dropdown on the current page.
+
+    Finds the ``<select>`` element and selects the option matching ``value``
+    by its ``value`` attribute.
+
+    Args:
+        selector: Playwright selector for the ``<select>`` element
+                  (e.g. ``"select#country"``, ``"[name='size']"``).
+        value: The option value (``value`` attribute) to select.
+
+    Returns:
+        Updated ARIA snapshot of the page after the selection.
+
+    Example::
+
+        open_page("https://example.com/order")
+        select_option("[name='size']", "large")
+        click_element("text=Add to cart")
+    """
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    logger.info("Selecting option '%s' from '%s'", value, selector)
+    return _execute_with_retry(_select_option, selector, value)
+
+
+def _wait_for_element(browser: Browser, selector: str, timeout_ms: int) -> str:
+    """Wait for an element to be visible on the current page."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    try:
+        _current_page.locator(selector).wait_for(state="visible", timeout=timeout_ms)
+    except PlaywrightTimeoutError as e:
+        raise RuntimeError(
+            f"Element '{selector}' did not appear within {timeout_ms}ms. "
+            "The page may still be loading, or the selector is wrong."
+        ) from e
+    return _page_snapshot()
+
+
+def wait_for_element(selector: str, timeout_ms: int = 5000) -> str:
+    """Wait for a DOM element to become visible on the current page.
+
+    Blocks until the element matching ``selector`` is visible, then returns
+    the updated page snapshot. Useful after clicking something that triggers
+    a dynamic content load, modal, or redirect.
+
+    Args:
+        selector: Playwright selector for the element to wait for.
+        timeout_ms: Maximum wait time in milliseconds (default: 5000).
+                    Raises ``RuntimeError`` if element does not appear.
+
+    Returns:
+        Updated ARIA snapshot of the page once the element is visible.
+
+    Example::
+
+        open_page("https://x.com/compose/tweet")
+        wait_for_element("[data-testid='tweetTextarea_0']", timeout_ms=8000)
+        fill_element("[data-testid='tweetTextarea_0']", "Hello from gptme!")
+        click_element("[data-testid='tweetButtonInline']")
+    """
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    if timeout_ms <= 0:
+        raise ValueError(f"timeout_ms must be positive, got: {timeout_ms!r}")
+    logger.info("Waiting for element '%s' (timeout=%dms)", selector, timeout_ms)
+    return _execute_with_retry(_wait_for_element, selector, timeout_ms)
+
+
+def _hover(browser: Browser, selector: str) -> str:
+    """Hover over an element on the current page."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    _current_page.locator(selector).hover(timeout=10000)
+    _current_page.wait_for_timeout(300)
+    return _page_snapshot()
+
+
+def hover_element(selector: str) -> str:
+    """Hover over an element on the current page and return updated ARIA snapshot.
+
+    Triggers ``mouseover`` and ``mouseenter`` events, revealing hover-only
+    content such as dropdown menus, tooltips, and contextual buttons.  Use it
+    before clicking a menu item that only appears on hover.
+
+    Args:
+        selector: Playwright selector for the element to hover over.
+
+    Returns:
+        Updated ARIA snapshot of the page after the hover.
+
+    Example::
+
+        open_page("https://example.com")
+        hover_element("text=Products")   # reveal dropdown
+        click_element("text=Pricing")    # click item that appeared
+    """
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    logger.info("Hovering over element: '%s'", selector)
+    return _execute_with_retry(_hover, selector)
+
+
+def _snapshot_current_page(_browser: Browser) -> str:
+    """Return the current page snapshot from the browser thread."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    return _page_snapshot()
+
+
+def snapshot_page() -> str:
+    """Get the ARIA accessibility snapshot of the current interactive page.
+
+    Returns the structured accessibility tree of the page that is currently
+    open via ``open_page()``, reflecting all DOM changes made by subsequent
+    interactions (clicks, fills, scrolls, key presses, hover events).
+
+    Use this when you need to re-read the current page state without
+    triggering any action — e.g. after a dynamic update or to verify a
+    form's state before submitting.
+
+    Returns:
+        Structured ARIA snapshot including page title and current URL.
+
+    Raises:
+        RuntimeError: If no page is currently open.
+
+    Example::
+
+        open_page("https://example.com/form")
+        fill_element("[name='email']", "user@example.com")
+        state = snapshot_page()   # verify the field was filled before submitting
+        click_element("text=Submit")
+    """
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    logger.info("Snapshotting current page state")
+    return _execute_with_retry(_snapshot_current_page)
+
+
+def _get_current_url(_browser: Browser) -> str:
+    """Return the current page URL from the browser thread."""
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    return _current_page.url
+
+
+def get_current_url() -> str:
+    """Return the URL of the currently open browser page.
+
+    Useful after a redirect, navigation, or login flow to confirm where
+    the browser ended up.
+
+    Returns:
+        The current URL as a string.
+
+    Raises:
+        RuntimeError: If no page is currently open.
+
+    Example::
+
+        open_page("https://example.com/login")
+        fill_element("#username", "alice")
+        fill_element("#password", "secret")
+        click_element("text=Log in")
+        url = get_current_url()   # confirm redirect to /dashboard
+    """
+    if _current_page is None:
+        raise RuntimeError("No page is open. Call open_page(url) first.")
+    return _execute_with_retry(_get_current_url)
 
 
 def _take_screenshot(

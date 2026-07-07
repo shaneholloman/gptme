@@ -1,6 +1,8 @@
 """Tests for the gptme doctor command."""
 
 import json
+from collections import UserDict
+from types import SimpleNamespace
 from unittest.mock import patch
 
 from click.testing import CliRunner
@@ -312,6 +314,109 @@ class TestCheckPythonDeps:
         # Names from info.py EXTRAS list (synced with pyproject.toml)
         assert any("browser" in name for name in dep_names)
         assert any("dspy" in name for name in dep_names)
+
+    def test_pyproject_fallback_used_when_metadata_empty(self, tmp_path):
+        """Test that pyproject.toml is read when Provides-Extra is absent.
+
+        Poetry / uv editable installs often omit Provides-Extra from the
+        package metadata.  The fallback must parse pyproject.toml instead
+        so that gptme-doctor can show optional deps in dev environments.
+        """
+        import json
+
+        from gptme.info import _parse_extras_from_metadata
+
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[tool.poetry.extras]\n"
+            'browser = ["playwright"]\n'
+            "computer = []\n"
+            'dspy = ["dspy"]\n'
+        )
+        direct_url = tmp_path / "direct_url.json"
+        direct_url.write_text(
+            json.dumps({"url": f"file://{tmp_path}", "dir_info": {"editable": True}})
+        )
+
+        import gptme.info as _info
+
+        old_cache = _info._EXTRAS_CACHE
+        try:
+            _info._EXTRAS_CACHE = None  # clear cache so fresh parse runs
+
+            def _fake_dist(name):
+                class FakeMeta:
+                    def get_all(self, key):
+                        return [] if key == "Provides-Extra" else None
+
+                class FakeDist:
+                    metadata = FakeMeta()
+                    requires = []
+
+                    def read_text(self, fname):
+                        if fname == "direct_url.json":
+                            return direct_url.read_text()
+                        return None
+
+                return FakeDist()
+
+            import importlib.metadata as _imeta
+
+            with patch.object(_imeta, "distribution", side_effect=_fake_dist):
+                result = _parse_extras_from_metadata()
+
+            names = [e.name for e in result]
+            assert "browser" in names
+            assert "computer" in names
+            assert "dspy" in names
+        finally:
+            _info._EXTRAS_CACHE = old_cache
+
+    def test_pyproject_fallback_normalizes_pep621_requirements(self, tmp_path):
+        """PEP 621 optional-dependencies should map to importable package names."""
+        from gptme.info import _parse_extras_from_pyproject
+
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text(
+            "[project]\n"
+            "[project.optional-dependencies]\n"
+            'browser = ["playwright>=1.40"]\n'
+            'telemetry = ["opentelemetry-api>=1.20", "opentelemetry-sdk"]\n'
+            'server = ["flask[async]>=3.0"]\n'
+        )
+
+        result = _parse_extras_from_pyproject(pyproject)
+        extras = {extra.name: extra.packages for extra in result}
+
+        assert extras["browser"] == ["playwright"]
+        assert extras["telemetry"] == ["opentelemetry-api", "opentelemetry-sdk"]
+        assert extras["server"] == ["flask"]
+
+    def test_pyproject_fallback_accepts_tomlkit_mapping(self, tmp_path):
+        """tomlkit returns a mapping, not a plain dict."""
+        from gptme.info import _parse_extras_from_pyproject
+
+        pyproject = tmp_path / "pyproject.toml"
+        pyproject.write_text("")
+        tomlkit_like = SimpleNamespace(
+            load=lambda _f: UserDict(
+                {"tool": {"poetry": {"extras": {"browser": ["playwright"]}}}}
+            )
+        )
+
+        def fake_import_module(module_name):
+            if module_name == "tomlkit":
+                return tomlkit_like
+            raise ImportError(module_name)
+
+        with patch(
+            "gptme.info.importlib.import_module", side_effect=fake_import_module
+        ):
+            result = _parse_extras_from_pyproject(pyproject)
+
+        assert [(extra.name, extra.packages) for extra in result] == [
+            ("browser", ["playwright"])
+        ]
 
 
 class TestCheckConfig:
@@ -946,3 +1051,255 @@ class TestCheckComputer:
 
         xdotool = next(r for r in results if r.name == "Computer: xdotool")
         assert xdotool.details == "/usr/bin/xdotool"
+
+    @patch("sys.platform", "linux")
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {"DISPLAY": ":1"})
+    def test_display_live_xdpyinfo_ok(self, mock_which, mock_run):
+        """When xdpyinfo confirms the display is live, DISPLAY check is OK."""
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot", "xdpyinfo") else None
+        )
+        mock_run.return_value = None  # subprocess.run returns CompletedProcess-like; None is fine since we only check=True
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert names["Computer: DISPLAY"].status == CheckStatus.OK
+        assert "reachable" in names["Computer: DISPLAY"].message
+
+    @patch("sys.platform", "linux")
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {"DISPLAY": ":1"})
+    def test_display_dead_xdpyinfo_fails(self, mock_which, mock_run):
+        """When xdpyinfo reports the X server is unreachable, DISPLAY check warns."""
+        import subprocess
+
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot", "xdpyinfo") else None
+        )
+        mock_run.side_effect = subprocess.CalledProcessError(1, "xdpyinfo")
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert names["Computer: DISPLAY"].status == CheckStatus.WARNING
+        assert "not responding" in names["Computer: DISPLAY"].message
+        hint = names["Computer: DISPLAY"].fix_hint or ""
+        assert "Xvfb" in hint or "xvfb-run" in hint
+
+    @patch("sys.platform", "linux")
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {"DISPLAY": ":1"})
+    def test_linux_wm_detected(self, mock_which, mock_run):
+        """When xprop finds _NET_SUPPORTING_WM_CHECK, WM check is OK."""
+        import subprocess
+
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot", "xprop") else None
+        )
+
+        def _run_side(args, **_kw):
+            if args[0].endswith("xprop"):
+                return subprocess.CompletedProcess(
+                    args,
+                    0,
+                    stdout="_NET_SUPPORTING_WM_CHECK(WINDOW): window id # 0x200001",
+                    stderr="",
+                )
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        mock_run.side_effect = _run_side
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert "Computer: window manager" in names
+        assert names["Computer: window manager"].status == CheckStatus.OK
+
+    @patch("sys.platform", "linux")
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {"DISPLAY": ":1"})
+    def test_linux_no_wm(self, mock_which, mock_run):
+        """When xprop finds no EWMH WM, WM check warns with fix hint."""
+        import subprocess
+
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot", "xprop") else None
+        )
+
+        def _run_side(args, **_kw):
+            if args[0].endswith("xprop"):
+                return subprocess.CompletedProcess(args, 1, stdout="", stderr="")
+            return subprocess.CompletedProcess(args, 0, stdout="", stderr="")
+
+        mock_run.side_effect = _run_side
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert "Computer: window manager" in names
+        assert names["Computer: window manager"].status == CheckStatus.WARNING
+        hint = names["Computer: window manager"].fix_hint or ""
+        assert "mutter" in hint or "fluxbox" in hint
+
+    @patch("sys.platform", "linux")
+    @patch("importlib.util.find_spec")
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {"DISPLAY": ":1"})
+    def test_linux_pyatspi_present(self, mock_which, mock_run, mock_find_spec):
+        """When pyatspi is installed, accessibility check is OK."""
+        import subprocess
+
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot") else None
+        )
+        mock_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        mock_find_spec.side_effect = lambda name: (
+            object() if name == "pyatspi" else None
+        )
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert "Computer: pyatspi" in names
+        assert names["Computer: pyatspi"].status == CheckStatus.OK
+
+    @patch("sys.platform", "linux")
+    @patch("importlib.util.find_spec")
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {"DISPLAY": ":1"})
+    def test_linux_pyatspi_missing(self, mock_which, mock_run, mock_find_spec):
+        """When pyatspi is missing, accessibility check warns with install hint."""
+        import subprocess
+
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot") else None
+        )
+        mock_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        mock_find_spec.return_value = None
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert "Computer: pyatspi" in names
+        assert names["Computer: pyatspi"].status == CheckStatus.WARNING
+        hint = names["Computer: pyatspi"].fix_hint or ""
+        assert "pyatspi" in hint
+
+    @patch("sys.platform", "linux")
+    @patch("importlib.util.find_spec")
+    @patch("subprocess.run")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {}, clear=True)
+    def test_linux_no_display_pyatspi_skipped(
+        self, mock_which, mock_run, mock_find_spec
+    ):
+        """When DISPLAY is not set, pyatspi check should be skipped entirely."""
+        import subprocess
+
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot") else None
+        )
+        mock_run.return_value = subprocess.CompletedProcess([], 0, stdout="", stderr="")
+        mock_find_spec.return_value = None
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert "Computer: pyatspi" not in names
+
+    @patch("sys.platform", "linux")
+    @patch("importlib.util.find_spec")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {"DISPLAY": ":1"})
+    def test_ffmpeg_present(self, mock_which, mock_find_spec):
+        """When ffmpeg is installed, the screen-recording check is OK."""
+        mock_find_spec.return_value = None
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot", "ffmpeg") else None
+        )
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert "Computer: ffmpeg" in names
+        assert names["Computer: ffmpeg"].status == CheckStatus.OK
+
+    @patch("sys.platform", "linux")
+    @patch("importlib.util.find_spec")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {"DISPLAY": ":1"})
+    def test_ffmpeg_missing(self, mock_which, mock_find_spec):
+        """When ffmpeg is not installed, the screen-recording check warns with install hint."""
+        mock_find_spec.return_value = None
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot") else None
+        )
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert "Computer: ffmpeg" in names
+        assert names["Computer: ffmpeg"].status == CheckStatus.WARNING
+        hint = names["Computer: ffmpeg"].fix_hint or ""
+        assert "ffmpeg" in hint
+        assert "apt install ffmpeg" in hint or "brew install ffmpeg" in hint
+
+    @patch("sys.platform", "linux")
+    @patch("importlib.util.find_spec")
+    @patch("shutil.which")
+    @patch.dict("os.environ", {"DISPLAY": ":1"})
+    def test_ffmpeg_verbose_shows_path(self, mock_which, mock_find_spec):
+        """Verbose mode should show the ffmpeg path in details."""
+        mock_find_spec.return_value = None
+        mock_which.side_effect = lambda t: (
+            f"/usr/bin/{t}" if t in ("xdotool", "scrot", "ffmpeg") else None
+        )
+
+        results = _check_computer(verbose=True)
+
+        ffmpeg = next(r for r in results if r.name == "Computer: ffmpeg")
+        assert ffmpeg.details == "/usr/bin/ffmpeg"
+
+    @patch("sys.platform", "darwin")
+    @patch("shutil.which")
+    def test_ffmpeg_present_macos(self, mock_which):
+        """ffmpeg check should work on macOS too."""
+        mock_which.side_effect = lambda t: (
+            "/usr/bin/screencapture"
+            if t == "screencapture"
+            else "/usr/local/bin/cliclick"
+            if t == "cliclick"
+            else "/usr/local/bin/ffmpeg"
+            if t == "ffmpeg"
+            else None
+        )
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert "Computer: ffmpeg" in names
+        assert names["Computer: ffmpeg"].status == CheckStatus.OK
+
+    @patch("sys.platform", "darwin")
+    @patch("shutil.which")
+    def test_ffmpeg_missing_macos(self, mock_which):
+        """ffmpeg missing on macOS should warn with brew install hint."""
+        mock_which.side_effect = lambda t: (
+            "/usr/bin/screencapture" if t == "screencapture" else None
+        )
+
+        results = _check_computer()
+
+        names = {r.name: r for r in results}
+        assert "Computer: ffmpeg" in names
+        assert names["Computer: ffmpeg"].status == CheckStatus.WARNING
+        hint = names["Computer: ffmpeg"].fix_hint or ""
+        assert "brew install ffmpeg" in hint

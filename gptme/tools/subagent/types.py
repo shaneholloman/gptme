@@ -13,7 +13,8 @@ import re
 import subprocess
 import sys
 import threading
-from dataclasses import dataclass
+import time
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal, TypedDict
 
@@ -29,7 +30,7 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-Status = Literal["running", "success", "failure", "clarification_needed"]
+Status = Literal["running", "success", "failure", "clarification_needed", "timeout"]
 Role = Literal["general", "explore", "implement", "verify"]
 
 # Role → profile name mapping
@@ -136,7 +137,11 @@ def set_subagent_result_if_absent(agent_id: str, result: "ReturnType") -> bool:
 @dataclass(frozen=True)
 class ReturnType:
     status: Status
-    result: str | None = None
+    result: str | dict[str, object] | None = None
+    # Token budget tracking: LLM token counts for the subagent's run.
+    # None means unavailable (e.g. cached terminal result, pre-budget-tracking log).
+    input_tokens: int | None = None
+    output_tokens: int | None = None
 
 
 def clarification_result_from_content(content: str) -> ReturnType | None:
@@ -194,13 +199,116 @@ class Subagent:
     role: Role | None = None
     # Secret redaction: when True, common secret patterns (API keys, tokens, passwords)
     # are redacted from workspace context messages before they are seen by the subagent.
-    redact_secrets: bool = False
+    redact_secrets: bool = True
+    # Context window: None = no limit; 0 = minimal (no workspace files); N = at most N msgs
+    context_window: int | None = None
+    # Number of parent conversation turns to forward as context (P1: persist for re-spawn)
+    context_turns: int | None = None
+    # Timestamp (seconds since epoch) when this subagent was created
+    started_at: float = field(default_factory=time.time)
+    # Wall-clock limit in seconds; when set, a watchdog auto-cancels after this time
+    max_time: float | None = None
+
+    def _normalize_json_result(self, result: str) -> str:
+        """Normalize a complete-block result as canonical JSON.
+
+        When output_schema is set, the complete block content must be valid JSON.
+        If it parses as valid JSON, the result is returned as a canonical JSON string
+        (re-serialized for consistency). If it fails to parse, the original string
+        is returned unchanged so the caller still gets a result (parsing failure is
+        logged as a warning, not treated as a hard failure).
+
+        Note: this validates JSON *syntax*, not Pydantic schema conformance —
+        callers that need full schema validation should call
+        ``output_schema.model_validate(parsed)`` separately.
+
+        Args:
+            result: The raw text from the complete block.
+
+        Returns:
+            Canonical JSON string when output_schema is set and the result is valid
+            JSON; otherwise the original result string unchanged.
+        """
+        if self.output_schema is None:
+            return result
+        import json
+
+        try:
+            parsed = json.loads(result)
+            return json.dumps(parsed)
+        except json.JSONDecodeError as e:
+            logger.warning(
+                "Subagent '%s' output_schema set but complete block is not valid JSON: %s. "
+                "Returning raw result. Snippet: %.200r",
+                self.agent_id,
+                e,
+                result,
+            )
+            return result
 
     def get_log(self) -> "LogManager":
         # noreorder
         from ...logmanager import LogManager  # fmt: skip
 
         return LogManager.load(self.logdir)
+
+    def _read_token_stats(self) -> tuple[int | None, int | None]:
+        """Return (input_tokens, output_tokens) from the subagent's conversation log.
+
+        Reads the JSONL log file directly to sum up usage metadata across all
+        assistant turns — same approach as logmanager/conversations.py _full_scan().
+        Returns (None, None) on any error so missing stats never block the caller.
+        """
+        import json
+
+        try:
+            conv_fn = self.logdir / "conversation.jsonl"
+            if not conv_fn.exists():
+                # Some log layouts use the directory name as the file
+                candidates = list(self.logdir.glob("*.jsonl"))
+                if not candidates:
+                    return None, None
+                conv_fn = candidates[0]
+
+            input_tokens = 0
+            output_tokens = 0
+            saw_usage = False
+            with open(conv_fn, "rb") as f:
+                for line in f:
+                    line = line.strip()
+                    if not line or b'"metadata"' not in line:
+                        continue
+                    try:
+                        msg = json.loads(line)
+                        meta = msg.get("metadata")
+                        if not meta:
+                            continue
+                        usage = meta.get("usage")
+                        src = usage if isinstance(usage, dict) else meta
+                        token_keys = (
+                            "input_tokens",
+                            "output_tokens",
+                            "cache_read_tokens",
+                            "cache_creation_tokens",
+                        )
+                        if not any(k in src for k in token_keys):
+                            continue
+                        saw_usage = True
+                        cache_read = src.get("cache_read_tokens", 0) or 0
+                        input_tokens += (
+                            (src.get("input_tokens", 0) or 0)
+                            + cache_read
+                            + (src.get("cache_creation_tokens", 0) or 0)
+                        )
+                        output_tokens += src.get("output_tokens", 0) or 0
+                    except (json.JSONDecodeError, TypeError):
+                        continue
+            if not saw_usage:
+                return None, None
+            return input_tokens, output_tokens
+        except Exception as e:
+            logger.debug("Could not read token stats for %s: %s", self.agent_id, e)
+            return None, None
 
     def is_running(self) -> bool:
         """Check if the subagent is still running."""
@@ -214,6 +322,10 @@ class Subagent:
         return False
 
     def status(self) -> ReturnType:
+        with _subagent_results_lock:
+            cached_result = _subagent_results.get(self.agent_id)
+        if cached_result is not None:
+            return cached_result
         if self.is_running():
             return ReturnType("running")
         return self._read_log()
@@ -229,6 +341,9 @@ class Subagent:
             if self.agent_id in _subagent_results:
                 return _subagent_results[self.agent_id]
 
+        # Read token stats once; attach to every terminal ReturnType we return.
+        in_tok, out_tok = self._read_token_stats()
+
         # Check if executor used the complete tool
         try:
             log = self.get_log().log
@@ -236,9 +351,16 @@ class Subagent:
             return ReturnType(
                 "failure",
                 f"Subagent exited before creating a conversation log: {self.logdir}",
+                input_tokens=in_tok,
+                output_tokens=out_tok,
             )
         if not log:
-            return ReturnType("failure", "No messages in log")
+            return ReturnType(
+                "failure",
+                "No messages in log",
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+            )
 
         last_msg = log[-1]
 
@@ -246,7 +368,13 @@ class Subagent:
         # Must be checked before the complete block so a "clarify" isn't misread as failure.
         clarification_result = clarification_result_from_content(last_msg.content)
         if clarification_result:
-            return clarification_result
+            # Attach token stats to clarification result too
+            return ReturnType(
+                clarification_result.status,
+                clarification_result.result,
+                input_tokens=in_tok,
+                output_tokens=out_tok,
+            )
 
         # Check for complete tool call in last message
         # Try parsing as ToolUse first
@@ -258,11 +386,14 @@ class Subagent:
             # Don't silently fall back - make it clear when no summary was provided
             if complete_tool.content and complete_tool.content.strip():
                 result = complete_tool.content.strip()
+                result = self._normalize_json_result(result)
             else:
                 result = "Task completed (no summary provided)"
             return ReturnType(
                 "success",
                 result + f"\n\nFull log: {self.logdir}",
+                input_tokens=in_tok,
+                output_tokens=out_tok,
             )
 
         # Fallback: Check for complete code block directly
@@ -275,11 +406,14 @@ class Subagent:
                 content = match.group(1).strip()
                 if content:
                     result = content
+                    result = self._normalize_json_result(result)
                 else:
                     result = "Task completed (no summary provided)"
                 return ReturnType(
                     "success",
                     result + f"\n\nFull log: {self.logdir}",
+                    input_tokens=in_tok,
+                    output_tokens=out_tok,
                 )
 
         # Check if session ended with system completion message
@@ -287,10 +421,14 @@ class Subagent:
             return ReturnType(
                 "success",
                 f"Task completed successfully. Full log: {self.logdir}",
+                input_tokens=in_tok,
+                output_tokens=out_tok,
             )
 
         # Task didn't complete properly
         return ReturnType(
             "failure",
             f"Task did not complete properly. Check log: {self.logdir}",
+            input_tokens=in_tok,
+            output_tokens=out_tok,
         )

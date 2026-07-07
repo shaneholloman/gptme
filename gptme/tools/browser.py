@@ -23,6 +23,13 @@ Playwright backend:
        PW_VERSION=$(pipx runpip gptme show playwright | grep Version | cut -d' ' -f2)
        pipx run playwright==$PW_VERSION install chromium-headless-shell
 
+ - To use Firefox instead of Chromium (useful for pages that block headless Chromium):
+
+   .. code-block:: bash
+
+       pipx run playwright==$PW_VERSION install firefox
+       export GPTME_BROWSER_ENGINE=firefox
+
  - To use an existing Chromium-compatible browser over Chrome DevTools Protocol
    instead of launching Playwright's bundled Chromium, start it with remote
    debugging enabled and set GPTME_BROWSER_CDP_URL:
@@ -345,13 +352,24 @@ if browser == "playwright":
     from ._browser_playwright import click_element as click_element_pw  # fmt: skip
     from ._browser_playwright import close_page as close_page_pw  # fmt: skip
     from ._browser_playwright import fill_element as fill_element_pw  # fmt: skip
+    from ._browser_playwright import get_current_url as get_current_url_pw  # fmt: skip
+    from ._browser_playwright import hover_element as hover_element_pw  # fmt: skip
     from ._browser_playwright import open_page as open_page_pw  # fmt: skip
+    from ._browser_playwright import press_key as press_key_pw  # fmt: skip
     from ._browser_playwright import read_logs as read_logs_playwright  # fmt: skip
     from ._browser_playwright import read_page_text as read_page_text_pw  # fmt: skip
     from ._browser_playwright import read_url as read_url_playwright  # fmt: skip
+    from ._browser_playwright import (
+        save_browser_state as save_browser_state_pw,  # fmt: skip
+    )
     from ._browser_playwright import screenshot_url as screenshot_url_pw  # fmt: skip
     from ._browser_playwright import scroll_page as scroll_page_pw  # fmt: skip
     from ._browser_playwright import search_duckduckgo, search_google  # fmt: skip
+    from ._browser_playwright import select_option as select_option_pw  # fmt: skip
+    from ._browser_playwright import snapshot_page as snapshot_page_pw  # fmt: skip
+    from ._browser_playwright import (
+        wait_for_element as wait_for_element_pw,  # fmt: skip
+    )
 elif browser == "lynx":
     from ._browser_lynx import read_url as read_url_lynx  # fmt: skip
     from ._browser_lynx import search as search_lynx  # fmt: skip
@@ -951,6 +969,85 @@ def close_page() -> str:
     raise ValueError("Interactive browsing not supported with lynx backend")
 
 
+def save_browser_state(path: str) -> str:
+    """Save the current browser session (cookies, localStorage) to a file.
+
+    Captures the full authentication state of the active browser context so
+    it can be restored in a future session via ``GPTME_BROWSER_STORAGE_STATE``.
+
+    Call this after logging in to a site with open_page() + fill_element() +
+    click_element() so you don't have to re-authenticate next time.
+
+    Typical workflow::
+
+        open_page("https://x.com/login")
+        fill_element("#username", "you@example.com")
+        fill_element("#password", "hunter2")
+        click_element("text=Log in")
+        save_browser_state("~/.config/gptme/twitter-session.json")
+        # Next session: export GPTME_BROWSER_STORAGE_STATE=~/.config/gptme/twitter-session.json
+
+    Args:
+        path: File path to write the session JSON. Directories are created
+              automatically. ``~`` is expanded to the home directory.
+
+    Returns:
+        Confirmation string with the absolute path where the state was saved.
+    """
+    assert browser
+    if browser == "playwright":
+        return save_browser_state_pw(path)
+    raise ValueError(
+        "save_browser_state() is only supported with the playwright backend"
+    )
+
+
+def load_browser_state(path: str) -> str:
+    """Load a previously saved browser session (cookies, localStorage) from a file.
+
+    In-session complement to ``save_browser_state()``.  Restores authentication
+    state without requiring a process restart or setting the
+    ``GPTME_BROWSER_STORAGE_STATE`` environment variable.
+
+    After calling this, call ``open_page(url)`` to start a browser session with
+    the restored cookies and localStorage.
+
+    Typical workflow::
+
+        # First session — log in and save state:
+        open_page("https://x.com/login")
+        fill_element("#username", "you@example.com")
+        fill_element("#password", "hunter2")
+        click_element("text=Log in")
+        save_browser_state("~/.config/gptme/twitter-session.json")
+
+        # Later in the same session (or a new one):
+        load_browser_state("~/.config/gptme/twitter-session.json")
+        open_page("https://x.com")           # opens already logged in
+        click_element("text=What is happening?!")
+        fill_element('[data-testid="tweetTextarea_0"]', "hello from gptme!")
+        click_element('[data-testid="tweetButtonInline"]')
+
+    Args:
+        path: Path to the session JSON previously written by ``save_browser_state()``.
+              ``~`` is expanded to the home directory.
+
+    Returns:
+        Confirmation string. The next ``open_page()`` will use the restored state.
+
+    Raises:
+        FileNotFoundError: If *path* does not exist.
+    """
+    assert browser
+    if browser == "playwright":
+        from ._browser_playwright import load_browser_state as load_browser_state_pw
+
+        return load_browser_state_pw(path)
+    raise ValueError(
+        "load_browser_state() is only supported with the playwright backend"
+    )
+
+
 def read_page_text() -> str:
     """Read the full text content of the current interactive page as Markdown.
 
@@ -1015,6 +1112,165 @@ def scroll_page(direction: str = "down", amount: int = 500) -> str:
     raise ValueError("Interactive browsing not supported with lynx backend")
 
 
+def press_key(key: str) -> str:
+    """Press a keyboard key or shortcut in the current browser page.
+
+    Dispatches the key event to the focused element (or document). Use for
+    submitting forms (``Enter``), navigating menus (``ArrowDown``), dismissing
+    dialogs (``Escape``), or triggering shortcuts (e.g. ``Control+a``).
+
+    Requires open_page() to be called first.
+
+    Args:
+        key: Playwright key name. Examples: ``"Enter"``, ``"Tab"``,
+             ``"Escape"``, ``"ArrowDown"``, ``"Control+a"``, ``"Meta+k"``.
+
+    Returns:
+        Updated ARIA snapshot of the page after the key press.
+
+    Example::
+
+        open_page("https://example.com/search")
+        fill_element("[name='q']", "gptme")
+        press_key("Enter")
+    """
+    assert browser
+    if browser == "playwright":
+        return press_key_pw(key)
+    raise ValueError("Interactive browsing not supported with lynx backend")
+
+
+def select_option(selector: str, value: str) -> str:
+    """Select an option from a <select> dropdown on the current page.
+
+    Requires open_page() to be called first.
+
+    Args:
+        selector: Playwright selector for the ``<select>`` element.
+        value: The option value attribute or visible text to select.
+
+    Returns:
+        Updated ARIA snapshot of the page after the selection.
+
+    Example::
+
+        open_page("https://example.com/order")
+        select_option("[name='size']", "large")
+        click_element("text=Add to cart")
+    """
+    assert browser
+    if browser == "playwright":
+        return select_option_pw(selector, value)
+    raise ValueError("Interactive browsing not supported with lynx backend")
+
+
+def wait_for_element(selector: str, timeout_ms: int = 5000) -> str:
+    """Wait for a DOM element to become visible on the current page.
+
+    Blocks until the element matching ``selector`` is visible, then returns
+    the updated ARIA snapshot. Use after actions that trigger dynamic content
+    loading (modals, async renders, redirects).
+
+    Requires open_page() to be called first.
+
+    Args:
+        selector: Playwright selector for the element to wait for.
+        timeout_ms: Maximum wait time in milliseconds (default: 5000).
+
+    Returns:
+        Updated ARIA snapshot once the element is visible.
+
+    Example::
+
+        open_page("https://x.com/compose/tweet")
+        wait_for_element("[data-testid='tweetTextarea_0']", timeout_ms=8000)
+        fill_element("[data-testid='tweetTextarea_0']", "Hello from gptme!")
+        click_element("[data-testid='tweetButtonInline']")
+    """
+    assert browser
+    if browser == "playwright":
+        return wait_for_element_pw(selector, timeout_ms)
+    raise ValueError("Interactive browsing not supported with lynx backend")
+
+
+def hover_element(selector: str) -> str:
+    """Hover over an element on the current page and return updated ARIA snapshot.
+
+    Triggers mouseover/mouseenter events, revealing hover-only content such as
+    dropdown menus, tooltips, and contextual buttons. Use before clicking a
+    menu item that only appears on hover.
+
+    Requires open_page() to be called first.
+
+    Args:
+        selector: Playwright selector for the element to hover over.
+
+    Returns:
+        Updated ARIA snapshot of the page after the hover.
+
+    Example::
+
+        open_page("https://example.com")
+        hover_element("text=Products")   # reveal dropdown
+        click_element("text=Pricing")    # click item that appeared
+    """
+    assert browser
+    if browser == "playwright":
+        return hover_element_pw(selector)
+    raise ValueError("Interactive browsing not supported with lynx backend")
+
+
+def snapshot_page() -> str:
+    """Get the ARIA accessibility snapshot of the current interactive page.
+
+    Returns the structured accessibility tree of the page open via open_page(),
+    reflecting all DOM changes made by subsequent interactions. Use to re-read
+    the current page state without triggering any action.
+
+    Returns:
+        Structured ARIA snapshot including page title and current URL.
+
+    Raises:
+        RuntimeError: If no page is currently open.
+
+    Example::
+
+        open_page("https://example.com/form")
+        fill_element("[name='email']", "user@example.com")
+        state = snapshot_page()   # verify the field was filled before submitting
+        click_element("text=Submit")
+    """
+    assert browser
+    if browser == "playwright":
+        return snapshot_page_pw()
+    raise ValueError("Interactive browsing not supported with lynx backend")
+
+
+def get_current_url() -> str:
+    """Return the URL of the currently open browser page.
+
+    Useful after a redirect, navigation, or login flow to confirm where
+    the browser ended up.
+
+    Returns:
+        The current URL as a string.
+
+    Raises:
+        RuntimeError: If no page is currently open.
+
+    Example::
+
+        open_page("https://example.com/login")
+        fill_element("#username", "alice")
+        click_element("text=Log in")
+        url = get_current_url()   # confirm redirect to /dashboard
+    """
+    assert browser
+    if browser == "playwright":
+        return get_current_url_pw()
+    raise ValueError("Interactive browsing not supported with lynx backend")
+
+
 tool = ToolSpec(
     name="browser",
     desc="Browse, interact with, search, or screenshot the web",
@@ -1029,8 +1285,11 @@ services with APIs, prefer shell or Python over scraping.""",
         "search the web with search() using auto-detected backends and fallback, "
         "capture screenshots with screenshot_url(), "
         "get ARIA accessibility snapshots with snapshot_url(), "
-        "interact with pages using open_page() + click_element()/fill_element()/scroll_page(), "
+        "interact with pages using open_page() + click_element()/fill_element()/"
+        "scroll_page()/press_key()/select_option()/wait_for_element()/"
+        "hover_element()/snapshot_page()/get_current_url(), "
         "read interactive page content with read_page_text(), "
+        "save/restore browser auth sessions with save_browser_state()/load_browser_state(), "
         "check browser console errors with read_logs(), "
         "or convert a local PDF to images with pdf_to_images().",
     },
@@ -1044,15 +1303,24 @@ services with APIs, prefer shell or Python over scraping.""",
             snapshot_url,
             open_page,
             close_page,
+            save_browser_state,
+            load_browser_state,
             read_page_text,
             click_element,
             fill_element,
             scroll_page,
+            press_key,
+            select_option,
+            wait_for_element,
             read_logs,
             pdf_to_images,
+            hover_element,
+            snapshot_page,
+            get_current_url,
         ]
     ],
     available=has_browser_tool,
     init=init,
+    hints=frozenset({"web", "destructive"}),
 )
 __doc__ = tool.get_doc(__doc__)

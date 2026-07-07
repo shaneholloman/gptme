@@ -349,11 +349,22 @@ def test_click_without_open_page():
         click_element("#some-button")
 
 
-def test_fill_without_open_page():
+def test_fill_without_open_page(monkeypatch):
     """Test that fill_element fails gracefully without open_page."""
+    monkeypatch.setenv("GPTME_COMPUTER_CONFIRM_SENSITIVE", "1")
     close_page()  # Ensure no page is open
     with pytest.raises(RuntimeError, match="No page is open"):
         fill_element("#some-input", "value")
+
+
+def test_fill_with_open_page_checks_sensitive_gate(monkeypatch):
+    """Test that fill_element checks the gate once a page is open."""
+    from gptme.tools import _browser_playwright
+
+    monkeypatch.setenv("GPTME_COMPUTER_CONFIRM_SENSITIVE", "true")
+    monkeypatch.setattr(_browser_playwright, "_current_page", object())
+    with pytest.raises(ValueError, match="GPTME_COMPUTER_CONFIRM_SENSITIVE"):
+        _browser_playwright.fill_element("#some-input", "value")
 
 
 def test_scroll_without_open_page():
@@ -378,6 +389,46 @@ def test_read_page_text_without_open_page():
     close_page()  # Ensure no page is open
     with pytest.raises(RuntimeError, match="No page is open"):
         read_page_text()
+
+
+def test_snapshot_page_uses_retry_wrapper(monkeypatch):
+    """Test that snapshot_page routes current-page reads through retry wrapper."""
+    from gptme.tools import _browser_playwright
+
+    calls = []
+
+    def fake_execute_with_retry(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return func(Mock())
+
+    monkeypatch.setattr(_browser_playwright, "_current_page", object())
+    monkeypatch.setattr(_browser_playwright, "_page_snapshot", lambda: "snapshot")
+    monkeypatch.setattr(
+        _browser_playwright, "_execute_with_retry", fake_execute_with_retry
+    )
+
+    assert _browser_playwright.snapshot_page() == "snapshot"
+    assert calls == [(_browser_playwright._snapshot_current_page, (), {})]
+
+
+def test_get_current_url_uses_retry_wrapper(monkeypatch):
+    """Test that get_current_url routes current-page reads through retry wrapper."""
+    from gptme.tools import _browser_playwright
+
+    calls = []
+    page = Mock(url="data:text/html,current-url-fixture")
+
+    def fake_execute_with_retry(func, *args, **kwargs):
+        calls.append((func, args, kwargs))
+        return func(Mock())
+
+    monkeypatch.setattr(_browser_playwright, "_current_page", page)
+    monkeypatch.setattr(
+        _browser_playwright, "_execute_with_retry", fake_execute_with_retry
+    )
+
+    assert _browser_playwright.get_current_url() == "data:text/html,current-url-fixture"
+    assert calls == [(_browser_playwright._get_current_url, (), {})]
 
 
 def test_scroll_invalid_amount():

@@ -44,6 +44,7 @@ BuiltinProvider = Literal[
     "anthropic",
     "azure",
     "openrouter",
+    "requesty",
     "gptme",
     "gemini",
     "groq",
@@ -92,6 +93,7 @@ PROVIDERS_OPENAI = [
     "openai",
     "azure",
     "openrouter",
+    "requesty",
     "gptme",
     "gemini",
     "xai",
@@ -116,6 +118,7 @@ class ModelMeta:
     supports_parallel_tool_calls: bool = (
         False  # models that can emit multiple tool calls in a single response
     )
+    supports_strict_tools: bool = False  # models that support strict=True in tool schemas (OpenAI structured outputs)
 
     # price in USD per 1M tokens
     # if price is not set, it is assumed to be 0
@@ -225,6 +228,7 @@ class _ModelDictMeta(TypedDict):
     supports_reasoning: NotRequired[bool]
     supports_responses_api: NotRequired[bool]
     supports_parallel_tool_calls: NotRequired[bool]
+    supports_strict_tools: NotRequired[bool]
 
     knowledge_cutoff: NotRequired[datetime]
     deprecated: NotRequired[bool]

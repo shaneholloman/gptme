@@ -1,6 +1,7 @@
 import atexit
 import cProfile
 import importlib
+import importlib.metadata as _ilm
 import logging
 import os
 import pstats
@@ -8,6 +9,7 @@ import select
 import shlex
 import shutil
 import signal
+import subprocess
 import sys
 import tempfile
 import time
@@ -60,6 +62,64 @@ from ..util.prompt import add_history
 from ..util.tokens import len_tokens
 
 logger = logging.getLogger(__name__)
+
+# Core scripts shipped with gptme itself — dynamically discovered from the
+# installed package's console_scripts entry points so this never drifts from
+# [project.scripts] in pyproject.toml.
+try:
+    _dist = _ilm.distribution("gptme")
+    _CORE_GPTME_SCRIPTS: frozenset[str] = frozenset(
+        ep.name for ep in _dist.entry_points if ep.group == "console_scripts"
+    )
+except _ilm.PackageNotFoundError:
+    _CORE_GPTME_SCRIPTS = frozenset()
+
+
+def _discover_gptme_plugins() -> list[str]:
+    """Find gptme-* executables in PATH that are not part of core gptme.
+
+    Returns a sorted list of binary names, e.g. ['gptme-sessions', 'gptme-tools'].
+    """
+    seen: set[str] = set()
+    plugins: list[str] = []
+
+    for path_dir in os.environ.get("PATH", "").split(os.pathsep):
+        if not path_dir:
+            continue
+        try:
+            for entry in Path(path_dir).iterdir():
+                name = entry.name
+                if (
+                    name.startswith("gptme-")
+                    and name not in _CORE_GPTME_SCRIPTS
+                    and name not in seen
+                    and entry.is_file()
+                    and os.access(entry, os.X_OK)
+                ):
+                    seen.add(name)
+                    plugins.append(name)
+        except OSError:
+            continue
+
+    return sorted(plugins)
+
+
+class _DynamicHelpCommand(click.Command):
+    """click.Command subclass that appends discovered gptme-* plugins to --help."""
+
+    def format_help(self, ctx: click.Context, formatter: click.HelpFormatter) -> None:
+        super().format_help(ctx, formatter)
+        plugins = _discover_gptme_plugins()
+        if plugins:
+            with formatter.section("Installed external subcommands"):
+                rows = [
+                    (
+                        f"gptme {name.removeprefix('gptme-')}",
+                        f"delegates to {name}",
+                    )
+                    for name in plugins
+                ]
+                formatter.write_dl(rows)
 
 
 def _validate_model_param(
@@ -304,13 +364,20 @@ The interface provides /commands during a conversation:
 {commands_help}
 
 \b
+Subcommand shortcuts:
+  gptme search QUERY      Search conversation logs (alias for gptme-util chats search)
+  gptme chats [args]      Any gptme-util subcommand works directly (chats, tools, skills, ...)
+  gptme <cmd> [args]      gptme-util subcommand or gptme-<cmd> binary, in that order
+  (installed gptme-* binaries in PATH are listed at the bottom of this help)
+
+\b
 Utilities (gptme-util):
   gptme-util tools list       List all tools and their availability
   gptme-util tools info TOOL  Show detailed tool instructions/examples
   gptme-util skills list      List discoverable skills in the current workspace
   gptme-util skills show NAME Show a skill or lesson by name
   gptme-util chats list       List past conversations
-  gptme-util chats search Q   Search conversations for query
+  gptme-util chats search Q   Search conversations for query (full options)
   gptme-util chats send ID MSG Queue a prompt for a running chat from another terminal
   gptme-util chats rename     Rename a conversation
   gptme-util models list      List available models
@@ -321,7 +388,11 @@ Utilities (gptme-util):
 Run 'gptme-util --help' for all utility commands."""
 
 
-@click.command(help=docstring, context_settings={"auto_envvar_prefix": "GPTME"})
+@click.command(
+    help=docstring,
+    context_settings={"auto_envvar_prefix": "GPTME"},
+    cls=_DynamicHelpCommand,
+)
 @click.pass_context
 @click.argument(
     "prompts",
@@ -386,8 +457,8 @@ Run 'gptme-util --help' for all utility commands."""
 @click.option(
     "--system",
     "prompt_system",
-    default="full",
-    help="System prompt [full|short|<custom>]. Defaults to 'full'.",
+    default=None,
+    help="System prompt [full|short|<custom>]. Defaults to 'full', or the value of `system` in gptme.toml [prompt] if set.",
 )
 @click.option(
     "-t",
@@ -525,7 +596,7 @@ Run 'gptme-util --help' for all utility commands."""
 def main(
     ctx: click.Context,
     prompts: list[str],
-    prompt_system: str,
+    prompt_system: str | None,
     name: str,
     model: str | None,
     tool_allowlist: tuple[str, ...],
@@ -554,6 +625,43 @@ def main(
     output_schema: str | None,
 ):
     """Main entrypoint for the CLI."""
+
+    # Dispatch: `gptme search QUERY` → chats search (discoverability alias)
+    if prompts and prompts[0] == "search" and not version and not version_json:
+        from ..tools.chats import search_chats  # fmt: skip
+
+        query = " ".join(prompts[1:]).strip()
+        if not query:
+            raise click.UsageError(
+                "Usage: gptme search <query>\n\nFor all options, use: gptme-util chats search --help"
+            )
+        search_chats(
+            query, max_results=20, context_lines=1, max_matches=1
+        )  # show more results than the default 5
+        return
+
+    # gptme-util subcommand mirroring: `gptme chats [...]` → `gptme-util chats [...]`
+    # Any top-level gptme-util subcommand can be invoked without typing 'gptme-util'.
+    if prompts and not version and not version_json:
+        from .util import UTIL_SUBCOMMANDS  # cheap: just a sorted list constant
+
+        if prompts[0] in UTIL_SUBCOMMANDS:
+            if util_exec := shutil.which("gptme-util"):
+                sys.exit(subprocess.call([util_exec, *prompts]))
+            else:
+                print(
+                    f"Error: '{prompts[0]}' is a gptme-util subcommand but gptme-util is not installed.\n"
+                    "Install it with: pip install gptme[util]",
+                    file=sys.stderr,
+                )
+                sys.exit(1)
+
+    # Plugin dispatch: `gptme CMD [args...]` → `gptme-CMD [args...]` if installed
+    # Enables extensibility: `gptme sessions` works if gptme-sessions is in PATH.
+    if prompts and not version and not version_json:
+        plugin = f"gptme-{prompts[0]}"
+        if plugin_path := shutil.which(plugin):
+            sys.exit(subprocess.call([plugin_path, *prompts[1:]]))
 
     # Defense-in-depth: handle empty/whitespace names in case Click bypasses convert()
     # (observed to occur in some Click versions when --name "" is passed)
@@ -834,6 +942,13 @@ def main(
                 raise click.UsageError(str(e)) from e
             assert config.chat and config.chat.tool_format
 
+            # Resolve prompt type using project config if --system was not set
+            effective_prompt_system = prompt_system
+            if effective_prompt_system is None:
+                effective_prompt_system = (
+                    config.project.system if config.project else None
+                ) or "full"
+
             logger.debug(f"Using tools: {config.chat.tools}")
             try:
                 tools = init_tools(config.chat.tools)
@@ -854,7 +969,7 @@ def main(
             )
             stats = get_prompt_stats(
                 tools=tools,
-                prompt=prompt_system,
+                prompt=effective_prompt_system,
                 interactive=config.chat.interactive,
                 tool_format=config.chat.tool_format,
                 model=config.chat.model,
@@ -879,7 +994,7 @@ def main(
                 )
             header = (
                 "System prompt stats"
-                f" (prompt={prompt_system}, tool_format={config.chat.tool_format}, "
+                f" (prompt={effective_prompt_system}, tool_format={config.chat.tool_format}, "
                 f"tools={len(tools)}, interactive={config.chat.interactive})"
             )
             click.echo(
@@ -959,6 +1074,10 @@ def main(
     except ValueError as e:
         raise click.UsageError(str(e)) from e
     assert config.chat and config.chat.tool_format
+
+    # Resolve effective system prompt type: CLI flag > gptme.toml [prompt] system > "full"
+    if prompt_system is None:
+        prompt_system = (config.project.system if config.project else None) or "full"
 
     # early init tools to generate system prompt
     # We pass the tool_allowlist CLI argument. If it's not provided, init_tools
@@ -1183,6 +1302,8 @@ def main(
             output_format,
         )
         show_resume_hint_on_exit = True
+    except click.ClickException:
+        raise  # let Click handle proper exit code (2 for UsageError)
     except (RuntimeError, Exception) as e:
         logger.error("Fatal error occurred")
         if verbose:

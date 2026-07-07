@@ -73,10 +73,13 @@ const CreateAgentDialog: FC<Props> = ({ open, onOpenChange, onAgentCreated }) =>
       return;
     }
 
-    // Generate fork_command if not explicitly set
+    // Generate fork_command if not explicitly set.
+    // Use {path} and {name} as server-side format placeholders — the server
+    // substitutes these with the actual (possibly auto-generated) values via
+    // fork_command.format(path=..., name=...) before running the command.
     const processedData = { ...data };
     if (!processedData.fork_command.trim()) {
-      processedData.fork_command = `./scripts/fork.sh ${processedData.path} ${processedData.name}`;
+      processedData.fork_command = `./scripts/fork.sh {path} {name}`;
     }
 
     setIsLoading(true);
@@ -285,7 +288,7 @@ const CreateAgentDialog: FC<Props> = ({ open, onOpenChange, onAgentCreated }) =>
                           <FormLabel>Fork Command</FormLabel>
                           <FormControl>
                             <Textarea
-                              placeholder="./scripts/fork.sh <workspace-path> <agent-name>"
+                              placeholder="./scripts/fork.sh {path} {name}"
                               {...field}
                               disabled={isLoading}
                               rows={3}

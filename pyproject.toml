@@ -28,6 +28,7 @@ gptme-eval = "gptme.eval.main:main"
 gptme-eval-swebench = "gptme.eval.swebench.main:main"
 gptme-eval-tbench = "gptme.eval.tbench.run:main"
 gptme-util = "gptme.cli.util:main"
+gptme-attest = "gptme.cli.cmd_attest:main"
 gptme-agent = "gptme.agent.cli:main"
 gptme-doctor = "gptme.cli.doctor:main"
 gptme-auth = "gptme.cli.auth:main"
@@ -59,22 +60,22 @@ tomlkit = "*"
 typing-extensions = "*"
 platformdirs = "^4.10"
 lxml = "*"
-pypdf = ">=6.13.2"  # For PDF text extraction in browser tool (CVE fix: RAM exhaustion + infinite loop)
+pypdf = ">=6.14.2"  # For PDF text extraction in browser tool (CVE fix: RAM exhaustion + infinite loop)
 requests = "^2.34"  # For HTTP requests in browser tool (PDF detection)
-json-repair = "^0.61.0"
-mcp = "^1.27.2"
+json-repair = "^0.61.1"
+mcp = "^1.28.1"
 questionary = "^2.1.1"
 python-dateutil = "^2.9.0.post0"
 pyyaml = "^6.0.3"
 
 # providers
-openai = "^1.0"
-anthropic = "^0.109"
+openai = "^2.44"
+anthropic = "^0.116"
 
 # tools
-ipython = "^8.17.2"
+ipython = "^8.39.0"
 bashlex = "^0.18"
-playwright = {version = "1.60.0", optional=true}  # version constrained due to annoying to have to run `playwright install` on every update
+playwright = {version = "1.61.0", optional=true}  # version constrained due to annoying to have to run `playwright install` on every update
 python-xlib = {version = "^0.33", optional=true}  # for X11 interaction
 
 # evals
@@ -151,7 +152,7 @@ sphinx-autobuild = "^2024.10.3"
 sphinx-llms-txt = "^0.7.1"
 sphinxcontrib-programoutput = "*"
 sphinxcontrib-asciinema = "*"
-sphinxcontrib-mermaid = "^1.0.0"
+sphinxcontrib-mermaid = "^2.0.2"
 myst-parser = "*"
 
 # types
@@ -166,7 +167,7 @@ server = ["flask", "flask-cors", "flask-compress", "pydantic", "prometheus-clien
 browser = ["playwright"]
 datascience = ["matplotlib", "pandas", "numpy"]  # pillow (non-opt)
 sounds = ["sounddevice", "scipy"]
-computer = []  # pillow (non-opt)
+computer = []  # pillow (non-opt); AT-SPI2 accessibility needs system pkg: apt install python3-pyatspi
 pyinstaller = ["pyinstaller"]
 acp = ["agent-client-protocol"]
 telemetry = [
@@ -317,6 +318,7 @@ markers = [
     "requires_api: marks tests that require API access",
     "flaky: marks tests as flaky (retried automatically)",
     "integration: marks tests as integration tests requiring external services",
+    "x11: marks tests that require a real or headless X11 display (Xvfb, xdotool, scrot)",
     "xdist_group: marks tests that should run in the same xdist group",
 ]
 asyncio_default_fixture_loop_scope = "function"

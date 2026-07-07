@@ -5,7 +5,7 @@ import type { Message, StreamingMessage } from '@/types/conversation';
 import type { ChatOptions } from '@/components/ChatInput';
 import { demoConversations, getDemoMessages } from '@/democonversations';
 import { isDemoMode } from '@/utils/connectionConfig';
-import { use$ } from '@legendapp/state/react';
+import { use$, useObservable } from '@legendapp/state/react';
 import {
   conversations$,
   updateConversation,
@@ -30,6 +30,7 @@ import {
   setMaxTokens,
   setTemperature,
   setTopP,
+  prependLogPage,
 } from '@/stores/conversations';
 import { playChime } from '@/utils/audio';
 import { speakText } from '@/utils/tts';
@@ -52,6 +53,9 @@ export function useConversation(conversationId: string, serverId?: string) {
   const topP = use$(() => conversation$?.topP.get());
 
   const messageJustCompleted = useRef(false);
+  const loadingOlderMessagesRef = useRef(false);
+  const isLoadingOlderMessages$ = useObservable(false);
+  const isLoadingOlderMessages = use$(isLoadingOlderMessages$);
   // Bumped by retryLoad() to re-run the load+connect effect after a failure.
   const [retryNonce, setRetryNonce] = useState(0);
 
@@ -132,7 +136,7 @@ export function useConversation(conversationId: string, serverId?: string) {
         if (!isWindowHydrated) {
           // Only load from API if we don't already have conversation data
           try {
-            const data = await api.getConversation(conversationId);
+            const data = await api.getConversation(conversationId, { limit: 50 });
 
             // Also load the chat config
             try {
@@ -809,6 +813,42 @@ export function useConversation(conversationId: string, serverId?: string) {
     setRetryNonce((n) => n + 1);
   }, [conversationId]);
 
+  const loadOlderMessages = async () => {
+    const conv$ = conversations$.get(conversationId);
+    if (!conv$) return;
+    const logOffset = conv$.logOffset.peek();
+    if (logOffset <= 0) return;
+    if (loadingOlderMessagesRef.current) return;
+    loadingOlderMessagesRef.current = true;
+    isLoadingOlderMessages$.set(true);
+    try {
+      const data = await api.getConversation(conversationId, {
+        limit: 50,
+        before: logOffset,
+      });
+      prependLogPage(
+        conversationId,
+        data.log,
+        data.has_more ? (data.before ?? 0) : 0,
+        data.has_more ?? false
+      );
+    } catch (error) {
+      console.warn('[useConversation] Failed to load older messages:', error);
+      const { title, description } = getApiErrorPresentation(error, {
+        fallbackTitle: 'Failed to load older messages',
+        fallbackDescription: 'Failed to load older messages',
+      });
+      toast({
+        variant: 'destructive',
+        title,
+        description,
+      });
+    } finally {
+      loadingOlderMessagesRef.current = false;
+      isLoadingOlderMessages$.set(false);
+    }
+  };
+
   return {
     conversation$,
     retryLoad,
@@ -822,5 +862,7 @@ export function useConversation(conversationId: string, serverId?: string) {
     switchBranch,
     confirmTool,
     interruptGeneration,
+    isLoadingOlderMessages,
+    loadOlderMessages,
   };
 }

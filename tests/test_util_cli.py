@@ -2,9 +2,11 @@
 
 import json
 import os
+import re
 import time
 from pathlib import Path
 from types import SimpleNamespace
+from typing import Any
 
 import pytest
 from click.testing import CliRunner
@@ -24,12 +26,34 @@ def test_tokens_count(tmp_path):
     assert "Token count" in result.output
     assert "gpt-4" in result.output  # default model
 
-    # Test invalid model
+    # Provider-prefixed model names (gptme's canonical "provider/model" form)
+    # must count, not error. Regression: tiktoken doesn't know the "openai/"
+    # prefix, so the old raw encoding_for_model() rejected valid models.
     result = runner.invoke(
-        main, ["tokens", "count", "--model", "invalid-model", "test"]
+        main, ["tokens", "count", "--model", "openai/gpt-4o", "Hello, world!"]
     )
-    assert result.exit_code == 1
-    assert "not supported" in result.output
+    assert result.exit_code == 0
+    assert "Token count" in result.output
+    m = re.search(r"Token count [^:]+: (\d+)", result.output)
+    assert m and int(m.group(1)) > 0
+
+    # Models tiktoken doesn't natively recognize fall back to an estimate
+    # (cl100k_base) rather than erroring — a counter should count, not refuse.
+    result = runner.invoke(
+        main, ["tokens", "count", "--model", "anthropic/claude-3-5-sonnet", "test"]
+    )
+    assert result.exit_code == 0
+    assert "Token count" in result.output
+    m = re.search(r"Token count [^:]+: (\d+)", result.output)
+    assert m and int(m.group(1)) > 0
+
+    # Provider-prefixed models needing prefix-strip (e.g. openai/o1) should
+    # get the correct encoding (o200k_base), not fall back to cl100k_base.
+    result = runner.invoke(main, ["tokens", "count", "--model", "openai/o1", "test"])
+    assert result.exit_code == 0
+    assert "Token count" in result.output
+    m = re.search(r"Token count [^:]+: (\d+)", result.output)
+    assert m and int(m.group(1)) > 0
 
     # Test file input
     tmp_file = Path(tmp_path) / "test.txt"
@@ -383,7 +407,11 @@ def test_tools_list(mocker):
     """Test the tools list command."""
     import json
 
-    runner = CliRunner()
+    runner_cls: Any = CliRunner
+    try:
+        runner = runner_cls(mix_stderr=False)
+    except TypeError:
+        runner = runner_cls()
 
     mocker.patch("gptme.tools.browser.browser", "playwright")
 
@@ -392,6 +420,7 @@ def test_tools_list(mocker):
     assert "Available tools" in result.output
     assert result.exit_code == 0
     assert "Using browser tool with" not in result.output
+    assert "Failed to register hook" not in getattr(result, "stderr", "")
 
     # Test langtags
     result = runner.invoke(main, ["tools", "list", "--langtags"])
@@ -1141,3 +1170,40 @@ def test_context_journal_rejects_file_path(tmp_path):
     result = runner.invoke(main, ["context", "journal", "--path", str(journal_file)])
     assert result.exit_code != 0
     assert "Directory" in result.output
+
+
+def test_context_search_conversations(tmp_path):
+    """context search-conversations is registered and returns results."""
+    from unittest.mock import patch
+
+    runner = CliRunner()
+    with (
+        patch("gptme.tools.rag._has_gptme_rag", return_value=True),
+        patch(
+            "gptme.tools.rag.rag_search",
+            return_value="snippet from a past conversation",
+        ),
+    ):
+        result = runner.invoke(main, ["context", "search-conversations", "pytest"])
+    assert result.exit_code == 0, result.output
+    assert "Top 3 relevant conversations" in result.output
+
+
+def test_context_search_conversations_top_k(tmp_path):
+    """context search-conversations --top-k option is forwarded correctly."""
+    from unittest.mock import patch
+
+    runner = CliRunner()
+    with (
+        patch("gptme.tools.rag._has_gptme_rag", return_value=True),
+        patch(
+            "gptme.tools.rag.rag_search",
+            return_value="snippet from a past conversation",
+        ) as mock_search,
+    ):
+        result = runner.invoke(
+            main, ["context", "search-conversations", "--top-k", "5", "pytest"]
+        )
+    assert result.exit_code == 0, result.output
+    assert "Top 5 relevant conversations" in result.output
+    mock_search.assert_called_once_with("pytest", return_full=True, top_k=5)

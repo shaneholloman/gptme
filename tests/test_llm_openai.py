@@ -182,6 +182,7 @@ def test_message_conversion_with_tools():
                     "required": ["path", "content"],
                     "additionalProperties": False,
                 },
+                "strict": True,
             },
         }
     ]
@@ -689,7 +690,9 @@ def test_chat_uses_responses_api_for_gpt5_by_default(monkeypatch):
         None,
     )
 
-    assert result == "Hello from Responses"
+    # Reasoning summary is embedded as a <think> block, consistent with the
+    # streaming path and the Anthropic provider (instead of being dropped).
+    assert result == "<think>\nNeed no extra tools.\n</think>\nHello from Responses"
     assert metadata is not None
     assert metadata["usage"]["input_tokens"] == 100
     assert metadata["usage"]["output_tokens"] == 30
@@ -733,6 +736,59 @@ def test_chat_responses_api_formats_function_calls(monkeypatch):
     assert metadata is None
     responses_create.assert_called_once()
     mock_client.chat.completions.create.assert_not_called()
+
+
+def test_chat_completions_embeds_reasoning_content(monkeypatch):
+    """Chat Completions reasoning (DeepSeek/OpenRouter) is embedded, not dropped.
+
+    Keeps the non-streaming path consistent with ``stream()`` and Anthropic,
+    which both surface reasoning as a ``<think>`` block instead of discarding it.
+    """
+    completion = SimpleNamespace(
+        usage=None,
+        choices=[
+            SimpleNamespace(
+                finish_reason="stop",
+                message=SimpleNamespace(
+                    content="The answer is 4.",
+                    tool_calls=None,
+                    reasoning_content="Adding 2 and 2 gives 4.",
+                ),
+            )
+        ],
+    )
+    completions_create = Mock(return_value=completion)
+    mock_client = SimpleNamespace(
+        chat=SimpleNamespace(completions=SimpleNamespace(create=completions_create))
+    )
+
+    monkeypatch.setattr(llm_openai, "get_client", lambda provider: mock_client)
+    monkeypatch.setattr(llm_openai, "_is_proxy", lambda client: False)
+    monkeypatch.setattr(llm_openai, "_should_use_responses_api", lambda *args: False)
+
+    result, _ = llm_openai.chat(
+        [Message(role="user", content="What is 2+2?")],
+        "openai/gpt-4o",
+        None,
+    )
+
+    assert result == "<think>\nAdding 2 and 2 gives 4.\n</think>\n\nThe answer is 4."
+
+
+def test_extract_responses_reasoning_prefers_summary_over_content():
+    item = SimpleNamespace(
+        summary=[SimpleNamespace(text="short summary")],
+        content=[SimpleNamespace(text="full reasoning")],
+    )
+    assert llm_openai._extract_responses_reasoning(item) == "short summary"
+
+
+def test_extract_responses_reasoning_falls_back_to_content():
+    item = SimpleNamespace(
+        summary=[],
+        content=[SimpleNamespace(text="full reasoning")],
+    )
+    assert llm_openai._extract_responses_reasoning(item) == "full reasoning"
 
 
 def test_content_to_responses_input_preserves_images():
@@ -2547,6 +2603,8 @@ class TestMaybeApplyVerbosity:
 
         with caplog.at_level(logging.WARNING, logger="gptme.llm.llm_openai"):
             _maybe_apply_verbosity({}, model)
+            # Verify the flag was persisted (guards against parallel-state interference)
+            assert llm_openai._verbosity_warned is True
             _maybe_apply_verbosity({}, model)
         assert caplog.text.count("OPENAI_VERBOSITY") == 1
 
@@ -2712,3 +2770,142 @@ class TestResolveMaxTokens:
             "openrouter/anthropic/claude-sonnet-4-20250514", None
         )
         assert result == 16000
+
+
+class TestSpec2ToolStrictSchema:
+    """Tests for strict tool schema support based on model capability flag."""
+
+    def _all_required_spec(self) -> "ToolSpec":
+        from gptme.tools.base import Parameter, ToolSpec
+
+        return ToolSpec(
+            name="test",
+            desc="A test tool",
+            parameters=[
+                Parameter(name="x", type="string", description="arg", required=True)
+            ],
+        )
+
+    def test_model_with_strict_support_gets_strict_true(self):
+        """Models with supports_strict_tools=True get strict:True when all params required."""
+        from gptme.llm.llm_openai import _spec2tool
+        from gptme.llm.models.types import ModelMeta
+
+        model = ModelMeta(
+            provider="openai",
+            model="gpt-4o",
+            context=4096,
+            supports_strict_tools=True,
+        )
+        result = _spec2tool(self._all_required_spec(), model)
+        assert result["function"]["strict"] is True
+
+    def test_registry_gpt4o_gets_strict_true(self):
+        """gpt-4o from the model registry has supports_strict_tools=True."""
+        from gptme.llm.llm_openai import _spec2tool
+        from gptme.llm.models import get_model
+
+        model = get_model("openai/gpt-4o")
+        result = _spec2tool(self._all_required_spec(), model)
+        assert result["function"]["strict"] is True
+
+    def test_registry_legacy_model_no_strict(self):
+        """Deprecated models (gpt-4-turbo, gpt-4) do NOT get strict:True."""
+        from gptme.llm.llm_openai import _spec2tool
+        from gptme.llm.models import get_model
+
+        for legacy in ("openai/gpt-4-turbo", "openai/gpt-4"):
+            model = get_model(legacy)
+            result = _spec2tool(self._all_required_spec(), model)
+            assert "strict" not in result["function"], (
+                f"{legacy} should not get strict=True (pre-strict-mode model)"
+            )
+
+    def test_azure_without_strict_support_no_strict(self):
+        """Azure deployments with unknown capability default to no strict.
+
+        Azure deployment names are arbitrary and may back pre-strict-mode models.
+        Strict mode must be explicitly enabled via supports_strict_tools=True.
+        """
+        from gptme.llm.llm_openai import _spec2tool
+        from gptme.llm.models.types import ModelMeta
+
+        model = ModelMeta(provider="azure", model="my-company-deployment", context=4096)
+        result = _spec2tool(self._all_required_spec(), model)
+        assert "strict" not in result["function"]
+
+    def test_azure_with_strict_support_gets_strict_true(self):
+        """Azure deployments explicitly marked as supports_strict_tools get strict:True."""
+        from gptme.llm.llm_openai import _spec2tool
+        from gptme.llm.models.types import ModelMeta
+
+        model = ModelMeta(
+            provider="azure",
+            model="my-gpt4o-deployment",
+            context=4096,
+            supports_strict_tools=True,
+        )
+        result = _spec2tool(self._all_required_spec(), model)
+        assert result["function"]["strict"] is True
+
+    def test_openrouter_provider_no_strict(self):
+        """openrouter provider should NOT get strict: True (not supported)."""
+        from gptme.llm.llm_openai import _spec2tool
+        from gptme.llm.models.types import ModelMeta
+
+        model = ModelMeta(provider="openrouter", model="openai/gpt-4o", context=4096)
+        result = _spec2tool(self._all_required_spec(), model)
+        assert "strict" not in result["function"]
+
+    def test_openai_with_optional_param_no_strict(self):
+        """strict:True is skipped when some params are optional.
+
+        OpenAI strict mode requires ALL params in required[], which isn't satisfied
+        when a ToolSpec has optional (required=False) parameters.
+        """
+        from gptme.llm.llm_openai import _spec2tool
+        from gptme.llm.models.types import ModelMeta
+        from gptme.tools.base import Parameter, ToolSpec
+
+        spec = ToolSpec(
+            name="test",
+            desc="A test tool",
+            parameters=[
+                Parameter(
+                    name="path",
+                    type="string",
+                    description="required path",
+                    required=True,
+                ),
+                Parameter(
+                    name="limit",
+                    type="integer",
+                    description="optional limit",
+                    required=False,
+                ),
+            ],
+        )
+        model = ModelMeta(
+            provider="openai",
+            model="gpt-4o",
+            context=4096,
+            supports_strict_tools=True,
+        )
+        result = _spec2tool(spec, model)
+        assert "strict" not in result["function"]
+
+    def test_openai_no_params_gets_strict_true(self):
+        """strict:True applies to no-parameter tools (all() on empty list is True)."""
+        from gptme.llm.llm_openai import _spec2tool
+        from gptme.llm.models.types import ModelMeta
+        from gptme.tools.base import ToolSpec
+
+        spec = ToolSpec(name="test", desc="A tool with no params", parameters=[])
+        model = ModelMeta(
+            provider="openai",
+            model="gpt-4o",
+            context=4096,
+            supports_strict_tools=True,
+        )
+        result = _spec2tool(spec, model)
+        assert result["function"]["strict"] is True

@@ -9,10 +9,11 @@ import random
 import string
 import subprocess
 import threading
+import time
 import uuid
 from dataclasses import asdict
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal
 
 from . import execution as _exec
 from .concurrency import get_slot_sem
@@ -34,6 +35,23 @@ from .types import (
 logger = logging.getLogger(__name__)
 
 
+def _wait_for_cached_subagent_result(
+    agent_id: str, timeout: float = 0.05, poll_interval: float = 0.005
+) -> ReturnType | None:
+    """Briefly wait for a concurrent watchdog/cancel result to hit the cache."""
+    deadline = time.monotonic() + timeout
+    while True:
+        with _subagent_results_lock:
+            cached_result = _subagent_results.get(agent_id)
+        if cached_result is not None:
+            return cached_result
+
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            return None
+        time.sleep(min(poll_interval, remaining))
+
+
 def subagent(
     agent_id: str,
     prompt: str,
@@ -51,7 +69,11 @@ def subagent(
     isolated: bool | None = None,
     timeout: int = 1800,
     role: Role | None = None,
-    redact_secrets: bool = False,
+    redact_secrets: bool = True,
+    context_window: int | None = None,
+    max_time: float | None = None,
+    context_turns: int | None = None,
+    workdir: str | Path | None = None,
 ):
     """Starts an asynchronous subagent. Returns None immediately.
 
@@ -114,8 +136,8 @@ def subagent(
             Falls back to a temporary directory if not in a git repo.
         timeout: Maximum seconds before the subprocess monitor kills the
             subagent (default 1800 = 30 min). Only applies to subprocess mode.
-        redact_secrets: If True, scrub common secret patterns from workspace
-            context messages before they are passed to the subagent.
+        redact_secrets: If True (default), scrub common secret patterns from
+            workspace context messages before they are passed to the subagent.
             Redacts values from lines where the variable name matches patterns
             like API_KEY, TOKEN, PASSWORD, PRIVATE_KEY, etc.
 
@@ -127,7 +149,74 @@ def subagent(
 
             Only applies to thread-mode subagents (subprocess and ACP modes
             run as a separate gptme process and handle their own context).
-            Default: False (no redaction).
+            Set to False to disable redaction if legitimate config values are
+            being incorrectly redacted.
+        context_window: Limit workspace context messages passed to the subagent.
+            Controls how much of the workspace context (files from gptme.toml
+            [prompt] files, context_cmd output) is shared with the subagent.
+
+            - ``None`` (default): no limit — full workspace context is shared.
+            - ``0``: minimal context — only agent identity and tools; no workspace
+              files or context_cmd output. Equivalent to
+              ``context_mode="selective", context_include=["agent", "tools"]``.
+            - ``N > 0``: at most N workspace context messages are passed.
+
+            Use ``context_window=0`` when the subagent does not need the parent
+            workspace configuration (e.g. a verification task that should only
+            see what the orchestrator explicitly tells it).
+
+            Only applies to thread-mode subagents; has no effect in subprocess
+            or ACP modes (which build their own context as a separate process).
+        max_time: Wall-clock time limit in seconds. When set, a watchdog timer
+            marks the subagent result as ``"timeout"`` after ``max_time`` seconds
+            and delivers a timeout status notification via the LOOP_CONTINUE hook.
+            In subprocess mode the child process is terminated. In thread mode
+            the background thread is not force-stopped; callers see the cached
+            timeout result immediately while the thread continues until it
+            finishes naturally. Defaults to ``None`` (no limit).
+
+            Use this for defensive orchestration (prevent a stuck subagent from
+            blocking the parent) or hard time budgets in autonomous sessions.
+            ``max_time=None`` is fully backwards-compatible — no change in behavior.
+        context_turns: Number of recent parent conversation turns to forward to
+            the subagent as context. A "turn" starts at a user message and
+            includes all subsequent assistant and tool-result (system) messages
+            until the next user message, so the total message count per turn
+            varies with the number of tool calls. The messages are injected as
+            a system message so the subagent understands what the parent has
+            been doing without confusing its own conversation flow.
+
+            - ``None`` (default): no parent context forwarded (current behavior).
+            - ``N > 0``: forward the last N turns from the parent's active log.
+
+            The parent log is fetched automatically from the currently active
+            ``LogManager`` (set by the chat loop via ``ContextVar``). This works
+            when ``subagent()`` is called from within the ``ipython`` tool during
+            a running chat session.
+
+            Use this when the subagent needs awareness of what the parent has
+            already done (e.g. "the parent tried A and B, now try C") or when
+            the task prompt alone doesn't provide enough context.
+
+            Only applies to thread-mode subagents; has no effect in subprocess
+            or ACP modes.
+        workdir: Working directory for the subagent. Defaults to the current
+            working directory (``Path.cwd()``) when ``None``.
+
+            Use this when you want the subagent to operate in a specific
+            directory — for example, when a ``cd`` into a project with a
+            ``gptme.toml`` triggers workspace detection and you want the
+            subagent to load that workspace's config:
+
+            .. code-block:: python
+
+                subagent("impl", "Add feature X", workdir="/path/to/project",
+                         use_subprocess=True)
+
+            In subprocess mode the subagent process starts with this as its
+            ``cwd``, so it picks up the ``gptme.toml`` from that directory.
+            In thread mode the workspace context (files, ``context_cmd``) is
+            loaded relative to this path.
 
     Returns:
         None: Starts asynchronous execution.
@@ -137,6 +226,47 @@ def subagent(
             Executors use the `complete` tool to signal completion with a summary.
             The full conversation log is available at the logdir path.
     """
+    if context_window is not None and context_window < 0:
+        raise ValueError(
+            f"context_window must be None, 0, or a positive integer, got {context_window!r}"
+        )
+    if context_turns is not None and context_turns <= 0:
+        raise ValueError(
+            f"context_turns must be None or a positive integer, got {context_turns!r}"
+        )
+
+    # Fetch parent messages from the active LogManager when context_turns is set.
+    # LogManager.get_current_log() reads a ContextVar set by the chat loop, so
+    # this works when subagent() is called from within an ipython tool execution.
+    parent_messages = None
+    if context_turns is not None:
+        from ...logmanager import LogManager  # fmt: skip
+
+        parent_log = LogManager.get_current_log()
+        if parent_log is not None:
+            msgs = parent_log.log
+            # Slice from the N-th-from-last user message so tool-result system
+            # messages within a turn are included and the count is exact.
+            # Fallback to user_indices[0] (not 0) so leading system bootstrap
+            # messages (identity, workspace context) are never forwarded when
+            # context_turns exceeds available turns.
+            user_indices = [i for i, m in enumerate(msgs) if m.role == "user"]
+            if user_indices:
+                start = (
+                    user_indices[-context_turns]
+                    if len(user_indices) >= context_turns
+                    else user_indices[0]
+                )
+                parent_messages = list(msgs[start:])
+            else:
+                parent_messages = list(msgs)
+        else:
+            logger.warning(
+                "context_turns=%d set but no active LogManager found; "
+                "parent context will not be forwarded",
+                context_turns,
+            )
+
     # noreorder
     from gptme.cli.main import get_logdir  # fmt: skip
     from gptme.llm.models import get_default_model  # fmt: skip
@@ -199,19 +329,73 @@ def subagent(
         current_model = get_default_model()
         model_name = current_model.full if current_model else None
 
+    # Resolve explicit workdir once, shared by the planner and executor paths.
+    # When workdir is None each path falls back to Path.cwd() at spawn time.
+    workdir_path: Path | None = None
+    if workdir is not None:
+        workdir_path = Path(workdir).resolve()
+        if not workdir_path.exists():
+            raise ValueError(f"workdir does not exist: {workdir_path}")
+        if not workdir_path.is_dir():
+            raise ValueError(f"workdir is not a directory: {workdir_path}")
+
     if mode == "planner":
+        if context_turns is not None:
+            logger.warning(
+                "context_turns=%d set but planner mode does not forward parent context; "
+                "parameter is ignored",
+                context_turns,
+            )
         if not subtasks:
             raise ValueError("Planner mode requires subtasks parameter")
-        return _exec._run_planner(
-            agent_id,
-            prompt,
-            subtasks,
-            execution_mode,
-            context_mode,
-            context_include,
-            model_name,
-            profile_name=profile,
+
+        # Register the planner as a subagent and launch the watchdog timer.
+        # The planner runs synchronously in the parent thread, so the timer
+        # logs and marks the result as "timeout" on expiry — same pattern as
+        # thread-mode watchdog.
+        logdir = get_logdir(f"subagent-{agent_id}")
+        sa = Subagent(
+            agent_id=agent_id,
+            prompt=prompt,
+            thread=None,
+            logdir=logdir,
+            model=model_name,
+            context_mode=context_mode,
+            context_include=context_include,
+            profile=profile,
+            isolated=isolated,
+            redact_secrets=redact_secrets,
+            context_window=context_window,
+            max_time=max_time,
         )
+        with _subagents_lock:
+            _subagents.append(sa)
+
+        _timer = None
+        if max_time is not None:
+            _timer = threading.Timer(
+                max_time, _timeout_subagent, args=(agent_id, max_time)
+            )
+            _timer.daemon = True
+            _timer.start()
+
+        try:
+            return _exec._run_planner(
+                agent_id,
+                prompt,
+                subtasks,
+                execution_mode,
+                context_mode,
+                context_include,
+                model_name,
+                profile_name=profile,
+                redact_secrets=redact_secrets,
+                context_window=context_window,
+                workdir=workdir_path,
+            )
+        finally:
+            if _timer is not None:
+                _timer.cancel()
 
     # Validate context_mode parameters
     if context_mode == "selective" and not context_include:
@@ -226,12 +410,16 @@ def subagent(
     name = f"subagent-{agent_id}"
     logdir = get_logdir(name + "-" + random_string(4))
 
-    # Get workspace, handling case where cwd was deleted (e.g., in tests)
-    try:
-        workspace = Path.cwd()
-    except FileNotFoundError:
-        # Fallback to logdir's parent if cwd doesn't exist
-        workspace = logdir.parent
+    # Resolve workspace: explicit workdir (validated above) > current working dir
+    if workdir_path is not None:
+        workspace = workdir_path
+    else:
+        # Get workspace, handling case where cwd was deleted (e.g., in tests)
+        try:
+            workspace = Path.cwd()
+        except FileNotFoundError:
+            # Fallback to logdir's parent if cwd doesn't exist
+            workspace = logdir.parent
 
     # Set up worktree isolation if requested
     worktree_path: Path | None = None
@@ -270,7 +458,7 @@ def subagent(
 
     if redact_secrets and (use_acp or use_subprocess):
         exec_mode = "ACP" if use_acp else "subprocess"
-        logger.warning(
+        logger.debug(
             f"Subagent {agent_id}: 'redact_secrets=True' has no effect in {exec_mode} mode "
             "(only thread-mode subagents inherit workspace context from the parent process)"
         )
@@ -301,6 +489,12 @@ def subagent(
         if context_include:
             logger.warning(
                 f"Subagent {agent_id}: 'context_include' is not supported in ACP mode (ignored)"
+            )
+        if context_turns is not None:
+            logger.warning(
+                "context_turns=%d set but ACP mode does not forward parent context; "
+                "parameter is ignored",
+                context_turns,
             )
 
         def run_acp_subagent():
@@ -376,7 +570,21 @@ def subagent(
                 try:
                     status, summary = asyncio.run(_acp_run())
 
-                    result = ReturnType(status, summary)
+                    with _subagents_lock:
+                        sa_ref = next(
+                            (s for s in _subagents if s.agent_id == agent_id), None
+                        )
+                    in_tok, out_tok = (
+                        sa_ref._read_token_stats()
+                        if sa_ref is not None
+                        else (None, None)
+                    )
+                    result = ReturnType(
+                        status,
+                        summary,
+                        input_tokens=in_tok,
+                        output_tokens=out_tok,
+                    )
                     if not set_subagent_result_if_absent(agent_id, result):
                         return
                     notify_completion(
@@ -421,6 +629,8 @@ def subagent(
             worktree_path=worktree_path,
             repo_path=repo_path,
             role=role,
+            max_time=max_time,
+            context_turns=context_turns,
         )
         # Append sa before starting the thread so the finally block can find it
         # (avoids race condition where fast completion can't locate sa in _subagents)
@@ -433,6 +643,12 @@ def subagent(
         # A launcher thread acquires the slot before starting the OS process so that
         # excess agents queue (rather than all starting at once).
         logger.info(f"Starting subagent {agent_id} in subprocess mode")
+        if context_turns is not None:
+            logger.warning(
+                "context_turns=%d set but subprocess mode does not forward parent context; "
+                "parameter is ignored",
+                context_turns,
+            )
         if profile:
             logger.info(f"  with profile: {profile}")
         # Convert output_schema type to JSON string if present
@@ -507,6 +723,8 @@ def subagent(
             repo_path=repo_path,
             timeout=timeout,
             role=role,
+            max_time=max_time,
+            context_turns=context_turns,
         )
         with _subagents_lock:
             _subagents.append(sa)
@@ -544,6 +762,8 @@ def subagent(
                         profile_name=profile,
                         agent_id=agent_id,
                         redact_secrets=redact_secrets,
+                        context_window=context_window,
+                        parent_messages=parent_messages,
                     )
                 except Exception as e:
                     # If subagent creation fails, notify with error status
@@ -617,10 +837,59 @@ def subagent(
             repo_path=repo_path,
             role=role,
             redact_secrets=redact_secrets,
+            context_window=context_window,
+            max_time=max_time,
+            context_turns=context_turns,
         )
         with _subagents_lock:
             _subagents.append(sa)
         t.start()
+
+    # Launch max_time watchdog after all execution paths have registered the subagent.
+    # The watchdog fires _timeout_subagent() after max_time seconds, which marks
+    # a timeout result and delivers a notification via the LOOP_CONTINUE hook.
+    if max_time is not None:
+        _timer = threading.Timer(max_time, _timeout_subagent, args=(agent_id, max_time))
+        _timer.daemon = True
+        _timer.start()
+
+
+def _timeout_subagent(agent_id: str, max_time: float) -> None:
+    """Internal: auto-cancel a subagent that exceeded its max_time wall-clock budget.
+
+    Called by the watchdog timer launched in subagent(). Uses set_subagent_result_if_absent
+    so a subagent that already completed normally is not affected (the race is handled
+    atomically).
+    """
+    with _subagents_lock:
+        sa = next((s for s in _subagents if s.agent_id == agent_id), None)
+
+    if sa is None or not sa.is_running():
+        return  # Already finished normally before the timer fired
+
+    timeout_result = ReturnType(
+        "timeout", f"Auto-cancelled after {max_time}s (max_time exceeded)"
+    )
+    if not set_subagent_result_if_absent(agent_id, timeout_result):
+        return  # Another result was set concurrently (subagent finished at the same time)
+
+    if sa.execution_mode == "subprocess" and sa.process:
+        sa.process.terminate()
+        try:
+            sa.process.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            sa.process.kill()
+            sa.process.wait()
+        logger.info(
+            f"Subagent '{agent_id}' subprocess killed after {max_time}s (max_time)."
+        )
+    else:
+        logger.info(
+            f"Subagent '{agent_id}' marked timed-out after {max_time}s "
+            "(thread will stop at its next checkpoint)."
+        )
+
+    notify_completion(agent_id, "timeout", f"Timed out after {max_time}s")
 
 
 def subagent_cancel(agent_id: str) -> str:
@@ -746,6 +1015,9 @@ def subagent_reply(agent_id: str, reply: str) -> None:
             timeout=sa.timeout,
             role=sa.role,
             redact_secrets=sa.redact_secrets,
+            context_window=sa.context_window,
+            max_time=sa.max_time,
+            context_turns=sa.context_turns,
         )
     except Exception:
         with _subagents_lock:
@@ -754,6 +1026,54 @@ def subagent_reply(agent_id: str, reply: str) -> None:
             with _subagent_results_lock:
                 _subagent_results[agent_id] = old_result
         raise
+
+
+def subagent_list() -> list[dict]:
+    """Returns a list of all subagents with their current status.
+
+    Each entry contains:
+    - agent_id: The subagent identifier
+    - status: running/success/failure/clarification_needed
+    - model: The model used (or None)
+    - execution_mode: thread/subprocess/acp
+    - elapsed_s: Seconds since the subagent started (from started_at timestamp)
+    - prompt_preview: First 100 characters of the prompt
+
+    Useful for:
+    - Interactive sessions: "what's running right now?"
+    - Orchestrators deciding whether to spawn more agents
+    - Debugging runaway subagent fans
+    """
+    import time
+
+    now = time.time()
+    with _subagents_lock:
+        agents = list(_subagents)  # copy under lock, then iterate outside
+
+    result: list[dict[str, Any]] = []
+    for sa in agents:
+        status = sa.status().status
+
+        # Estimate elapsed time from start time
+        elapsed_s = int(now - sa.started_at)
+
+        # Truncate prompt for preview
+        prompt = sa.prompt[:97] + "..." if len(sa.prompt) > 100 else sa.prompt
+
+        result.append(
+            {
+                "agent_id": sa.agent_id,
+                "status": status,
+                "model": sa.model,
+                "execution_mode": sa.execution_mode,
+                "elapsed_s": max(elapsed_s, 0),
+                "prompt_preview": prompt,
+            }
+        )
+
+    # Sort newest first (smallest elapsed_s = most recently started)
+    result.sort(key=lambda x: x["elapsed_s"])
+    return result
 
 
 def subagent_status(agent_id: str) -> dict:
@@ -765,12 +1085,17 @@ def subagent_status(agent_id: str) -> dict:
     return asdict(sa.status())
 
 
-def subagent_wait(agent_id: str, timeout: int = 60) -> dict:
+def subagent_wait(
+    agent_id: str, timeout: int = 60, max_result_chars: int = 2000
+) -> dict:
     """Waits for a subagent to finish.
 
     Args:
         agent_id: The subagent to wait for
         timeout: Maximum seconds to wait (default 60)
+        max_result_chars: Truncate result text to this many characters (default 2000).
+            Long subagent outputs are truncated to keep the parent's context clean.
+            Call subagent_read_log(agent_id) to read the full output.
 
     Returns:
         Status dict with 'status' and 'result' keys
@@ -807,8 +1132,80 @@ def subagent_wait(agent_id: str, timeout: int = 60) -> dict:
         # Thread mode: join thread
         sa.thread.join(timeout=timeout)
 
-    status = sa.status()
-    return asdict(status)
+    cached_status = (
+        _wait_for_cached_subagent_result(agent_id) if sa.is_running() else None
+    )
+    status = cached_status if cached_status is not None else sa.status()
+    result_dict = asdict(status)
+
+    # Apply output_schema parsing before truncation — the parsed object may be
+    # larger or smaller than the raw JSON string, so we measure truncation against
+    # the final result text, not the pre-parse raw.
+    if sa.output_schema is not None and result_dict.get("status") == "success":
+        from .batch import (
+            _parse_result,  # late import avoids circular (batch imports api)
+        )
+
+        result_dict = _parse_result(result_dict, sa.output_schema)
+
+    # Compact result: truncate long outputs so they don't flood the parent's context.
+    # The complete block is meant to be a brief summary; if it's longer than
+    # max_result_chars the parent agent can call subagent_read_log() to get details.
+    result_text = result_dict.get("result")
+    if (
+        isinstance(result_text, str)
+        and max_result_chars > 0
+        and len(result_text) > max_result_chars
+    ):
+        result_dict["result"] = (
+            result_text[:max_result_chars]
+            + f"\n... [truncated — call subagent_read_log('{agent_id}') for full output]"
+        )
+
+    return result_dict
+
+
+def subagent_wait_any(
+    agent_ids: list[str],
+    timeout: int = 300,
+) -> tuple[str, dict]:
+    """Wait for the first of the given subagents to complete.
+
+    Useful for speculative/hedging patterns: spawn N subagents and take
+    whichever finishes first, then cancel the rest with ``subagent_cancel()``.
+
+    Args:
+        agent_ids: List of agent IDs to wait on.
+        timeout: Maximum seconds to wait for any agent to complete.
+
+    Returns:
+        Tuple of ``(agent_id, result_dict)`` for the first agent that
+        completes. ``result_dict`` has ``"status"`` (``"success"`` /
+        ``"failure"`` / ``"clarification_needed"``) and ``"result"`` keys.
+
+    Raises:
+        ValueError: If ``agent_ids`` is empty.
+        TimeoutError: If no agent completes within ``timeout`` seconds.
+
+    Example::
+
+        # Race pattern: take whichever approach finishes first
+        subagent("fast", "Quick attempt at task X")
+        subagent("thorough", "Thorough attempt at task X")
+        first_id, result = subagent_wait_any(["fast", "thorough"], timeout=120)
+        print(f"{first_id} won the race: {result['status']}")
+        # Cancel the slower agent
+        for aid in ("fast", "thorough"):
+            if aid != first_id:
+                subagent_cancel(aid)
+    """
+    if not agent_ids:
+        raise ValueError("agent_ids must not be empty")
+
+    from .batch import BatchJob
+
+    job = BatchJob(agent_ids=list(agent_ids))
+    return job.wait_any(timeout=timeout)
 
 
 def subagent_read_log(

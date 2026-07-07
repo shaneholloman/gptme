@@ -1020,17 +1020,24 @@ export class ApiClient {
     }
   }
 
-  async getConversation(logfile: string): Promise<ConversationResponse> {
+  async getConversation(
+    logfile: string,
+    params?: { limit?: number; before?: number }
+  ): Promise<ConversationResponse> {
     if (!this.isConnected) {
       throw new ApiClientError('Not connected to API');
     }
     try {
-      const response = await this.fetchJson<ConversationResponse>(
-        `${this.baseUrl}/api/v2/conversations/${logfile}`,
-        {
-          signal: this.controller?.signal,
-        }
-      );
+      let url = `${this.baseUrl}/api/v2/conversations/${logfile}`;
+      if (params?.limit !== undefined || params?.before !== undefined) {
+        const qs = new URLSearchParams();
+        if (params.limit !== undefined) qs.set('limit', String(params.limit));
+        if (params.before !== undefined) qs.set('before', String(params.before));
+        url = `${url}?${qs.toString()}`;
+      }
+      const response = await this.fetchJson<ConversationResponse>(url, {
+        signal: this.controller?.signal,
+      });
       return response;
     } catch (error) {
       if (error instanceof DOMException && error.name === 'AbortError') {
@@ -1263,7 +1270,7 @@ export class ApiClient {
     if (!this.isConnected) {
       throw new ApiClientError('Not connected to API');
     }
-    const sessionId = this.sessions$.get(logfile);
+    const sessionId: string | undefined = this.sessions$.get(logfile).get();
     if (!sessionId) {
       throw new ApiClientError('No active session for this conversation');
     }

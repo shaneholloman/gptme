@@ -1,11 +1,49 @@
 """Trajectory-focused evals for the subagent tool."""
 
+import re
 from typing import TYPE_CHECKING
 
 from gptme.message import Message
 
 if TYPE_CHECKING:
-    from gptme.eval.types import EvalSpec
+    from gptme.eval.types import EvalSpec, ResultContext
+
+
+# `expect`/`check_log` callables are stored in the EvalSpec dict, which gets
+# pickled by ProcessPoolExecutor.submit() even when running with --parallel 1
+# (the executor always routes submissions through a picklable call queue).
+# Lambdas can't be pickled ("attribute lookup <lambda> ... failed"), so every
+# check here must be a named module-level function, not an inline lambda.
+def _expect_words_marker(ctx: "ResultContext") -> bool:
+    return "WORDS=6" in ctx.stdout
+
+
+def _expect_lines_marker(ctx: "ResultContext") -> bool:
+    return "LINES=4" in ctx.stdout
+
+
+def _expect_exists_marker(ctx: "ResultContext") -> bool:
+    return "EXISTS=yes" in ctx.stdout
+
+
+def _expect_clean_exit(ctx: "ResultContext") -> bool:
+    return ctx.exit_code == 0
+
+
+def _expect_sum_marker(ctx: "ResultContext") -> bool:
+    return "SUM=5050" in ctx.stdout
+
+
+def _expect_greeting_marker(ctx: "ResultContext") -> bool:
+    return "GREETING=" in ctx.stdout
+
+
+def _expect_score_marker(ctx: "ResultContext") -> bool:
+    return "SCORE=" in ctx.stdout
+
+
+def _expect_reviewed_marker(ctx: "ResultContext") -> bool:
+    return "REVIEWED=" in ctx.stdout
 
 
 def _role_contents(messages: list[Message], role: str) -> str:
@@ -52,9 +90,12 @@ def check_subagent_parallel_integrated_results(messages: list[Message]) -> bool:
 def check_subagent_complete_spawned(messages: list[Message]) -> bool:
     """Parent log should show the roundtrip subagent being started."""
     assistant_log = _role_contents(messages, "assistant")
+    # Accept both positional and keyword argument syntax
     return (
         'subagent("sum-roundtrip"' in assistant_log
         or "subagent('sum-roundtrip'" in assistant_log
+        or 'subagent(agent_id="sum-roundtrip"' in assistant_log
+        or "subagent(agent_id='sum-roundtrip'" in assistant_log
     )
 
 
@@ -110,9 +151,14 @@ def check_subagent_complete_waited_before_result(messages: list[Message]) -> boo
 
 def check_clarification_spawned(messages: list[Message]) -> bool:
     """Parent log should show the clarification subagent being started."""
-    return _any_message_contains(
-        messages, "assistant", 'subagent("greeter"'
-    ) or _any_message_contains(messages, "assistant", "subagent('greeter'")
+    # Accept both positional and keyword argument syntax
+    assistant_log = _role_contents(messages, "assistant")
+    return (
+        'subagent("greeter"' in assistant_log
+        or "subagent('greeter'" in assistant_log
+        or 'subagent(agent_id="greeter"' in assistant_log
+        or "subagent(agent_id='greeter'" in assistant_log
+    )
 
 
 def check_clarification_hook_notification(messages: list[Message]) -> bool:
@@ -137,9 +183,101 @@ def check_clarification_reply_with_language(messages: list[Message]) -> bool:
     )
 
 
+def check_output_schema_used(messages: list[Message]) -> bool:
+    """Parent should pass output_schema= when spawning the subagent."""
+    assistant_log = _role_contents(messages, "assistant")
+    return "output_schema=" in assistant_log
+
+
+def check_output_schema_result_is_structured(messages: list[Message]) -> bool:
+    """The result retrieved via subagent_wait should look like parsed JSON/dict.
+
+    A trajectory-level check: the parent's final assistant message must contain
+    a Python dict literal or JSON object that includes the 'score' key, proving
+    the parent received and used a structured (not free-text) result.
+
+    Pattern: matches `'score': <value>` (with dict/list delimiters before the key)
+    where <value> is NOT a type keyword (int, str, etc), but IS a concrete value
+    (number, string literal, object/array, or JSON constant).
+    """
+    final_msg = _last_assistant_content(messages)
+    return (
+        re.search(
+            r"[\{\[,]\s*['\"]score['\"]\s*:\s*"
+            r"(?!(?:int|str|float|bool|list|dict|tuple|set)(?:\b|[,\}\]]))"
+            r"(?:-?\d+(?:\.\d+)?|['\"]|\{|\[|true\b|false\b|null\b|None\b)",
+            final_msg,
+        )
+        is not None
+    )
+
+
+def check_output_schema_wait_called(messages: list[Message]) -> bool:
+    """Parent must call subagent_wait after spawning the output_schema subagent."""
+    return _any_message_contains(messages, "assistant", "subagent_wait(")
+
+
+def check_pipeline_used(messages: list[Message]) -> bool:
+    """Parent should use subagent_pipeline for staged fan-out."""
+    return _any_message_contains(messages, "assistant", "subagent_pipeline(")
+
+
+def check_pipeline_results_integrated(messages: list[Message]) -> bool:
+    """Final assistant message should include results from the pipeline."""
+    final_msg = _last_assistant_content(messages)
+    return "REVIEWED=" in final_msg or "SUMMARY=" in final_msg
+
+
+def check_pipeline_no_explicit_waits(messages: list[Message]) -> bool:
+    """subagent_pipeline manages its own waits; the parent should not call subagent_wait.
+
+    The point of subagent_pipeline is barrier-free fan-out — the helper handles
+    scheduling internally. If the parent still calls subagent_wait() manually it
+    defeats the purpose and suggests the agent misunderstood the API.
+    """
+    assistant_log = _role_contents(messages, "assistant")
+    return "subagent_wait(" not in assistant_log
+
+
+def _expect_race_marker(ctx: "ResultContext") -> bool:
+    return (
+        "RACE=done" in ctx.stdout
+        and re.search(r"\bWINNER=(fast|thorough)\b", ctx.stdout) is not None
+    )
+
+
+def check_wait_any_used(messages: list[Message]) -> bool:
+    """Parent should call subagent_wait_any to race two subagents."""
+    return _any_message_contains(messages, "assistant", "subagent_wait_any(")
+
+
+def check_wait_any_loser_cancelled(messages: list[Message]) -> bool:
+    """Parent should cancel the agent that did not win the race."""
+    assistant_log = _role_contents(messages, "assistant")
+    if "subagent_cancel(" not in assistant_log:
+        return False
+    if re.search(r"subagent_cancel\(\s*first_id\s*\)", assistant_log):
+        return False
+    return any(
+        re.search(pattern, assistant_log, re.DOTALL) is not None
+        for pattern in (
+            r"if\s+\w+\s*!=\s*first_id\s*:\s*\n\s*subagent_cancel\(\s*\w+\s*\)",
+            r"loser\s*=.*first_id.*subagent_cancel\(\s*loser\s*\)",
+            r"slower\s*=.*first_id.*subagent_cancel\(\s*slower\s*\)",
+        )
+    )
+
+
+def check_wait_any_result_used(messages: list[Message]) -> bool:
+    """Final assistant message should reference the winning subagent result."""
+    final_msg = _last_assistant_content(messages)
+    return "WINNER=" in final_msg and "RACE=" in final_msg
+
+
 _PARALLEL_A = "alpha beta gamma delta epsilon zeta\n"
 _PARALLEL_B = "one\ntwo\nthree\nfour\n"
 _NOTES = "Keep this brief. The parent can read this between spawn and wait.\n"
+_RACE_FILE = "The answer is FORTYTWO.\n"
 
 
 tests: list["EvalSpec"] = [
@@ -165,10 +303,10 @@ tests: list["EvalSpec"] = [
         ),
         "tools": ["read", "save", "shell", "ipython", "subagent"],
         "expect": {
-            "writes WORDS marker": lambda ctx: "WORDS=6" in ctx.stdout,
-            "writes LINES marker": lambda ctx: "LINES=4" in ctx.stdout,
-            "writes EXISTS marker": lambda ctx: "EXISTS=yes" in ctx.stdout,
-            "clean exit": lambda ctx: ctx.exit_code == 0,
+            "writes WORDS marker": _expect_words_marker,
+            "writes LINES marker": _expect_lines_marker,
+            "writes EXISTS marker": _expect_exists_marker,
+            "clean exit": _expect_clean_exit,
         },
         "check_log": {
             "used subagent delegation": check_subagent_parallel_used,
@@ -195,8 +333,8 @@ tests: list["EvalSpec"] = [
         ),
         "tools": ["read", "save", "shell", "ipython", "subagent"],
         "expect": {
-            "writes SUM marker": lambda ctx: "SUM=5050" in ctx.stdout,
-            "clean exit": lambda ctx: ctx.exit_code == 0,
+            "writes SUM marker": _expect_sum_marker,
+            "clean exit": _expect_clean_exit,
         },
         "check_log": {
             "spawned roundtrip subagent": check_subagent_complete_spawned,
@@ -226,14 +364,106 @@ tests: list["EvalSpec"] = [
         ),
         "tools": ["read", "save", "shell", "ipython", "subagent"],
         "expect": {
-            "writes GREETING marker": lambda ctx: "GREETING=" in ctx.stdout,
-            "clean exit": lambda ctx: ctx.exit_code == 0,
+            "writes GREETING marker": _expect_greeting_marker,
+            "clean exit": _expect_clean_exit,
         },
         "check_log": {
             "spawned greeter subagent": check_clarification_spawned,
             "received clarification hook notification": check_clarification_hook_notification,
             "called subagent_reply": check_clarification_reply_called,
             "replied with English": check_clarification_reply_with_language,
+        },
+    },
+    {
+        "name": "subagent-output-schema",
+        "files": {
+            "reviews.txt": (
+                "Product A: excellent build quality, fast shipping\n"
+                "Product B: poor packaging, slow delivery\n"
+            ),
+        },
+        "run": "cat answer.txt",
+        "prompt": (
+            "Spawn a subagent with agent_id 'reviewer' to evaluate reviews.txt. "
+            "Pass output_schema={'score': int, 'summary': str} so the subagent returns "
+            "structured data. In the subagent prompt tell it to:\n"
+            "  - Read reviews.txt\n"
+            "  - Compute an overall quality score from 1-10\n"
+            "  - Write a one-sentence summary\n"
+            "  - Return the result via complete() as JSON: "
+            '{"score": <int>, "summary": "<text>"}\n'
+            "After spawning, wait for the subagent. "
+            "The result from subagent_wait should be a parsed dict, not raw text. "
+            "Write answer.txt containing:\n"
+            "SCORE=<the integer score>\n"
+            "SUMMARY=<the one-sentence summary>\n"
+            "Include SCORE= in your final assistant message."
+        ),
+        "tools": ["read", "save", "shell", "ipython", "subagent"],
+        "expect": {
+            "writes SCORE marker": _expect_score_marker,
+            "clean exit": _expect_clean_exit,
+        },
+        "check_log": {
+            "passed output_schema to subagent": check_output_schema_used,
+            "called subagent_wait for result": check_output_schema_wait_called,
+            "result contains structured score field": check_output_schema_result_is_structured,
+        },
+    },
+    {
+        "name": "subagent-pipeline-staged",
+        "files": {
+            "items.txt": "apple\nbanana\ncherry\n",
+        },
+        "run": "cat answer.txt",
+        "prompt": (
+            "Use subagent_pipeline to process items.txt in two stages without a barrier:\n"
+            "Stage 1: for each fruit name, spawn a subagent that converts it to UPPERCASE.\n"
+            "Stage 2: for each uppercased result, spawn a subagent that wraps it in "
+            "'REVIEWED: <name>'.\n"
+            "subagent_pipeline runs stage 2 on item A while item B is still in stage 1 — "
+            "do NOT call subagent_wait manually; let subagent_pipeline manage scheduling.\n"
+            "When finished, write answer.txt containing the three REVIEWED= lines, one per fruit.\n"
+            "Include 'REVIEWED=' in your final assistant message."
+        ),
+        "tools": ["read", "save", "shell", "ipython", "subagent"],
+        "expect": {
+            "writes REVIEWED marker": _expect_reviewed_marker,
+            "clean exit": _expect_clean_exit,
+        },
+        "check_log": {
+            "used subagent_pipeline": check_pipeline_used,
+            "integrated pipeline results": check_pipeline_results_integrated,
+            "did not call subagent_wait manually": check_pipeline_no_explicit_waits,
+        },
+    },
+    {
+        "name": "subagent-wait-any-race",
+        "files": {
+            "data.txt": _RACE_FILE,
+        },
+        "run": "cat answer.txt",
+        "prompt": (
+            "Demonstrate the race/hedging pattern with subagent_wait_any:\n"
+            "1. Spawn TWO subagents concurrently — agent_id 'fast' and 'thorough' — "
+            "each instructed to read data.txt and return its content via the complete tool.\n"
+            "2. Call subagent_wait_any(['fast', 'thorough']) to wait for whichever "
+            "finishes first.\n"
+            "3. Cancel the slower agent with subagent_cancel().\n"
+            "4. Write answer.txt containing:\n"
+            "WINNER=<the agent_id that won>\n"
+            "RACE=done\n"
+            "Include both WINNER= and RACE= in your final assistant message."
+        ),
+        "tools": ["read", "save", "shell", "ipython", "subagent"],
+        "expect": {
+            "writes RACE marker": _expect_race_marker,
+            "clean exit": _expect_clean_exit,
+        },
+        "check_log": {
+            "called subagent_wait_any": check_wait_any_used,
+            "cancelled the losing agent": check_wait_any_loser_cancelled,
+            "used winner result": check_wait_any_result_used,
         },
     },
 ]

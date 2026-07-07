@@ -19,7 +19,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
 from ...message import Message
-from .. import get_tools, load_tool, set_tools
+from .. import clear_tools, get_tools, load_tool, set_tools
 from .._allowlist import (
     is_hint_pattern,
     matching_allowlist_tools,
@@ -126,6 +126,19 @@ def _build_memory_system_message(
     return Message("system", "\n\n".join(parts))
 
 
+def _build_parent_context_message(parent_messages: list[Message]) -> Message:
+    """Format parent conversation messages into a system context message for the subagent."""
+    lines = ["# Parent Conversation Context\n"]
+    for msg in parent_messages:
+        role_label = msg.role.capitalize()
+        lines.append(f"**{role_label}:**\n\n{msg.content}\n")
+    lines.append(
+        "\n_This context is provided so you can understand what the parent agent has been doing. "
+        "Focus on your own task — don't re-execute work the parent has already completed._"
+    )
+    return Message("system", "\n".join(lines))
+
+
 def _create_subagent_thread(
     prompt: str,
     logdir: Path,
@@ -137,7 +150,9 @@ def _create_subagent_thread(
     output_schema: type | None = None,
     profile_name: str | None = None,
     agent_id: str | None = None,
-    redact_secrets: bool = False,
+    redact_secrets: bool = True,
+    context_window: int | None = None,
+    parent_messages: list[Message] | None = None,
 ) -> None:
     """Shared function for running subagent threads.
 
@@ -151,10 +166,26 @@ def _create_subagent_thread(
         target: Who will review the results ("parent" or "planner")
         profile_name: Optional agent profile to apply (system prompt + hard tool enforcement)
         agent_id: Identifier stored in thread-local so the progress tool can self-identify
+        context_window: Limit workspace context messages. None = no limit; 0 = minimal
+            context (just agent identity + tools, no workspace files); N > 0 = at most
+            N workspace context messages included.
+        parent_messages: Recent messages from the parent's conversation to inject as context.
+            Formatted as a system message so the subagent understands what the parent has
+            been doing without confusing the subagent's own conversation flow.
     """
     # Store agent_id in thread-local so the progress tool can identify this subagent
     if agent_id is not None:
         _thread_local.agent_id = agent_id
+
+    # Detach from the parent thread's tool list. Python's threading.Thread copies
+    # the parent's context into the child, so _loaded_tools_var initially points to
+    # the *same list object* as the parent. Any append inside init_tools() or
+    # _ensure_subagent_signal_tools_loaded() would mutate the parent's list, creating
+    # a data race with the parent's concurrent execute_msg() calls. Calling
+    # clear_tools() here replaces the ContextVar binding with a fresh empty list so
+    # all subsequent tool operations operate on an independent list. This is the fix
+    # for the thread-mode "transient non-runnable" race (#554).
+    clear_tools()
 
     # noreorder
     from gptme.chat import chat  # fmt: skip
@@ -221,9 +252,35 @@ def _create_subagent_thread(
 
     prompt_msgs = [Message("user", prompt)]
 
-    # Build initial messages based on context_mode
-    if context_mode == "selective":
-        # Selective context - build from specified components
+    # Build initial messages based on context_mode and context_window
+    if context_window == 0:
+        # Minimal context: just agent identity and tools, no workspace files.
+        # This is the context isolation mode requested by the --isolate flag.
+        # Note: if context_mode="selective" is also set, context_window=0 takes
+        # precedence and the context_include list is ignored — agent+tools only.
+        from ...prompts import prompt_gptme, prompt_tools
+
+        if (
+            context_mode == "selective"
+            and context_include
+            and set(context_include)
+            - {
+                "agent",
+                "tools",
+            }
+        ):
+            logger.warning(
+                "context_window=0 overrides context_include=%r; "
+                "only agent identity and tools will be included",
+                context_include,
+            )
+        initial_msgs = list(prompt_gptme(False, None, agent_name=None)) + list(
+            prompt_tools(tools=available_tools, tool_format="markdown")
+        )
+    elif context_mode == "selective":
+        # Selective context — build from specified components.
+        # context_window > 0 is not applied in selective mode; the caller
+        # controls the context set explicitly via context_include instead.
         from ...prompts import prompt_gptme, prompt_tools
 
         initial_msgs = []
@@ -243,6 +300,18 @@ def _create_subagent_thread(
         initial_msgs = get_prompt(
             available_tools, interactive=False, workspace=workspace
         )
+        # Truncate workspace context if a positive window is specified.
+        # Base messages (agent identity + tools) do NOT count against the
+        # window — only the workspace context messages after them do.
+        #
+        # get_prompt() merges core sections into a single combined message
+        # (via _join_messages()). In the typical subagent case (no active
+        # chat history, no context_cmd) n_base=1. Dynamic sections such as
+        # SYSTEM_PROMPT_CACHE_BOUNDARY, chat_history, or context_cmd output
+        # may add more — the measurement below handles all cases correctly.
+        if context_window is not None and context_window > 0:
+            n_base = len(get_prompt(available_tools, interactive=False, workspace=None))
+            initial_msgs = initial_msgs[: n_base + context_window]
 
     # Apply secret redaction to workspace context messages if requested.
     # This redacts values from lines where the variable name matches common
@@ -267,15 +336,40 @@ def _create_subagent_thread(
         memory_msg = _build_memory_system_message(memory_content, memory_dir)
         initial_msgs.append(memory_msg)
 
-    # Add completion instruction as a system message
+    # Inject parent conversation context if provided
+    # Redact secrets from parent messages to prevent leaking API keys/tokens
+    # that may appear in parent conversation output (e.g., shell output, env reads).
+    if parent_messages:
+        if redact_secrets:
+            from .context import redact_secrets_from_messages
+
+            parent_messages = redact_secrets_from_messages(parent_messages)
+        initial_msgs.append(_build_parent_context_message(parent_messages))
+
+    # Add completion instruction as a system message.
+    # When output_schema is set, the instruction is extended with the expected
+    # JSON schema so the subagent knows the format to use in its complete block.
+    # output_schema is intentionally NOT passed to chat() here — the LLM-level
+    # response_format (structured JSON output) conflicts with markdown tool_format
+    # because the model can't write markdown code blocks while also being forced to
+    # output raw JSON. Schema contract is enforced at the complete-block layer in
+    # Subagent._read_log() instead.
     complete_instruction = Message(
         "system",
-        _get_complete_instruction(target),
+        _get_complete_instruction(target, output_schema=output_schema),
     )
     initial_msgs.append(complete_instruction)
 
     # Note: workspace parameter is always passed to chat() (required parameter)
     # Workspace context in messages is controlled by initial_msgs
+    #
+    # Suppress terminal output for thread-mode subagents via output_format="quiet":
+    # each thread has its own ContextVar copy (Python's threading semantics), so
+    # this only affects this thread and never bleeds into the parent's output
+    # stream. Passing it through chat()'s own save/restore machinery (rather than
+    # calling set_output_format() before the call) is required — chat() itself
+    # calls set_output_format(output_format) at its start, which would otherwise
+    # immediately override quiet mode back to the default "text".
     chat(
         prompt_msgs,
         initial_msgs,
@@ -287,7 +381,7 @@ def _create_subagent_thread(
         interactive=False,
         show_hidden=False,
         tool_format="markdown",
-        output_schema=output_schema,
+        output_format="quiet",
     )
 
 
@@ -349,9 +443,9 @@ def _run_subagent_subprocess(
                     tool_allowlist.append(tool_name)
             cmd.extend(["--tools", ",".join(tool_allowlist)])
         else:
-            cmd.extend(["--tools", "+clarify"])
+            cmd.extend(["--tools", "+complete,+clarify"])
     else:
-        cmd.extend(["--tools", "+clarify"])
+        cmd.extend(["--tools", "+complete,+clarify"])
 
     # Map context_mode/context_include to the --context CLI flag
     if context_mode == "selective" and context_include:
@@ -492,6 +586,9 @@ def _monitor_subprocess(
         subagent.process.kill()
         subagent.process.wait()  # reap the killed process
 
+    input_tokens: int | None = None
+    output_tokens: int | None = None
+
     # Determine status based on return code
     if subagent.process.returncode == 0:
         status: Status = "success"
@@ -501,6 +598,8 @@ def _monitor_subprocess(
             if log_status.status == "clarification_needed":
                 status = "clarification_needed"
             result = log_status.result
+            input_tokens = log_status.input_tokens
+            output_tokens = log_status.output_tokens
         except Exception:
             result = "Task completed (check log for details)"
     elif _timed_out:
@@ -512,7 +611,12 @@ def _monitor_subprocess(
         result = f"Process exited with code {subagent.process.returncode}"
 
     # Cache the result in module-level dict (Subagent is frozen)
-    final_result = ReturnType(status, result)
+    final_result = ReturnType(
+        status,
+        result,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+    )
     if not set_subagent_result_if_absent(subagent.agent_id, final_result):
         _cleanup_isolation(subagent)
         return
@@ -537,6 +641,9 @@ def _run_planner(
     context_include: list[str] | None = None,
     model: str | None = None,
     profile_name: str | None = None,
+    redact_secrets: bool = True,
+    context_window: int | None = None,
+    workdir: Path | None = None,
 ) -> None:
     """Run a planner that delegates work to multiple executor subagents.
 
@@ -549,6 +656,13 @@ def _run_planner(
         context_include: For selective mode, list of context components to include
         profile_name: Agent profile to apply to executor subagents (per-subtask role
             always overrides this when set — subtask role is more specific)
+        redact_secrets: If True, scrub secret patterns from workspace context before
+            thread-mode executors see it. Has no effect on subprocess-mode executors
+            (which manage their own context); a debug message is logged in that case.
+        context_window: Limit workspace context messages passed to executor subagents.
+            None = no limit; 0 = minimal context (no workspace files); N > 0 = at most N.
+        workdir: Pre-resolved working directory for all executor subagents. When
+            None, each executor falls back to Path.cwd() at spawn time.
     """
     from gptme.cli.main import get_logdir
 
@@ -600,12 +714,15 @@ def _run_planner(
                 f"isolated={resolved_isolated}"
             )
 
-        # Capture workspace before spawning to avoid FileNotFoundError
-        # if cwd is deleted (e.g., tmpdir cleanup in tests)
-        try:
-            workspace = Path.cwd()
-        except FileNotFoundError:
-            workspace = logdir.parent
+        # Explicit workdir > current working directory. Capture before spawning
+        # to avoid FileNotFoundError if cwd is deleted (e.g., tmpdir cleanup in tests)
+        if workdir is not None:
+            workspace = workdir
+        else:
+            try:
+                workspace = Path.cwd()
+            except FileNotFoundError:
+                workspace = logdir.parent
 
         # Set up worktree isolation if the resolved role requires it
         worktree_path: Path | None = None
@@ -642,6 +759,11 @@ def _run_planner(
                 )
 
         if resolved_use_subprocess:
+            if redact_secrets:
+                logger.debug(
+                    f"Planner executor {executor_id}: 'redact_secrets=True' has no effect "
+                    "in subprocess mode (only thread-mode subagents inherit workspace context)"
+                )
             sa = Subagent(
                 executor_id,
                 executor_prompt,
@@ -766,6 +888,8 @@ def _run_planner(
                         target="planner",
                         profile_name=subtask_profile,
                         agent_id=executor_agent_id,
+                        redact_secrets=redact_secrets,
+                        context_window=context_window,
                     )
                 finally:
                     try:

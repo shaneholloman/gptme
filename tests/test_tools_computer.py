@@ -1,5 +1,6 @@
 """Tests for the computer tool."""
 
+import os
 import shutil
 import subprocess
 from typing import Any, cast
@@ -13,8 +14,13 @@ from gptme.tools.computer import (
     MODIFIER_KEYS,
     _chunks,
     _get_display_resolution,
+    _get_macos_display_scale,
+    _linux_accessibility_tree,
+    _linux_click_accessible_element,
     _linux_scroll,
     _linux_window_focus,
+    _macos_accessibility_tree,
+    _macos_click_accessible_element,
     _macos_window_focus,
     _parse_key_sequence,
     _run_xdotool,
@@ -296,6 +302,130 @@ Graphics/Displays:
         width, height = _get_display_resolution()
         assert width == 2560
         assert height == 1664
+
+
+# === _get_macos_display_scale() tests ===
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_via_appkit():
+    """Scale factor is read from AppKit.NSScreen.backingScaleFactor() when available."""
+    _get_macos_display_scale.cache_clear()
+    mock_screen = mock.MagicMock()
+    mock_screen.backingScaleFactor.return_value = 2.0
+    mock_appkit = mock.MagicMock()
+    mock_appkit.NSScreen.mainScreen.return_value = mock_screen
+
+    with mock.patch.dict("sys.modules", {"AppKit": mock_appkit}):
+        scale = _get_macos_display_scale()
+
+    assert scale == 2.0
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_via_system_profiler():
+    """Scale factor is derived from system_profiler when AppKit is unavailable."""
+    _get_macos_display_scale.cache_clear()
+    profiler_output = """\
+Graphics/Displays:
+    Apple M1:
+      Displays:
+        Color LCD:
+          Resolution: 2560 x 1664 Retina
+          UI Looks like: 1280 x 832 @ 60.00Hz
+"""
+
+    with (
+        mock.patch.dict("sys.modules", {"AppKit": None}),
+        mock.patch("subprocess.check_output", return_value=profiler_output),
+    ):
+        scale = _get_macos_display_scale()
+
+    assert scale == pytest.approx(2560 / 1280, rel=1e-3)
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_via_system_profiler_multi_display():
+    """Scale factor parsed correctly even when system_profiler has 'Maximum Resolution' before 'Resolution:'."""
+    _get_macos_display_scale.cache_clear()
+    profiler_output = """\
+Graphics/Displays:
+
+    Display with External Monitor:
+      Displays:
+        Built-In Retina:
+          Maximum Resolution: 3840 x 2160
+          Resolution: 2560 x 1664 Retina
+          UI Looks like: 1280 x 832 @ 60.00Hz
+        External Monitor:
+          Resolution: 1920 x 1080
+          UI Looks like: 1920 x 1080 @ 60.00Hz
+"""
+
+    with (
+        mock.patch.dict("sys.modules", {"AppKit": None}),
+        mock.patch("subprocess.check_output", return_value=profiler_output),
+    ):
+        scale = _get_macos_display_scale()
+
+    # Must NOT match "Maximum Resolution: 3840 x 2160" — should find actual Resolution: 2560
+    # giving 2560 / 1280 = 2.0
+    assert scale == pytest.approx(2.0, rel=1e-3)
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_via_system_profiler_prefers_main_display():
+    """Main Display metadata wins when multiple display blocks have valid scale pairs."""
+    _get_macos_display_scale.cache_clear()
+    profiler_output = """\
+Graphics/Displays:
+    Apple M1:
+      Displays:
+        External Monitor:
+          Resolution: 1920 x 1080
+          UI Looks like: 1920 x 1080 @ 60.00Hz
+        Color LCD:
+          Main Display: Yes
+          Resolution: 2560 x 1664 Retina
+          UI Looks like: 1280 x 832 @ 60.00Hz
+"""
+
+    with (
+        mock.patch.dict("sys.modules", {"AppKit": None}),
+        mock.patch("subprocess.check_output", return_value=profiler_output),
+    ):
+        scale = _get_macos_display_scale()
+
+    assert scale == pytest.approx(2.0, rel=1e-3)
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_get_macos_display_scale_fallback_to_2x():
+    """Falls back to 2.0 when both AppKit and system_profiler are unavailable."""
+    _get_macos_display_scale.cache_clear()
+    with (
+        mock.patch.dict("sys.modules", {"AppKit": None}),
+        mock.patch(
+            "subprocess.check_output",
+            side_effect=subprocess.CalledProcessError(1, "system_profiler"),
+        ),
+    ):
+        scale = _get_macos_display_scale()
+
+    assert scale == 2.0
+
+
+@mock.patch("gptme.tools.computer._get_display_resolution", return_value=(2560, 1664))
+@mock.patch("gptme.tools.computer._get_macos_display_scale", return_value=2.0)
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+def test_coordinate_scaling_macos_2x(mock_scale, mock_res):
+    """Coordinate scaling on macOS 2× Retina yields logical (non-physical) coords."""
+    # Physical: 2560×1664, logical (after ÷2): 1280×832
+    # Clicking at API (640, 416) with API space 1280×832 → physical (1280, 832)
+    # But gptme works in logical space, so we expect (640, 416)
+    x, y = _scale_coordinates(_ScalingSource.API, 640, 416, 1280, 832)
+    assert x == 640
+    assert y == 416
 
 
 # === _run_xdotool() tests ===
@@ -830,8 +960,9 @@ _MOCK_MACOS_RES = (1920, 1080)
 @mock.patch(
     "gptme.tools.computer._get_display_resolution", return_value=_MOCK_MACOS_RES
 )
+@mock.patch("gptme.tools.computer._get_macos_display_scale", return_value=2.0)
 @mock.patch("subprocess.run")
-def test_computer_cursor_position_macos(mock_run, mock_res):
+def test_computer_cursor_position_macos(mock_run, mock_scale, mock_res):
     """Test cursor_position on macOS parses cliclick output correctly."""
     from gptme.tools.computer import computer
 
@@ -1088,6 +1219,61 @@ def test_compute_change_ratio_mismatched_sizes():
         p2.unlink(missing_ok=True)
 
 
+def test_compute_change_ratio_small_text_change():
+    """Simulated terminal text change stays above the 0.2% detection threshold.
+
+    Typing a short command into an xterm on a 1024x768 screen changes roughly
+    0.3–0.5% of pixels (22 chars × ~112px each out of 786,432 total).  This
+    test verifies that a 0.3% change is detectable with the new threshold (0.002)
+    and was NOT detectable with the old threshold (0.01) — catching a regression
+    where act_and_observe always reported "No screen change detected" after typing.
+    """
+    from PIL import Image
+
+    # Simulate a 1024×768 terminal screen: mostly black background
+    size = (1024, 768)
+    img1 = Image.new("RGB", size, (0, 0, 0))
+    img2 = img1.copy()
+
+    # Simulate typing "echo act_and_observe_ok" into an xterm at the bottom of the window.
+    # Each character is roughly 7×14 pixels; 22 chars = 22 × 7 × 14 = 2156 pixels.
+    # We paint a 154×14 pixel rectangle (22 chars wide) to represent the text.
+    char_w, char_h = 7, 14
+    num_chars = 22
+    text_x, text_y = 100, 700  # near the bottom of the terminal
+    for x in range(text_x, text_x + num_chars * char_w):
+        for y in range(text_y, text_y + char_h):
+            img2.putpixel((x, y), (200, 200, 200))  # light text on dark background
+
+    changed_pixels = num_chars * char_w * char_h  # 2156
+    expected_ratio = changed_pixels / (size[0] * size[1])  # ~0.0027
+
+    f1 = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    f2 = tempfile.NamedTemporaryFile(suffix=".png", delete=False)
+    img1.save(f1.name)
+    img2.save(f2.name)
+    f1.close()
+    f2.close()
+    p1, p2 = Path(f1.name), Path(f2.name)
+    try:
+        ratio = _compute_change_ratio(p1, p2)
+        # Should be approximately the expected ratio
+        assert abs(ratio - expected_ratio) < 0.001, (
+            f"expected ~{expected_ratio:.4f}, got {ratio:.4f}"
+        )
+        # Must be above the new 0.002 threshold so act_and_observe detects it
+        assert ratio >= 0.002, (
+            f"ratio {ratio:.4f} is below new threshold 0.002 — small text changes won't be detected"
+        )
+        # This confirms the old 0.01 threshold was wrong: it was ABOVE the change ratio
+        assert ratio < 0.01, (
+            f"ratio {ratio:.4f} exceeds old 0.01 threshold — old behaviour would have detected this; test premise is wrong"
+        )
+    finally:
+        p1.unlink(missing_ok=True)
+        p2.unlink(missing_ok=True)
+
+
 # ============================================================
 # wait_for_change action tests (unit — mocks screenshot/time)
 # ============================================================
@@ -1120,7 +1306,7 @@ def test_wait_for_change_detects_change(mock_transport, mock_res, tmp_path):
 
     with (
         mock.patch("gptme.tools.computer.screenshot", side_effect=_fake_screenshot),
-        mock.patch("gptme.tools.computer.time.sleep"),
+        mock.patch("gptme.tools.computer._sleep"),
         mock.patch(
             "gptme.tools.computer._make_screenshot_msg", return_value=mock.sentinel.msg
         ),
@@ -1152,9 +1338,9 @@ def test_wait_for_change_timeout_returns_screenshot(mock_transport, mock_res, tm
 
     with (
         mock.patch("gptme.tools.computer.screenshot", return_value=static),
-        mock.patch("gptme.tools.computer.time.sleep"),
+        mock.patch("gptme.tools.computer._sleep"),
         mock.patch(
-            "gptme.tools.computer.time.monotonic", side_effect=monotonic_side_effect
+            "gptme.tools.computer._monotonic", side_effect=monotonic_side_effect
         ),
         mock.patch(
             "gptme.tools.computer._make_screenshot_msg",
@@ -1164,6 +1350,47 @@ def test_wait_for_change_timeout_returns_screenshot(mock_transport, mock_res, tm
         result = computer("wait_for_change", text="1")
 
     assert result is mock.sentinel.timeout_msg
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", False)
+@mock.patch(
+    "gptme.tools.computer._get_display_resolution", return_value=_MOCK_LINUX_RES_WFC
+)
+@mock.patch("gptme.tools.computer.get_transport", return_value=None)
+def test_wait_for_change_polls_with_backoff(mock_transport, mock_res, tmp_path):
+    """wait_for_change uses adaptive backoff: starts at 50ms, backs off to 500ms cap."""
+    from PIL import Image
+
+    static = tmp_path / "static.png"
+    Image.new("RGB", (100, 100), (42, 42, 42)).save(static)
+
+    sleep_calls = []
+
+    def _record_sleep(interval):
+        sleep_calls.append(interval)
+
+    def _fake_monotonic():
+        # Keep the loop inside the deadline until the third sleep has observed
+        # the backoff sequence, then expire it on the next loop check.
+        return 0.0 if len(sleep_calls) < 3 else 100.0
+
+    with (
+        mock.patch("gptme.tools.computer.screenshot", return_value=static),
+        mock.patch("gptme.tools.computer._sleep", side_effect=_record_sleep),
+        mock.patch("gptme.tools.computer._monotonic", side_effect=_fake_monotonic),
+        mock.patch(
+            "gptme.tools.computer._make_screenshot_msg",
+            return_value=mock.sentinel.timeout_msg,
+        ),
+    ):
+        result = computer("wait_for_change", text="1")
+
+    assert result is mock.sentinel.timeout_msg
+    # First call: 50ms; second: 100ms; third: 200ms — doubling backoff
+    assert len(sleep_calls) >= 3
+    assert sleep_calls[0] == pytest.approx(0.05)  # 50ms initial interval
+    assert sleep_calls[1] == pytest.approx(0.10)  # 100ms after first backoff
+    assert sleep_calls[2] == pytest.approx(0.20)  # 200ms after second backoff
 
 
 # ============================================================
@@ -1290,8 +1517,8 @@ def test_macos_window_focus_no_match_raises():
     """
     with (
         mock.patch("gptme.tools.computer.subprocess.run") as mock_run,
-        mock.patch("gptme.tools.computer.time.monotonic") as mock_time,
-        mock.patch("gptme.tools.computer.time.sleep"),
+        mock.patch("gptme.tools.computer._monotonic") as mock_time,
+        mock.patch("gptme.tools.computer._sleep"),
         pytest.raises(RuntimeError, match="No window matching.*'MissingApp'"),
     ):
         # First call returns not_found, second call has monotonic past deadline
@@ -1311,10 +1538,8 @@ def test_macos_window_focus_retry_then_found():
     ]
     with (
         mock.patch("gptme.tools.computer.subprocess.run", side_effect=results),
-        mock.patch(
-            "gptme.tools.computer.time.monotonic", side_effect=[0.0, 0.5, 1.0, 1.5]
-        ),
-        mock.patch("gptme.tools.computer.time.sleep"),
+        mock.patch("gptme.tools.computer._monotonic", side_effect=[0.0, 0.5, 1.0, 1.5]),
+        mock.patch("gptme.tools.computer._sleep"),
     ):
         _macos_window_focus("SlowApp", timeout=10.0)
 
@@ -1342,3 +1567,347 @@ def test_macos_window_focus_accepts_double_quotes_in_pattern():
     assert cmd[0] == "osascript"
     assert cmd[-1] == pattern
     assert pattern not in cmd[2]
+
+
+# === Accessibility tree tests ===
+
+
+def _make_mock_accessible(
+    role_name: str, name: str, children: list | None = None, bbox=None
+):
+    """Build a minimal pyatspi-like mock accessible object."""
+    obj = mock.MagicMock()
+    obj.getRoleName.return_value = role_name
+    obj.name = name
+    state_set = mock.MagicMock()
+    state_set.contains.return_value = False
+    obj.getState.return_value = state_set
+    kids = children or []
+    obj.childCount = len(kids)
+    obj.__getitem__ = lambda self, i: kids[i]
+    if bbox is not None:
+        component = mock.MagicMock()
+        component.getExtents.return_value = mock.MagicMock(
+            x=bbox[0], y=bbox[1], width=bbox[2], height=bbox[3]
+        )
+        obj.queryComponent.return_value = component
+    return obj
+
+
+def _make_pyatspi_module(desktop_obj):
+    """Return a minimal pyatspi mock module."""
+    mod = mock.MagicMock()
+    mod.Registry.getDesktop.return_value = desktop_obj
+    mod.DESKTOP_COORDS = 0
+    return mod
+
+
+@pytest.mark.skipif(IS_MACOS, reason="AT-SPI2 is Linux-only")
+def test_accessibility_tree_no_pyatspi_raises():
+    """Missing pyatspi raises RuntimeError with install hint."""
+    with (
+        mock.patch.dict("sys.modules", {"pyatspi": None}),
+        pytest.raises(RuntimeError, match="pyatspi not installed"),
+    ):
+        _linux_accessibility_tree(":1")
+
+
+@pytest.mark.skipif(IS_MACOS, reason="AT-SPI2 is Linux-only")
+def test_accessibility_tree_returns_structured_text():
+    """accessibility_tree returns indented role:name lines for each accessible object."""
+    button = _make_mock_accessible("push button", "OK")
+    app = _make_mock_accessible("application", "TestApp", children=[button])
+    desktop = _make_mock_accessible("desktop frame", "", children=[app])
+
+    pyatspi_mod = _make_pyatspi_module(desktop)
+
+    with mock.patch.dict("sys.modules", {"pyatspi": pyatspi_mod}):
+        result = _linux_accessibility_tree(":1")
+
+    assert "TestApp" in result
+    assert "push button" in result
+    assert "OK" in result
+    # Roles and names must NOT be repr-quoted so agents can copy them directly
+    # into click_accessible_element without quote mismatches.
+    assert "'push button'" not in result
+    assert "'OK'" not in result
+    # app should be indented one level, button two levels
+    lines = result.splitlines()
+    app_line = next(ln for ln in lines if "TestApp" in ln)
+    btn_line = next(ln for ln in lines if "OK" in ln)
+    assert btn_line.startswith("  " + "  ")  # deeper indent than app
+    assert app_line.startswith("  ")
+    # The button line should be directly copyable as role_name:element_name
+    assert "push button: OK" in result
+
+
+@pytest.mark.skipif(IS_MACOS, reason="AT-SPI2 is Linux-only")
+def test_accessibility_tree_empty_desktop():
+    """Empty desktop returns a non-empty string indicating zero apps."""
+    desktop = _make_mock_accessible("desktop frame", "", children=[])
+    pyatspi_mod = _make_pyatspi_module(desktop)
+
+    with mock.patch.dict("sys.modules", {"pyatspi": pyatspi_mod}):
+        result = _linux_accessibility_tree(":1")
+
+    assert "Desktop" in result or "empty" in result or result.strip()
+
+
+@pytest.mark.skipif(IS_MACOS, reason="AT-SPI2 is Linux-only")
+def test_accessibility_tree_sets_display_env():
+    """accessibility_tree sets DISPLAY to the given display before connecting to pyatspi."""
+    desktop = _make_mock_accessible("desktop frame", "", children=[])
+    captured: list[str] = []
+
+    def capturing_get_desktop(index):
+        captured.append(os.environ.get("DISPLAY", ""))
+        return desktop
+
+    pyatspi_mod = _make_pyatspi_module(desktop)
+    pyatspi_mod.Registry.getDesktop.side_effect = capturing_get_desktop
+
+    with mock.patch.dict("sys.modules", {"pyatspi": pyatspi_mod}):
+        _linux_accessibility_tree(":42")
+
+    assert captured == [":42"]
+
+
+@pytest.mark.skipif(IS_MACOS, reason="AT-SPI2 is Linux-only")
+def test_click_accessible_element_no_pyatspi_raises():
+    """Missing pyatspi raises RuntimeError."""
+    with (
+        mock.patch.dict("sys.modules", {"pyatspi": None}),
+        pytest.raises(RuntimeError, match="pyatspi not installed"),
+    ):
+        _linux_click_accessible_element("push button", "OK", ":1")
+
+
+@pytest.mark.skipif(IS_MACOS, reason="AT-SPI2 is Linux-only")
+def test_click_accessible_element_found_returns_center():
+    """click_accessible_element returns the center (x, y) of a matching element."""
+    # bbox: x=100, y=200, width=80, height=40 → center (140, 220)
+    button = _make_mock_accessible("push button", "Submit", bbox=(100, 200, 80, 40))
+    app = _make_mock_accessible("application", "MyApp", children=[button])
+    desktop = _make_mock_accessible("desktop frame", "", children=[app])
+
+    pyatspi_mod = _make_pyatspi_module(desktop)
+
+    with mock.patch.dict("sys.modules", {"pyatspi": pyatspi_mod}):
+        x, y = _linux_click_accessible_element("push button", "Submit", ":1")
+
+    assert x == 140
+    assert y == 220
+
+
+@pytest.mark.skipif(IS_MACOS, reason="AT-SPI2 is Linux-only")
+def test_click_accessible_element_case_insensitive():
+    """Name matching is case-insensitive (substring)."""
+    button = _make_mock_accessible("push button", "SUBMIT FORM", bbox=(0, 0, 100, 50))
+    app = _make_mock_accessible("application", "App", children=[button])
+    desktop = _make_mock_accessible("desktop frame", "", children=[app])
+
+    pyatspi_mod = _make_pyatspi_module(desktop)
+
+    with mock.patch.dict("sys.modules", {"pyatspi": pyatspi_mod}):
+        x, y = _linux_click_accessible_element("push button", "submit", ":1")
+
+    assert x == 50
+    assert y == 25
+
+
+@pytest.mark.skipif(IS_MACOS, reason="AT-SPI2 is Linux-only")
+def test_click_accessible_element_not_found_raises():
+    """Raises RuntimeError with helpful message when element is not found."""
+    desktop = _make_mock_accessible("desktop frame", "", children=[])
+    pyatspi_mod = _make_pyatspi_module(desktop)
+
+    with (
+        mock.patch.dict("sys.modules", {"pyatspi": pyatspi_mod}),
+        pytest.raises(RuntimeError, match="No accessible element"),
+    ):
+        _linux_click_accessible_element("push button", "Nonexistent", ":1")
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+@mock.patch("gptme.tools.computer._get_display_resolution", return_value=(1920, 1080))
+def test_computer_accessibility_tree_routes_to_macos(mock_res):
+    """On macOS, accessibility_tree calls _macos_accessibility_tree (not Linux path)."""
+    with mock.patch(
+        "gptme.tools.computer._macos_accessibility_tree",
+        return_value="Process: Safari\n  Window: Test\n    AXButton: Search",
+    ) as mock_tree:
+        computer("accessibility_tree")
+    mock_tree.assert_called_once()
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", False)
+@mock.patch("gptme.tools.computer._get_display_resolution", return_value=(1920, 1080))
+def test_computer_click_accessible_element_missing_text(mock_res):
+    """click_accessible_element without text raises ValueError on Linux."""
+    with pytest.raises(ValueError, match="text="):
+        computer("click_accessible_element")
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", False)
+@mock.patch("gptme.tools.computer._get_display_resolution", return_value=(1920, 1080))
+def test_computer_click_accessible_element_missing_colon(mock_res):
+    """click_accessible_element with text missing ':' raises ValueError."""
+    with pytest.raises(ValueError, match="role_name:element_name"):
+        computer("click_accessible_element", text="no-colon-here")
+
+
+# === macOS accessibility_tree tests ===
+
+
+def test_macos_accessibility_tree_success():
+    """_macos_accessibility_tree parses osascript output correctly."""
+    fake_output = "Process: Safari\n  Window: Test\n    AXButton: Search\n      AXTextField: query"
+    mock_result = mock.MagicMock()
+    mock_result.stdout = fake_output
+
+    with mock.patch("subprocess.run", return_value=mock_result):
+        result = _macos_accessibility_tree()
+
+    assert "Process: Safari" in result
+    assert "AXButton: Search" in result
+
+
+def test_macos_accessibility_tree_max_depth_controls_child_walk():
+    """_macos_accessibility_tree wires max_depth into the generated AppleScript."""
+    mock_result = mock.MagicMock()
+    mock_result.stdout = ""
+
+    with mock.patch("subprocess.run", return_value=mock_result) as mock_run:
+        _macos_accessibility_tree(max_depth=1)
+    script_depth_1 = mock_run.call_args.args[0][2]
+
+    with mock.patch("subprocess.run", return_value=mock_result) as mock_run:
+        _macos_accessibility_tree(max_depth=2)
+    script_depth_2 = mock_run.call_args.args[0][2]
+
+    assert "every UI element of elem1" not in script_depth_1
+    assert "every UI element of elem1" in script_depth_2
+
+
+def test_macos_accessibility_tree_empty_output():
+    """_macos_accessibility_tree returns placeholder for empty output."""
+    mock_result = mock.MagicMock()
+    mock_result.stdout = ""
+
+    with mock.patch("subprocess.run", return_value=mock_result):
+        result = _macos_accessibility_tree()
+
+    assert result == "(empty accessibility tree)"
+
+
+def test_macos_accessibility_tree_osascript_missing():
+    """_macos_accessibility_tree raises RuntimeError if osascript is not found."""
+    with (
+        mock.patch("subprocess.run", side_effect=FileNotFoundError),
+        pytest.raises(RuntimeError, match="osascript not found"),
+    ):
+        _macos_accessibility_tree()
+
+
+def test_macos_accessibility_tree_timeout():
+    """_macos_accessibility_tree raises RuntimeError on timeout."""
+    with (
+        mock.patch(
+            "subprocess.run", side_effect=subprocess.TimeoutExpired("osascript", 20)
+        ),
+        pytest.raises(RuntimeError, match="timed out"),
+    ):
+        _macos_accessibility_tree()
+
+
+def test_macos_accessibility_tree_permission_error():
+    """_macos_accessibility_tree raises RuntimeError with helpful message on failure."""
+    err = subprocess.CalledProcessError(1, "osascript", stderr="Not authorized")
+    with (
+        mock.patch("subprocess.run", side_effect=err),
+        pytest.raises(RuntimeError, match="Accessibility permission"),
+    ):
+        _macos_accessibility_tree()
+
+
+# === macOS click_accessible_element tests ===
+
+
+def test_macos_click_accessible_element_success():
+    """_macos_click_accessible_element returns correct (x, y) from osascript output."""
+    mock_result = mock.MagicMock()
+    mock_result.stdout = "AXButton\x1fSubmit\x1f150\x1f300\n"
+
+    with mock.patch("subprocess.run", return_value=mock_result):
+        x, y = _macos_click_accessible_element("AXButton", "Submit")
+
+    assert x == 150
+    assert y == 300
+
+
+def test_macos_click_accessible_element_not_found():
+    """_macos_click_accessible_element raises RuntimeError when element not found."""
+    mock_result = mock.MagicMock()
+    mock_result.stdout = ""
+
+    with (
+        mock.patch("subprocess.run", return_value=mock_result),
+        pytest.raises(RuntimeError, match="No accessible element"),
+    ):
+        _macos_click_accessible_element("AXButton", "Nonexistent")
+
+
+def test_macos_click_accessible_element_does_not_inject_inputs():
+    """Caller-controlled role/name values are matched in Python, not AppleScript."""
+    mock_result = mock.MagicMock()
+    mock_result.stdout = ""
+
+    role_name = 'AXButton" then\n    do shell script "touch /tmp/pwned"'
+    element_name = 'Submit" then\n    do shell script "touch /tmp/pwned"'
+
+    with (
+        mock.patch("subprocess.run", return_value=mock_result) as mock_run,
+        pytest.raises(RuntimeError, match="No accessible element"),
+    ):
+        _macos_click_accessible_element(role_name, element_name)
+
+    script = mock_run.call_args.args[0][2]
+    assert role_name not in script
+    assert element_name not in script
+    assert "do shell script" not in script
+
+
+def test_macos_click_accessible_element_osascript_missing():
+    """_macos_click_accessible_element raises RuntimeError when osascript not found."""
+    with (
+        mock.patch("subprocess.run", side_effect=FileNotFoundError),
+        pytest.raises(RuntimeError, match="osascript not found"),
+    ):
+        _macos_click_accessible_element("AXButton", "Submit")
+
+
+def test_macos_click_accessible_element_timeout():
+    """_macos_click_accessible_element raises RuntimeError on timeout."""
+    with (
+        mock.patch(
+            "subprocess.run", side_effect=subprocess.TimeoutExpired("osascript", 15)
+        ),
+        pytest.raises(RuntimeError, match="timed out"),
+    ):
+        _macos_click_accessible_element("AXButton", "Submit")
+
+
+@mock.patch("gptme.tools.computer.IS_MACOS", True)
+@mock.patch("gptme.tools.computer._get_display_resolution", return_value=(1920, 1080))
+def test_computer_click_accessible_element_routes_to_macos(mock_res):
+    """On macOS, click_accessible_element calls _macos_click_accessible_element."""
+    with (
+        mock.patch(
+            "gptme.tools.computer._macos_click_accessible_element",
+            return_value=(100, 200),
+        ) as mock_click,
+        mock.patch("gptme.tools.computer._macos_mouse_move"),
+        mock.patch("gptme.tools.computer._macos_click"),
+    ):
+        computer("click_accessible_element", text="AXButton:OK")
+    mock_click.assert_called_once_with("AXButton", "OK")

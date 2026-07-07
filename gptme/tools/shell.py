@@ -1427,12 +1427,18 @@ def execute_shell_impl(
                 yield workspace_hint
 
 
+# Workspace paths already hinted this session, so we don't spam the
+# "Workspace detected" message on every cd into the same workspace.
+_hinted_workspaces: set[str] = set()
+
+
 def _check_workspace_config() -> Message | None:
     """Return a hint message if the current directory has a gptme.toml config.
 
     Called after a successful ``cd`` to let the agent know it can spawn a
     workspace-aware subagent instead of running in a generic context.
-    Returns None if no gptme.toml is found (or CWD lookup fails).
+    Returns None if no gptme.toml is found (or CWD lookup fails), or if this
+    workspace has already been hinted this session.
     """
     try:
         cwd = Path.cwd()
@@ -1443,6 +1449,12 @@ def _check_workspace_config() -> Message | None:
     if not config_file.exists():
         return None
 
+    # Only hint once per workspace per session.
+    workspace_key = str(cwd.resolve())
+    if workspace_key in _hinted_workspaces:
+        return None
+    _hinted_workspaces.add(workspace_key)
+
     workspace_name = cwd.name
     return Message(
         "system",
@@ -1450,9 +1462,9 @@ def _check_workspace_config() -> Message | None:
         f"To work within this workspace context (custom tools, files, prompt), "
         f"spawn a subagent here:\n"
         f"```ipython\n"
-        f'subagent("{workspace_name}", "Your task here", use_subprocess=True)\n'
+        f'subagent("{workspace_name}", "Your task here", workdir="{cwd}", use_subprocess=True)\n'
         f"```\n"
-        f"The subagent will inherit the workspace config from `{config_file}`.",
+        f"The subagent will load the workspace config from `{config_file}`.",
     )
 
 
@@ -1969,5 +1981,6 @@ tool = ToolSpec(
         "allowlist": ("tool.confirm", shell_allowlist_hook, 10),
         "session_end": ("session.end", _session_end_shell_cleanup, 0),
     },
+    hints=frozenset({"code-exec", "destructive"}),
 )
 __doc__ = tool.get_doc(__doc__)

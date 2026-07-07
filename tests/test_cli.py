@@ -85,6 +85,71 @@ def test_help(runner: CliRunner):
     assert "gptme-util skills show NAME" in result.output
 
 
+def test_discover_gptme_plugins_finds_external_binaries(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """External gptme-* binaries in PATH appear in the discovery list."""
+    # Create a fake gptme-sessions executable
+    fake_bin = tmp_path / "gptme-sessions"
+    fake_bin.write_text("#!/bin/sh\necho sessions\n")
+    fake_bin.chmod(0o755)
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    from gptme.cli.main import _discover_gptme_plugins
+
+    plugins = _discover_gptme_plugins()
+    assert "gptme-sessions" in plugins
+
+
+def test_discover_gptme_plugins_excludes_core_scripts(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """Core gptme-* scripts are not included in discovered plugins."""
+    # Create fake versions of core scripts
+    for name in ("gptme-util", "gptme-server", "gptme-eval"):
+        p = tmp_path / name
+        p.write_text("#!/bin/sh\n")
+        p.chmod(0o755)
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    from gptme.cli.main import _discover_gptme_plugins
+
+    plugins = _discover_gptme_plugins()
+    assert "gptme-util" not in plugins
+    assert "gptme-server" not in plugins
+    assert "gptme-eval" not in plugins
+
+
+def test_help_shows_discovered_external_subcommands(
+    runner: CliRunner, tmp_path: Path, monkeypatch: pytest.MonkeyPatch
+):
+    """gptme --help lists gptme-* binaries discovered in PATH."""
+    fake_bin = tmp_path / "gptme-sessions"
+    fake_bin.write_text("#!/bin/sh\necho sessions\n")
+    fake_bin.chmod(0o755)
+
+    monkeypatch.setenv("PATH", str(tmp_path))
+
+    result = runner.invoke(cli.main, ["--help"])
+    assert result.exit_code == 0
+    assert "Installed external subcommands" in result.output
+    assert "gptme sessions" in result.output
+    assert "gptme-sessions" in result.output
+
+
+def test_help_no_external_subcommands_section_when_none_installed(
+    runner: CliRunner, monkeypatch: pytest.MonkeyPatch
+):
+    """gptme --help omits the external-subcommands section when PATH has none."""
+    monkeypatch.setenv("PATH", "")
+
+    result = runner.invoke(cli.main, ["--help"])
+    assert result.exit_code == 0
+    assert "Installed external subcommands" not in result.output
+
+
 def test_version(runner: CliRunner):
     result = runner.invoke(cli.main, ["--version"])
     assert result.exit_code == 0
@@ -1527,3 +1592,106 @@ def test_non_python_custom_tool_path_reports_suffix_before_existence(
     assert "stdin is not a TTY and prompts provided" not in result.output
     assert "Using project configuration" not in result.output
     assert "Using local configuration" not in result.output
+
+
+def test_click_exception_inside_chat_exits_2(
+    tmp_path: Path, monkeypatch, runner: CliRunner
+):
+    """ClickException raised inside chat() must propagate as exit code 2, not 1.
+
+    Regression guard for the except clause ordering fix: before the fix,
+    `except (RuntimeError, Exception)` swallowed ClickException and always
+    exited 1; after the fix `except click.ClickException: raise` runs first.
+    """
+    # Use a pre-existing conversation so get_prompt() is skipped (no LLM call)
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    logdir = tmp_path / "test-conv-exit2"
+    logdir.mkdir(parents=True)
+    (logdir / "conversation.jsonl").write_text('{"role":"user","content":"hello"}\n')
+
+    monkeypatch.setattr(cli, "get_logdir", lambda name: logdir)
+    monkeypatch.setattr(cli, "init_telemetry", lambda **kwargs: None)
+
+    def _raise_usage_error(*args, **kwargs):
+        raise click.UsageError("simulated usage error from inside chat")
+
+    monkeypatch.setattr(cli, "chat", _raise_usage_error)
+
+    result = runner.invoke(
+        cli.main, ["--name", "test-conv-exit2", "--non-interactive", "hello"]
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Fatal error occurred" not in result.output
+
+
+@pytest.mark.slow
+class TestPluginDiscovery:
+    """Tests for gptme-<cmd> PATH-based plugin dispatch."""
+
+    def test_dispatches_to_external_binary(self, runner, monkeypatch, tmp_path):
+        """gptme <cmd> delegates to gptme-<cmd> when found in PATH."""
+        fake_bin = str(tmp_path / "gptme-sessions")
+
+        subprocess_calls: list[list[str]] = []
+        monkeypatch.setattr(
+            "gptme.cli.main.shutil.which",
+            lambda x: fake_bin if x == "gptme-sessions" else None,
+        )
+        monkeypatch.setattr(
+            "gptme.cli.main.subprocess.call",
+            lambda args: _record_subprocess_call(args, subprocess_calls),
+        )
+
+        result = runner.invoke(cli.main, ["sessions", "list"])
+
+        assert result.exit_code == 0
+        assert subprocess_calls == [[fake_bin, "list"]]
+
+    def test_no_dispatch_when_binary_missing(self, runner, monkeypatch, tmp_path):
+        """gptme <cmd> falls through to chat when gptme-<cmd> is not in PATH."""
+        subprocess_calls: list = []
+        monkeypatch.setattr("gptme.cli.main.shutil.which", lambda x: None)
+        monkeypatch.setattr(
+            "gptme.cli.main.subprocess.call",
+            lambda args: _record_subprocess_call(args, subprocess_calls),
+        )
+
+        # Short-circuit before any LLM/network setup to keep the test fast.
+        # The point is only to verify subprocess was NOT called; we don't need a
+        # full session run.
+        def _early_exit(*args, **kwargs):
+            raise SystemExit(1)
+
+        monkeypatch.setattr("gptme.cli.main.setup_config_from_cli", _early_exit)
+
+        runner.invoke(cli.main, ["sessions"])
+
+        assert subprocess_calls == []
+
+    def test_search_alias_takes_precedence(self, runner, monkeypatch):
+        """Built-in `search` alias is not intercepted by plugin dispatch."""
+        subprocess_calls: list = []
+        # Even if gptme-search existed in PATH, the built-in alias must run first.
+        monkeypatch.setattr(
+            "gptme.cli.main.shutil.which",
+            lambda x: "/fake/gptme-search" if x == "gptme-search" else None,
+        )
+        monkeypatch.setattr(
+            "gptme.cli.main.subprocess.call",
+            lambda args: _record_subprocess_call(args, subprocess_calls),
+        )
+
+        # UsageError fires before search_chats is called (no query given),
+        # so the built-in alias exits early — plugin dispatch must never run.
+        result = runner.invoke(cli.main, ["search"])
+
+        assert subprocess_calls == [], (
+            "Plugin dispatch ran before built-in search alias"
+        )
+        assert result.exit_code != 0  # UsageError (no query given)
+
+
+def _record_subprocess_call(args, calls: list[list[str]]) -> int:
+    calls.append(list(args))
+    return 0

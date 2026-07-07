@@ -11,6 +11,7 @@ import importlib.util
 import logging
 import os
 import shutil
+import subprocess
 import sys
 from dataclasses import dataclass
 from enum import Enum
@@ -631,13 +632,48 @@ def _check_computer(verbose: bool = False) -> list[CheckResult]:
         # Check DISPLAY
         display = os.environ.get("DISPLAY")
         if display:
-            results.append(
-                CheckResult(
-                    name="Computer: DISPLAY",
-                    status=CheckStatus.OK,
-                    message=f"X11 display available ({display})",
+            # Verify the X server at DISPLAY is actually reachable
+            xdpyinfo_path = shutil.which("xdpyinfo")
+            if xdpyinfo_path:
+                try:
+                    env = os.environ.copy()
+                    env["DISPLAY"] = display
+                    subprocess.run(
+                        [xdpyinfo_path],
+                        env=env,
+                        capture_output=True,
+                        check=True,
+                        timeout=3,
+                    )
+                    results.append(
+                        CheckResult(
+                            name="Computer: DISPLAY",
+                            status=CheckStatus.OK,
+                            message=f"X11 display reachable ({display})",
+                        )
+                    )
+                except (subprocess.CalledProcessError, subprocess.TimeoutExpired):
+                    results.append(
+                        CheckResult(
+                            name="Computer: DISPLAY",
+                            status=CheckStatus.WARNING,
+                            message=f"DISPLAY={display} is set but X server is not responding",
+                            fix_hint=(
+                                "Start an X server first:\n"
+                                "  Xvfb :1 -screen 0 1024x768x24 &\n"
+                                "  export DISPLAY=:1\n"
+                                "Or use: xvfb-run gptme ..."
+                            ),
+                        )
+                    )
+            else:
+                results.append(
+                    CheckResult(
+                        name="Computer: DISPLAY",
+                        status=CheckStatus.OK,
+                        message=f"X11 display set ({display}) — install xdpyinfo to verify it's reachable",
+                    )
                 )
-            )
         else:
             results.append(
                 CheckResult(
@@ -647,6 +683,72 @@ def _check_computer(verbose: bool = False) -> list[CheckResult]:
                     fix_hint="export DISPLAY=:1  or run inside Xvfb: xvfb-run gptme ...",
                 )
             )
+
+        # Check for a running window manager (EWMH: _NET_SUPPORTING_WM_CHECK on root window)
+        xprop_path = shutil.which("xprop")
+        if display and xprop_path:
+            try:
+                env = os.environ.copy()
+                env["DISPLAY"] = display
+                result_proc = subprocess.run(
+                    [xprop_path, "-root", "_NET_SUPPORTING_WM_CHECK"],
+                    env=env,
+                    capture_output=True,
+                    text=True,
+                    timeout=3,
+                    check=False,
+                )
+                if (
+                    result_proc.returncode == 0
+                    and "_NET_SUPPORTING_WM_CHECK" in result_proc.stdout
+                ):
+                    results.append(
+                        CheckResult(
+                            name="Computer: window manager",
+                            status=CheckStatus.OK,
+                            message="EWMH-compliant window manager detected",
+                        )
+                    )
+                else:
+                    results.append(
+                        CheckResult(
+                            name="Computer: window manager",
+                            status=CheckStatus.WARNING,
+                            message="No EWMH window manager detected — window_focus may not work",
+                            fix_hint=(
+                                "Start a window manager before using computer tool:\n"
+                                "  mutter --replace --sm-disable &   # lightweight, used in Docker setup\n"
+                                "  fluxbox &                          # minimal X11 WM\n"
+                                "  i3 &                               # tiling WM"
+                            ),
+                        )
+                    )
+            except (subprocess.TimeoutExpired, FileNotFoundError):
+                pass  # xprop unavailable or X server not responding — skip silently
+
+        # Check for pyatspi (Linux accessibility tree support)
+        if display:
+            if importlib.util.find_spec("pyatspi"):
+                results.append(
+                    CheckResult(
+                        name="Computer: pyatspi",
+                        status=CheckStatus.OK,
+                        message="AT-SPI2 accessibility tree available (accessibility_tree + click_accessible_element)",
+                    )
+                )
+            else:
+                results.append(
+                    CheckResult(
+                        name="Computer: pyatspi",
+                        status=CheckStatus.WARNING,
+                        message="pyatspi not installed — accessibility_tree and click_accessible_element unavailable",
+                        fix_hint=(
+                            "pip install pyatspi\n"
+                            "(also requires AT-SPI2 system packages: apt install python3-pyatspi)"
+                        ),
+                    )
+                )
+
     else:
         # Unsupported platform (Windows, FreeBSD, etc.) — no checks available
         results.append(
@@ -654,6 +756,32 @@ def _check_computer(verbose: bool = False) -> list[CheckResult]:
                 name="Computer: platform",
                 status=CheckStatus.WARNING,
                 message=f"Computer tool is only supported on Linux and macOS (current: {sys.platform})",
+            )
+        )
+        return results
+
+    # ffmpeg is required for screen recording (start_recording / record_screen).
+    # Only checked on supported platforms (Linux + macOS) since the install hint is platform-specific.
+    ffmpeg_path = shutil.which("ffmpeg")
+    if ffmpeg_path:
+        results.append(
+            CheckResult(
+                name="Computer: ffmpeg",
+                status=CheckStatus.OK,
+                message="screen recording (start_recording / record_screen)",
+                details=ffmpeg_path if verbose else None,
+            )
+        )
+    else:
+        results.append(
+            CheckResult(
+                name="Computer: ffmpeg",
+                status=CheckStatus.WARNING,
+                message="Not found — required for start_recording() and record_screen()",
+                fix_hint=(
+                    "Linux:  sudo apt install ffmpeg  or  sudo pacman -S ffmpeg\n"
+                    "macOS:  brew install ffmpeg"
+                ),
             )
         )
 

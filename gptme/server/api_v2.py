@@ -91,6 +91,7 @@ from .openapi_docs import (
     CONTRACT_REVISION,
     CONVERSATION_ID_PARAM,
     ApiRootResponse,
+    ApiVersionResponse,
     AudioTranscriptionResponse,
     ConversationCreateRequest,
     ConversationListResponse,
@@ -310,6 +311,23 @@ def _append_conversation_system_prompt(
     """Append a conversation-local system prompt override when configured."""
     if system_prompt:
         messages.append(Message("system", system_prompt))
+
+
+def _resolve_conversation_system_prompt(chat_config: ChatConfig) -> str | None:
+    """Return the conversation prompt, falling back to the server default profile."""
+    if chat_config.system_prompt:
+        return chat_config.system_prompt
+
+    server_default_profile = flask.current_app.config.get("SERVER_DEFAULT_PROFILE")
+    if not server_default_profile:
+        return None
+
+    from ..profiles import get_profile
+
+    profile = get_profile(server_default_profile)
+    if profile and profile.system_prompt:
+        return profile.system_prompt
+    return None
 
 
 def _generate_fork_conversation_id() -> str:
@@ -691,6 +709,21 @@ def api_root():
         "provider_configured": provider_configured,
     }
     response = flask.jsonify(body)
+    response.headers["X-API-Version"] = str(API_VERSION)
+    return response
+
+
+@v2_api.route("/api/v2/version")
+@api_doc_simple(responses={200: ApiVersionResponse}, tags=["meta"])
+def api_version():
+    """Get the current API version.
+
+    Lightweight alternative to the full /api/v2 root for clients that only
+    need to check version compatibility.
+    """
+    response = flask.jsonify(
+        {"api_version": API_VERSION, "contract_revision": CONTRACT_REVISION}
+    )
     response.headers["X-API-Version"] = str(API_VERSION)
     return response
 
@@ -1494,7 +1527,12 @@ def api_conversation_put(conversation_id: str):
             )
         )
 
-    _append_conversation_system_prompt(msgs, chat_config.system_prompt)
+    resolved_prompt = _resolve_conversation_system_prompt(chat_config)
+    # Persist the resolved prompt back to chat_config so it survives server
+    # restarts that don't pass --default-profile (fixes Greptile P1 durability gap).
+    if resolved_prompt and not chat_config.system_prompt:
+        chat_config.system_prompt = resolved_prompt
+    _append_conversation_system_prompt(msgs, resolved_prompt)
 
     for role, content, timestamp, files_raw in validated_msgs:
         file_paths: list[FilePath] = []
@@ -1900,18 +1938,24 @@ def api_conversation_delete_message(conversation_id: str, index: int):
 
     new_msgs = msgs[:index] + msgs[index + 1 :]
 
-    # Validate role sequence: consecutive same-role messages break LLM APIs
-    non_system = [m for m in new_msgs if m.role != "system"]
-    for i in range(1, len(non_system)):
-        if non_system[i].role == non_system[i - 1].role:
-            return (
-                flask.jsonify(
-                    {
-                        "error": f"Deleting this message would create consecutive {non_system[i].role!r} messages, which is not supported by LLM APIs"
-                    }
-                ),
-                400,
-            )
+    # Validate role sequence: consecutive same-role messages break LLM APIs.
+    # Deleting a (non-system) message can only introduce a NEW adjacency at the
+    # seam — between its nearest non-system neighbours on either side. Check only
+    # that seam; scanning the whole conversation would reject valid deletions
+    # whenever an unrelated pre-existing adjacency exists elsewhere in the log.
+    prev_role = next(
+        (m.role for m in reversed(msgs[:index]) if m.role != "system"), None
+    )
+    next_role = next((m.role for m in msgs[index + 1 :] if m.role != "system"), None)
+    if prev_role is not None and prev_role == next_role:
+        return (
+            flask.jsonify(
+                {
+                    "error": f"Deleting this message would create consecutive {next_role!r} messages, which is not supported by LLM APIs"
+                }
+            ),
+            400,
+        )
 
     manager.edit(Log(new_msgs))
 
@@ -2506,7 +2550,9 @@ def api_conversation_config_patch(conversation_id: str):
                 agent_path=chat_config.agent,
             )
         )
-        _append_conversation_system_prompt(new_system_msgs, chat_config.system_prompt)
+        _append_conversation_system_prompt(
+            new_system_msgs, _resolve_conversation_system_prompt(chat_config)
+        )
         manager.log = Log(new_system_msgs + remaining_msgs)
     manager.write()
 
@@ -3009,7 +3055,10 @@ def api_user_config_file_patch():
     except ValueError as exc:
         return flask.jsonify({"error": str(exc)}), 400
 
-    set_config_value(key, value, reload=reload_config)
+    try:
+        set_config_value(key, value, reload=reload_config)
+    except ValueError as exc:
+        return flask.jsonify({"error": str(exc)}), 400
     content = _read_user_config_file_text()
     response = _get_user_config_file_response(content)
     response["status"] = "ok"

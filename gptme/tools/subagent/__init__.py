@@ -6,7 +6,7 @@ Package structure:
 - types.py      — Data classes and module-level state (Subagent, ReturnType, etc.)
 - hooks.py      — Completion notification system (LOOP_CONTINUE hook)
 - api.py        — Public API (subagent, subagent_status, subagent_wait, etc.)
-- batch.py      — Batch execution (BatchJob, subagent_batch)
+- batch.py      — Batch execution (BatchJob, subagent_batch, subagent_parallel, subagent_pipeline)
 - execution.py  — Execution backends (thread, subprocess, process monitoring)
 """
 
@@ -16,12 +16,15 @@ from ..base import ToolFunction, ToolSpec, ToolUse
 from .api import (
     subagent,
     subagent_cancel,
+    subagent_list,
     subagent_read_log,
     subagent_reply,
     subagent_status,
     subagent_wait,
+    subagent_wait_any,
 )
-from .batch import BatchJob, subagent_batch
+from .batch import BatchJob, subagent_batch, subagent_parallel, subagent_pipeline
+from .execution import get_current_agent_id
 from .hooks import (
     _get_complete_instruction,
     _subagent_completion_hook,
@@ -118,6 +121,18 @@ Assistant: I'll use subprocess mode for better output isolation.
     }
 System: Subagent started in subprocess mode.
 
+### Workspace-Aware Subagent (explicit workdir)
+User: I just cd'd into /path/to/project which has a gptme.toml — spawn a subagent there
+Assistant: I'll use workdir to make the subagent operate in that workspace and load its config.
+{
+        ToolUse(
+            "ipython",
+            [],
+            'subagent("project", "Add feature X", workdir="/path/to/project", use_subprocess=True)',
+        ).to_output(tool_format)
+    }
+System: Subagent started in subprocess mode (workdir=/path/to/project).
+
 ### ACP Mode (multi-harness support)
 User: delegate this task to a Claude Code agent
 Assistant: I'll use ACP mode to run this via a different agent harness.
@@ -130,9 +145,68 @@ Assistant: I'll use ACP mode to run this via a different agent harness.
     }
 System: Started subagent "claude-task" in ACP mode.
 
-### Batch Execution (parallel tasks)
-User: implement, test, and document a feature in parallel
-Assistant: I'll use subagent_batch for parallel execution with fire-and-gather pattern.
+### List Subagents (observability)
+User: what subagents are currently running?
+Assistant: I'll use subagent_list to check running agents.
+{
+        ToolUse(
+            "ipython",
+            [],
+            "subagent_list()",
+        ).to_output(tool_format)
+    }
+System: Listing 2 subagents::
+  - analyze (running, 42s) -- "Analyze the codebase architecture..."
+  - fib-13 (success, 120s) -- "compute the 13th Fibonacci number"
+
+### Parallel Fan-out (wait for all, ordered results)
+User: implement, test, and document a feature in parallel and collect all results
+Assistant: I'll use subagent_parallel to fan out all tasks and wait for them together.
+{
+        ToolUse(
+            "ipython",
+            [],
+            '''tasks = [
+    ("impl", "Implement the user authentication feature"),
+    ("test", "Write tests for authentication"),
+    ("docs", "Document the authentication API"),
+]
+results = subagent_parallel(tasks, timeout=300)
+for (agent_id, _), result in zip(tasks, results):
+    print(f"{{agent_id}}: {{result['status']}} — {{result['result'][:60]}}")''',
+        ).to_output(tool_format)
+    }
+System: impl: success — Authentication feature implemented in auth.py
+test: success — 12 tests added, all passing
+docs: success — API documented in docs/auth.md
+
+### Pipeline (multi-stage fan-out, no barrier between stages)
+User: review these files in two stages — first find issues, then verify each finding
+Assistant: I'll use subagent_pipeline so file B's review starts while file A's verification is running.
+{
+        ToolUse(
+            "ipython",
+            [],
+            '''results = subagent_pipeline(
+    [("auth", "Review auth.py for bugs"), ("db", "Review db.py for bugs")],
+    # Stage 0: review each file
+    lambda item, _: item,
+    # Stage 1: adversarially verify the review findings
+    lambda item, prev: "Verify these findings, keep only real bugs: " + prev,
+    timeout=300,
+)
+# auth advances to stage 1 as soon as its stage 0 finishes,
+# while db may still be in stage 0.
+for (prefix, _), stage_results in zip([("auth", ...), ("db", ...)], results):
+    print(f"{prefix}: {stage_results[-1]['status']}")''',
+        ).to_output(tool_format)
+    }
+System: auth-s0 done → auth-s1 started; db-s0 done → db-s1 started
+System: auth: success, db: success
+
+### Batch Execution (fire-and-forget with explicit sync)
+User: start tasks in background and continue working
+Assistant: I'll use subagent_batch to start tasks in the background. Completion hooks will notify me.
 {
         ToolUse(
             "ipython",
@@ -140,18 +214,14 @@ Assistant: I'll use subagent_batch for parallel execution with fire-and-gather p
             '''job = subagent_batch([
     ("impl", "Implement the user authentication feature"),
     ("test", "Write tests for authentication"),
-    ("docs", "Document the authentication API"),
 ])
-# Do other work while subagents run...
-results = job.wait_all(timeout=300)
-for agent_id, result in results.items():
-    print(f"{{agent_id}}: {{result['status']}}")''',
+# Do other work while subagents run — hook notifications arrive automatically:
+# "✅ Subagent 'impl' completed: ..."
+# Or explicitly wait for all when needed:
+results = job.wait_all(timeout=300)''',
         ).to_output(tool_format)
     }
-System: Started batch of 3 subagents: ['impl', 'test', 'docs']
-impl: success
-test: success
-docs: success
+System: Started batch of 2 subagents: ['impl', 'test']
 
 ### Fire-and-Forget with Hook Notifications
 User: start a subagent and continue working
@@ -216,6 +286,18 @@ Assistant: I'll run the subagent in an isolated git worktree so it won't modify 
         ).to_output(tool_format)
     }
 System: Subagent started successfully.
+
+### Context-Isolated Subagent (no workspace context)
+User: verify this output without exposing our workspace secrets to the subagent
+Assistant: I'll use context_window=0 so the subagent only sees what I explicitly give it in the prompt, with no workspace files or secrets inherited.
+{
+        ToolUse(
+            "ipython",
+            [],
+            'subagent("verifier", "Check that the output file has no syntax errors", context_window=0)',
+        ).to_output(tool_format)
+    }
+System: Subagent started successfully.
 """.strip()
 
 
@@ -235,9 +317,15 @@ Key features:
 - use_acp=True: Run subagent via ACP protocol (supports any ACP-compatible agent)
 - acp_command="claude-code-acp": Use a different ACP agent (default: gptme-acp)
 - isolated=True: Run subagent in a git worktree for filesystem isolation
-- redact_secrets=True: Redact API keys, tokens, and passwords from workspace context
-- subagent_batch(): Start multiple subagents in parallel
+- workdir="/path/to/dir": Set the working directory for the subagent (defaults to cwd)
+- redact_secrets=True (default): Redact API keys, tokens, and passwords from workspace context
+- context_window=0: Minimal context — only agent identity + tools, no workspace files (strongest isolation)
+- context_window=N: Limit workspace context to at most N messages
+- subagent_parallel(tasks, timeout): Fan out N subagents and wait for all — returns ordered list of results
+- subagent_pipeline(items, *stages, timeout): Multi-stage fan-out with no barrier between stages — item A advances to stage 2 while item B is still in stage 1; each stage callable receives (item_prompt, prev_result) and returns the next stage's prompt
+- subagent_batch(): Start multiple subagents and return a BatchJob for explicit synchronization
 - subagent_cancel(): Cancel a running subagent (SIGTERM for subprocess, marks result for threads)
+- subagent_wait_any(agent_ids, timeout): Wait for the first of N subagents to complete — returns (agent_id, result). Useful for race/hedging patterns.
 - subagent_reply(agent_id, reply): Answer a clarification request and re-spawn the subagent
 - Hook-based notifications: Completions (and clarification requests) delivered as system messages
 
@@ -251,11 +339,28 @@ with a fresh context. What subagents DO inherit (in context_mode="full"):
 - User-level config files from ~/.config/gptme
 
 This means secrets stored in workspace config files or produced by context_cmd
-can reach the subagent. Use redact_secrets=True to scrub common secret patterns
-(API_KEY, TOKEN, PASSWORD, etc.) from these inherited context messages.
+can reach the subagent. Secret patterns (API_KEY, TOKEN, PASSWORD, etc.) are
+redacted by default (redact_secrets=True). Pass redact_secrets=False to disable
+if legitimate config values are incorrectly redacted.
 
-For stronger isolation, use context_mode="selective" with context_include=["agent"]
-to share only the agent identity (no workspace files or dynamic context).
+### Controlling context depth with context_window
+
+Limit how much workspace context flows to the subagent. Reach for these when
+you need tighter control over what the subagent sees:
+
+- `context_window=None` (default): The subagent sees your full workspace (files,
+  tools, recent conversation). Best for tasks that benefit from maximum awareness.
+- `context_window=0`: **Strongest isolation** — the subagent gets only agent
+  identity and tool descriptions, no workspace files or context_cmd output. Use
+  this when the subagent handles sensitive data (secrets, prompts) that should
+  not leak into verification or analysis tasks. The subagent knows only what
+  you explicitly tell it in the task prompt.
+- `context_window=N`: Limits workspace to at most N context messages. Useful when
+  the default is too bloated but you still want the subagent to see some workspace
+  history — trim without fully isolating.
+
+`context_window=0` is equivalent to `context_mode="selective", context_include=["agent", "tools"]`
+but is a simpler one-parameter alternative. Only applies to thread-mode subagents.
 
 ## Agent Profiles for Subagents
 
@@ -327,11 +432,15 @@ tool = ToolSpec(
         for f in [
             subagent,
             subagent_cancel,
+            subagent_list,
             subagent_reply,
             subagent_status,
             subagent_wait,
+            subagent_wait_any,
             subagent_read_log,
             subagent_batch,
+            subagent_parallel,
+            subagent_pipeline,
         ]
     ],
     disabled_by_default=True,
@@ -349,11 +458,15 @@ __all__ = [
     # Public API
     "subagent",
     "subagent_cancel",
+    "subagent_list",
     "subagent_reply",
     "subagent_status",
     "subagent_wait",
+    "subagent_wait_any",
     "subagent_read_log",
     "subagent_batch",
+    "subagent_parallel",
+    "subagent_pipeline",
     "BatchJob",
     # Types
     "SubtaskDef",
@@ -365,6 +478,8 @@ __all__ = [
     "notify_progress",
     "_subagent_completion_hook",
     "_get_complete_instruction",
+    # Execution context
+    "get_current_agent_id",
     # Module-level state (re-exported for backward compatibility)
     "_subagents",
     "_subagents_lock",

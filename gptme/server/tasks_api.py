@@ -678,7 +678,7 @@ def setup_task_workspace(task_id: str, target_repo: str | None = None) -> Path:
 @tasks_api.route("/api/v2/tasks")
 @require_auth
 @api_doc_simple(
-    responses={200: TaskListResponse, 500: ErrorResponse},
+    responses={200: TaskListResponse, 400: ErrorResponse, 500: ErrorResponse},
     tags=["tasks"],
 )
 def api_tasks_list():
@@ -686,11 +686,24 @@ def api_tasks_list():
 
     List tasks with their cached status information.
     Archived tasks are excluded by default; include ?archived=true to show them.
+    Filter by cached status with ?status=pending|active|completed|failed.
     """
     try:
         archived_str = flask.request.args.get("archived", "false")
         include_archived = archived_str.lower() in ("true", "1")
+
+        status_filter = flask.request.args.get("status")
+        if status_filter is not None:
+            valid_statuses = get_args(TaskStatus)
+            if status_filter not in valid_statuses:
+                return flask.jsonify(
+                    {"error": f"status must be one of: {', '.join(valid_statuses)}"}
+                ), 400
+
         tasks = list_tasks(include_archived=include_archived)
+
+        if status_filter is not None:
+            tasks = [t for t in tasks if t.status == status_filter]
 
         # Return with stored status (no side effects in GET)
         tasks_info = [asdict(task) for task in tasks]
@@ -837,6 +850,22 @@ def api_tasks_update(task_id: str):
         return flask.jsonify({"error": "No JSON data provided"}), 400
     if not isinstance(req_json, dict):
         return flask.jsonify({"error": "Request body must be a JSON object"}), 400
+
+    # Reject unknown/unsupported fields to prevent silent no-ops
+    allowed_fields = {"content", "target_type", "target_repo", "metadata"}
+    # Check `status` first (before the generic unknown-fields guard) so callers
+    # get an actionable message instead of the generic "unknown field(s): status".
+    if "status" in req_json:
+        return flask.jsonify(
+            {
+                "error": "status cannot be set directly; it is derived from conversation and git state. Use the archive endpoint to archive a task."
+            }
+        ), 400
+    unknown_fields = set(req_json) - allowed_fields
+    if unknown_fields:
+        return flask.jsonify(
+            {"error": f"unknown field(s): {', '.join(sorted(unknown_fields))}"}
+        ), 400
 
     # Validate field types before applying
     if "content" in req_json and not isinstance(req_json["content"], str):

@@ -7,6 +7,7 @@ from ~/.config/gptme/config.toml and config.local.toml.
 import copy
 import logging
 import os
+from collections.abc import MutableMapping
 from dataclasses import asdict, fields
 from pathlib import Path
 from typing import TYPE_CHECKING, Any
@@ -51,6 +52,28 @@ def _filter_known_fields(
             f"Unknown keys in [{section}] config: {sorted(unknown)} (ignored)"
         )
     return {k: v for k, v in data.items() if k in known}
+
+
+def _strip_unknown_config_keys(path: str, keys: set[str]) -> None:
+    """Remove the given top-level keys from a config file on disk.
+
+    Called after detecting unknown keys in load_user_config() so that the
+    warning fires only once instead of on every future invocation.
+    """
+    if not os.path.exists(path):
+        return
+    doc = _load_config_doc(path)
+    changed = False
+    for key in keys:
+        if key in doc:
+            del doc[key]  # type: ignore[attr-defined]
+            changed = True
+    if changed:
+        try:
+            with open(path, "w") as f:
+                tomlkit.dump(doc, f)
+        except OSError as e:
+            logger.warning(f"Could not strip unknown config keys from {path}: {e}")
 
 
 ABOUT_ACTIVITYWATCH = """ActivityWatch is a free and open-source automated time-tracker that helps you track how you spend your time on your devices."""
@@ -268,7 +291,17 @@ def load_user_config(path: str | None = None) -> UserConfig:
             plugin_config = plugin_data
 
     if config:
-        logger.warning(f"Unknown keys in config: {config.keys()}")
+        unknown = set(config.keys())
+        strip_targets = str(path_with_tilde(config_file))
+        if has_local:
+            strip_targets += f" and {path_with_tilde(local_path)}"
+        logger.warning(
+            f"Unknown keys in config: {sorted(unknown)} — stripping from"
+            f" {strip_targets}"
+        )
+        _strip_unknown_config_keys(str(config_file), unknown)
+        if has_local:
+            _strip_unknown_config_keys(str(local_path), unknown)
 
     return UserConfig(
         prompt=prompt,
@@ -321,6 +354,10 @@ def set_config_value(
         reload: Whether to reload the in-memory config after writing.
         local: If True, write to config.local.toml instead of config.toml.
                Use for secrets (API keys) that should not be in the shared config.
+
+    Raises:
+        ValueError: If an intermediate keypath segment already exists
+            but is not a TOML table (e.g. traversing into a string value).
     """
     if local:
         _, local_path = get_user_config_paths()
@@ -339,10 +376,67 @@ def set_config_value(
     for k in keypath[:-1]:
         if k not in d:
             d[k] = tomlkit.table()
+        else:
+            existing = d[k]
+            if not isinstance(existing, MutableMapping):
+                raise ValueError(f"Cannot set '{key}': '{k}' exists but is not a table")
         d = d[k]  # type: ignore[assignment]
     d[keypath[-1]] = value
 
     # Write the config
+    if local:
+        os.makedirs(os.path.dirname(write_path), exist_ok=True)
+    with open(write_path, "w") as config_file:
+        tomlkit.dump(doc, config_file)
+
+    if reload:
+        from .core import reload_config
+
+        reload_config()
+
+
+def save_provider_config(
+    provider: "ProviderConfig", reload: bool = True, local: bool = False
+) -> None:
+    """Append a [[providers]] entry to the user config file.
+
+    Args:
+        provider: ProviderConfig to save.
+        reload: Whether to reload the in-memory config after writing.
+        local: If True, write to config.local.toml instead of config.toml.
+               Use for entries with inline api_key (secrets).
+    """
+    if local:
+        _, local_path = get_user_config_paths()
+        write_path = str(local_path)
+        doc: TOMLDocument | Container = (
+            _load_config_doc(write_path) if local_path.exists() else tomlkit.document()
+        )
+    else:
+        write_path = config_path
+        doc = _load_config_doc()
+
+    provider_table = tomlkit.table()
+    provider_table.add("name", provider.name)
+    provider_table.add("base_url", provider.base_url)
+    if provider.api_key:
+        provider_table.add("api_key", provider.api_key)
+    if provider.api_key_env:
+        provider_table.add("api_key_env", provider.api_key_env)
+    if provider.default_model:
+        provider_table.add("default_model", provider.default_model)
+
+    if "providers" not in doc:
+        doc.add("providers", tomlkit.aot())  # type: ignore[attr-defined]
+
+    providers = doc["providers"]
+    for idx, existing_provider in enumerate(providers):  # type: ignore[union-attr]
+        if existing_provider.get("name") == provider.name:
+            providers[idx] = provider_table
+            break
+    else:
+        providers.append(provider_table)
+
     if local:
         os.makedirs(os.path.dirname(write_path), exist_ok=True)
     with open(write_path, "w") as config_file:
@@ -401,6 +495,26 @@ def _merge_config_data(main_config: dict, local_config: dict) -> dict:
                 if mcp_key != "servers":
                     merged["mcp"][mcp_key] = mcp_value
 
+        elif key == "providers" and isinstance(value, list):
+            # Merge providers by name - local provider entries update matching
+            # main providers (e.g. adding api_key to an otherwise-identical entry),
+            # and new providers are appended.
+            if key not in merged:
+                merged[key] = []
+            main_providers = merged[key]
+            main_by_name: dict = {}
+            for p in main_providers:
+                if isinstance(p, dict) and "name" in p:
+                    main_by_name[p["name"]] = p
+            for local_provider in value:
+                if not isinstance(local_provider, dict):
+                    main_providers.append(local_provider)
+                    continue
+                name = local_provider.get("name")
+                if name and name in main_by_name:
+                    main_by_name[name].update(local_provider)
+                else:
+                    main_providers.append(local_provider)
         elif (
             isinstance(value, dict) and key in merged and isinstance(merged[key], dict)
         ):

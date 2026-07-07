@@ -15,6 +15,19 @@ def _wait_for_new_subagent_threads(initial_count: int, timeout: float = 1.0) -> 
             assert not sa.thread.is_alive()
 
 
+def _new_subagents(initial_count: int):
+    """Return subagents registered since the test started."""
+    return _subagents[initial_count:]
+
+
+def _planner_children(initial_count: int, planner_id: str):
+    """Split new planner-mode registrations into planner + executor children."""
+    new_agents = _new_subagents(initial_count)
+    planner = next(sa for sa in new_agents if sa.agent_id == planner_id)
+    executors = [sa for sa in new_agents if sa.agent_id != planner_id]
+    return planner, executors
+
+
 def test_planner_mode_requires_subtasks():
     """Test that planner mode requires subtasks parameter."""
     with pytest.raises(ValueError, match="Planner mode requires subtasks"):
@@ -39,11 +52,12 @@ def test_planner_mode_spawns_executors(mock_create_thread: MagicMock):
     )
     _wait_for_new_subagent_threads(initial_count)
 
-    # Should have spawned 2 executor subagents
-    assert len(_subagents) == initial_count + 2
+    planner, executors = _planner_children(initial_count, "test-planner")
+    assert planner.agent_id == "test-planner"
+    assert len(executors) == 2
 
     # Check executor IDs are correctly formed
-    executor_ids = [s.agent_id for s in _subagents[-2:]]
+    executor_ids = [s.agent_id for s in executors]
     assert "test-planner-task1" in executor_ids
     assert "test-planner-task2" in executor_ids
 
@@ -65,7 +79,9 @@ def test_planner_mode_executor_prompts(mock_create_thread: MagicMock):
     _wait_for_new_subagent_threads(initial_count)
 
     # Check the spawned executor has correct prompt
-    executor = _subagents[-1]
+    _, executors = _planner_children(initial_count, "test-planner")
+    assert len(executors) == 1
+    executor = executors[0]
     assert "This is the overall context" in executor.prompt
     assert "Do something specific" in executor.prompt
 
@@ -107,11 +123,11 @@ def test_planner_parallel_mode(mock_create_thread: MagicMock):
     )
     _wait_for_new_subagent_threads(initial_count)
 
-    # All 3 executors should be spawned
-    assert len(_subagents) == initial_count + 3
+    _, executors = _planner_children(initial_count, "test-parallel")
+    assert len(executors) == 3
 
     # Check all have correct ID prefix
-    executor_ids = [s.agent_id for s in _subagents[-3:]]
+    executor_ids = [s.agent_id for s in executors]
     assert all(eid.startswith("test-parallel-") for eid in executor_ids)
 
 
@@ -136,11 +152,11 @@ def test_planner_sequential_mode():
         )
         _wait_for_new_subagent_threads(initial_count)
 
-    # Should spawn 2 executors
-    assert len(_subagents) == initial_count + 2
+    _, executors = _planner_children(initial_count, "test-sequential")
+    assert len(executors) == 2
 
     # Check IDs are correctly formed
-    executor_ids = [s.agent_id for s in _subagents[-2:]]
+    executor_ids = [s.agent_id for s in executors]
     assert "test-sequential-seq1" in executor_ids
     assert "test-sequential-seq2" in executor_ids
 
@@ -163,8 +179,8 @@ def test_planner_default_is_parallel(mock_create_thread: MagicMock):
     )
     _wait_for_new_subagent_threads(initial_count)
 
-    # Should spawn 1 executor (parallel is default)
-    assert len(_subagents) == initial_count + 1
+    _, executors = _planner_children(initial_count, "test-default")
+    assert len(executors) == 1
 
 
 @patch("gptme.tools.subagent.execution._create_subagent_thread")
@@ -279,8 +295,8 @@ def test_planner_mode_with_context_modes(mock_create_thread: MagicMock):
     )
     _wait_for_new_subagent_threads(initial_count)
 
-    # Should spawn 2 executors
-    assert len(_subagents) == initial_count + 2
+    _, executors = _planner_children(initial_count, "test-planner-context")
+    assert len(executors) == 2
 
 
 # Phase 1 Tests: Subprocess mode, callbacks, batch execution
@@ -457,6 +473,75 @@ def test_subagent_wait_returns_failure_when_thread_startup_raises(
         _subagent_results.clear()
 
 
+@patch("gptme.tools.subagent.api.notify_completion")
+@patch("gptme.tools.subagent.execution._create_subagent_thread")
+def test_subagent_wait_truncates_long_result(
+    _mock_create_thread: MagicMock, _mock_notify: MagicMock
+):
+    """subagent_wait() should truncate very long results to keep parent context clean."""
+    from gptme.tools.subagent import (
+        ReturnType,
+        _subagent_results,
+        _subagents_lock,
+        subagent,
+        subagent_wait,
+    )
+
+    _subagents.clear()
+    _subagent_results.clear()
+
+    try:
+        subagent(agent_id="test-truncate-wait", prompt="Long output task")
+
+        # Inject a long result into the cache (simulates a completed subagent)
+        long_result = "A" * 5000 + "\n\nFull log: /tmp/test-logdir"
+        with _subagents_lock:
+            _subagent_results["test-truncate-wait"] = ReturnType("success", long_result)
+
+        result = subagent_wait("test-truncate-wait", timeout=1, max_result_chars=2000)
+        assert result["status"] == "success"
+        assert result["result"] is not None
+        assert len(result["result"]) < 3000  # truncated + hint text
+        assert "truncated" in result["result"]
+        assert "subagent_read_log" in result["result"]
+        assert "test-truncate-wait" in result["result"]
+    finally:
+        _subagents.clear()
+        _subagent_results.clear()
+
+
+@patch("gptme.tools.subagent.api.notify_completion")
+@patch("gptme.tools.subagent.execution._create_subagent_thread")
+def test_subagent_wait_short_result_not_truncated(
+    _mock_create_thread: MagicMock, _mock_notify: MagicMock
+):
+    """Short results should pass through unchanged."""
+    from gptme.tools.subagent import (
+        ReturnType,
+        _subagent_results,
+        _subagents_lock,
+        subagent,
+        subagent_wait,
+    )
+
+    _subagents.clear()
+    _subagent_results.clear()
+
+    try:
+        subagent(agent_id="test-short-wait", prompt="Short output task")
+
+        short_result = "Fibonacci 13 = 233\n\nFull log: /tmp/logdir"
+        with _subagents_lock:
+            _subagent_results["test-short-wait"] = ReturnType("success", short_result)
+
+        result = subagent_wait("test-short-wait", timeout=1)
+        assert result["status"] == "success"
+        assert result["result"] == short_result  # unchanged
+    finally:
+        _subagents.clear()
+        _subagent_results.clear()
+
+
 @pytest.mark.slow
 @pytest.mark.eval
 def test_subagent_wait_basic():
@@ -470,8 +555,14 @@ def test_subagent_wait_basic():
     # Note: This test may take up to timeout seconds
     result = subagent_wait("test-wait-agent", timeout=30)
     assert isinstance(result, dict)
-    # Status should be either success, failure, or running (if it takes too long)
-    assert result.get("status") in ["success", "failure", "running", "timeout"]
+    # Status should be a valid subagent status (including clarification_needed)
+    assert result.get("status") in [
+        "success",
+        "failure",
+        "running",
+        "timeout",
+        "clarification_needed",
+    ]
 
 
 @pytest.mark.slow
@@ -681,7 +772,7 @@ def test_subprocess_command_includes_required_flags():
             assert "--model" in cmd
             assert "test-model" in cmd
             assert "--tools" in cmd
-            assert cmd[cmd.index("--tools") + 1] == "+clarify"
+            assert cmd[cmd.index("--tools") + 1] == "+complete,+clarify"
             assert "Test task" not in cmd  # Prompt passed via stdin, not argv
 
         finally:
@@ -729,6 +820,84 @@ def test_subprocess_profile_preserves_profile_tools_and_adds_clarify():
     assert captured_cmd[captured_cmd.index("--tools") + 1] == (
         "read,chats,complete,clarify"
     )
+
+
+def test_subprocess_no_profile_includes_complete_and_clarify():
+    """Subprocess without a profile must include both complete and clarify tools."""
+    import tempfile
+    from pathlib import Path
+
+    from gptme.tools.subagent.execution import _run_subagent_subprocess
+
+    captured_cmd: list[str] = []
+
+    def fake_popen(cmd, **kwargs):
+        captured_cmd.clear()
+        captured_cmd.extend(cmd)
+        mock = MagicMock()
+        mock.poll.return_value = None
+        mock.args = cmd
+        return mock
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logdir = Path(tmpdir) / "logs"
+        logdir.mkdir()
+
+        with patch("gptme.tools.subagent.execution.subprocess.Popen", fake_popen):
+            _run_subagent_subprocess(
+                prompt="Do a task",
+                logdir=logdir,
+                model=None,
+                workspace=Path(tmpdir),
+                profile=None,
+            )
+
+    assert "--tools" in captured_cmd
+    assert captured_cmd[captured_cmd.index("--tools") + 1] == "+complete,+clarify"
+
+
+def test_subprocess_profile_without_toollist_includes_complete_and_clarify():
+    """Profile with no tools list must fall back to +complete,+clarify."""
+    import tempfile
+    from pathlib import Path
+
+    from gptme.tools.subagent.execution import _run_subagent_subprocess
+
+    captured_cmd: list[str] = []
+
+    def fake_popen(cmd, **kwargs):
+        captured_cmd.clear()
+        captured_cmd.extend(cmd)
+        mock = MagicMock()
+        mock.poll.return_value = None
+        mock.args = cmd
+        return mock
+
+    # Use a mock profile object with tools=None to hit the else branch inside `if profile:`
+    mock_profile = MagicMock()
+    mock_profile.tools = None
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logdir = Path(tmpdir) / "logs"
+        logdir.mkdir()
+
+        with (
+            patch("gptme.tools.subagent.execution.subprocess.Popen", fake_popen),
+            patch(
+                "gptme.profiles.get_profile",
+                return_value=mock_profile,
+            ),
+        ):
+            _run_subagent_subprocess(
+                prompt="Do a task",
+                logdir=logdir,
+                model=None,
+                workspace=Path(tmpdir),
+                profile="custom",
+            )
+
+    assert "--tools" in captured_cmd
+    assert captured_cmd[captured_cmd.index("--tools") + 1] == "+complete,+clarify"
 
 
 @pytest.mark.slow
@@ -914,6 +1083,7 @@ def test_subprocess_monitor_timeout():
     assert result is not None
     assert result.status == "failure"
     assert result.result is not None
+    assert isinstance(result.result, str)
     assert "timeout" in result.result.lower()
 
     # Cleanup
@@ -1102,7 +1272,8 @@ def test_planner_with_profile(mock_create_thread: MagicMock):
         profile="explorer",
     )
 
-    assert len(_subagents) == initial_count + 2
+    _, executors = _planner_children(initial_count, "test-planner-profile")
+    assert len(executors) == 2
 
     _wait_for_new_subagent_threads(initial_count)
 
@@ -1938,6 +2109,7 @@ def test_role_explore_does_not_set_use_subprocess(mock_create_thread: MagicMock)
     )
 
     assert len(_subagents) == initial_count + 1
+    _wait_for_new_subagent_threads(initial_count)
     sa = _subagents[-1]
     assert sa.execution_mode == "thread"
     assert sa.isolated is False
@@ -1955,6 +2127,7 @@ def test_role_implement_does_not_set_use_subprocess(mock_create_thread: MagicMoc
     )
 
     assert len(_subagents) == initial_count + 1
+    _wait_for_new_subagent_threads(initial_count)
     sa = _subagents[-1]
     assert sa.execution_mode == "thread"
     assert sa.isolated is False
@@ -1973,6 +2146,7 @@ def test_role_verify_subprocess_has_verifier_profile(
         role="verify",
     )
 
+    _wait_for_new_subagent_threads(0)
     sa = _subagents[-1]
 
     # The Subagent should capture isolate=True
@@ -2083,11 +2257,12 @@ def test_planner_subtask_role_passthrough(
 
     time.sleep(0.3)
 
-    # Should have spawned 3 executors
-    assert len(_subagents) == initial_count + 3
-    assert _subagents[-3].agent_id.endswith("-scout")
-    assert _subagents[-2].agent_id.endswith("-build")
-    assert _subagents[-1].agent_id.endswith("-check")
+    _, executors = _planner_children(initial_count, "test-role-planner")
+    assert len(executors) == 3
+    executor_ids = {sa.agent_id for sa in executors}
+    assert "test-role-planner-scout" in executor_ids
+    assert "test-role-planner-build" in executor_ids
+    assert "test-role-planner-check" in executor_ids
 
 
 @patch("gptme.tools.subagent.execution._create_subagent_thread")
@@ -2115,8 +2290,9 @@ def test_planner_subtask_role_does_not_affect_planner_internals(
         subtasks=subtasks,
     )
 
-    assert len(_subagents) == initial_count + 1
-    executor = _subagents[-1]
+    _, executors = _planner_children(initial_count, "test-planner-with-role")
+    assert len(executors) == 1
+    executor = executors[0]
     assert executor.agent_id == "test-planner-with-role-task1"
 
     _wait_for_new_subagent_threads(initial_count, timeout=5.0)
@@ -2154,7 +2330,8 @@ def test_planner_with_role_uses_role_for_self_profile(mock_create_thread: MagicM
         subtasks=subtasks,
     )
 
-    assert len(_subagents) == initial_count + 2
+    _, executors = _planner_children(initial_count, "builder-plan")
+    assert len(executors) == 2
 
     _wait_for_new_subagent_threads(initial_count, timeout=2.0)
 
@@ -2223,9 +2400,9 @@ def test_planner_subtask_role_overrides_planner_profile(
         "Per-subtask role should always override planner-level profile."
     )
 
-    new_agents = _subagents[initial_count:]
-    assert len(new_agents) == 1
-    assert new_agents[0].execution_mode == "subprocess"
+    _, executors = _planner_children(initial_count, "impl-plan")
+    assert len(executors) == 1
+    assert executors[0].execution_mode == "subprocess"
 
 
 # ---------------------------------------------------------------------------
@@ -2270,9 +2447,9 @@ def test_planner_subtask_role_verify_uses_subprocess(
     mock_monitor.assert_called_once()
 
     # The registered Subagent should carry execution_mode="subprocess"
-    new_agents = _subagents[initial_count:]
-    assert len(new_agents) == 1
-    sa = new_agents[0]
+    _, executors = _planner_children(initial_count, "test-verify-sub")
+    assert len(executors) == 1
+    sa = executors[0]
     assert sa.execution_mode == "subprocess"
     assert sa.agent_id == "test-verify-sub-check"
 
@@ -2305,9 +2482,9 @@ def test_planner_subtask_role_verify_sets_isolated(
 
     _wait_for_new_subagent_threads(initial_count, timeout=1.0)
 
-    new_agents = _subagents[initial_count:]
-    assert len(new_agents) == 1
-    sa = new_agents[0]
+    _, executors = _planner_children(initial_count, "test-verify-isolated")
+    assert len(executors) == 1
+    sa = executors[0]
     assert sa.isolated is True
 
 
@@ -2344,9 +2521,9 @@ def test_planner_subtask_role_verify_cleans_isolation_on_launch_failure(
     mock_run_subprocess.assert_called_once()
     mock_monitor.assert_not_called()
     mock_cleanup_isolation.assert_called_once()
-    new_agents = _subagents[initial_count:]
-    assert len(new_agents) == 1
-    assert new_agents[0].execution_mode == "subprocess"
+    _, executors = _planner_children(initial_count, "test-verify-launch-failure")
+    assert len(executors) == 1
+    assert executors[0].execution_mode == "subprocess"
 
 
 @patch("gptme.tools.subagent.execution._create_subagent_thread")
@@ -2369,9 +2546,9 @@ def test_planner_subtask_role_explore_uses_thread_mode(mock_create_thread: Magic
     # Thread backend used, not subprocess
     mock_create_thread.assert_called_once()
 
-    new_agents = _subagents[initial_count:]
-    assert len(new_agents) == 1
-    sa = new_agents[0]
+    _, executors = _planner_children(initial_count, "test-explore-thread")
+    assert len(executors) == 1
+    sa = executors[0]
     assert sa.execution_mode == "thread"
 
 
@@ -2410,9 +2587,9 @@ def test_planner_thread_mode_cleans_isolation_after_completion(
 
     mock_create_thread.assert_called_once()
     mock_cleanup_isolation.assert_called_once()
-    new_agents = _subagents[initial_count:]
-    assert len(new_agents) == 1
-    assert new_agents[0].isolated is True
+    _, executors = _planner_children(initial_count, "test-thread-isolated-cleanup")
+    assert len(executors) == 1
+    assert executors[0].isolated is True
 
 
 @patch("gptme.tools.subagent.execution._create_subagent_thread")
@@ -2434,9 +2611,9 @@ def test_planner_subtask_role_implement_uses_thread_mode(mock_create_thread: Mag
 
     mock_create_thread.assert_called_once()
 
-    new_agents = _subagents[initial_count:]
-    assert len(new_agents) == 1
-    sa = new_agents[0]
+    _, executors = _planner_children(initial_count, "test-impl-thread")
+    assert len(executors) == 1
+    sa = executors[0]
     assert sa.execution_mode == "thread"
 
 
@@ -2476,10 +2653,10 @@ def test_planner_mixed_roles_use_correct_backends(
     mock_run_subprocess.assert_called_once()
     mock_monitor.assert_called_once()
 
-    new_agents = _subagents[initial_count:]
-    assert len(new_agents) == 2
+    _, executors = _planner_children(initial_count, "test-mixed")
+    assert len(executors) == 2
 
-    by_id = {sa.agent_id: sa for sa in new_agents}
+    by_id = {sa.agent_id: sa for sa in executors}
     assert by_id["test-mixed-impl"].execution_mode == "thread"
     assert by_id["test-mixed-verify"].execution_mode == "subprocess"
 
@@ -2553,3 +2730,621 @@ def test_hint_allowlist_filters_subagent_tools(
         assert "hint:read-only" not in str(call), (
             "hint: pattern incorrectly flagged as unknown tool"
         )
+
+
+def test_subagent_list_empty():
+    """Test that subagent_list returns an empty list when no subagents exist."""
+    from gptme.tools.subagent import _subagents, _subagents_lock, subagent_list
+
+    with _subagents_lock:
+        _subagents.clear()
+    result = subagent_list()
+    assert isinstance(result, list)
+    assert result == []
+
+
+@patch("gptme.tools.subagent.execution._create_subagent_thread")
+def test_subagent_list_structure(mock_create_thread: MagicMock):
+    """Test that subagent_list returns the correct structure."""
+    from gptme.tools.subagent import (
+        _subagents,
+        _subagents_lock,
+        subagent,
+        subagent_list,
+    )
+
+    with _subagents_lock:
+        _subagents.clear()
+
+    subagent(agent_id="test-list-1", prompt="Test agent one")
+    _wait_for_new_subagent_threads(0)
+    result = subagent_list()
+
+    try:
+        assert isinstance(result, list)
+        assert len(result) >= 1
+
+        entry = result[0]
+        assert isinstance(entry, dict)
+        assert "agent_id" in entry
+        assert "status" in entry
+        assert "model" in entry
+        assert "execution_mode" in entry
+        assert "elapsed_s" in entry
+        assert "prompt_preview" in entry
+
+        # Verify types
+        assert isinstance(entry["agent_id"], str)
+        assert isinstance(entry["status"], str)
+        assert isinstance(entry["elapsed_s"], int)
+        assert isinstance(entry["prompt_preview"], str)
+
+        # Verify our agent is in the list
+        ids = [e["agent_id"] for e in result]
+        assert "test-list-1" in ids
+    finally:
+        with _subagents_lock:
+            _subagents[:] = [s for s in _subagents if s.agent_id != "test-list-1"]
+
+
+def test_subagent_list_prompt_truncation():
+    """Test that long prompts are truncated in the preview."""
+    import threading
+    from pathlib import Path
+
+    from gptme.tools.subagent import (
+        Subagent,
+        _subagents,
+        _subagents_lock,
+        subagent_list,
+    )
+
+    long_prompt = "x" * 200
+    sa = Subagent(
+        agent_id="test-truncate",
+        prompt=long_prompt,
+        thread=threading.Thread(),
+        logdir=Path("/tmp"),
+        model=None,
+    )
+    with _subagents_lock:
+        _subagents.append(sa)
+
+    try:
+        result = subagent_list()
+        entry = next(e for e in result if e["agent_id"] == "test-truncate")
+        assert len(entry["prompt_preview"]) <= 103  # 100 chars + "..."
+        assert entry["prompt_preview"].endswith("...")
+    finally:
+        with _subagents_lock:
+            _subagents[:] = [s for s in _subagents if s.agent_id != "test-truncate"]
+
+
+def test_subagent_thread_does_not_mutate_parent_tool_list():
+    """Thread-mode subagent must NOT mutate the parent's loaded tool list.
+
+    Python's threading.Thread copies the parent's ContextVar context into the
+    child thread, so _loaded_tools_var initially points to the *same list object*
+    as the parent. Before the fix, init_tools() and
+    _ensure_subagent_signal_tools_loaded() would append signal tools to that
+    shared list, creating a data race with the parent's concurrent execute_msg()
+    calls (#554 — "transient non-runnable" crash).
+
+    After the fix, clear_tools() at thread entry replaces the ContextVar binding
+    with a fresh empty list so the subagent's tool operations never touch the
+    parent's list.
+    """
+    import threading
+    from contextvars import copy_context
+
+    from gptme.tools import clear_tools, get_tools, init_tools
+
+    # Set up a baseline tool list in the parent's context.
+    init_tools(["read"])
+    parent_list = get_tools()
+    parent_list_id = id(parent_list)
+    parent_len = len(parent_list)
+
+    # Simulate what happened BEFORE the fix: a child thread that inherits the
+    # parent's context and calls load_tool() without first calling clear_tools().
+    # This would mutate the parent's list (append to it).
+    without_fix_appended: list[bool] = []
+
+    def child_without_fix():
+        # Inherit parent list (same object), then append a new tool.
+        # In the real bug, this was init_tools()/load_tool("complete") etc.
+        inherited = get_tools()  # Returns parent's list
+        without_fix_appended.append(id(inherited) == parent_list_id)
+        # Simulate what load_tool does: appends to the ContextVar list
+        get_tools().append(object())  # type: ignore[arg-type]
+
+    ctx = copy_context()
+    t_bad = threading.Thread(target=lambda: ctx.run(child_without_fix))
+    t_bad.start()
+    t_bad.join(timeout=2.0)
+    assert not t_bad.is_alive()
+    # Confirm the "without fix" thread DID see the parent's list
+    assert without_fix_appended == [True], "setup: child must inherit parent list"
+    # And that it mutated it (this is the pre-fix behavior we're guarding against)
+    assert len(parent_list) == parent_len + 1, "setup: pre-fix mutation confirmed"
+    parent_list.pop()  # undo the mutation for the real test
+
+    # Simulate what happens AFTER the fix: child calls clear_tools() first.
+    child_saw_fresh_list: list[bool] = []
+    child_appended_to_parent: list[bool] = []
+
+    def child_with_fix():
+        clear_tools()  # The fix: detach from parent's list
+        child_saw_fresh_list.append(id(get_tools()) != parent_list_id)
+        # Any subsequent tool operations use the child's own fresh list
+        get_tools().append(object())  # type: ignore[arg-type]
+        child_appended_to_parent.append(id(get_tools()) == parent_list_id)
+
+    ctx2 = copy_context()
+    t_good = threading.Thread(target=lambda: ctx2.run(child_with_fix))
+    t_good.start()
+    t_good.join(timeout=2.0)
+    assert not t_good.is_alive()
+
+    # After the fix: child got a fresh list, parent's list is unchanged.
+    assert child_saw_fresh_list == [True], (
+        "child must get a fresh list after clear_tools()"
+    )
+    assert child_appended_to_parent == [False], (
+        "child's append went to parent's list, not child's own list"
+    )
+    assert len(get_tools()) == parent_len, (
+        f"Parent tool list changed from {parent_len} to {len(get_tools())} — "
+        "subagent thread mutated parent's tool list (race condition #554)"
+    )
+
+
+# Tests for subagent_pipeline
+
+
+def test_subagent_pipeline_empty_returns_empty():
+    """subagent_pipeline([]) returns [] without touching any subagent."""
+    from gptme.tools.subagent import subagent_pipeline
+
+    result = subagent_pipeline([], lambda item, prev: item)
+    assert result == []
+
+
+def test_subagent_pipeline_requires_at_least_one_stage():
+    """subagent_pipeline with no stages raises ValueError."""
+    from gptme.tools.subagent import subagent_pipeline
+
+    with pytest.raises(ValueError, match="at least one stage"):
+        subagent_pipeline([("a", "prompt")])
+
+
+def test_subagent_pipeline_single_stage_single_item():
+    """Single-stage pipeline: spawns one subagent and returns its result."""
+    from gptme.tools.subagent import subagent_pipeline
+
+    with (
+        patch("gptme.tools.subagent.batch.subagent") as mock_subagent,
+        patch("gptme.tools.subagent.batch.subagent_wait") as mock_wait,
+    ):
+        mock_wait.return_value = {"status": "success", "result": "done"}
+
+        results = subagent_pipeline(
+            [("item-a", "Do task A")],
+            lambda item, prev: f"Stage 0 for: {item}",
+            timeout=10,
+        )
+
+    assert len(results) == 1
+    assert len(results[0]) == 1
+    assert results[0][0] == {"status": "success", "result": "done"}
+    mock_subagent.assert_called_once()
+    call_kwargs = mock_subagent.call_args
+    assert call_kwargs.kwargs["agent_id"] == "item-a-s0"
+    assert "Stage 0 for: Do task A" in call_kwargs.kwargs["prompt"]
+
+
+def test_subagent_pipeline_two_stages_prompt_chaining():
+    """Each stage fn receives (item_prompt, prev_result)."""
+    from gptme.tools.subagent import subagent_pipeline
+
+    stage_inputs: list[tuple[str, str, str]] = []
+
+    def stage0(item, prev):
+        stage_inputs.append(("s0", item, prev))
+        return f"s0:{item}"
+
+    def stage1(item, prev):
+        stage_inputs.append(("s1", item, prev))
+        return f"s1:{item}:{prev}"
+
+    with (
+        patch("gptme.tools.subagent.batch.subagent"),
+        patch("gptme.tools.subagent.batch.subagent_wait") as mock_wait,
+    ):
+        mock_wait.side_effect = [
+            {"status": "success", "result": "result-of-s0"},
+            {"status": "success", "result": "result-of-s1"},
+        ]
+
+        results = subagent_pipeline(
+            [("item", "my-prompt")],
+            stage0,
+            stage1,
+            timeout=10,
+        )
+
+    assert len(results) == 1
+    assert len(results[0]) == 2
+    assert results[0][0]["result"] == "result-of-s0"
+    assert results[0][1]["result"] == "result-of-s1"
+
+    # Stage 0 receives (item_prompt, "") — prev_result starts empty
+    s0_call = next(x for x in stage_inputs if x[0] == "s0")
+    assert s0_call[1] == "my-prompt"
+    assert s0_call[2] == ""
+
+    # Stage 1 receives (item_prompt, result-of-s0)
+    s1_call = next(x for x in stage_inputs if x[0] == "s1")
+    assert s1_call[1] == "my-prompt"
+    assert s1_call[2] == "result-of-s0"
+
+
+def test_subagent_pipeline_stage_failure_skips_remaining():
+    """When a stage fails, remaining stages are marked 'skipped'."""
+    from gptme.tools.subagent import subagent_pipeline
+
+    with (
+        patch("gptme.tools.subagent.batch.subagent"),
+        patch("gptme.tools.subagent.batch.subagent_wait") as mock_wait,
+    ):
+        mock_wait.return_value = {"status": "failure", "result": "error msg"}
+
+        results = subagent_pipeline(
+            [("item", "prompt")],
+            lambda item, prev: item,
+            lambda item, prev: item,
+            lambda item, prev: item,
+            timeout=10,
+        )
+
+    assert results[0][0]["status"] == "failure"
+    assert results[0][1]["status"] == "skipped"
+    assert results[0][2]["status"] == "skipped"
+
+
+def test_subagent_pipeline_stage_callable_exception_reported_as_failure():
+    """A stage_fn that raises is reported as 'failure', not 'timeout'."""
+    from gptme.tools.subagent import subagent_pipeline
+
+    def boom(item, prev):
+        raise RuntimeError("bad lambda")
+
+    with (
+        patch("gptme.tools.subagent.batch.subagent"),
+        patch("gptme.tools.subagent.batch.subagent_wait"),
+    ):
+        results = subagent_pipeline(
+            [("item", "prompt")],
+            boom,
+            lambda item, prev: item,
+            timeout=10,
+        )
+
+    assert results[0][0]["status"] == "failure"
+    assert "bad lambda" in results[0][0]["result"]
+    assert results[0][1]["status"] == "skipped"
+
+
+def test_subagent_pipeline_multiple_items_independent():
+    """Multiple items are processed in parallel (independent threads)."""
+    import threading
+
+    from gptme.tools.subagent import subagent_pipeline
+
+    started_agents: list[str] = []
+    lock = threading.Lock()
+
+    def fake_subagent(**kwargs):
+        with lock:
+            started_agents.append(kwargs["agent_id"])
+
+    with (
+        patch("gptme.tools.subagent.batch.subagent", side_effect=fake_subagent),
+        patch("gptme.tools.subagent.batch.subagent_wait") as mock_wait,
+    ):
+        mock_wait.return_value = {"status": "success", "result": "ok"}
+
+        results = subagent_pipeline(
+            [("a", "task A"), ("b", "task B"), ("c", "task C")],
+            lambda item, prev: item,
+            timeout=10,
+        )
+
+    assert len(results) == 3
+    assert all(r[0]["status"] == "success" for r in results)
+    # All three items should have been processed
+    assert set(started_agents) == {"a-s0", "b-s0", "c-s0"}
+
+
+def test_subagent_pipeline_timeout_is_total_deadline():
+    """The outer timeout applies to the whole pipeline, not once per item."""
+    import threading
+    import time
+
+    from gptme.tools.subagent import subagent_pipeline
+
+    release_waits = threading.Event()
+    created_threads = []
+    real_thread = threading.Thread
+
+    def tracking_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        created_threads.append(thread)
+        return thread
+
+    def slow_wait(agent_id, **kwargs):
+        release_waits.wait(timeout=1)
+        return {"status": "success", "result": f"late {agent_id}"}
+
+    try:
+        with (
+            patch("gptme.tools.subagent.batch.threading.Thread", tracking_thread),
+            patch("gptme.tools.subagent.batch.subagent"),
+            patch("gptme.tools.subagent.batch.subagent_wait", side_effect=slow_wait),
+        ):
+            started = time.perf_counter()
+            results = subagent_pipeline(
+                [("a", "task A"), ("b", "task B"), ("c", "task C")],
+                lambda item, prev: item,
+                timeout=0.05,
+            )
+            elapsed = time.perf_counter() - started
+    finally:
+        release_waits.set()
+        for thread in created_threads:
+            thread.join(timeout=1)
+
+    assert elapsed < 0.12
+    assert [item[0]["status"] for item in results] == [
+        "timeout",
+        "timeout",
+        "timeout",
+    ]
+
+
+def test_subagent_pipeline_timeout_result_is_stable_snapshot():
+    """Late worker completion must not mutate the caller's returned timeout list."""
+    import threading
+
+    from gptme.tools.subagent import subagent_pipeline
+
+    release_stage_1 = threading.Event()
+    created_threads = []
+    real_thread = threading.Thread
+
+    def tracking_thread(*args, **kwargs):
+        thread = real_thread(*args, **kwargs)
+        created_threads.append(thread)
+        return thread
+
+    def wait_by_stage(agent_id, **kwargs):
+        if agent_id.endswith("-s0"):
+            return {"status": "success", "result": "stage 0 complete"}
+        release_stage_1.wait(timeout=1)
+        return {"status": "success", "result": "late stage 1 complete"}
+
+    try:
+        with (
+            patch("gptme.tools.subagent.batch.threading.Thread", tracking_thread),
+            patch("gptme.tools.subagent.batch.subagent"),
+            patch(
+                "gptme.tools.subagent.batch.subagent_wait",
+                side_effect=wait_by_stage,
+            ),
+        ):
+            results = subagent_pipeline(
+                [("item", "task")],
+                lambda item, prev: item,
+                lambda item, prev: f"verify {prev}",
+                timeout=0.05,
+            )
+
+        assert results[0][0]["status"] == "success"
+        assert results[0][1]["status"] == "timeout"
+    finally:
+        release_stage_1.set()
+        for thread in created_threads:
+            thread.join(timeout=1)
+
+    assert results[0][1]["status"] == "timeout"
+    assert "timed out" in results[0][1]["result"]
+
+
+def test_subagent_pipeline_uses_full_agent_id_format():
+    """Agent IDs follow the {prefix}-s{stage_idx} convention."""
+    from gptme.tools.subagent import subagent_pipeline
+
+    agent_ids_seen: list[str] = []
+
+    def fake_subagent(**kwargs):
+        agent_ids_seen.append(kwargs["agent_id"])
+
+    with (
+        patch("gptme.tools.subagent.batch.subagent", side_effect=fake_subagent),
+        patch("gptme.tools.subagent.batch.subagent_wait") as mock_wait,
+    ):
+        mock_wait.return_value = {"status": "success", "result": "ok"}
+
+        subagent_pipeline(
+            [("review-auth", "Review auth.py"), ("review-db", "Review db.py")],
+            lambda item, prev: f"stage0:{item}",
+            lambda item, prev: f"stage1:{prev}",
+            timeout=10,
+        )
+
+    assert "review-auth-s0" in agent_ids_seen
+    assert "review-auth-s1" in agent_ids_seen
+    assert "review-db-s0" in agent_ids_seen
+    assert "review-db-s1" in agent_ids_seen
+
+
+def test_subagent_pipeline_forwards_acp_options():
+    """subagent_pipeline forwards ACP options consistently with parallel/batch."""
+    from gptme.tools.subagent import subagent_pipeline
+
+    subagent_kwargs: list[dict] = []
+
+    def fake_subagent(**kwargs):
+        subagent_kwargs.append(kwargs)
+
+    with (
+        patch("gptme.tools.subagent.batch.subagent", side_effect=fake_subagent),
+        patch("gptme.tools.subagent.batch.subagent_wait") as mock_wait,
+    ):
+        mock_wait.return_value = {"status": "success", "result": "ok"}
+
+        subagent_pipeline(
+            [("item", "prompt")],
+            lambda item, prev: "stage0",
+            lambda item, prev: "stage1",
+            timeout=10,
+            use_acp=True,
+            acp_command="fake-acp",
+        )
+
+    assert [kwargs["agent_id"] for kwargs in subagent_kwargs] == [
+        "item-s0",
+        "item-s1",
+    ]
+    assert all(kwargs["use_acp"] is True for kwargs in subagent_kwargs)
+    assert all(kwargs["acp_command"] == "fake-acp" for kwargs in subagent_kwargs)
+
+
+def test_subagent_pipeline_output_schema_only_on_final_stage():
+    """output_schema is only passed to the final stage, not intermediate stages."""
+    from pydantic import BaseModel
+
+    from gptme.tools.subagent import subagent_pipeline
+
+    class Result(BaseModel):
+        score: int
+
+    schema_kwargs_by_id: dict[str, type | None] = {}
+
+    def fake_subagent(**kwargs):
+        schema_kwargs_by_id[kwargs["agent_id"]] = kwargs.get("output_schema")
+
+    with (
+        patch("gptme.tools.subagent.batch.subagent", side_effect=fake_subagent),
+        patch("gptme.tools.subagent.batch.subagent_wait") as mock_wait,
+    ):
+        mock_wait.return_value = {"status": "success", "result": '{"score": 42}'}
+
+        subagent_pipeline(
+            [("item", "prompt")],
+            lambda item, prev: "stage0",
+            lambda item, prev: "stage1",
+            output_schema=Result,
+            timeout=10,
+        )
+
+    # Stage 0 should NOT get output_schema
+    assert schema_kwargs_by_id.get("item-s0") is None
+    # Stage 1 (final) should get output_schema
+    assert schema_kwargs_by_id.get("item-s1") is Result
+
+
+# Tests for subagent_wait_any
+
+
+def test_subagent_wait_any_raises_on_empty_list():
+    """subagent_wait_any([]) should raise ValueError."""
+    import pytest
+
+    from gptme.tools.subagent import subagent_wait_any
+
+    with pytest.raises(ValueError, match="agent_ids must not be empty"):
+        subagent_wait_any([])
+
+
+def test_subagent_wait_any_returns_first_completed():
+    """subagent_wait_any should return the first agent that completes."""
+    from unittest.mock import patch
+
+    from gptme.tools.subagent import subagent_wait_any
+
+    call_order: list[str] = []
+
+    def fake_wait(agent_id, timeout, max_result_chars=0):
+        call_order.append(agent_id)
+        if agent_id == "fast":
+            return {"status": "success", "result": "fast result"}
+        # "slow" blocks longer — in practice the thread pool handles it
+        return {"status": "success", "result": "slow result"}
+
+    with patch("gptme.tools.subagent.batch.subagent_wait", side_effect=fake_wait):
+        first_id, result = subagent_wait_any(["fast", "slow"], timeout=10)
+
+    assert first_id in ("fast", "slow")
+    assert result["status"] == "success"
+
+
+def test_subagent_wait_any_timeout_raises():
+    """subagent_wait_any should raise TimeoutError when all agents keep running."""
+    from unittest.mock import patch
+
+    import pytest
+
+    from gptme.tools.subagent import subagent_wait_any
+
+    wait_timeouts: list[int] = []
+
+    def still_running_wait(agent_id, timeout, max_result_chars=0):
+        wait_timeouts.append(timeout)
+        return {"status": "running", "result": None}
+
+    with (
+        patch(
+            "gptme.tools.subagent.batch.subagent_wait", side_effect=still_running_wait
+        ),
+        pytest.raises(TimeoutError),
+    ):
+        subagent_wait_any(["a", "b"], timeout=1)
+
+    assert wait_timeouts == [1, 1]
+
+
+def test_batch_job_wait_any_returns_first():
+    """BatchJob.wait_any() should return whichever agent completes first."""
+    from unittest.mock import patch
+
+    from gptme.tools.subagent.batch import BatchJob
+
+    results_seen: list[str] = []
+
+    def fake_wait(agent_id, timeout, max_result_chars=0):
+        results_seen.append(agent_id)
+        return {"status": "success", "result": f"result from {agent_id}"}
+
+    job = BatchJob(agent_ids=["a", "b", "c"])
+    with patch("gptme.tools.subagent.batch.subagent_wait", side_effect=fake_wait):
+        first_id, result = job.wait_any(timeout=10)
+
+    assert first_id in ("a", "b", "c")
+    assert result["status"] == "success"
+    assert f"result from {first_id}" in result["result"]
+
+
+def test_batch_job_wait_any_already_done():
+    """BatchJob.wait_any() should return immediately when a result is already cached."""
+    from gptme.tools.subagent.batch import BatchJob
+    from gptme.tools.subagent.types import ReturnType
+
+    job = BatchJob(agent_ids=["x", "y"])
+    job.results["x"] = ReturnType("success", "cached result")
+
+    # Should not need to call subagent_wait at all
+    first_id, result = job.wait_any(timeout=1)
+    assert first_id == "x"
+    assert result["status"] == "success"
+    assert result["result"] == "cached result"

@@ -1,7 +1,7 @@
 Providers
 =========
 
-We support LLMs from several providers, including OpenAI, Anthropic, OpenRouter, Deepseek, Azure, and any OpenAI-compatible server (e.g. ``ollama``, ``llama-cpp-python``).
+We support LLMs from several providers, including OpenAI, Anthropic, OpenRouter, Requesty, Deepseek, Azure, and any OpenAI-compatible server (e.g. ``ollama``, ``llama-cpp-python``).
 
 .. note::
 
@@ -167,6 +167,55 @@ falsy values.
     # Restrict to specific quantization levels (optional)
     # Common values: fp16, bf16, fp8, int8, int4, unknown
     OPENROUTER_QUANTIZATION = "fp16,bf16"
+
+.. rubric:: Requesty
+
+`Requesty <https://requesty.ai/>`_ is an OpenAI-compatible LLM gateway that routes to many models through a single API key, using the same ``provider/model`` naming as OpenRouter (e.g. ``requesty/openai/gpt-4o-mini``, ``requesty/anthropic/claude-sonnet-4-5``). It is reached through the standard OpenAI-compatible client path.
+
+**Configuration:**
+
+.. code-block:: toml
+
+    # In gptme.toml or ~/.config/gptme/config.toml
+    [env]
+    REQUESTY_API_KEY = "your-api-key"
+
+Get an API key at https://app.requesty.ai/api-keys. See https://docs.requesty.ai for details.
+
+.. rubric:: Groq
+
+`Groq <https://groq.com/>`_ provides fast inference for open-source models via its own API key — **not** through the ``OPENAI_BASE_URL`` / ``OPENAI_API_KEY`` pattern.
+
+**Configuration:**
+
+.. code-block:: sh
+
+    export GROQ_API_KEY="gsk_..."
+    gptme "hello" -m groq/llama-3.3-70b-versatile
+
+Or store the key via the interactive setup:
+
+.. code-block:: sh
+
+    gptme '/account setup groq'
+
+Or in ``~/.config/gptme/config.toml``:
+
+.. code-block:: toml
+
+    [env]
+    GROQ_API_KEY = "gsk_..."
+
+.. note::
+
+    Using ``OPENAI_BASE_URL=https://api.groq.com/openai/v1`` with ``OPENAI_API_KEY``
+    will return a 401 — Groq requires its own ``GROQ_API_KEY``.
+    The ``groq/<model>`` provider prefix handles this automatically.
+
+Popular Groq models:
+
+- ``groq/llama-3.3-70b-versatile`` — fast 70B Llama 3.3
+- ``groq/llama-3.1-8b-instant`` — fastest, smallest
 
 .. rubric:: OpenAI Subscription
 

@@ -1,10 +1,14 @@
 import { act, renderHook, waitFor } from '@testing-library/react';
+import { observable } from '@legendapp/state';
 import { useProviderHealth } from '../useProviderHealth';
 import { useUserSettings } from '../useUserSettings';
 import { providerHealth$ } from '@/stores/providerHealth';
 
 const mockFetch = jest.fn();
 const mockIsDemoMode = jest.fn();
+// Created at module scope so it can be referenced inside the jest.mock() factory
+// (jest.mock() is hoisted before imports, but factory closures evaluate lazily).
+const isConnected$ = observable(false);
 
 jest.mock('@/contexts/ApiContext', () => ({
   useApi: () => ({
@@ -12,6 +16,7 @@ jest.mock('@/contexts/ApiContext', () => ({
       baseUrl: 'demo://offline',
       authHeader: null,
     },
+    isConnected$,
   }),
 }));
 
@@ -63,6 +68,20 @@ describe('demo-mode hooks', () => {
       providers_configured: [],
       default_model: null,
     });
+    expect(result.current.error).toBeNull();
+    expect(mockFetch).not.toHaveBeenCalled();
+  });
+
+  it('useUserSettings does not fetch when not in demo mode and not connected', async () => {
+    mockIsDemoMode.mockReturnValue(false);
+
+    const { result } = renderHook(() => useUserSettings());
+
+    await waitFor(() => {
+      expect(result.current.isLoading).toBe(false);
+    });
+
+    expect(result.current.settings).toBeNull();
     expect(result.current.error).toBeNull();
     expect(mockFetch).not.toHaveBeenCalled();
   });

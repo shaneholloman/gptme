@@ -21,7 +21,7 @@ import { useApi } from '@/contexts/ApiContext';
 import { useSettings } from '@/contexts/SettingsContext';
 import { useModels } from '@/hooks/useModels';
 import { chatRoute } from '@/utils/routes';
-import { AlertTriangle, ArrowDown, RefreshCw, WifiOff } from 'lucide-react';
+import { AlertTriangle, ArrowDown, ChevronUp, RefreshCw, WifiOff } from 'lucide-react';
 import { Button } from '@/components/ui/button';
 
 interface Props {
@@ -44,6 +44,8 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
     switchBranch,
     confirmTool,
     interruptGeneration,
+    isLoadingOlderMessages,
+    loadOlderMessages,
   } = useConversation(conversationId, serverId);
   const navigate = useNavigate();
   const queryClient = useQueryClient();
@@ -54,6 +56,7 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
   const reconnectMaxAttempts = use$(() => conversation$?.reconnectMaxAttempts.get() ?? null);
   const reconnectRetryInMs = use$(() => conversation$?.reconnectRetryInMs.get() ?? null);
   const connectionError = use$(() => conversation$?.connectionError.get() ?? null);
+  const hasMoreBefore = use$(() => conversation$?.hasMoreBefore.get() ?? false);
   // State to track when to auto-focus the input
   const shouldFocus$ = useObservable(false);
   // Store the previous conversation ID to detect changes
@@ -313,6 +316,25 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
   const handleSendMessage = (message: string, options?: ChatOptions) => {
     sendMessage({ message, options });
   };
+
+  const handleLoadOlderMessages = useCallback(async () => {
+    const container = scrollContainerRef.current;
+    if (!container) {
+      await loadOlderMessages();
+      return;
+    }
+
+    const previousScrollHeight = container.scrollHeight;
+    const previousScrollTop = container.scrollTop;
+    autoScrollAborted$.set(true);
+    isScrolledUp$.set(true);
+
+    await loadOlderMessages();
+
+    requestAnimationFrame(() => {
+      container.scrollTop = previousScrollTop + (container.scrollHeight - previousScrollHeight);
+    });
+  }, [autoScrollAborted$, isScrolledUp$, loadOlderMessages]);
 
   const clearSearchHighlights = useCallback(() => {
     scrollContainerRef.current
@@ -638,6 +660,21 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
           }}
         </Memo>
 
+        {hasMoreBefore && (
+          <div className="flex justify-center py-2">
+            <Button
+              variant="outline"
+              size="sm"
+              onClick={() => void handleLoadOlderMessages()}
+              disabled={isLoadingOlderMessages}
+              className="gap-1 text-xs text-muted-foreground"
+            >
+              <ChevronUp className={`h-3 w-3 ${isLoadingOlderMessages ? 'animate-pulse' : ''}`} />
+              {isLoadingOlderMessages ? 'Loading older messages' : 'Load older messages'}
+            </Button>
+          </div>
+        )}
+
         <For each={conversation$?.data.log ?? []}>
           {(msg$) => {
             // index is the LOCAL array position in the current log window.
@@ -729,6 +766,9 @@ export const ConversationContent: FC<Props> = ({ conversationId, serverId, isRea
                   onRegenerate={isReadOnly ? undefined : regenerateMessage}
                   onFork={isReadOnly ? undefined : handleForkMessage}
                   messageIndex={absoluteIndex}
+                  hideAvatar={
+                    stepRole?.type === 'group-start' && expandedGroups$.get().has(stepRole.groupId)
+                  }
                 />
                 {/* Branch indicator at fork points */}
                 <Memo>

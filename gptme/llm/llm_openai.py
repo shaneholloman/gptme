@@ -292,21 +292,26 @@ def _prepare_messages_for_responses_api(
     return instructions, input_items, responses_tools
 
 
-def _log_responses_reasoning(item: Any) -> None:
+def _extract_responses_reasoning(item: Any) -> str:
+    """Extract reasoning text from a Responses API ``reasoning`` output item.
+
+    Prefers the ``summary`` over the raw ``content``. Returns an empty string
+    when no reasoning text is present. The caller logs it and embeds it in the
+    response as a ``<think>`` block so the non-streaming path is consistent with
+    ``stream()`` and the Anthropic provider, which both preserve reasoning.
+    """
     summary = _obj_get(item, "summary") or []
     summary_text = "\n".join(
         part.text if hasattr(part, "text") else part.get("text", "") for part in summary
     ).strip()
     if summary_text:
-        logger.info("Reasoning content: %s", summary_text)
-        return
+        return summary_text
 
     content = _obj_get(item, "content") or []
     content_text = "\n".join(
         part.text if hasattr(part, "text") else part.get("text", "") for part in content
     ).strip()
-    if content_text:
-        logger.info("Reasoning content: %s", content_text)
+    return content_text
 
 
 def _init_openai_client(
@@ -413,6 +418,15 @@ def init(provider: Provider, config: Config):
         clients[provider] = OpenAI(
             api_key=api_key,
             base_url=proxy_url or "https://openrouter.ai/api/v1",
+            timeout=timeout,
+        )
+    elif provider == "requesty":
+        api_key = proxy_key or _get_provider_api_key(
+            config, provider, "REQUESTY_API_KEY"
+        )
+        clients[provider] = OpenAI(
+            api_key=api_key,
+            base_url=proxy_url or "https://router.requesty.ai/v1",
             timeout=timeout,
         )
     elif provider == "gptme":
@@ -886,7 +900,9 @@ def chat(
         for item in response.output:
             item_type = _obj_get(item, "type")
             if item_type == "reasoning":
-                _log_responses_reasoning(item)
+                if reasoning_text := _extract_responses_reasoning(item):
+                    logger.debug("Reasoning content: %s", reasoning_text)
+                    result.append(f"<think>\n{reasoning_text}\n</think>")
             elif item_type == "function_call":
                 name = _obj_get(item, "name", "").strip()
                 call_id = _obj_get(item, "call_id", "").strip()
@@ -948,7 +964,8 @@ def chat(
             getattr(choice.message, "reasoning_content", None)
             or getattr(choice.message, "reasoning", None)
         ):
-            logger.info("Reasoning content: %s", reasoning_content)
+            logger.debug("Reasoning content: %s", reasoning_content)
+            result.append(f"<think>\n{reasoning_content}\n</think>\n")
         if choice.message.content:
             result.append(choice.message.content)
 
@@ -1631,15 +1648,18 @@ def _spec2tool(spec: ToolSpec, model: ModelMeta) -> "ChatCompletionToolParam":
         "deepseek",
         "local",
     ] or is_custom_provider(model.model.split("/")[0]):
-        return {
-            "type": "function",
-            "function": {
-                "name": name,
-                "description": description,
-                "parameters": parameters2dict(spec.parameters),
-                # "strict": False,  # not supported by OpenRouter
-            },
+        all_required = all(p.required for p in spec.parameters)
+        supports_strict = model.supports_strict_tools and all_required
+        function_def: dict[str, Any] = {
+            "name": name,
+            "description": description,
+            "parameters": parameters2dict(spec.parameters),
         }
+        if supports_strict:
+            function_def["strict"] = True
+        return cast(
+            "ChatCompletionToolParam", {"type": "function", "function": function_def}
+        )
     raise ValueError("Provider doesn't support tools API")
 
 

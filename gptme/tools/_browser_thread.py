@@ -3,9 +3,10 @@ import logging
 import time
 from collections.abc import Callable
 from dataclasses import dataclass
+from pathlib import Path
 from queue import Empty, Queue
 from threading import Event, Lock, Thread
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, TypeVar, cast
 
 from playwright.sync_api import Browser, BrowserContext, Playwright, sync_playwright
 
@@ -17,6 +18,11 @@ T = TypeVar("T")
 
 TIMEOUT = 20  # seconds - accounts for retry attempts with browser restarts
 
+# Supported browser engines for the Playwright backend.
+# Set GPTME_BROWSER_ENGINE=firefox to use Firefox instead of Chromium.
+BrowserEngine = Literal["chromium", "firefox"]
+_VALID_ENGINES: tuple[BrowserEngine, ...] = ("chromium", "firefox")
+
 # Default context options applied to every browser context (and, in CDP mode,
 # to the shared session context). Per-call request headers are layered on top
 # at page creation time (see _create_page).
@@ -25,6 +31,71 @@ DEFAULT_CONTEXT_OPTIONS: dict[str, Any] = {
     "geolocation": {"latitude": 37.773972, "longitude": 13.39},
     "permissions": ["geolocation"],
 }
+
+# In-session override set by load_browser_state().  Takes priority over the
+# GPTME_BROWSER_STORAGE_STATE env var so the agent can reload state without
+# restarting the process.
+_override_storage_state: Path | None = None
+
+
+def set_storage_state_override(path: Path | None) -> None:
+    """Set (or clear) the in-session storage-state override.
+
+    Called by ``load_browser_state()`` so the next ``open_page()`` picks up the
+    new authentication state without needing a process restart.
+    """
+    global _override_storage_state
+    _override_storage_state = path
+
+
+def get_context_options() -> dict[str, Any]:
+    """Return browser context options, optionally loading a saved session state.
+
+    Priority order for storage state:
+    1. In-session override set by ``load_browser_state()`` (highest priority).
+    2. ``GPTME_BROWSER_STORAGE_STATE`` environment variable.
+    3. No storage state — fresh (unauthenticated) context (default).
+
+    Typical workflow for one-time login + persistent sessions::
+
+        # 1. Open the page and log in:
+        open_page("https://x.com/login")
+        fill_element("#username", "you@example.com")
+        fill_element("#password", "hunter2")
+        click_element("text=Log in")
+        save_browser_state("~/.config/gptme/twitter-session.json")
+
+        # 2a. Next time via env var (persists across restarts):
+        export GPTME_BROWSER_STORAGE_STATE=~/.config/gptme/twitter-session.json
+        gptme --agent-profile computer-use "tweet 'hello from gptme'"
+
+        # 2b. Or load programmatically in the same session:
+        load_browser_state("~/.config/gptme/twitter-session.json")
+        open_page("https://x.com")  # opens with saved cookies
+    """
+    options = dict(DEFAULT_CONTEXT_OPTIONS)
+
+    # In-session override takes precedence over the env var.
+    if _override_storage_state is not None:
+        options["storage_state"] = str(_override_storage_state)
+        logger.info(
+            "Using in-session storage state override: %s", _override_storage_state
+        )
+        return options
+
+    storage_path_raw = get_config().get_env("BROWSER_STORAGE_STATE")
+    if storage_path_raw:
+        storage_path = Path(storage_path_raw).expanduser()
+        if storage_path.exists():
+            options["storage_state"] = str(storage_path)
+            logger.info("Loading browser storage state from %s", storage_path)
+        else:
+            logger.warning(
+                "GPTME_BROWSER_STORAGE_STATE=%s does not exist — "
+                "starting with a fresh (unauthenticated) session",
+                storage_path_raw,
+            )
+    return options
 
 
 def _is_connection_error(error: Exception) -> bool:
@@ -54,20 +125,49 @@ class Command:
 Action = Literal["stop"]
 
 
-def _connect_or_launch_browser(playwright: Playwright, cdp_url: str | None) -> Browser:
+def _connect_or_launch_browser(
+    playwright: Playwright,
+    cdp_url: str | None,
+    engine: BrowserEngine = "chromium",
+) -> Browser:
     if cdp_url:
+        # CDP is only supported for Chromium-based browsers.
+        if engine != "chromium":
+            logger.warning(
+                "CDP connections only support Chromium; ignoring GPTME_BROWSER_ENGINE=%s",
+                engine,
+            )
         browser = playwright.chromium.connect_over_cdp(cdp_url)
         logger.info("Connected to browser over CDP")
         return browser
 
-    browser = playwright.chromium.launch()
-    logger.info("Browser launched")
+    browser_launcher = getattr(playwright, engine)
+    browser = browser_launcher.launch()
+    logger.info("Browser launched (engine=%s)", engine)
     return browser
 
 
 class BrowserThread:
-    def __init__(self, cdp_url: str | None = None) -> None:
+    def __init__(
+        self, cdp_url: str | None = None, engine: BrowserEngine | None = None
+    ) -> None:
         self.cdp_url = cdp_url or get_config().get_env("BROWSER_CDP_URL")
+
+        # Resolve engine: explicit arg > env var > default "chromium"
+        if engine is None:
+            raw = (get_config().get_env("BROWSER_ENGINE") or "").strip().lower()
+            if raw in _VALID_ENGINES:
+                engine = cast(BrowserEngine, raw)
+            else:
+                if raw:
+                    logger.warning(
+                        "Invalid GPTME_BROWSER_ENGINE='%s'; falling back to 'chromium'. "
+                        "Valid values: %s",
+                        raw,
+                        ", ".join(_VALID_ENGINES),
+                    )
+                engine = "chromium"
+        self.engine: BrowserEngine = engine
         self.queue: Queue[tuple[Command | Action, object]] = Queue()
         self.results: dict[object, tuple[Any, Exception | None]] = {}
         self.lock = Lock()
@@ -109,14 +209,14 @@ class BrowserThread:
                     except Exception:
                         pass
                     self._session_context = None
-                browser = _connect_or_launch_browser(playwright, self.cdp_url)
+                browser = _connect_or_launch_browser(
+                    playwright, self.cdp_url, self.engine
+                )
                 # For CDP, (re)create an isolated session context so parallel
                 # gptme instances don't share cookies/tabs. Recreated on every
                 # (re)connect so it never points at a dead browser.
                 if self.cdp_url:
-                    self._session_context = browser.new_context(
-                        **DEFAULT_CONTEXT_OPTIONS
-                    )
+                    self._session_context = browser.new_context(**get_context_options())
                     logger.info("Created isolated session context for CDP connection")
                 return None
             except Exception as e:
@@ -125,8 +225,13 @@ class BrowserThread:
 
                 if "Executable doesn't exist" in str(e):
                     pw_version = importlib.metadata.version("playwright")
+                    install_target = (
+                        "chromium-headless-shell"
+                        if self.engine == "chromium"
+                        else self.engine
+                    )
                     error = RuntimeError(
-                        f"Browser executable not found. Run: pipx run playwright=={pw_version} install chromium-headless-shell"
+                        f"Browser executable not found. Run: pipx run playwright=={pw_version} install {install_target}"
                     )
                 else:
                     error = e

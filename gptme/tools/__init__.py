@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import importlib
-import inspect
 import logging
 import pkgutil
 import threading
@@ -27,6 +26,7 @@ from .base import (
     ToolFunction,
     ToolSpec,
     ToolUse,
+    _iter_tool_specs,
     get_tool_format,
     set_tool_format,
 )
@@ -125,7 +125,7 @@ def _discover_tools(module_names: list[str]) -> list[ToolSpec]:
 
         # Find instances of ToolSpec in the modules
         for module in modules:
-            for _, obj in inspect.getmembers(module, lambda c: isinstance(c, ToolSpec)):
+            for obj in _iter_tool_specs(module):
                 spec_id = id(obj)
                 if spec_id in seen_specs:
                     continue
@@ -321,27 +321,56 @@ def execute_msg(
     """Uses any tools called in a message and returns the response."""
     assert msg.role == "assistant", "Only assistant messages can be executed"
 
-    # Collect all runnable tool uses
-    runnable_tools = [
-        tu for tu in ToolUse.iter_from_content(msg.content) if tu.is_runnable
-    ]
+    # Snapshot runnability once per tool_use. Evaluating `is_runnable` a second
+    # time later would open a TOCTOU gap: a tool whose loaded-state changes
+    # between the two checks (e.g. a subagent thread concurrently (re)initializing
+    # tools) could fall through both branches and leave a structured tool_use with
+    # no tool_result — which the Anthropic API rejects with a hard 400 (#554).
+    classified = [(tu, tu.is_runnable) for tu in ToolUse.iter_from_content(msg.content)]
 
-    if not runnable_tools:
+    if not classified:
         return
 
-    for tooluse in runnable_tools:
-        with terminal_state_title(f"🛠️ running {tooluse.tool}"):
-            try:
-                for tool_response in tooluse.execute(log=log, workspace=workspace):
-                    yield tool_response.replace(call_id=tooluse.call_id)
-            except KeyboardInterrupt:
-                clear_interruptible()
-                yield Message(
-                    "system",
-                    INTERRUPT_CONTENT,
-                    call_id=tooluse.call_id,
-                )
-                break
+    remaining = iter(classified)
+    for tooluse, runnable in remaining:
+        if runnable:
+            with terminal_state_title(f"🛠️ running {tooluse.tool}"):
+                try:
+                    for tool_response in tooluse.execute(log=log, workspace=workspace):
+                        yield tool_response.replace(call_id=tooluse.call_id)
+                except KeyboardInterrupt:
+                    clear_interruptible()
+                    yield Message(
+                        "system",
+                        INTERRUPT_CONTENT,
+                        call_id=tooluse.call_id,
+                    )
+                    # Drain the rest: any structured tool_use that's left in the
+                    # message still needs a paired tool_result or the next API
+                    # request will 400 with a dangling tool_use.
+                    for rem_tu, _ in remaining:
+                        if rem_tu.call_id is not None:
+                            yield Message(
+                                "system",
+                                f"Tool '{rem_tu.tool}' was not executed (interrupted).",
+                                call_id=rem_tu.call_id,
+                            )
+                    return
+        elif tooluse.call_id is not None:
+            # A structured (tool-format) tool_use that isn't runnable still needs
+            # a paired tool_result, or the next API request dangles it and 400s.
+            # Markdown code blocks (call_id is None) are not API tool_uses, so
+            # they're intentionally left unpaired.
+            logger.warning(
+                "Tool '%s' is not runnable; emitting an error tool_result to keep "
+                "the tool_use/tool_result pairing valid.",
+                tooluse.tool,
+            )
+            yield Message(
+                "system",
+                f"Tool '{tooluse.tool}' is not available for execution.",
+                call_id=tooluse.call_id,
+            )
 
 
 def get_tool_for_langtag(lang: str) -> ToolSpec | None:
@@ -416,11 +445,18 @@ def get_available_tools(include_mcp: bool = True) -> list[ToolSpec]:
 
 
 def clear_tools():
-    """Clear all context-local tool state."""
+    """Clear all context-local tool state.
+
+    Resets the ContextVar-bound tool list so the current context has a
+    fresh empty list, fully decoupled from any other context (parent
+    thread, sibling thread, etc.).
+
+    Does NOT clear module-global state like _warned_mcp_allowlists, which
+    is shared across all contexts for log-deduplication. Only the
+    context-local tool list and its cache are reset.
+    """
     _set_available_tools_cache(None)
     _loaded_tools_var.set([])
-    with _warned_mcp_allowlists_lock:
-        _warned_mcp_allowlists.clear()
 
 
 def get_tools() -> list[ToolSpec]:

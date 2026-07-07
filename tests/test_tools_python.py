@@ -306,3 +306,61 @@ def test_execute_python_no_plot_no_artifact(tmp_path):
 
     artifacts = (msg.metadata or {}).get("artifacts", [])
     assert artifacts == []
+
+
+def test_execute_python_returns_list_of_messages():
+    """execute_python yields each Message when a list[Message] is returned.
+
+    This is the key integration needed for observe_web() which returns
+    list[Message] (ARIA snapshot + optional screenshot). Without this fix,
+    observe_web() results would be shown as repr(list) instead of each
+    message being delivered to the conversation.
+    """
+
+    code = """\
+from gptme.message import Message
+[Message("system", "msg1"), Message("system", "msg2")]
+"""
+    msgs = list(execute_python(code, [], None))
+    # Both messages should be yielded, not collapsed into a repr string
+    assert len(msgs) == 2, f"Expected 2 messages, got {len(msgs)}: {msgs}"
+    assert msgs[0].content == "msg1"
+    assert msgs[1].content == "msg2"
+
+
+def test_execute_python_returns_empty_list_falls_through_to_repr():
+    """Empty list should fall through to the normal repr path, showing 'Result: []'.
+
+    An empty list from any computation — whether from observe_web returning no
+    results or a regular list comprehension filtering to nothing — should show
+    the LLM a clear 'Result: []' rather than silent no-output (which hides
+    information) or a potentially misleading 'No results returned.' message.
+
+    The list[Message] fast-path only activates for non-empty lists where every
+    item is a Message; empty lists fall through to the normal repr output.
+    """
+    code = """\
+from gptme.message import Message
+[m for m in [] if isinstance(m, Message)]  # evaluates to []
+"""
+    msgs = list(execute_python(code, [], None))
+    assert len(msgs) == 1, f"Expected 1 repr message for empty list, got: {msgs}"
+    assert "[]" in msgs[0].content, (
+        f"Expected '[]' in repr output, got: {msgs[0].content!r}"
+    )
+
+
+def test_execute_python_returns_mixed_list_falls_through():
+    """A mixed list (Message + non-Message) should NOT yield from; show as repr.
+
+    A type guard checking only result[0] would incorrectly yield the non-Message
+    items, violating the generator's return type. The all() check prevents this.
+    """
+    code = """\
+from gptme.message import Message
+[Message("system", "real"), "not-a-message"]
+"""
+    msgs = list(execute_python(code, [], None))
+    # Should fall through to repr output, not yield 2 items of mixed type
+    assert len(msgs) == 1, f"Expected 1 repr output message, got {len(msgs)}: {msgs}"
+    assert "not-a-message" in msgs[0].content
