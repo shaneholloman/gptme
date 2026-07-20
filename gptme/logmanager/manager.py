@@ -45,7 +45,7 @@ from ..message import Message, _migrate_metadata, len_tokens, print_msg
 from ..tools import ToolUse
 from ..util.context import enrich_messages_with_context
 from ..util.conversation_ids import conversation_id_error, validate_conversation_id
-from ..util.reduce import limit_log, reduce_log
+from ..util.reduce import limit_log, proactive_summarize_log, reduce_log
 from ..util.uri import URI
 from . import eventlog
 
@@ -104,8 +104,9 @@ class Log:
         with open(path, "w") as file:
             file.writelines(json.dumps(msg.to_dict()) + "\n" for msg in self.messages)
 
-    def print(self, show_hidden: bool = False):
-        print_msg(self.messages, oneline=False, show_hidden=show_hidden)
+    def print(self, show_hidden: bool = False) -> int:
+        """Prints the log to the console. Returns the number of messages shown."""
+        return print_msg(self.messages, oneline=False, show_hidden=show_hidden)
 
 
 # Context-local storage for current LogManager instance
@@ -737,10 +738,20 @@ def _merge_consecutive_messages(msgs: list[Message]) -> list[Message]:
     Dropping an assistant turn between two user turns creates a sequence strict
     providers reject.  Merge the adjacent messages while preserving attachments
     and message flags via Message.concat().
+
+    Exception: system messages with a call_id are structured tool results.
+    Merging them would discard all but the first call_id, causing providers
+    that use the Responses API (Codex/OpenAI) to return 400 "No tool output
+    found for function call <id>" on the next multi-tool-call turn.
     """
     merged: list[Message] = []
     for msg in msgs:
-        if merged and merged[-1].role == msg.role:
+        if (
+            merged
+            and merged[-1].role == msg.role
+            and not msg.call_id
+            and not merged[-1].call_id
+        ):
             merged[-1] = merged[-1].concat(msg)
         else:
             merged.append(msg)
@@ -767,7 +778,9 @@ def ephemeral_cache_boundary(
 
 
 def prepare_messages(
-    msgs: list[Message], workspace: Path | None = None
+    msgs: list[Message],
+    workspace: Path | None = None,
+    logdir: Path | None = None,
 ) -> list[Message]:
     """
     Prepares the messages before sending to the LLM.
@@ -780,6 +793,10 @@ def prepare_messages(
 
     # Enrich with enabled context enhancements (RAG, fresh context)
     msgs = enrich_messages_with_context(msgs, workspace)
+
+    # Proactively summarize older turns when approaching the context limit.
+    # No-op unless GPTME_AUTO_SUMMARIZE_THRESHOLD is set (e.g. export GPTME_AUTO_SUMMARIZE_THRESHOLD=0.8).
+    msgs = proactive_summarize_log(msgs)
 
     # Use regular reduction
     msgs_reduced = list(reduce_log(msgs))
@@ -807,6 +824,15 @@ def prepare_messages(
         logger.info(
             f"Limited log from {len(msgs_pruned)} to {len(msgs_limited)} messages"
         )
+
+    # Evidence replay: re-inject relevant earlier messages lost to compaction.
+    # Enabled with GPTME_EVIDENCE_REPLAY=1. Only activates when logdir is known.
+    if os.environ.get("GPTME_EVIDENCE_REPLAY") and logdir is not None:
+        master_logfile = logdir / "conversation.jsonl"
+        if master_logfile.exists():
+            from ..util.replay import inject_relevant_evidence  # fmt: skip
+
+            msgs_limited = inject_relevant_evidence(msgs_limited, master_logfile)
 
     return msgs_limited
 

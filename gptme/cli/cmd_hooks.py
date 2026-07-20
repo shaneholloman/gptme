@@ -279,6 +279,11 @@ def run(workspace: Path | None = None) -> None:
     gptme.toml [lessons] dirs. Already-injected lessons are tracked per session
     to avoid duplicates.
     """
+    # Suppress diagnostic output since this command must output only JSON
+    from ..message import set_output_format
+
+    set_output_format("json")
+
     try:
         raw = sys.stdin.read()
         if not raw.strip():
@@ -454,7 +459,7 @@ def _load_lesson_dirs(workspace: Path) -> list[Path]:
         if sys.version_info >= (3, 11):
             import tomllib
         else:
-            import tomli as tomllib  # type: ignore[no-redef]
+            import tomli as tomllib
         with open(toml_path, "rb") as f:
             cfg = tomllib.load(f)
         raw_dirs = cfg.get("lessons", {}).get("dirs", ["lessons"])

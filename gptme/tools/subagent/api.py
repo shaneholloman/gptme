@@ -15,8 +15,10 @@ from dataclasses import asdict
 from pathlib import Path
 from typing import Any, Literal
 
+from ...llm.retry_abort import bind_thread_generation, release_thread
 from . import execution as _exec
 from .concurrency import get_slot_sem
+from .control import append_control_op
 from .hooks import notify_completion
 from .types import (
     ReturnType,
@@ -30,9 +32,50 @@ from .types import (
     clarification_result_from_content,
     resolve_role_defaults,
     set_subagent_result_if_absent,
+    update_subagent_result_with_branch,
 )
 
 logger = logging.getLogger(__name__)
+
+
+def _write_cancel_op(logdir: Path, agent_id: str) -> None:
+    """Append a cancel op to logdir/control.jsonl for the cooperative checkpoint.
+
+    Uses the same JSONL/flock conventions as prompt_queue.py.
+    The subagent's STEP_PRE checkpoint hook reads this file each step and exits
+    cleanly when it sees a cancel op, releasing its concurrency slot.
+    """
+    import importlib
+    import json
+    from datetime import datetime, timezone
+
+    try:
+        fcntl = importlib.import_module("fcntl")
+    except ImportError:  # Windows / environments without fcntl
+        fcntl = None
+
+    control_file = logdir / "control.jsonl"
+    record = json.dumps(
+        {
+            "op": "cancel",
+            "agent_id": agent_id,
+            "ts": datetime.now(timezone.utc).isoformat(),
+        }
+    )
+
+    lock_file = logdir / ".control.lock"
+    lock_file.parent.mkdir(parents=True, exist_ok=True)
+    lock_file.touch(exist_ok=True)
+
+    with lock_file.open("r+") as lock_fd:
+        if fcntl is not None:
+            fcntl.flock(lock_fd, fcntl.LOCK_EX)
+        try:
+            with control_file.open("a") as f:
+                f.write(record + "\n")
+        finally:
+            if fcntl is not None:
+                fcntl.flock(lock_fd, fcntl.LOCK_UN)
 
 
 def _wait_for_cached_subagent_result(
@@ -60,13 +103,14 @@ def subagent(
     execution_mode: Literal["parallel", "sequential"] = "parallel",
     context_mode: Literal["full", "selective"] = "full",
     context_include: list[str] | None = None,
-    output_schema: type | None = None,
+    output_schema: "type | dict | None" = None,
     use_subprocess: bool | None = None,
     use_acp: bool = False,
     acp_command: str = "gptme-acp",
     profile: str | None = None,
     model: str | None = None,
     isolated: bool | None = None,
+    isolation: Literal["worktree"] | None = None,
     timeout: int = 1800,
     role: Role | None = None,
     redact_secrets: bool = True,
@@ -134,6 +178,20 @@ def subagent(
             can modify files without affecting the parent. The worktree is
             automatically cleaned up after the subagent completes.
             Falls back to a temporary directory if not in a git repo.
+            Prefer ``isolation="worktree"`` for new code — it is the string-based
+            API equivalent and enables smarter cleanup behaviour.
+        isolation: String-based isolation mode. Use ``"worktree"`` to create a
+            temporary git worktree for the subagent, giving it an isolated copy
+            of the repository to work in. On completion:
+
+            - **No local changes**: worktree directory *and* branch are removed
+              automatically (zero cleanup needed).
+            - **Local changes exist**: the branch is preserved and its name is
+              reported in the result so the orchestrator can inspect or merge it.
+              The working-tree directory is still removed.
+
+            Falls back to a temporary directory when not in a git repository.
+            Equivalent to ``isolated=True`` but adds smart cleanup behaviour.
         timeout: Maximum seconds before the subprocess monitor kills the
             subagent (default 1800 = 30 min). Only applies to subprocess mode.
         redact_secrets: If True (default), scrub common secret patterns from
@@ -234,15 +292,29 @@ def subagent(
         raise ValueError(
             f"context_turns must be None or a positive integer, got {context_turns!r}"
         )
+    if isolation is not None and isolation != "worktree":
+        raise ValueError(
+            f"Unknown isolation mode: {isolation!r}. Supported values: 'worktree'."
+        )
 
-    # Fetch parent messages from the active LogManager when context_turns is set.
+    # isolation="worktree" is the string-based API equivalent of isolated=True.
+    # When isolation is set, it overrides isolated (but both can still coexist).
+    if isolation == "worktree":
+        isolated = True
+
+    # Capture the parent session's logdir unconditionally — used by SESSION_END
+    # cleanup to scope cancellation to this conversation only (multi-session safety).
     # LogManager.get_current_log() reads a ContextVar set by the chat loop, so
     # this works when subagent() is called from within an ipython tool execution.
+    from ...logmanager import LogManager  # fmt: skip
+
+    parent_log = LogManager.get_current_log()
+    parent_logdir = (
+        getattr(parent_log, "logdir", None) if parent_log is not None else None
+    )
+
     parent_messages = None
     if context_turns is not None:
-        from ...logmanager import LogManager  # fmt: skip
-
-        parent_log = LogManager.get_current_log()
         if parent_log is not None:
             msgs = parent_log.log
             # Slice from the N-th-from-last user message so tool-result system
@@ -339,6 +411,13 @@ def subagent(
         if not workdir_path.is_dir():
             raise ValueError(f"workdir is not a directory: {workdir_path}")
 
+    # Clear any stale cached result for this agent_id before starting a new run.
+    # Without this, a reused deterministic id (e.g. "<item>-s0" in a pipeline) can
+    # return the previous run's terminal result from the shared cache, hiding the
+    # current run entirely.
+    with _subagent_results_lock:
+        _subagent_results.pop(agent_id, None)
+
     if mode == "planner":
         if context_turns is not None:
             logger.warning(
@@ -364,9 +443,11 @@ def subagent(
             context_include=context_include,
             profile=profile,
             isolated=isolated,
+            isolation_mode=isolation,
             redact_secrets=redact_secrets,
             context_window=context_window,
             max_time=max_time,
+            parent_logdir=parent_logdir,
         )
         with _subagents_lock:
             _subagents.append(sa)
@@ -392,6 +473,7 @@ def subagent(
                 redact_secrets=redact_secrets,
                 context_window=context_window,
                 workdir=workdir_path,
+                parent_logdir=parent_logdir,
             )
         finally:
             if _timer is not None:
@@ -498,6 +580,9 @@ def subagent(
             )
 
         def run_acp_subagent():
+            # Bind retry generation at thread birth so test-teardown interrupts
+            # abort backoffs even for LLM calls that start after teardown.
+            bind_thread_generation()
             _sem = get_slot_sem()
             _sem.acquire()
             try:
@@ -605,8 +690,18 @@ def subagent(
                             (s for s in _subagents if s.agent_id == agent_id), None
                         )
                     if sa_ref:
-                        _exec._cleanup_isolation(sa_ref)
+                        # ACP always caches a result above before reaching this
+                        # cleanup, so patch the already-stored result with any
+                        # preserved branch (mirrors the thread-mode fallback).
+                        preserved_branch = _exec._cleanup_isolation(sa_ref)
+                        if preserved_branch:
+                            update_subagent_result_with_branch(
+                                agent_id,
+                                preserved_branch,
+                                has_output_schema=bool(sa_ref.output_schema),
+                            )
             finally:
+                release_thread()
                 _sem.release()
 
         t = threading.Thread(target=run_acp_subagent, daemon=True)
@@ -625,12 +720,15 @@ def subagent(
             process=None,
             execution_mode="acp",
             acp_command=acp_command,
+            workdir=workdir_path,
             isolated=isolated,
+            isolation_mode=isolation,
             worktree_path=worktree_path,
             repo_path=repo_path,
             role=role,
             max_time=max_time,
             context_turns=context_turns,
+            parent_logdir=parent_logdir,
         )
         # Append sa before starting the thread so the finally block can find it
         # (avoids race condition where fast completion can't locate sa in _subagents)
@@ -651,17 +749,23 @@ def subagent(
             )
         if profile:
             logger.info(f"  with profile: {profile}")
-        # Convert output_schema type to JSON string if present
+        # Convert output_schema for the subprocess launcher.
+        # The CLI --output-schema flag only accepts "module:ClassName" format,
+        # so all schemas (Pydantic, plain-dict, annotated) are passed via
+        # output_schema_dict and injected into the prompt instead.
         output_schema_str = None
+        output_schema_dict = None
         if output_schema is not None:
-            import json
-
-            # Convert pydantic model or type to JSON schema string
             if hasattr(output_schema, "model_json_schema"):
-                output_schema_str = json.dumps(output_schema.model_json_schema())
+                # Pydantic model: extract JSON Schema and inject via prompt,
+                # not via --output-schema (which expects module:ClassName).
+                output_schema_dict = output_schema.model_json_schema()
+            elif isinstance(output_schema, dict):
+                from .hooks import _dict_to_jsonschema
+
+                output_schema_dict = _dict_to_jsonschema(output_schema)
             elif hasattr(output_schema, "__annotations__"):
-                # TypedDict or dataclass - create simple schema
-                output_schema_str = json.dumps({"type": "object"})
+                output_schema_dict = {"type": "object"}
 
         def _launch_subprocess():
             _sem = get_slot_sem()
@@ -682,6 +786,7 @@ def subagent(
                     context_mode=context_mode,
                     context_include=context_include,
                     output_schema=output_schema_str,
+                    output_schema_dict=output_schema_dict,
                     profile=profile,
                 )
                 # Subagent is a frozen dataclass; install the live process on the
@@ -718,13 +823,16 @@ def subagent(
             output_schema=output_schema,
             process=None,
             execution_mode="subprocess",
+            workdir=workdir_path,
             isolated=isolated,
+            isolation_mode=isolation,
             worktree_path=worktree_path,
             repo_path=repo_path,
             timeout=timeout,
             role=role,
             max_time=max_time,
             context_turns=context_turns,
+            parent_logdir=parent_logdir,
         )
         with _subagents_lock:
             _subagents.append(sa)
@@ -734,6 +842,9 @@ def subagent(
         # The semaphore is acquired before starting LLM work and released in
         # finally so excess agents queue until a slot opens.
         def run_subagent():
+            # Bind retry generation at thread birth so test-teardown interrupts
+            # abort backoffs even for LLM calls that start after teardown.
+            bind_thread_generation()
             _sem = get_slot_sem()
             _sem.acquire()
             try:
@@ -798,17 +909,44 @@ def subagent(
                     # Use _read_log() instead of status(): the thread is still alive here,
                     # so status() would return "running" and poison the result cache.
                     result = sa._read_log()
+                    # Clean up isolation first so preserved branch name can be
+                    # included in the result returned to callers.
+                    preserved_branch = _exec._cleanup_isolation(sa)
+                    # Skip appending human-readable branch text when output_schema
+                    # is set — the result string is JSON that callers parse, and
+                    # appending text after it would break that parse.
+                    if (
+                        preserved_branch
+                        and isinstance(result.result, str)
+                        and not sa.output_schema
+                    ):
+                        from .types import ReturnType as _ReturnType
+
+                        result = _ReturnType(
+                            result.status,
+                            f"{result.result}\n\nChanges preserved on branch "
+                            f"{preserved_branch!r}"
+                            f" — merge with: git merge {preserved_branch}",
+                            input_tokens=result.input_tokens,
+                            output_tokens=result.output_tokens,
+                        )
                     if not set_subagent_result_if_absent(agent_id, result):
-                        _exec._cleanup_isolation(sa)
+                        # Timeout/cancel won the cache race. Cleanup already ran above.
+                        # Patch the stored result with branch info so callers can find it.
+                        if preserved_branch:
+                            update_subagent_result_with_branch(
+                                agent_id,
+                                preserved_branch,
+                                has_output_schema=bool(sa.output_schema),
+                            )
                         return
                     try:
                         summary = _exec._summarize_result(result, max_chars=200)
                         notify_completion(agent_id, result.status, summary)
                     except Exception as e:
                         logger.warning(f"Failed to notify subagent completion: {e}")
-                    # Clean up worktree isolation
-                    _exec._cleanup_isolation(sa)
             finally:
+                release_thread()
                 _sem.release()
 
         # Create thread (don't start yet)
@@ -832,7 +970,9 @@ def subagent(
             output_schema=output_schema,
             process=None,
             execution_mode="thread",
+            workdir=workdir_path,
             isolated=isolated,
+            isolation_mode=isolation,
             worktree_path=worktree_path,
             repo_path=repo_path,
             role=role,
@@ -840,6 +980,7 @@ def subagent(
             context_window=context_window,
             max_time=max_time,
             context_turns=context_turns,
+            parent_logdir=parent_logdir,
         )
         with _subagents_lock:
             _subagents.append(sa)
@@ -895,10 +1036,15 @@ def _timeout_subagent(agent_id: str, max_time: float) -> None:
 def subagent_cancel(agent_id: str) -> str:
     """Cancel a running subagent.
 
-    For subprocess-mode subagents, sends SIGTERM (then SIGKILL after 5s) to the
-    process. For thread-mode subagents, marks the result as cancelled — the thread
-    continues until its next natural checkpoint but the result is already recorded
-    as failure so callers won't block waiting for it.
+    For subprocess-mode subagents, writes a cancel op to ``logdir/control.jsonl``
+    so the agent's cooperative checkpoint can exit cleanly before SIGTERM arrives,
+    then sends SIGTERM (and SIGKILL after 5s) as escalation.
+
+    For thread-mode subagents, writes the cancel op and marks the result cache so
+    callers don't block.  The thread stops at its next STEP_PRE checkpoint and
+    releases its concurrency slot.
+
+    ACP-mode subagents keep today's cache-mark-only behavior (no control file).
 
     Args:
         agent_id: The subagent to cancel
@@ -915,11 +1061,21 @@ def subagent_cancel(agent_id: str) -> str:
     if not sa.is_running():
         return f"Subagent '{agent_id}' is not running (already finished)."
 
-    cancelled_result = ReturnType("failure", "Cancelled by orchestrator")
+    cancelled_result = ReturnType("cancelled", "Cancelled by orchestrator")
 
     if sa.execution_mode == "subprocess" and sa.process:
+        # Mark result BEFORE writing the control file so the cooperative checkpoint
+        # can never observe the cancel op without a "cancelled" result already in
+        # the cache — preventing a race where the hook's set_subagent_result_if_absent
+        # would win with the wrong status.
         if not set_subagent_result_if_absent(agent_id, cancelled_result):
             return f"Subagent '{agent_id}' already finished before cancellation."
+        try:
+            append_control_op(sa.logdir, "cancel", agent_id=agent_id)
+        except OSError as e:
+            logger.warning(
+                "Failed to write cancel control op for '%s': %s", agent_id, e
+            )
         sa.process.terminate()
         try:
             sa.process.wait(timeout=5)
@@ -928,16 +1084,39 @@ def subagent_cancel(agent_id: str) -> str:
             sa.process.wait()
         logger.info(f"Subagent '{agent_id}' subprocess terminated.")
         return f"Subagent '{agent_id}' cancelled."
-    # Thread/ACP mode: threads cannot be forcefully stopped in Python.
-    # Mark the result so the orchestrator sees it as cancelled immediately.
+    if sa.execution_mode == "thread":
+        # Thread mode: mark result BEFORE writing the control file (same race fix).
+        # The thread stops at its next STEP_PRE checkpoint and releases the slot.
+        if not set_subagent_result_if_absent(agent_id, cancelled_result):
+            return f"Subagent '{agent_id}' already finished before cancellation."
+        try:
+            append_control_op(sa.logdir, "cancel", agent_id=agent_id)
+        except OSError as e:
+            logger.warning(
+                "Failed to write cancel control op for '%s': %s — "
+                "falling back to in-memory cancel_event",
+                agent_id,
+                e,
+            )
+            # Control file is unavailable; signal the thread in-memory so the
+            # STEP_PRE checkpoint hook can still stop it at its next step.
+            sa.cancel_event.set()
+        logger.info(
+            f"Subagent '{agent_id}' marked cancelled (thread will stop at next checkpoint)."
+        )
+        return (
+            f"Subagent '{agent_id}' marked as cancelled. "
+            "The background thread will stop at its next cooperative checkpoint."
+        )
+    # ACP mode: threads cannot be stopped; keep cache-mark-only behavior.
     if not set_subagent_result_if_absent(agent_id, cancelled_result):
         return f"Subagent '{agent_id}' already finished before cancellation."
     logger.info(
-        f"Subagent '{agent_id}' marked cancelled (thread will stop at next checkpoint)."
+        f"Subagent '{agent_id}' (ACP) marked cancelled (no cooperative checkpoint)."
     )
     return (
         f"Subagent '{agent_id}' marked as cancelled. "
-        "The background thread will stop at its next natural checkpoint."
+        "The background thread will stop at its next step boundary."
     )
 
 
@@ -1011,6 +1190,7 @@ def subagent_reply(agent_id: str, reply: str) -> None:
             use_acp=sa.use_acp,
             acp_command=sa.acp_command or "gptme-acp",
             profile=sa.profile,
+            workdir=sa.workdir,
             isolated=sa.isolated,
             timeout=sa.timeout,
             role=sa.role,
@@ -1100,12 +1280,10 @@ def subagent_wait(
     Returns:
         Status dict with 'status' and 'result' keys
     """
-    sa = None
+    # Use the most recently spawned entry — _subagents is append-only, so
+    # reversed() finds the newest match when the same agent_id is reused.
     with _subagents_lock:
-        for s in _subagents:
-            if s.agent_id == agent_id:
-                sa = s
-                break
+        sa = next((s for s in reversed(_subagents) if s.agent_id == agent_id), None)
 
     if sa is None:
         raise ValueError(f"Subagent with ID {agent_id} not found.")
@@ -1225,12 +1403,10 @@ def subagent_read_log(
     Returns:
         Formatted log output showing the conversation
     """
-    sa = None
+    # Use the most recently spawned entry — _subagents is append-only, so
+    # reversed() finds the newest match when the same agent_id is reused.
     with _subagents_lock:
-        for s in _subagents:
-            if s.agent_id == agent_id:
-                sa = s
-                break
+        sa = next((s for s in reversed(_subagents) if s.agent_id == agent_id), None)
 
     if sa is None:
         raise ValueError(f"Subagent with ID {agent_id} not found.")

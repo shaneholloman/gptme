@@ -54,6 +54,7 @@ Mouse:
     - right_click: Click right mouse button
     - middle_click: Click middle mouse button
     - double_click: Double click left mouse button
+    - triple_click: Triple click at position (selects all text in most native inputs; use with coordinate to click a field)
     - left_click_drag: Click and drag to coordinates
 
 Screen:
@@ -106,13 +107,12 @@ from typing import IO, TYPE_CHECKING, Literal, TypedDict
 
 from ._computer_gate import action_risk_level, sensitive_action_gate
 from .base import ToolFunction, ToolSpec, ToolUse
-from .computer_transport import get_transport
+from .computer_transport import ComputerTransport, _resize_image, get_transport
 from .screenshot import screenshot
 from .vision import view_image
 
 if TYPE_CHECKING:
     from ..message import ArtifactDescriptor, Message, MessageMetadata
-    from .computer_transport import ComputerTransport
 
 logger = logging.getLogger(__name__)
 
@@ -244,6 +244,7 @@ Action = Literal[
     "right_click",
     "middle_click",
     "double_click",
+    "triple_click",
     "scroll",
     "screenshot",
     "cursor_position",
@@ -341,7 +342,7 @@ def _get_macos_display_scale() -> float:
     """
     # Method 1: AppKit (preferred — works for all display configs including external monitors)
     try:
-        import AppKit  # type: ignore[import-not-found,import-untyped]
+        import AppKit
 
         screen = AppKit.NSScreen.mainScreen()
         if screen is not None:
@@ -681,14 +682,14 @@ def _linux_scroll(
 def _macos_scroll(x: int, y: int, direction: str, amount: int = 3) -> None:
     """Scroll in a direction at (x, y) on macOS using Quartz scroll wheel events."""
     try:
-        from Quartz import (  # type: ignore[import-not-found]
+        from Quartz import (
             CGEventCreateScrollWheelEvent,
             CGEventPost,
             CGEventSetLocation,
             kCGHIDEventTap,
             kCGScrollEventUnitLine,
         )
-        from Quartz.CoreGraphics import CGPoint  # type: ignore[import-not-found]
+        from Quartz.CoreGraphics import CGPoint
     except ImportError:
         raise RuntimeError(
             "pyobjc-framework-Quartz is required for scroll on macOS. "
@@ -779,7 +780,7 @@ def _linux_accessibility_tree(display: str, max_depth: int = 8) -> str:
         RuntimeError: If pyatspi is not installed or the desktop is not accessible.
     """
     try:
-        import pyatspi  # type: ignore[import-not-found,import-untyped]
+        import pyatspi
     except ImportError:
         raise RuntimeError(
             "pyatspi not installed. Install with: pip install pyatspi\n"
@@ -859,7 +860,7 @@ def _linux_click_accessible_element(
             no geometry.
     """
     try:
-        import pyatspi  # type: ignore[import-not-found,import-untyped]
+        import pyatspi
     except ImportError:
         raise RuntimeError(
             "pyatspi not installed. Install with: pip install pyatspi\n"
@@ -1410,7 +1411,13 @@ def _dispatch_transport(
             print(f"Dragged to {x},{y}")
         return None
 
-    click_actions = {"left_click", "right_click", "middle_click", "double_click"}
+    click_actions = {
+        "left_click",
+        "right_click",
+        "middle_click",
+        "double_click",
+        "triple_click",
+    }
     if action in click_actions:
         if coordinate:
             x, y = coordinate
@@ -1420,6 +1427,7 @@ def _dispatch_transport(
             "right_click": transport.right_click,
             "middle_click": transport.middle_click,
             "double_click": transport.double_click,
+            "triple_click": transport.triple_click,
         }[action]
         click_fn()
         print(f"Performed {action}")
@@ -1638,6 +1646,55 @@ def computer(
             _run_xdotool("click --repeat 2 --delay 100 1", display)
         print("Performed double_click")
         return None
+    if action == "triple_click":
+        if coordinate:
+            sx, sy = _scale_coordinates(
+                _ScalingSource.API, coordinate[0], coordinate[1], width, height
+            )
+            if IS_MACOS:
+                try:
+                    subprocess.run(
+                        ["cliclick", f"tc:{sx},{sy}"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    raise RuntimeError("cliclick triple-click timed out") from e
+                except subprocess.CalledProcessError as e:
+                    raise RuntimeError(f"Failed to triple-click: {e.stderr}") from e
+            else:
+                _run_xdotool(
+                    f"mousemove --sync {sx} {sy} click --repeat 3 --delay 100 1",
+                    display,
+                )
+        else:
+            if IS_MACOS:
+                try:
+                    result = subprocess.run(
+                        ["cliclick", "p"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                    pos = result.stdout.strip()
+                    subprocess.run(
+                        ["cliclick", f"tc:{pos}"],
+                        check=True,
+                        capture_output=True,
+                        text=True,
+                        timeout=10,
+                    )
+                except subprocess.TimeoutExpired as e:
+                    raise RuntimeError("cliclick triple-click timed out") from e
+                except subprocess.CalledProcessError as e:
+                    raise RuntimeError(f"Failed to triple-click: {e.stderr}") from e
+            else:
+                _run_xdotool("click --repeat 3 --delay 100 1", display)
+        print("Performed triple_click")
+        return None
     if action in ("left_click", "right_click", "middle_click"):
         click_map = {
             "left_click": 1,
@@ -1735,7 +1792,12 @@ def computer(
         # burning CPU on long waits.
         poll_interval = 0.05
         max_poll_interval = 0.5
-        change_threshold = 0.01  # 1% of pixels must differ
+        # 0.2% threshold — must match _poll_for_change (transport path).
+        # The old 1% threshold caused "No screen change detected" even when the
+        # xterm had updated: typing a short command changes only ~0.3–0.5% of a
+        # 1024×768 screen (issue #216). PNG is lossless so identical frames are
+        # always exactly 0.0%, making false positives impossible in Xvfb.
+        change_threshold = 0.002
         baseline = screenshot()
         deadline = _monotonic() + timeout
         while _monotonic() < deadline:
@@ -2040,7 +2102,7 @@ Common modifiers (ctrl, alt, cmd/super, shift) work consistently across platform
 
 ### Observation helpers (structured-first policy)
 
-Three higher-level helpers are available that implement the structured-first observation policy:
+Higher-level helpers are available that implement the structured-first observation policy:
 
 - ``observe_web(url, screenshot_too=False)`` — observe a web page using ARIA snapshots first
   (no vision tokens), with automatic fallback to a browser screenshot, then desktop screenshot.
@@ -2052,6 +2114,10 @@ Three higher-level helpers are available that implement the structured-first obs
   ``wait_for_change`` in one call — the complete "act then look" loop without separate
   screenshot calls. Use this for tight interaction loops where you want to see the screen
   after every click, keypress, or scroll.
+- ``fill_native(coordinate, text)`` — replace text in a native (non-browser) text field in one
+  call. Triple-clicks to select all existing text, then types the replacement. The native
+  equivalent of ``fill_element(selector, value)`` for DOM targets. Use when the target is a
+  native app input (terminal, dialog, form) rather than a web page.
 - ``computer_task(task, timeout=300, model=None)`` — run a multi-step computer-use task
   in a **context-isolated subagent** and block until done. All screenshots and intermediate
   steps are kept inside the subagent's own context — the caller's context stays lean. Use
@@ -2190,6 +2256,58 @@ def observe_desktop() -> Message | None:
         # Equivalent to computer("screenshot"), but signals intent clearly.
     """
     return computer("screenshot")
+
+
+def fill_native(coordinate: tuple[int, int], text: str) -> list[Message]:
+    """Fill a native (non-browser) text field by clicking, selecting all, and typing.
+
+    Use this to replace the content of a native text input with new text —
+    equivalent to ``fill_element(selector, value)`` for web targets, but for
+    native desktop/X11/macOS apps.
+
+    The sequence is: triple-click to select all existing text, then type the
+    replacement text.  No separate ctrl+a step is needed.
+
+    .. note::
+        Triple-click selects all text in *most* single-line native inputs, but
+        may select only a word or line in terminals and multi-line text widgets.
+        Verify the field type before using this helper in those contexts.
+
+    .. note::
+        A screenshot is always captured after the fill so callers can observe
+        the field state and detect partial or failed replacements.
+
+    Args:
+        coordinate: X,Y coordinates of the text field (in API space).
+        text: Replacement text to type into the field.
+
+    Returns:
+        List of :class:`~gptme.message.Message` objects — usually a single
+        screenshot message showing the field state after the fill.
+
+    Example (from IPython in a computer-use session)::
+
+        # Replace the URL bar text in a browser window
+        msgs = fill_native((400, 50), "https://example.com")
+
+        # Fill a login field in a native app
+        msgs = fill_native((300, 200), "username@example.com")
+    """
+    messages: list[Message] = []
+    # Triple-click selects all text in the field (works in most native text inputs)
+    result = computer("triple_click", coordinate=coordinate)
+    if result is not None:
+        messages.append(result)
+    # Type the replacement text (overwrites the selected content)
+    result = computer("type", text=text)
+    if result is not None:
+        messages.append(result)
+    # Capture a post-fill screenshot so callers can observe the field state
+    # and detect partial or failed replacements before continuing.
+    observation = computer("screenshot")
+    if observation is not None:
+        messages.append(observation)
+    return messages
 
 
 class ScreenRecording:
@@ -2427,6 +2545,70 @@ _OBSERVATION_ACTIONS: frozenset[str] = frozenset(
 )
 
 
+class _NativeScreenshotTransport(ComputerTransport):
+    """Minimal ComputerTransport that captures screenshots via the native screenshot() function.
+
+    Used by :func:`act_and_observe` when no ``GPTME_COMPUTER_TRANSPORT`` is configured,
+    so that :func:`_poll_for_change` can be reused for settle_time support and
+    pre-action baseline detection on the native xdotool/cliclick path.
+
+    Only :meth:`screenshot` is implemented; all other methods raise
+    :class:`NotImplementedError` since this transport is used only for
+    observation (polling), never for control actions.
+    """
+
+    def screenshot(self, width: int = 0, height: int = 0) -> Path:
+        path = screenshot()
+        if not width or not height:
+            width, height = _get_api_resolution()
+        try:
+            _resize_image(path, width, height)
+        except RuntimeError as e:
+            # Tolerate resize failures (e.g. ImageMagick missing) the same way
+            # the old native wait_for_change path did — return the unresized
+            # screenshot rather than aborting the poll/act_and_observe call.
+            print(
+                f"Warning: screenshot resize failed ({e!r}); returning unresized image"
+            )
+        return path
+
+    def close(self) -> None:
+        pass
+
+    def key(self, text: str) -> None:
+        raise NotImplementedError
+
+    def type_text(self, text: str) -> None:
+        raise NotImplementedError
+
+    def mouse_move(self, x: int, y: int) -> None:
+        raise NotImplementedError
+
+    def left_click(self) -> None:
+        raise NotImplementedError
+
+    def right_click(self) -> None:
+        raise NotImplementedError
+
+    def middle_click(self) -> None:
+        raise NotImplementedError
+
+    def double_click(self) -> None:
+        raise NotImplementedError
+
+    def left_click_drag(self, x: int, y: int) -> None:
+        raise NotImplementedError
+
+    def scroll(self, x: int, y: int, direction: str, amount: int = 3) -> None:
+        raise NotImplementedError
+
+    def cursor_position(self) -> tuple[int, int]:
+        raise NotImplementedError
+
+    def window_focus(self, pattern: str) -> None:
+        raise NotImplementedError
+
+
 def act_and_observe(
     action: Action,
     text: str | None = None,
@@ -2496,14 +2678,27 @@ def act_and_observe(
     # always times out, producing the "delay" symptom reported in #216.
     pre_action_baseline = None
     transport = None
+    _poll_transport: ComputerTransport | None = None
     if action not in _OBSERVATION_ACTIONS:
         transport = get_transport()
         if transport is not None:
+            _poll_transport = transport
             try:
                 pre_action_baseline = transport.screenshot()
             except Exception as e:
                 print(
                     f"Warning: pre-action baseline screenshot failed ({e!r}); falling back to post-action polling"
+                )
+        else:
+            # Native path: capture a pre-action baseline using the native screenshot()
+            # function and wrap it in a thin transport so _poll_for_change (and
+            # settle_time) can be reused — same fix as the transport path above.
+            _poll_transport = _NativeScreenshotTransport()
+            try:
+                pre_action_baseline = _poll_transport.screenshot()
+            except Exception as e:
+                print(
+                    f"Warning: native pre-action baseline screenshot failed ({e!r}); falling back to post-action polling"
                 )
 
     result = computer(action, text=text, coordinate=coordinate)
@@ -2516,14 +2711,15 @@ def act_and_observe(
 
     # For any action that modifies desktop state, poll for changes and return
     # one screenshot showing the settled screen.
-    if pre_action_baseline is not None and transport is not None:
+    if pre_action_baseline is not None and _poll_transport is not None:
         # Use the pre-action baseline so changes that happened immediately
         # (e.g. window_focus) are detected rather than missed.
         # settle_time ensures we wait for the screen to stop changing (not just
         # detect the first frame of a multi-phase transition like a terminal
         # appearing frame-by-frame before the shell prompt renders).
+        # This now works on both the transport path AND the native xdotool path.
         settled = _poll_for_change(
-            transport, pre_action_baseline, timeout, settle_time=settle_time
+            _poll_transport, pre_action_baseline, timeout, settle_time=settle_time
         )
     else:
         settled = computer("wait_for_change", text=str(timeout))
@@ -2699,6 +2895,18 @@ User: Open Firefox, go to https://x.com/compose/tweet, type "Hello from gptme!" 
 Assistant: I'll delegate this to computer_task() so all the intermediate screenshots stay in a subagent context rather than here.
 {ToolUse("ipython", [], _COMPUTER_TASK_TWEET_EXAMPLE).to_output(tool_format)}
 System: {{"status": "success", "result": "Tweet submitted successfully. Firefox opened, x.com/compose/tweet loaded, typed the message, clicked Tweet. Confirmed tweet posted.", "agent_id": "computer-task-a1b2c3d4"}}
+
+User: Replace the text in the URL bar of the browser window with "https://example.com"
+Assistant: I'll use fill_native to triple-click the URL bar to select all text, then type the new URL.
+{ToolUse("ipython", [], 'fill_native((760, 45), "https://example.com")').to_output(tool_format)}
+System: Performed triple_click
+Typed text: https://example.com
+
+User: Fill the "Username" field at (300, 200) in this native login dialog
+Assistant: I'll use fill_native to replace whatever is in the field with the username.
+{ToolUse("ipython", [], 'fill_native((300, 200), "alice@example.com")').to_output(tool_format)}
+System: Performed triple_click
+Typed text: alice@example.com
 """
 
     # Platform-specific keyboard shortcut examples
@@ -2736,6 +2944,7 @@ tool = ToolSpec(
         ToolFunction.from_callable(observe_web),
         ToolFunction.from_callable(observe_desktop),
         ToolFunction.from_callable(act_and_observe),
+        ToolFunction.from_callable(fill_native),
         ToolFunction.from_callable(computer_task),
         ToolFunction.from_callable(record_screen),
         ToolFunction.from_callable(start_recording),

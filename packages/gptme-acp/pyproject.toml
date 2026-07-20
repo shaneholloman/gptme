@@ -1,0 +1,30 @@
+[project]
+name = "gptme-acp"
+version = "0.32.1"
+description = "ACP (Agent Client Protocol) entry point for gptme — lets editors like Zed and JetBrains launch gptme via uvx"
+authors = [
+    { name = "Erik Bjäreholt", email = "erik@bjareho.lt" },
+]
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.10"
+dependencies = ["gptme[acp]>=0.31.0"]
+
+[project.urls]
+Homepage = "https://gptme.org/"
+Repository = "https://github.com/gptme/gptme"
+Documentation = "https://gptme.org/docs/acp.html"
+Issues = "https://github.com/gptme/gptme/issues"
+
+[project.scripts]
+gptme-acp = "gptme.acp.__main__:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+# Minimal stub package — all logic lives in `gptme[acp]` (a declared dependency).
+# The gptme_acp/__init__.py is empty; it exists only to satisfy hatchling's
+# requirement that the wheel contain at least one Python package.
+packages = ["gptme_acp"]

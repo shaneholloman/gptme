@@ -41,6 +41,8 @@ from typing import TYPE_CHECKING
 
 import click
 
+from ..util.git_cmd import GIT_CMD
+
 if TYPE_CHECKING:
     from rich.tree import Tree as RichTree
 
@@ -54,6 +56,7 @@ _LAZY_COMMANDS: dict[str, tuple[str, str]] = {
     "mcp": (".cmd_mcp", "mcp"),
     "resume": (".cmd_resume", "resume"),
     "skills": (".cmd_skills", "skills"),
+    "slop": (".cmd_slop", "slop"),
     "snapshot": (".cmd_snapshot", "snapshot"),
     "status": (".cmd_status", "status"),
 }
@@ -402,7 +405,7 @@ def _git_run(cmd: list[str], check: bool = True, timeout: int = 10) -> tuple[str
         env = os.environ.copy()
         env.update({"PAGER": "cat", "GIT_PAGER": "cat", "GIT_TERMINAL_PROMPT": "0"})
         result = subprocess.run(
-            ["git"] + cmd,
+            [GIT_CMD] + cmd,
             capture_output=True,
             text=True,
             check=check,
@@ -444,7 +447,7 @@ def _walk_directory(
     excludes: list[str],
     max_depth: int | None,
     depth: int = 1,
-) -> None:  # type: ignore[name-defined]
+) -> None:
     from rich.filesize import decimal
     from rich.markup import escape
     from rich.text import Text
@@ -545,7 +548,7 @@ def context_files(config: str | None):
     if sys.version_info >= (3, 11):
         import tomllib
     else:
-        import tomli as tomllib  # type: ignore[no-redef]
+        import tomli as tomllib
 
     # Discover gptme.toml from cwd → git root
     toml_path: Path | None
@@ -556,7 +559,7 @@ def context_files(config: str | None):
         root, ok = _git_run(["rev-parse", "--show-toplevel"])
         if ok and root:
             candidates.append(Path(root) / "gptme.toml")
-        toml_path = next((p for p in candidates if p.exists()), None)  # type: ignore[arg-type]
+        toml_path = next((p for p in candidates if p.exists()), None)
 
     if not toml_path or not toml_path.exists():
         click.echo("No gptme.toml found. Use --config to specify path.", err=True)
@@ -710,42 +713,51 @@ def llm_generate(
     # Capture stderr to suppress console output during initialization
     stderr_capture = io.StringIO()
 
-    with redirect_stderr(stderr_capture):
-        from ..init import init  # fmt: skip
-        from ..llm import (  # fmt: skip
-            _chat_complete,
-            _stream,
-            get_provider_from_model,
-            init_llm,
-        )
-        from ..llm.models import get_default_model  # fmt: skip
-        from ..message import Message  # fmt: skip
-        from ..util import console  # fmt: skip
+    from ..util import console  # fmt: skip
 
-        # Disable console output
-        console.quiet = True
+    # Disable console output during init, and always restore it: the console
+    # is a shared module-level object, so leaving quiet=True would silence all
+    # later console output in this process (notably in-process CLI tests).
+    prev_quiet = console.quiet
+    try:
+        with redirect_stderr(stderr_capture):
+            from ..init import init  # fmt: skip
+            from ..llm import (  # fmt: skip
+                _chat_complete,
+                _stream,
+                get_provider_from_model,
+                init_llm,
+            )
+            from ..llm.models import get_default_model  # fmt: skip
+            from ..message import Message  # fmt: skip
 
-        # Initialize with minimal setup - no tools needed for simple generation
-        try:
-            init(model, interactive=False, tool_allowlist=[], tool_format="markdown")
-        except ValueError as e:
-            raise click.UsageError(str(e)) from e
+            console.quiet = True
 
-        # Get model or use default
-        if not model:
-            default_model = get_default_model()
-            if not default_model:
-                raise click.UsageError(
-                    "No model specified and no default model available."
+            # Initialize with minimal setup - no tools needed for simple generation
+            try:
+                init(
+                    model, interactive=False, tool_allowlist=[], tool_format="markdown"
                 )
-            model = default_model.full
+            except ValueError as e:
+                raise click.UsageError(str(e)) from e
 
-        # Ensure provider is initialized
-        try:
-            provider = get_provider_from_model(model)
-            init_llm(provider)
-        except ValueError as e:
-            raise click.UsageError(str(e)) from e
+            # Get model or use default
+            if not model:
+                default_model = get_default_model()
+                if not default_model:
+                    raise click.UsageError(
+                        "No model specified and no default model available."
+                    )
+                model = default_model.full
+
+            # Ensure provider is initialized
+            try:
+                provider = get_provider_from_model(model)
+                init_llm(provider)
+            except ValueError as e:
+                raise click.UsageError(str(e)) from e
+    finally:
+        console.quiet = prev_quiet
 
     # Anthropic requires the first message to be a system message
     messages = [Message("system", system_prompt), Message("user", prompt)]

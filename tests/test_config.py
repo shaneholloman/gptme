@@ -1215,7 +1215,39 @@ def test_cli_auto_envvar_prefix():
     params = {p.name: p for p in main.params}
     assert "model" in params, "CLI should have --model option"
     assert "tool_format" in params, "CLI should have --tool-format option"
+    assert "prune_tool_output" in params, "CLI should have --prune-tool-output option"
     assert "workspace" in params, "CLI should have --workspace option"
+
+
+def test_setup_config_from_cli_merges_prune_tool_output_override(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+    (logdir / "config.toml").write_text(
+        f"""[chat]
+workspace = "{workspace!s}"
+
+[env]
+EXISTING = "1"
+"""
+    )
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=None,
+        tool_format=None,
+        prune_tool_output=True,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.env["EXISTING"] == "1"
+    assert config.chat.env["PRUNE_TOOL_OUTPUT"] == "1"
 
 
 def test_tool_exclusion_config(tmp_path):
@@ -1750,3 +1782,68 @@ def test_load_user_config_plugin_sections_preserved(tmp_path):
 
     content_after = config_file.read_text()
     assert "headroom_compressor" in content_after
+
+
+def test_chat_config_accepts_gear_field(tmp_path):
+    config = ChatConfig.from_dict({"chat": {"gear": 3, "workspace": str(tmp_path)}})
+
+    assert config.gear == 3
+
+
+@pytest.mark.parametrize("value", ["3", True])
+def test_chat_config_rejects_non_integer_gear(value):
+    with pytest.raises(ValueError, match="chat.gear must be an integer"):
+        ChatConfig.from_dict({"chat": {"gear": value}})
+
+
+def test_project_settings_gear_loaded():
+    config = ProjectConfig.from_dict({"settings": {"gear": 2}})
+
+    assert config.settings.gear == 2
+
+
+def test_setup_config_from_cli_applies_gear_preset(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=None,
+        tool_format=None,
+        gear=2,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.gear == 2
+    assert config.chat.no_confirm is False
+    assert config.chat.tools == ["read", "patch", "save", "append"]
+
+
+def test_setup_config_from_cli_explicit_tools_override_gear(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist="read",
+        tool_format=None,
+        gear=3,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.gear == 3
+    assert config.chat.tools == ["read"]

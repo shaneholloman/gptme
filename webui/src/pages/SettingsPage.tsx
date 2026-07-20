@@ -9,6 +9,7 @@ import { SettingsContent } from '@/components/SettingsContent';
 import { SETTINGS_CATEGORIES, type SettingsCategory } from '@/stores/settingsModal';
 import { use$ } from '@legendapp/state/react';
 import { settingsModal$ } from '@/stores/settingsModal';
+import { appRoute } from '@/utils/routes';
 
 function toCategoryOrDefault(raw: string | undefined): SettingsCategory {
   return (SETTINGS_CATEGORIES as ReadonlyArray<string>).includes(raw ?? '')
@@ -57,7 +58,7 @@ const SettingsPage: FC = () => {
   return (
     <div
       ref={containerRef}
-      className="flex h-screen flex-col"
+      className="flex h-dvh flex-col"
       tabIndex={-1}
       onKeyDown={(e) => {
         if (e.key === 'Escape') {
@@ -73,7 +74,7 @@ const SettingsPage: FC = () => {
           if (window.history.length > 2) {
             navigate(-1);
           } else {
-            navigate('/chat');
+            navigate(appRoute('/chat'));
           }
         }
       }}

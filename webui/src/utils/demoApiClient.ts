@@ -13,8 +13,14 @@
  * conversations.
  */
 import { observable } from '@legendapp/state';
-import type { ConnectionProbeResult, IApiClient } from '@/utils/api';
-import type { UserInfo, ConversationResponse, ChatConfig, ServerHealth } from '@/types/api';
+import type { ApiCompatibilityWarning, ConnectionProbeResult, IApiClient } from '@/utils/api';
+import type {
+  UserInfo,
+  ConversationResponse,
+  ChatConfig,
+  ServerHealth,
+  SkillListResponse,
+} from '@/types/api';
 import type { Message, ConversationSummary, ToolUse } from '@/types/conversation';
 import { ToolFormat } from '@/types/api';
 import { initConversation, setMaxTokens, setTemperature, setTopP } from '@/stores/conversations';
@@ -162,6 +168,7 @@ export function createDemoApiClient(baseUrl: string = DEMO_BASE_URL): IApiClient
     ok: true,
     url: baseUrl,
   });
+  const compatibilityWarning$ = observable<ApiCompatibilityWarning | null>(null);
   const sessions$ = observable(new Map<string, string>());
   const userInfo$ = observable<UserInfo | null>(DEMO_USER_INFO);
 
@@ -212,6 +219,7 @@ export function createDemoApiClient(baseUrl: string = DEMO_BASE_URL): IApiClient
     authHeader: null,
     isConnected$,
     lastConnectionResult$,
+    compatibilityWarning$,
     sessions$,
     userInfo$,
 
@@ -272,6 +280,7 @@ export function createDemoApiClient(baseUrl: string = DEMO_BASE_URL): IApiClient
       nextCursor: undefined,
     }),
     getExternalSessions: async () => [],
+    getSkills: async (): Promise<SkillListResponse> => ({ skills: [] }),
     getSessions: async () => [],
 
     // Conversation detail — serve the fixture or local in-memory conversations.

@@ -37,6 +37,7 @@ docs/releases/v*-*.md
 .coverage*
 coverage.xml
 htmlcov
+.mypy_coverage_report
 junit.xml
 __pycache__
 .*cache
@@ -77,3 +78,4 @@ scripts/changelog_contributors_twitter.csv
 
 # Keep the compose example env template tracked
 !.env.example
+state/

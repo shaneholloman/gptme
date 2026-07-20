@@ -43,6 +43,7 @@ logger = logging.getLogger(__name__)
 
 # Lazy imports to avoid dependency issues when acp is not installed
 Agent: type | None = None
+AuthMethodAgent: type | None = None
 Implementation: type | None = None
 InitializeResponse: type | None = None
 NewSessionResponse: type | None = None
@@ -67,6 +68,7 @@ def _import_acp() -> bool:
     """Import ACP modules lazily."""
     global \
         Agent, \
+        AuthMethodAgent, \
         Implementation, \
         InitializeResponse, \
         NewSessionResponse, \
@@ -96,6 +98,15 @@ def _import_acp() -> bool:
         NewSessionResponse = _NewSessionResponse
         PromptResponse = _PromptResponse
         Client = _Client
+
+        # AuthMethodAgent was added in a later release; degrade gracefully if absent
+        try:
+            from acp.schema import AuthMethodAgent as _AuthMethodAgent
+
+            AuthMethodAgent = _AuthMethodAgent
+        except ImportError:
+            pass
+
         return True
     except ImportError:
         return False
@@ -111,6 +122,29 @@ def _agent_info() -> Any:
     except Exception:
         gptme_version = "unknown"
     return _Impl(name="gptme", title="gptme ACP Agent", version=gptme_version)
+
+
+def _auth_methods() -> list:
+    """Build the authMethods for InitializeResponse.
+
+    gptme uses API keys (ANTHROPIC_API_KEY, OPENAI_API_KEY, etc.) configured
+    as environment variables or in ~/.config/gptme/config.local.toml before launch.
+    Returns an empty list on ACP releases that pre-date the AuthMethodAgent schema.
+    """
+    if AuthMethodAgent is None:
+        return []
+    return [
+        AuthMethodAgent(
+            id="api-key",
+            name="API Key",
+            description=(
+                "Set your LLM provider API key as an environment variable "
+                "(e.g. ANTHROPIC_API_KEY or OPENAI_API_KEY) before running gptme, "
+                "or add it to ~/.config/gptme/config.local.toml (not config.toml, "
+                "which may be version-controlled)."
+            ),
+        )
+    ]
 
 
 def _cwd_session_id(cwd: str) -> str:
@@ -498,6 +532,7 @@ class GptmeAgent:
                 return _check_acp_import(InitializeResponse, "InitializeResponse")(
                     protocol_version=protocol_version,
                     agent_info=_agent_info(),
+                    auth_methods=_auth_methods(),
                 )
 
             self._initialized = True
@@ -516,6 +551,7 @@ class GptmeAgent:
         return _InitializeResponse(
             protocol_version=protocol_version,
             agent_info=_agent_info(),
+            auth_methods=_auth_methods(),
         )
 
     async def new_session(
@@ -680,14 +716,19 @@ class GptmeAgent:
         )
 
         # Build modes and models state for the session response.
+        # Note: models field was removed from NewSessionResponse in ACP 0.11.0.
         modes = self._build_modes_state(session_id)
         models = self._build_models_state(session_model)
 
-        return _NewSessionResponse(
-            session_id=session_id,
-            modes=modes,
-            models=models,
-        )
+        # Build response dict, conditionally including models for older ACP versions
+        response_kwargs = {
+            "session_id": session_id,
+            "modes": modes,
+        }
+        if models is not None:
+            response_kwargs["models"] = models
+
+        return _NewSessionResponse(**response_kwargs)
 
     def _build_modes_state(self, session_id: str) -> Any:
         """Build SessionModeState for the session response.
@@ -1273,6 +1314,7 @@ class GptmeAgent:
         session_model = self._session_models.setdefault(session_id, self._model)
 
         # Build modes and models state (same as new_session)
+        # Note: models field was removed from NewSessionResponse in ACP 0.11.0.
         modes = self._build_modes_state(session_id)
         models = self._build_models_state(session_model)
 
@@ -1286,11 +1328,15 @@ class GptmeAgent:
                 )
             )
 
-        return _NewSessionResponse(
-            session_id=session_id,
-            modes=modes,
-            models=models,
-        )
+        # Build response dict, conditionally including models for older ACP versions
+        response_kwargs = {
+            "session_id": session_id,
+            "modes": modes,
+        }
+        if models is not None:
+            response_kwargs["models"] = models
+
+        return _NewSessionResponse(**response_kwargs)
 
     def _cleanup_session(self, session_id: str) -> None:
         """Remove all per-session state for a given session.

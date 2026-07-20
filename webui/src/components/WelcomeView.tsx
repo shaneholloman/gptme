@@ -4,10 +4,9 @@ import { useNavigate } from 'react-router-dom';
 import { useApi } from '@/contexts/ApiContext';
 import { useQueryClient } from '@tanstack/react-query';
 import { toast } from 'sonner';
-import { use$ } from '@legendapp/state/react';
-import { observable } from '@legendapp/state';
+import { use$, useObservable } from '@legendapp/state/react';
 import { ChatInput, type ChatOptions } from '@/components/ChatInput';
-import { History, Server, Copy, RotateCcw } from 'lucide-react';
+import { AlertTriangle, History, Server, Copy, RotateCcw } from 'lucide-react';
 import { useSettings } from '@/contexts/SettingsContext';
 import { ExamplesSection } from '@/components/ExamplesSection';
 import { serverRegistry$, getConnectedServers } from '@/stores/servers';
@@ -25,7 +24,7 @@ import {
 import { withLocalAddressSpace } from '@/utils/addressSpace';
 import { isLikelyChromeCorsPna } from '@/utils/api';
 import { isDemoMode } from '@/utils/connectionConfig';
-import { chatRoute } from '@/utils/routes';
+import { appRoute, chatRoute } from '@/utils/routes';
 
 const DEFAULT_LOCAL_SERVER_URLS = new Set(['http://127.0.0.1:5700', 'http://localhost:5700']);
 
@@ -53,6 +52,7 @@ export const WelcomeView = () => {
   const queryClient = useQueryClient();
   const isConnected = use$(isConnected$);
   const lastConnectionResult = use$(api.lastConnectionResult$);
+  const compatibilityWarning = use$(api.compatibilityWarning$);
   const providerStatusVersion = use$(setupWizard$.providerStatusVersion);
   const registry = use$(serverRegistry$);
   const connectedServers = getConnectedServers();
@@ -78,8 +78,8 @@ export const WelcomeView = () => {
     activeServerBaseUrl
   );
 
-  // Create observables that ChatInput expects
-  const autoFocus$ = observable(true);
+  // Stable observable for ChatInput autoFocus — must not be recreated on re-renders
+  const autoFocus$ = useObservable(true);
 
   const handleServerSwitch = async (serverId: string) => {
     try {
@@ -310,6 +310,34 @@ export const WelcomeView = () => {
                 </p>
               </div>
             </div>
+
+            {isConnected && compatibilityWarning && (
+              <Alert className="mx-auto w-full max-w-2xl border-amber-500/30 bg-amber-500/10 text-left">
+                <AlertTriangle className="h-4 w-4 text-amber-700 dark:text-amber-300" />
+                <AlertTitle>
+                  {compatibilityWarning.kind === 'server_older'
+                    ? 'Server update recommended'
+                    : 'Server compatibility warning'}
+                </AlertTitle>
+                <AlertDescription className="space-y-3">
+                  <p>
+                    {compatibilityWarning.kind === 'server_older'
+                      ? `This server uses contract revision ${compatibilityWarning.serverContractRevision}, but this web UI needs revision ${compatibilityWarning.minimumContractRevision}. Some features may be unavailable until the server is updated.`
+                      : `This server uses API v${compatibilityWarning.serverApiVersion}, but this web UI expects API v${compatibilityWarning.clientApiVersion}. Some features may not work correctly.`}
+                  </p>
+                  <Button
+                    variant="outline"
+                    size="sm"
+                    onClick={() => {
+                      settingsModal$.open.set(true);
+                      settingsModal$.category.set('servers');
+                    }}
+                  >
+                    Update server
+                  </Button>
+                </AlertDescription>
+              </Alert>
+            )}
 
             {!isConnected && (
               <Alert className="mx-auto w-full max-w-2xl border-amber-500/30 bg-amber-500/10 text-left">
@@ -567,7 +595,7 @@ export const WelcomeView = () => {
                 type="button"
                 variant="ghost"
                 size="sm"
-                onClick={() => navigate('/history')}
+                onClick={() => navigate(appRoute('/history'))}
                 className="rounded-full border border-transparent text-muted-foreground hover:border-border/70 hover:bg-background/70"
               >
                 <History className="mr-2 h-4 w-4" />

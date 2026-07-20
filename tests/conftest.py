@@ -1,5 +1,6 @@
 """Test configuration and shared fixtures."""
 
+import http.server
 import json
 import logging
 import os
@@ -17,10 +18,16 @@ import requests
 import gptme.init as _gptme_init
 from gptme.config import get_config, set_config
 from gptme.init import init
+from gptme.llm.retry_abort import interrupt_thread
 from gptme.tools import clear_tools
 from gptme.tools import shell as shell_module
 from gptme.tools.rag import _has_gptme_rag
-from gptme.tools.subagent import _subagent_results, _subagent_results_lock, _subagents
+from gptme.tools.subagent import (
+    _subagent_results,
+    _subagent_results_lock,
+    _subagents,
+    _subagents_lock,
+)
 from gptme.tools.subagent.concurrency import _reset_slot_sem
 
 logger = logging.getLogger(__name__)
@@ -114,10 +121,17 @@ def pytest_configure(config):
 @pytest.hookimpl(wrapper=True)
 def pytest_runtest_makereport(item, call):
     """Convert API quota/rate-limit failures to skips for requires_api tests.
+    Also suppresses pytest-retry StashKey teardown errors.
 
     The session-start quota check may pass with a tiny haiku call, but the
     actual test can hit quota limits with heavier models or longer generations.
     This hook catches those mid-run failures and converts them to skips.
+
+    For the StashKey case: when pytest-retry retries a test that uses tmp_path,
+    pytest's stash-based fixture tracking loses its key during teardown of the
+    retried attempt (an architectural issue in pytest-retry, not version-specific).
+    The test body itself passed; treat the teardown as passed to prevent a
+    spurious CI ERROR from masking the real result.
     """
     report = yield
 
@@ -131,6 +145,42 @@ def pytest_runtest_makereport(item, call):
         if any(pattern in error_str for pattern in _QUOTA_ERROR_PATTERNS):
             report.outcome = "skipped"
             report.longrepr = f"API quota exhausted or invalid credentials during test: {call.excinfo.value}"
+
+    # Count call-phase attempts so the teardown guard below can verify the test
+    # was actually retried (not just that a single passing call existed). Track
+    # whether the last call passed so we know the retry succeeded.
+    if report.when == "call":
+        item._stash_guard_call_attempts = (
+            getattr(item, "_stash_guard_call_attempts", 0) + 1
+        )
+        item._stash_guard_call_passed = report.passed
+
+    # pytest-retry compat: tmp_path (and caplog) stash keys are
+    # populated by pytest's fixture machinery during the first (failed) attempt.
+    # When pytest-retry re-runs the test body without a full fixture re-setup,
+    # the stash entry is absent during teardown of the retried (passing) attempt,
+    # producing KeyError: <_pytest.stash.StashKey object at 0x...>.
+    # Three-way guard to avoid masking genuine teardown failures (Greptile P1):
+    #   (a) test was actually retried (>1 call attempts seen by this hook)
+    #   (b) the last call attempt passed (retry succeeded)
+    #   (c) the error is specifically from _pytest.stash internals
+    if (
+        report.when == "teardown"
+        and report.failed
+        and getattr(item, "_stash_guard_call_attempts", 0) > 1
+        and getattr(item, "_stash_guard_call_passed", False)
+    ):
+        longrepr_str = str(report.longrepr)
+        if "_pytest.stash.StashKey" in longrepr_str and "KeyError" in longrepr_str:
+            logger.warning(
+                "Suppressed pytest-retry StashKey teardown error (known "
+                "infrastructure artifact, not version-specific) "
+                "for %s — the test body passed; this is a known infrastructure "
+                "artifact (see ErikBjare/bob#1084)",
+                item.nodeid,
+            )
+            report.outcome = "passed"
+            report.longrepr = None
 
     return report
 
@@ -151,6 +201,13 @@ def pytest_collection_modifyitems(config, items):
         for item in items:
             if "requires_api" in item.keywords:
                 item.add_marker(skip_api)
+
+    # Wire up no_retry: override pytest-retry's global --retries for these tests.
+    # @pytest.mark.flaky(retries=0) takes precedence over the --retries CLI flag.
+    no_retry_mark = pytest.mark.flaky(retries=0)
+    for item in items:
+        if "no_retry" in item.keywords:
+            item.add_marker(no_retry_mark)
 
 
 def pytest_sessionstart(session):
@@ -241,6 +298,35 @@ def cleanup_shell_after():
 
 
 @pytest.fixture(autouse=True)
+def cleanup_acp_health_monitor():
+    """Stop the ACP health monitor and clear SessionManager state after each test.
+
+    The health monitor is a module-level singleton thread. Without this fixture
+    the first test that starts it leaks the thread for the rest of the xdist
+    worker's life, racing with any test that writes to SessionManager._sessions
+    directly and causing RuntimeError: dictionary changed size during iteration.
+    """
+    yield
+    try:
+        try:
+            from gptme.server.session_step import stop_acp_health_monitor
+
+            stop_acp_health_monitor()
+        except ImportError:
+            pass
+        try:
+            from gptme.server.session_models import SessionManager
+
+            with SessionManager._lock:
+                SessionManager._sessions.clear()
+                SessionManager._conversation_sessions.clear()
+        except ImportError:
+            pass
+    except Exception as e:
+        logger.warning(f"Error during ACP health monitor cleanup: {e}")
+
+
+@pytest.fixture(autouse=True)
 def cleanup_subagents_after():
     """Clean up subagent threads and subprocesses after each test.
 
@@ -249,6 +335,24 @@ def cleanup_subagents_after():
     Subprocesses in subprocess mode need explicit termination.
     """
     yield
+    # Interrupt in-progress LLM retry backoff sleeps before joining subagent
+    # threads. The retry decorators sleep through exponential backoff (1+2+4+8s
+    # = 15s+), far past the 2s join timeout below — without this, a thread
+    # stuck in backoff leaks past teardown, later mutates sys.modules via lazy
+    # imports, and races any main-thread iteration of it in an unrelated test
+    # file ("dictionary changed size during iteration").
+    # Scoped to the registered subagent threads only (not process-wide) so
+    # unrelated background LLM work in the same pytest worker is unaffected.
+    with _subagents_lock:
+        # Make a copy to iterate over to avoid "dictionary changed size during iteration"
+        # if another thread or setup_method modifies _subagents during cleanup
+        subagents_copy = list(_subagents)
+    for subagent in subagents_copy:
+        # Subprocess launchers don't call backoff_wait(), so interrupt_thread()
+        # would create a stale pre-signaled event whose ident could be reused by
+        # a later real-LLM thread, aborting its first retry immediately.
+        if subagent.thread is not None and subagent.execution_mode != "subprocess":
+            interrupt_thread(subagent.thread)
     # Use try/finally so _subagents.clear() and _reset_slot_sem() always run
     # even if pytest-timeout interrupts the join/terminate phase.  The 5s
     # timeouts used here (thread join + process wait) together with pytest's
@@ -256,7 +360,7 @@ def cleanup_subagents_after():
     # sequence could take exactly 10s, triggering the timeout and leaving shared
     # globals dirty for the next test.  Shorter timeouts give headroom.
     try:
-        for subagent in _subagents:
+        for subagent in subagents_copy:
             # Clean up threads (2s cap — well under the 10s teardown limit)
             if subagent.thread is not None and subagent.thread.is_alive():
                 subagent.thread.join(timeout=2.0)
@@ -268,10 +372,20 @@ def cleanup_subagents_after():
                 except Exception:
                     # Force kill if graceful termination fails
                     subagent.process.kill()
+        # Leak check: warn loudly if a thread survived the join above so a
+        # future flake ("dictionary changed size during iteration" in an
+        # unrelated test) can be traced back to this test.
+        for subagent in subagents_copy:
+            if subagent.thread is not None and subagent.thread.is_alive():
+                logger.warning(
+                    "Subagent thread leaked past teardown: "
+                    f"{subagent.agent_id} ({subagent.thread.name})"
+                )
     finally:
         # Always reset shared state so subsequent tests start clean,
         # even if the join/terminate phase above was interrupted.
-        _subagents.clear()
+        with _subagents_lock:
+            _subagents.clear()
         # Clear cached terminal results too; many tests intentionally reuse agent IDs
         # like "explorer"/"checker", and the queued-cancel guards now treat a stale
         # cached result as "already completed" and skip the new launch.
@@ -515,6 +629,51 @@ def mock_generation():
         return mock_stream
 
     return create
+
+
+_LOCAL_FORM_HTML = """\
+<!DOCTYPE html>
+<html>
+<head><meta charset="utf-8"><title>Test Form</title></head>
+<body>
+<form>
+  <input name="q" type="text" placeholder="Search" />
+  <button type="submit">Go</button>
+</form>
+</body>
+</html>
+"""
+
+
+class _LocalFormHandler(http.server.BaseHTTPRequestHandler):
+    """Minimal HTTP handler that serves a simple form page."""
+
+    def log_message(self, *args):  # suppress request logs in test output
+        pass
+
+    def do_GET(self):
+        encoded = _LOCAL_FORM_HTML.encode()
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Length", str(len(encoded)))
+        self.end_headers()
+        self.wfile.write(encoded)
+
+
+@pytest.fixture()
+def local_form_page():
+    """Serve a minimal HTML form page locally and yield its URL.
+
+    Replaces external URLs (e.g. duckduckgo.com) in browser tests so the
+    suite stays hermetic and free of network flakiness.
+    """
+    server = http.server.HTTPServer(("127.0.0.1", 0), _LocalFormHandler)
+    port = server.server_address[1]
+    thread = threading.Thread(target=server.serve_forever, daemon=True)
+    thread.start()
+    yield f"http://127.0.0.1:{port}/"
+    server.shutdown()
+    thread.join(timeout=2)
 
 
 @pytest.fixture

@@ -76,7 +76,9 @@ echo "Pushing ${TAG} to origin..."
 if [ "$DRY_RUN" = "false" ]; then
     if [ "$PRERELEASE" = "false" ]; then
         # Stable releases: push version bump commit to master.
-        # Requires the user/bot to have branch protection bypass rights.
+        # Requires branch ruleset bypass rights: in CI this is the deploy
+        # key from the `release` environment (set up via actions/checkout
+        # ssh-key); locally it's the maintainer's own credentials.
         git push origin HEAD:master
     else
         # Pre-releases: skip the branch push entirely.
@@ -112,7 +114,13 @@ if [ "$DRY_RUN" = "false" ]; then
             # shellcheck disable=SC2064
             trap "rm -f '$TRUNCATED_FILE'" EXIT
             head -c "$GH_BODY_LIMIT" "$NOTES_FILE" > "$TRUNCATED_FILE"
-            printf '\n\n*(Changelog truncated — see full git log for details)*\n' >> "$TRUNCATED_FILE"
+            if [ -n "$NOTES_START" ]; then
+                REPO_SLUG=$(gh repo view --json nameWithOwner -q .nameWithOwner)
+                printf '\n\n*(Changelog truncated — see the [full release notes in the docs](https://gptme.org/docs/changelog.html) or the [full diff](https://github.com/%s/compare/%s...%s))*\n' \
+                    "$REPO_SLUG" "$NOTES_START" "$TAG" >> "$TRUNCATED_FILE"
+            else
+                printf '\n\n*(Changelog truncated — see the [full release notes in the docs](https://gptme.org/docs/changelog.html))*\n' >> "$TRUNCATED_FILE"
+            fi
             NOTES_FILE="$TRUNCATED_FILE"
         fi
 

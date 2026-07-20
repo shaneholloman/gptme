@@ -56,6 +56,35 @@ export DISPLAY=:1
 fluxbox &   # or any window manager
 ```
 
+## Validate your setup
+
+After installing prerequisites, confirm everything is working:
+
+```bash
+# Check computer-use specific prerequisites (X11 tools, Playwright, ffmpeg, AT-SPI2...)
+gptme-util computer doctor
+
+# Run all three milestone demos (tweet, factorio, doom) against local HTML fixtures
+gptme-util computer demo --all
+```
+
+`gptme-util computer doctor` reports Playwright and Chromium availability as
+warnings rather than hard errors. If it warns about a missing browser runtime,
+`gptme-util computer demo --all` will also fail — install the missing dependency
+before proceeding.
+
+`gptme-util computer demo --all` drives the real Playwright browser tool against
+local HTML fixtures — the same `open_page`, `fill_element`, and `click_element`
+calls that work against live sites. When all three milestones pass, browser
+interaction and selector resolution are working.
+
+For X11/native-desktop diagnostics (requires a running display):
+
+```bash
+gptme-util computer latency            # screenshot capture latency (target: < 100 ms)
+gptme-util computer latency --terminal # terminal startup latency (target: < 500 ms)
+```
+
 ## Start a computer-use session
 
 The `computer-use` profile sets the right tool access and backend selection policy:
@@ -392,3 +421,16 @@ mitigations above reduce total session time by shortening the wait, not by fixin
 - **Combine with `--non-interactive`**: add `-n` for scripted or CI use where you don't want
   prompts (but ensure the task is well-scoped first).
 - **Describe visual outcomes**: "confirm the dialog closed" works better than "click OK and move on".
+
+## Background
+
+Computer use support in gptme was bootstrapped in
+[issue #32](https://github.com/gptme/gptme/issues/32), where gptme used its own
+screenshot and keyboard tools to extend its own computer-use capabilities — writing
+much of the initial implementation itself.  That thread is an end-to-end example of
+gptme applying computer use in practice: taking screenshots of its own output, reading
+the results, and editing its own source code in response.
+
+The feature has since grown substantially (see [issue #216](https://github.com/gptme/gptme/issues/216)
+for the full development history), but the original conversation in #32 remains the
+clearest self-contained demonstration of what the tool can do when pointed at a real task.

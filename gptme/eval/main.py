@@ -26,6 +26,7 @@ from tabulate import tabulate
 from ..config import get_config
 from ..message import len_tokens
 from ..tools import ToolFormat
+from ..util.git_cmd import GIT_CMD
 from .run import run_evals
 from .suites import suites, tests_default, tests_default_ids, tests_map
 from .types import CaseResult, EvalResult, EvalSpec, ModelConfig
@@ -69,7 +70,7 @@ def docker_reexec(argv: list[str]) -> None:
     # Get git root
     try:
         git_root = subprocess.check_output(
-            ["git", "rev-parse", "--show-toplevel"],
+            [GIT_CMD, "rev-parse", "--show-toplevel"],
             text=True,
             cwd=Path(__file__).parent,
             timeout=10,
@@ -900,6 +901,7 @@ def read_results_from_csv(filename: str) -> dict[ModelConfig, list[EvalResult]]:
                     config = ModelConfig(model=model_name, tool_format="markdown")
                 test_dir = results_dir / model_name / row["Test"]
 
+            cost_usd_str = row.get("Cost USD", "")
             result = EvalResult(
                 name=row["Test"],
                 status="success" if row["Passed"] == "true" else "error",
@@ -916,9 +918,41 @@ def read_results_from_csv(filename: str) -> dict[ModelConfig, list[EvalResult]]:
                 log_dir=Path(row.get("Log Dir", str(test_dir))),
                 workspace_dir=Path(row.get("Workspace Dir", str(test_dir))),
                 tool_calls=int(row.get("Tool Calls", 0) or 0),
+                num_steps=int(row.get("Num Steps", 0) or 0),
+                tokens_input=int(row.get("Tokens Input", 0) or 0),
+                tokens_output=int(row.get("Tokens Output", 0) or 0),
+                cache_read_tokens=int(row.get("Cache Read Tokens", 0) or 0),
+                cache_creation_tokens=int(row.get("Cache Creation Tokens", 0) or 0),
+                cache_hit_rate=float(row.get("Cache Hit Rate", 0) or 0),
+                cost_usd=float(cost_usd_str) if cost_usd_str else None,
             )
             model_results[config].append(result)
     return dict(model_results)
+
+
+def _model_token_summary(results: list[EvalResult]) -> dict[str, float | int | None]:
+    """Aggregate per-task token metrics for harness efficiency comparison."""
+    total_tasks = len(results)
+    if not total_tasks:
+        return {
+            "tokens_per_task": 0,
+            "tokens_input_per_task": 0,
+            "tokens_output_per_task": 0,
+            "total_tokens": 0,
+            "total_cost_usd": None,
+        }
+
+    total_tokens = sum(r.tokens_total for r in results)
+    total_input = sum(r.tokens_input for r in results)
+    total_output = sum(r.tokens_output for r in results)
+    costs = [r.cost_usd for r in results if r.cost_usd is not None]
+    return {
+        "tokens_per_task": round(total_tokens / total_tasks, 2),
+        "tokens_input_per_task": round(total_input / total_tasks, 2),
+        "tokens_output_per_task": round(total_output / total_tasks, 2),
+        "total_tokens": total_tokens,
+        "total_cost_usd": round(sum(costs), 6) if costs else None,
+    }
 
 
 def results_to_json(
@@ -937,6 +971,7 @@ def results_to_json(
               "model": "anthropic/claude-sonnet-4-20250514",
               "tool_format": "tool",
               "pass_rate": 0.85,
+              "tokens_per_task": 12500.5,
               "total": 20,
               "passed": 17,
               "results": [ { "name": "hello", "status": "success", ... }, ... ]
@@ -953,6 +988,7 @@ def results_to_json(
             {
                 **config.to_dict(),
                 "pass_rate": round(passed / total, 4) if total else 0.0,
+                **_model_token_summary(results),
                 "total": total,
                 "passed": passed,
                 "results": result_dicts,
@@ -969,7 +1005,7 @@ def _get_commit_hash() -> str:
     """Get current commit hash and dirty status, like: a8b2ef0-dirty."""
     try:
         git_result = subprocess.run(
-            ["git", "describe", "--always", "--dirty", "--exclude", "'*'"],
+            [GIT_CMD, "describe", "--always", "--dirty", "--exclude", "'*'"],
             check=False,
             text=True,
             capture_output=True,
@@ -1012,6 +1048,14 @@ def write_results(
             "Passed",
             "Score",
             "Tool Calls",
+            "Num Steps",
+            "Tokens Input",
+            "Tokens Output",
+            "Tokens Total",
+            "Cache Read Tokens",
+            "Cache Creation Tokens",
+            "Cache Hit Rate",
+            "Cost USD",
             "Total Duration",
             "Generation Time",
             "Run Time",
@@ -1056,6 +1100,14 @@ def write_results(
                     "Passed": "true" if passed else "false",
                     "Score": score,
                     "Tool Calls": result.tool_calls,
+                    "Num Steps": result.num_steps,
+                    "Tokens Input": result.tokens_input,
+                    "Tokens Output": result.tokens_output,
+                    "Tokens Total": result.tokens_total,
+                    "Cache Read Tokens": result.cache_read_tokens,
+                    "Cache Creation Tokens": result.cache_creation_tokens,
+                    "Cache Hit Rate": result.cache_hit_rate,
+                    "Cost USD": result.cost_usd if result.cost_usd is not None else "",
                     "Total Duration": round(sum(result.timings.values()), 2),
                     "Generation Time": round(result.timings["gen"], 2),
                     "Run Time": round(result.timings["run"], 2),

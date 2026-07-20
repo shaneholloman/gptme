@@ -42,15 +42,17 @@ import webbrowser
 from base64 import urlsafe_b64decode
 from collections.abc import Generator
 from dataclasses import dataclass
+from math import isfinite
 from pathlib import Path
-from typing import Any
+from typing import Any, cast
 from urllib.parse import parse_qs, urlencode, urlparse
 from uuid import uuid4
 
 import requests
 
-from ..message import Message
+from ..message import Message, MessageMetadata
 from .openai_responses import (
+    _extract_usage_token_counts,
     _messages_to_responses_input,
     _stream_responses_events,
     _tool_spec_to_responses_tool,
@@ -506,8 +508,12 @@ def stream(
     tools: list[Any] | None = None,
     max_tokens: int | None = None,
     **kwargs: Any,
-) -> Generator[str, None, None]:
-    """Stream completion from ChatGPT subscription API."""
+) -> Generator[str, None, MessageMetadata | None]:
+    """Stream completion from ChatGPT subscription API.
+
+    Returns usage metadata dict via generator return value, captured by
+    _StreamWithMetadata in the caller.
+    """
     auth = get_auth()
 
     instructions, api_messages = _messages_to_responses_input(messages)
@@ -532,30 +538,112 @@ def stream(
         "session_id": str(uuid4()),
     }
 
-    response = requests.post(
-        CODEX_ENDPOINT,
-        json=request_body,
-        headers=headers,
-        stream=True,
-        timeout=120,
-    )
+    # Timeout is (connect, read). With stream=True the read timeout applies
+    # BETWEEN stream chunks — reasoning models (gpt-5.5 high, gpt-5.6-sol)
+    # can think for minutes without emitting an event, so the default is
+    # deliberately generous. Override via GPTME_SUBSCRIPTION_READ_TIMEOUT
+    # for latency-sensitive callers.
+    _DEFAULT_READ_TIMEOUT = 600.0
+    _env_val = os.environ.get("GPTME_SUBSCRIPTION_READ_TIMEOUT", "")
+    if _env_val:
+        try:
+            _parsed = float(_env_val)
+            if _parsed <= 0 or not isfinite(_parsed):
+                raise ValueError("must be a positive finite number")
+            read_timeout = _parsed
+        except ValueError:
+            logger.warning(
+                "Invalid GPTME_SUBSCRIPTION_READ_TIMEOUT=%r; using default %.0fs",
+                _env_val,
+                _DEFAULT_READ_TIMEOUT,
+            )
+            read_timeout = _DEFAULT_READ_TIMEOUT
+    else:
+        read_timeout = _DEFAULT_READ_TIMEOUT
+    # Stream retries, mirroring codex-rs (DEFAULT_STREAM_IDLE_TIMEOUT_MS=300s
+    # with DEFAULT_STREAM_MAX_RETRIES=5): silence/drop on the wire is a
+    # retryable condition, not fatal. No read timeout is a true upper bound on
+    # a reasoning pause, so a timeout alone always has a failure mode; the
+    # retry closes it. Only retried BEFORE the first event has been yielded —
+    # re-POSTing restarts generation, so retrying after partial output would
+    # duplicate content downstream.
+    try:
+        max_stream_retries = int(
+            os.environ.get("GPTME_SUBSCRIPTION_STREAM_RETRIES", "3")
+        )
+    except ValueError:
+        max_stream_retries = 3
+    max_stream_retries = max(0, min(max_stream_retries, 100))
 
-    if response.status_code != 200:
-        error_text = response.text[:500]
-        raise ValueError(f"Codex API error {response.status_code}: {error_text}")
+    def _open_response() -> requests.Response:
+        resp = requests.post(
+            CODEX_ENDPOINT,
+            json=request_body,
+            headers=headers,
+            stream=True,
+            timeout=(30, read_timeout),
+        )
+        if resp.status_code != 200:
+            error_text = resp.text[:500]
+            raise ValueError(f"Codex API error {resp.status_code}: {error_text}")
+        return resp
 
     def _sse_events():
-        for line in response.iter_lines():
-            if not line:
-                continue
-            data = _parse_sse_response(line)
-            if data is None:
-                continue
-            if data.get("done"):
+        attempts = 0
+        yielded_any = False
+        response = _open_response()
+        while True:
+            try:
+                for line in response.iter_lines():
+                    if not line:
+                        continue
+                    data = _parse_sse_response(line)
+                    if data is None:
+                        continue
+                    if data.get("done"):
+                        return
+                    yielded_any = True
+                    yield data
                 return
-            yield data
+            except (
+                requests.exceptions.Timeout,
+                requests.exceptions.ConnectionError,
+                requests.exceptions.ChunkedEncodingError,
+            ) as e:
+                if yielded_any or attempts >= max_stream_retries:
+                    raise
+                attempts += 1
+                logger.warning(
+                    "Subscription stream idle/dropped before first event (%s); "
+                    "retrying (%d/%d)",
+                    e,
+                    attempts,
+                    max_stream_retries,
+                )
+                response = _open_response()
 
-    yield from _stream_responses_events(_sse_events())
+    _usage_holder: list[Any] = []
+
+    def _capture_usage(usage: Any) -> None:
+        _usage_holder.append(usage)
+
+    yield from _stream_responses_events(_sse_events(), usage_callback=_capture_usage)
+
+    # Return usage metadata so _StreamWithMetadata can attach it to the message.
+    # _StreamWithMetadata adds the full provider-prefixed model name automatically.
+    if not _usage_holder:
+        return None
+    counts = _extract_usage_token_counts(_usage_holder[0])
+    usage_data: dict[str, int] = {}
+    if isinstance(counts.input_tokens, int):
+        usage_data["input_tokens"] = counts.input_tokens
+    if isinstance(counts.output_tokens, int):
+        usage_data["output_tokens"] = counts.output_tokens
+    if isinstance(counts.cache_read_tokens, int):
+        usage_data["cache_read_tokens"] = counts.cache_read_tokens
+    if isinstance(counts.cache_creation_tokens, int):
+        usage_data["cache_creation_tokens"] = counts.cache_creation_tokens
+    return cast(MessageMetadata, {"usage": usage_data}) if usage_data else None
 
 
 def chat(

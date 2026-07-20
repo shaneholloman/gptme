@@ -10,13 +10,14 @@ import os
 from collections.abc import MutableMapping
 from dataclasses import asdict, fields
 from pathlib import Path
-from typing import TYPE_CHECKING, Any
+from typing import TYPE_CHECKING, Any, cast
 
 import tomlkit
 from tomlkit import TOMLDocument
 
 if TYPE_CHECKING:
     from tomlkit.container import Container
+    from tomlkit.items import AoT
 
 from ..util import path_with_tilde
 from .models import (
@@ -25,6 +26,7 @@ from .models import (
     ModelsConfig,
     PluginsConfig,
     ProviderConfig,
+    SettingsConfig,
     UserConfig,
     UserIdentityConfig,
     UserPromptConfig,
@@ -66,7 +68,7 @@ def _strip_unknown_config_keys(path: str, keys: set[str]) -> None:
     changed = False
     for key in keys:
         if key in doc:
-            del doc[key]  # type: ignore[attr-defined]
+            del doc[key]
             changed = True
     if changed:
         try:
@@ -246,6 +248,30 @@ def load_user_config(path: str | None = None) -> UserConfig:
     providers_config = config.pop("providers", [])
     providers = [ProviderConfig(**provider) for provider in providers_config]
 
+    settings_data = config.pop("settings", {})
+    if not isinstance(settings_data, dict):
+        logger.warning(
+            f"[settings] should be a table, got {type(settings_data).__name__}"
+        )
+        settings_data = {}
+    settings_known = {f.name for f in fields(SettingsConfig)}
+    settings_unknown = set(settings_data) - settings_known
+    if settings_unknown:
+        logger.warning(
+            f"Unknown keys in [settings] config: {sorted(settings_unknown)} (ignored)"
+        )
+    settings = SettingsConfig(
+        **{k: v for k, v in settings_data.items() if k in settings_known}
+    )
+    if settings.gear is not None:
+        from ..gears import parse_gear
+
+        try:
+            settings.gear = parse_gear(settings.gear)
+        except ValueError:
+            logger.warning("[settings].gear should be an integer from 0 to 4")
+            settings.gear = None
+
     # Parse [models] section (model-related preferences like favorites)
     models_data = config.pop("models", {})
     if not isinstance(models_data, dict):
@@ -312,6 +338,7 @@ def load_user_config(path: str | None = None) -> UserConfig:
         lessons=lessons,
         models=models_config,
         plugins=plugins,
+        settings=settings,
         plugin=plugin_config,
     )
 
@@ -380,7 +407,7 @@ def set_config_value(
             existing = d[k]
             if not isinstance(existing, MutableMapping):
                 raise ValueError(f"Cannot set '{key}': '{k}' exists but is not a table")
-        d = d[k]  # type: ignore[assignment]
+        d = cast("Container", d[k])
     d[keypath[-1]] = value
 
     # Write the config
@@ -427,10 +454,10 @@ def save_provider_config(
         provider_table.add("default_model", provider.default_model)
 
     if "providers" not in doc:
-        doc.add("providers", tomlkit.aot())  # type: ignore[attr-defined]
+        doc.add("providers", tomlkit.aot())
 
-    providers = doc["providers"]
-    for idx, existing_provider in enumerate(providers):  # type: ignore[union-attr]
+    providers = cast("AoT", doc["providers"])
+    for idx, existing_provider in enumerate(providers):
         if existing_provider.get("name") == provider.name:
             providers[idx] = provider_table
             break

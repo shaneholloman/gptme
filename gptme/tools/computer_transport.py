@@ -77,6 +77,32 @@ class ComputerTransport(abc.ABC):
         """Double-click left mouse button at current position."""
         ...
 
+    def triple_click(self) -> None:
+        """Triple-click left mouse button at current position.
+
+        Selects all text in most native text inputs.
+        Not all transports support triple-click natively; the default falls
+        back to three rapid left_click calls.
+
+        For transports that require an explicit cursor position (e.g. CUA),
+        the fallback queries ``cursor_position()`` to anchor the cursor with
+        a ``mouse_move`` before clicking.  If the transport raises
+        ``RuntimeError`` (e.g. CUA transport before any ``mouse_move``), that
+        error propagates immediately.  Pass a ``coordinate`` to the top-level
+        ``computer('triple_click', coordinate=...)`` call to avoid this.
+        Transports that do not implement ``cursor_position`` at all
+        (``NotImplementedError`` / ``AttributeError``) proceed directly to the
+        three ``left_click`` calls.
+        """
+        try:
+            x, y = self.cursor_position()
+            self.mouse_move(x, y)
+        except (NotImplementedError, AttributeError):
+            pass
+        self.left_click()
+        self.left_click()
+        self.left_click()
+
     @abc.abstractmethod
     def left_click_drag(self, x: int, y: int) -> None:
         """Click and drag from current position to (x, y)."""
@@ -386,7 +412,7 @@ class CuaComputerTransport(ComputerTransport):
     def __init__(self) -> None:
         # Probe import eagerly so get_transport()'s try/except catches missing deps.
         try:
-            import cua_sandbox as _  # type: ignore[import-untyped,import-not-found] # noqa: F401
+            import cua_sandbox as _  # noqa: F401
         except ImportError:
             raise RuntimeError(
                 "cua-sandbox not installed. Install with: pip install cua-sandbox"
@@ -440,8 +466,8 @@ class CuaComputerTransport(ComputerTransport):
         import uuid
 
         from cua_sandbox import (
-            Image,  # type: ignore[import-untyped,import-not-found]
-            Sandbox,  # type: ignore[import-untyped,import-not-found]
+            Image,
+            Sandbox,
         )
 
         image = Image.linux(kind="container")
@@ -540,17 +566,17 @@ class CuaComputerTransport(ComputerTransport):
     def key(self, text: str) -> None:
         self._ensure_sandbox()
         assert self._sandbox is not None
-        self._run_async(self._sandbox.keyboard.key(text))  # type: ignore[attr-defined, union-attr]
+        self._run_async(self._sandbox.keyboard.key(text))  # type: ignore[attr-defined]
 
     def type_text(self, text: str) -> None:
         self._ensure_sandbox()
         assert self._sandbox is not None
-        self._run_async(self._sandbox.keyboard.type(text))  # type: ignore[attr-defined, union-attr]
+        self._run_async(self._sandbox.keyboard.type(text))  # type: ignore[attr-defined]
 
     def mouse_move(self, x: int, y: int) -> None:
         self._ensure_sandbox()
         assert self._sandbox is not None
-        self._run_async(self._sandbox.mouse.move(x, y))  # type: ignore[attr-defined, union-attr]
+        self._run_async(self._sandbox.mouse.move(x, y))  # type: ignore[attr-defined]
         self._cursor_position = (x, y)
 
     def _require_cursor_position(self) -> tuple[int, int]:
@@ -566,37 +592,37 @@ class CuaComputerTransport(ComputerTransport):
         self._ensure_sandbox()
         assert self._sandbox is not None
         x, y = self._require_cursor_position()
-        self._run_async(self._sandbox.mouse.click(x, y, "left"))  # type: ignore[attr-defined, union-attr]
+        self._run_async(self._sandbox.mouse.click(x, y, "left"))  # type: ignore[attr-defined]
 
     def right_click(self) -> None:
         self._ensure_sandbox()
         assert self._sandbox is not None
         x, y = self._require_cursor_position()
-        self._run_async(self._sandbox.mouse.right_click(x, y))  # type: ignore[attr-defined, union-attr]
+        self._run_async(self._sandbox.mouse.right_click(x, y))  # type: ignore[attr-defined]
 
     def middle_click(self) -> None:
         self._ensure_sandbox()
         assert self._sandbox is not None
         x, y = self._require_cursor_position()
-        self._run_async(self._sandbox.mouse.click(x, y, "middle"))  # type: ignore[attr-defined, union-attr]
+        self._run_async(self._sandbox.mouse.click(x, y, "middle"))  # type: ignore[attr-defined]
 
     def double_click(self) -> None:
         self._ensure_sandbox()
         assert self._sandbox is not None
         x, y = self._require_cursor_position()
-        self._run_async(self._sandbox.mouse.double_click(x, y))  # type: ignore[attr-defined, union-attr]
+        self._run_async(self._sandbox.mouse.double_click(x, y))  # type: ignore[attr-defined]
 
     def left_click_drag(self, x: int, y: int) -> None:
         self._ensure_sandbox()
         assert self._sandbox is not None
         start_x, start_y = self._require_cursor_position()
-        self._run_async(self._sandbox.mouse.drag(start_x, start_y, x, y))  # type: ignore[attr-defined, union-attr]
+        self._run_async(self._sandbox.mouse.drag(start_x, start_y, x, y))  # type: ignore[attr-defined]
         self._cursor_position = (x, y)
 
     def scroll(self, x: int, y: int, direction: str, amount: int = 3) -> None:
         self._ensure_sandbox()
         assert self._sandbox is not None
-        self._run_async(self._sandbox.mouse.scroll(x, y, direction, amount))  # type: ignore[attr-defined, union-attr]
+        self._run_async(self._sandbox.mouse.scroll(x, y, direction, amount))  # type: ignore[attr-defined]
 
     def screenshot(self, width: int = 0, height: int = 0) -> Path:
         self._ensure_sandbox()
@@ -611,9 +637,9 @@ class CuaComputerTransport(ComputerTransport):
             _os.close(fd)
             path = Path(tmp)
             if hasattr(self._sandbox, "screenshot"):
-                screenshot = await self._sandbox.screenshot()  # type: ignore[attr-defined, union-attr]
+                screenshot = await self._sandbox.screenshot()
             else:
-                screenshot = await self._sandbox.screen.screenshot()  # type: ignore[attr-defined, union-attr]
+                screenshot = await self._sandbox.screen.screenshot()  # type: ignore[attr-defined]
 
             if isinstance(screenshot, bytes):
                 path.write_bytes(screenshot)
@@ -634,11 +660,11 @@ class CuaComputerTransport(ComputerTransport):
         if self._sandbox is not None:
             try:
                 if hasattr(self._sandbox, "destroy"):
-                    self._run_async(self._sandbox.destroy())  # type: ignore[attr-defined, union-attr]
+                    self._run_async(self._sandbox.destroy())
                 elif hasattr(self._sandbox, "close"):
-                    self._run_async(self._sandbox.close())  # type: ignore[attr-defined, union-attr]
+                    self._run_async(self._sandbox.close())
                 elif hasattr(self._sandbox, "disconnect"):
-                    self._run_async(self._sandbox.disconnect())  # type: ignore[attr-defined, union-attr]
+                    self._run_async(self._sandbox.disconnect())
             finally:
                 self._sandbox = None
                 self._initialized = False

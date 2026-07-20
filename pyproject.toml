@@ -1,6 +1,6 @@
 [project]
 name = "gptme"
-version = "0.31.0"
+version = "0.32.1"
 description = "Powerful AI agent for coding and general tasks. Terminal-first with shell, code execution, file editing, web browsing, vision, computer use. Unconstrained."
 authors = [
     { name = "Erik Bjäreholt", email = "erik@bjareho.lt" },
@@ -22,6 +22,7 @@ aw_watcher_agent = "gptme.hooks.aw_watcher_agent:plugin"
 
 [project.scripts]
 gptme = "gptme.cli.main:main"
+gptme-tui = "gptme.tui.main:main"
 gptme-server = "gptme.server.cli:main"
 gptme-acp = "gptme.acp.__main__:main"
 gptme-eval = "gptme.eval.main:main"
@@ -40,6 +41,7 @@ gptme-dspy = "gptme.eval.dspy:main"
 gptme-eval-trends = "gptme.eval.trends:main"
 gptme-status = "gptme.cli.cmd_status:status"
 gptme-resume = "gptme.cli.cmd_resume:resume"
+gptme-mcp-server = "gptme.cli.cmd_mcp_serve:main"
 
 [tool.poetry]
 packages = [
@@ -52,7 +54,7 @@ python = "^3.10"
 click = "^8.4"
 click-default-group = "^1.2.4"
 python-dotenv = "^1.2.2"
-rich = "^13.5.2"
+rich = "^14.2"
 tabulate = "*"
 pick = {version = "^2.6.0", markers = "sys_platform != 'win32'"}
 tiktoken = ">=0.13.0"
@@ -62,14 +64,14 @@ platformdirs = "^4.10"
 lxml = "*"
 pypdf = ">=6.14.2"  # For PDF text extraction in browser tool (CVE fix: RAM exhaustion + infinite loop)
 requests = "^2.34"  # For HTTP requests in browser tool (PDF detection)
-json-repair = "^0.61.1"
+json-repair = "^0.61.4"
 mcp = "^1.28.1"
 questionary = "^2.1.1"
 python-dateutil = "^2.9.0.post0"
 pyyaml = "^6.0.3"
 
 # providers
-openai = "^2.44"
+openai = "^2.45"
 anthropic = "^0.116"
 
 # tools
@@ -117,7 +119,10 @@ sentence-transformers = {version = "^5.6.0", optional=true}
 pyinstaller = {version="^6.21", python=">=3.10,<3.15", optional=true}  # not yet compatible with Python 3.15+
 
 # acp (Agent Client Protocol)
-agent-client-protocol = {version = ">=0.10.1", optional=true, python=">=3.10,<3.15"}
+agent-client-protocol = {version = ">=0.11.0", optional=true, python=">=3.10,<3.15"}
+
+# tui
+textual = {version = ">=8,<9", optional=true}
 
 [tool.poetry.group.dev.dependencies]
 # lint
@@ -152,7 +157,7 @@ sphinx-autobuild = "^2024.10.3"
 sphinx-llms-txt = "^0.7.1"
 sphinxcontrib-programoutput = "*"
 sphinxcontrib-asciinema = "*"
-sphinxcontrib-mermaid = "^2.0.2"
+sphinxcontrib-mermaid = "^2.0.3"
 myst-parser = "*"
 
 # types
@@ -170,6 +175,7 @@ sounds = ["sounddevice", "scipy"]
 computer = []  # pillow (non-opt); AT-SPI2 accessibility needs system pkg: apt install python3-pyatspi
 pyinstaller = ["pyinstaller"]
 acp = ["agent-client-protocol"]
+tui = ["textual"]
 telemetry = [
     "opentelemetry-api", "opentelemetry-sdk",
     "opentelemetry-exporter-otlp", "opentelemetry-exporter-prometheus",
@@ -185,6 +191,8 @@ all = [
     "flask", "flask-cors", "flask-compress", "pydantic",
     # acp
     "agent-client-protocol",
+    # tui
+    "textual",
     # browser
     "playwright",
     # datascience
@@ -239,6 +247,7 @@ ignore = ["E402", "E501", "B905", "PERF203"]  # PERF203: try-except-in-loop ofte
 [tool.mypy]
 check_untyped_defs = true
 disable_error_code = "import-untyped"
+warn_unused_ignores = true
 
 [[tool.mypy.overrides]]
 module = "tomli_w"
@@ -302,11 +311,44 @@ module = "scipy.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = "gptme.llm.llm_anthropic"
+disable_error_code = ["unused-ignore"]
+
+[[tool.mypy.overrides]]
+module = "gptme.server.external_sessions"
+disable_error_code = ["unused-ignore"]
+
+[[tool.mypy.overrides]]
+module = "gptme.cli.cmd_computer"
+disable_error_code = ["unused-ignore"]
+
+[[tool.mypy.overrides]]
+module = [
+    "test_llm_anthropic",
+    "test_tools_browser_thread",
+    "test_browser_state",
+    "test_computer_transport",
+]
+disable_error_code = ["unused-ignore"]
+
+[[tool.mypy.overrides]]
 module = "sounddevice.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
 module = "cua_sandbox"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = ["AppKit", "Quartz", "Quartz.CoreGraphics"]
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "pyatspi"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
+module = "gptme_sessions.*"
 ignore_missing_imports = true
 
 [tool.pytest.ini_options]
@@ -317,6 +359,7 @@ markers = [
     "timeout: marks tests with timeout value in seconds",
     "requires_api: marks tests that require API access",
     "flaky: marks tests as flaky (retried automatically)",
+    "no_retry: marks tests that must not be retried (e.g. tmp_path teardown issues with pytest-retry)",
     "integration: marks tests as integration tests requiring external services",
     "x11: marks tests that require a real or headless X11 display (Xvfb, xdotool, scrot)",
     "xdist_group: marks tests that should run in the same xdist group",

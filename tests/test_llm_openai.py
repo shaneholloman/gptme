@@ -3,6 +3,8 @@ from types import SimpleNamespace
 from typing import Any, cast
 from unittest.mock import MagicMock, Mock, patch
 
+import openai  # warm import cache before per-test 10s timeout
+import openai._types  # noqa: F401  # warm openai._types (NOT_GIVEN) before per-test 10s timeout
 import pytest
 from pydantic import BaseModel
 
@@ -450,6 +452,9 @@ def test_timeout_default(monkeypatch):
         # Initialize OpenAI provider
         llm_openai.init("openai", config)
 
+        # Client construction is lazy; force materialization
+        _ = llm_openai.get_client("openai").base_url
+
         # Verify OpenAI was called with NOT_GIVEN (uses client default)
         mock_openai.assert_called_once()
         call_kwargs = mock_openai.call_args[1]
@@ -480,6 +485,9 @@ def test_timeout_custom(monkeypatch):
 
         # Initialize OpenAI provider
         llm_openai.init("openai", config)
+
+        # Client construction is lazy; force materialization
+        _ = llm_openai.get_client("openai").base_url
 
         # Verify OpenAI was called with custom timeout
         mock_openai.assert_called_once()
@@ -522,6 +530,9 @@ def test_timeout_all_providers(monkeypatch):
                 # Skip providers that require additional config
                 continue
 
+            # Client construction is lazy; force materialization
+            _ = llm_openai.get_client(provider).base_url
+
             # Verify timeout was passed
             if mock_openai.called:
                 call_kwargs = mock_openai.call_args[1]
@@ -563,9 +574,9 @@ def test_reinit_preserves_existing_base_url(monkeypatch):
     import gptme.llm.llm_openai as llm_openai
 
     llm_openai.clients.clear()
-    llm_openai.clients["openrouter"] = SimpleNamespace(
+    llm_openai.clients["openrouter"] = SimpleNamespace(  # type: ignore[assignment]
         base_url="https://openrouter.ai/api/v1"
-    )  # type: ignore[assignment]
+    )
 
     captured: dict[str, str | None] = {}
 
@@ -665,7 +676,7 @@ def test_chat_uses_responses_api_for_gpt5_by_default(monkeypatch):
         usage=ResponseUsage.model_validate(
             {
                 "input_tokens": 120,
-                "input_tokens_details": {"cached_tokens": 20},
+                "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 0},
                 "output_tokens": 30,
                 "output_tokens_details": {"reasoning_tokens": 10},
                 "total_tokens": 150,
@@ -1026,7 +1037,7 @@ def test_stream_responses_emits_function_calls_and_usage(monkeypatch):
     usage = ResponseUsage.model_validate(
         {
             "input_tokens": 120,
-            "input_tokens_details": {"cached_tokens": 20},
+            "input_tokens_details": {"cached_tokens": 20, "cache_write_tokens": 0},
             "output_tokens": 30,
             "output_tokens_details": {"reasoning_tokens": 10},
             "total_tokens": 150,
@@ -1429,34 +1440,40 @@ class TestOpenAIRetryLogic:
             "Error", response=mock_response, body={"error": "Overloaded"}
         )
 
-        # Test retry path: on attempt 0, should sleep and return (retry)
-        with patch("time.sleep") as mock_sleep:
+        # Test retry path: on attempt 0, should back off (wait) and return (retry)
+        with patch(
+            "gptme.llm.llm_openai.backoff_wait", return_value=False
+        ) as mock_wait:
             _handle_openai_transient_error(
                 error, attempt=0, max_retries=3, base_delay=0.1
             )
-            # Assert retry path was taken (sleep called = will retry)
-            mock_sleep.assert_called_once()
+            # Assert retry path was taken (backoff wait called = will retry)
+            mock_wait.assert_called_once()
 
         # Test with overload in string representation
         error_str = APIStatusError("Overloaded", response=mock_response, body=None)
 
-        with patch("time.sleep") as mock_sleep:
+        with patch(
+            "gptme.llm.llm_openai.backoff_wait", return_value=False
+        ) as mock_wait:
             _handle_openai_transient_error(
                 error_str, attempt=0, max_retries=3, base_delay=0.1
             )
             # Assert retry path was taken
-            mock_sleep.assert_called_once()
+            mock_wait.assert_called_once()
 
         # Test non-retry path: on last attempt, should raise the error
-        with patch("time.sleep") as mock_sleep:
+        with patch(
+            "gptme.llm.llm_openai.backoff_wait", return_value=False
+        ) as mock_wait:
             import pytest
 
             with pytest.raises(APIStatusError):
                 _handle_openai_transient_error(
                     error, attempt=2, max_retries=3, base_delay=0.1
                 )
-            # On last attempt, should not sleep (no retry)
-            mock_sleep.assert_not_called()
+            # On last attempt, should not back off (no retry)
+            mock_wait.assert_not_called()
 
     def test_handle_openai_transient_error_openrouter_402_diagnostic(self, caplog):
         """Test that OpenRouter 402 'insufficient credits' errors surface an
@@ -2139,7 +2156,7 @@ class TestExtraBody:
     """Tests for OpenRouter extra_body provider routing preferences."""
 
     @staticmethod
-    def _make_model(model: str, **kwargs):  # type: ignore[no-untyped-def]
+    def _make_model(model: str, **kwargs):
         from gptme.llm.models.types import ModelMeta
 
         return ModelMeta(
@@ -2398,7 +2415,10 @@ class TestRecordUsageCacheTokens:
             "total_tokens": input_tokens + output_tokens,
         }
         if cached_tokens is not None:
-            raw["input_tokens_details"] = {"cached_tokens": cached_tokens}
+            raw["input_tokens_details"] = {
+                "cached_tokens": cached_tokens,
+                "cache_write_tokens": 0,
+            }
         if reasoning_tokens is not None:
             raw["output_tokens_details"] = {"reasoning_tokens": reasoning_tokens}
         return ResponseUsage.model_validate(raw)

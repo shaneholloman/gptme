@@ -24,6 +24,7 @@ from gptme.tools.computer import (
     _dispatch_transport,
     _poll_for_change,
     act_and_observe,
+    fill_native,
     observe_desktop,
     observe_web,
 )
@@ -401,7 +402,14 @@ class TestActAndObserve:
                 return settled_msg
             return action_msg if action == "left_click" else None
 
-        with patch("gptme.tools.computer.computer", side_effect=mock_computer):
+        with (
+            patch("gptme.tools.computer.computer", side_effect=mock_computer),
+            patch("gptme.tools.computer.get_transport", return_value=None),
+            patch(
+                "gptme.tools.computer.screenshot",
+                side_effect=RuntimeError("no display"),
+            ),
+        ):
             msgs = act_and_observe("left_click", coordinate=(100, 200))
 
         assert len(call_args) == 2
@@ -418,7 +426,14 @@ class TestActAndObserve:
             call_args.append((action, text, coordinate))
             return settled_msg if action == "wait_for_change" else None
 
-        with patch("gptme.tools.computer.computer", side_effect=mock_computer):
+        with (
+            patch("gptme.tools.computer.computer", side_effect=mock_computer),
+            patch("gptme.tools.computer.get_transport", return_value=None),
+            patch(
+                "gptme.tools.computer.screenshot",
+                side_effect=RuntimeError("no display"),
+            ),
+        ):
             msgs = act_and_observe("type", text="hello")
 
         assert call_args[0][0] == "type"
@@ -469,6 +484,10 @@ class TestActAndObserve:
         with (
             patch("gptme.tools.computer.get_transport", return_value=None),
             patch("gptme.tools.computer.computer", side_effect=mock_computer),
+            patch(
+                "gptme.tools.computer.screenshot",
+                side_effect=RuntimeError("no display"),
+            ),
         ):
             act_and_observe("left_click", coordinate=(0, 0), timeout=7.5)
 
@@ -487,6 +506,10 @@ class TestActAndObserve:
         with (
             patch("gptme.tools.computer.get_transport", return_value=None),
             patch("gptme.tools.computer.computer", side_effect=mock_computer),
+            patch(
+                "gptme.tools.computer.screenshot",
+                side_effect=RuntimeError("no display"),
+            ),
         ):
             msgs = act_and_observe("scroll", coordinate=(0, 0), text="down")
 
@@ -502,6 +525,10 @@ class TestActAndObserve:
         with (
             patch("gptme.tools.computer.get_transport", return_value=None),
             patch("gptme.tools.computer.computer", side_effect=mock_computer),
+            patch(
+                "gptme.tools.computer.screenshot",
+                side_effect=RuntimeError("no display"),
+            ),
         ):
             msgs = act_and_observe("left_click", coordinate=(100, 100))
 
@@ -518,6 +545,10 @@ class TestActAndObserve:
         with (
             patch("gptme.tools.computer.get_transport", return_value=None),
             patch("gptme.tools.computer.computer", side_effect=mock_computer),
+            patch(
+                "gptme.tools.computer.screenshot",
+                side_effect=RuntimeError("no display"),
+            ),
         ):
             act_and_observe("key", text="Return")
 
@@ -592,10 +623,13 @@ class TestActAndObservePreBaseline:
             "act_and_observe should return a screenshot even for window_focus"
         )
 
-    def test_act_and_observe_falls_back_when_no_transport(self) -> None:
-        """When get_transport() returns None, fall back to computer('wait_for_change').
+    def test_act_and_observe_falls_back_when_no_transport_and_screenshot_fails(
+        self,
+    ) -> None:
+        """When get_transport()=None AND native screenshot() fails, fall back to computer('wait_for_change').
 
-        This is the path taken in environments without a display (CI, unit tests).
+        This is the path taken in environments without a display (CI, unit tests)
+        where screenshot() raises because DISPLAY is not set.
         """
         settled_msg = MagicMock()
         calls: list[str] = []
@@ -609,10 +643,194 @@ class TestActAndObservePreBaseline:
         with (
             patch("gptme.tools.computer.computer", side_effect=mock_computer),
             patch("gptme.tools.computer.get_transport", return_value=None),
+            patch(
+                "gptme.tools.computer.screenshot",
+                side_effect=RuntimeError("no display"),
+            ),
         ):
             msgs = act_and_observe("left_click", coordinate=(100, 100))
 
         assert "wait_for_change" in calls, (
-            "fallback path must call computer('wait_for_change') when no transport"
+            "fallback path must call computer('wait_for_change') when screenshot() fails"
         )
         assert settled_msg in msgs
+
+    def test_act_and_observe_native_baseline_uses_poll_for_change(
+        self, tmp_path: Path
+    ) -> None:
+        """When get_transport()=None but screenshot() succeeds, use _poll_for_change.
+
+        This is the native xdotool path (no GPTME_COMPUTER_TRANSPORT set) with a
+        working X11 display.  _poll_for_change should be used with the native
+        baseline so settle_time works and immediate changes (e.g. window_focus)
+        are detected.
+        """
+        # A pre-action baseline (white) and a post-action screenshot (black).
+        baseline_path = tmp_path / "baseline.png"
+        _write_png(baseline_path, (255, 255, 255))
+        post_action_path = tmp_path / "post.png"
+        _write_png(post_action_path, (0, 0, 0))
+
+        screenshot_calls: list[int] = [0]
+
+        def mock_screenshot() -> Path:
+            # First call = pre-action baseline (white); subsequent = changed (black)
+            screenshot_calls[0] += 1
+            if screenshot_calls[0] == 1:
+                return baseline_path
+            return post_action_path
+
+        with (
+            patch("gptme.tools.computer.computer", return_value=None),
+            patch("gptme.tools.computer.get_transport", return_value=None),
+            patch("gptme.tools.computer.screenshot", side_effect=mock_screenshot),
+            patch("gptme.tools.computer._resize_image"),  # no ImageMagick in CI
+            patch(
+                "gptme.tools.computer._get_api_resolution", return_value=(1024, 768)
+            ),  # no display in CI
+        ):
+            msgs = act_and_observe("left_click", coordinate=(100, 100), timeout=1.0)
+
+        # The poll must have fired: at least one screenshot after the action
+        assert screenshot_calls[0] >= 2, (
+            "native baseline path must poll for changes after the action"
+        )
+        # A settled screenshot should be returned
+        assert len(msgs) >= 1, (
+            "native baseline path must return at least one message (the settled screenshot)"
+        )
+
+    def test_act_and_observe_native_tolerates_resize_failure(
+        self, tmp_path: Path
+    ) -> None:
+        """A resize failure (e.g. missing ImageMagick) mid-poll must not abort
+        act_and_observe on the native path — it should return the unresized
+        screenshot instead, matching the old wait_for_change tolerance.
+        """
+        baseline_path = tmp_path / "baseline.png"
+        _write_png(baseline_path, (255, 255, 255))
+        post_action_path = tmp_path / "post.png"
+        _write_png(post_action_path, (0, 0, 0))
+
+        screenshot_calls: list[int] = [0]
+
+        def mock_screenshot() -> Path:
+            screenshot_calls[0] += 1
+            if screenshot_calls[0] == 1:
+                return baseline_path
+            return post_action_path
+
+        with (
+            patch("gptme.tools.computer.computer", return_value=None),
+            patch("gptme.tools.computer.get_transport", return_value=None),
+            patch("gptme.tools.computer.screenshot", side_effect=mock_screenshot),
+            patch(
+                "gptme.tools.computer._resize_image",
+                side_effect=RuntimeError("ImageMagick 'convert' not found."),
+            ),
+            patch("gptme.tools.computer._get_api_resolution", return_value=(1024, 768)),
+        ):
+            msgs = act_and_observe("left_click", coordinate=(100, 100), timeout=1.0)
+
+        assert screenshot_calls[0] >= 2, (
+            "polling must still proceed despite resize failures"
+        )
+        assert len(msgs) >= 1, (
+            "settled screenshot must still be returned when resize fails"
+        )
+
+
+# ---------------------------------------------------------------------------
+# TestTripleClick
+# ---------------------------------------------------------------------------
+
+
+class TestTripleClick:
+    """Tests for the triple_click action via the mock transport."""
+
+    def test_triple_click_dispatches_to_transport(self):
+        """triple_click must call transport.triple_click()."""
+        transport = MagicMock(spec=ComputerTransport)
+        _dispatch_transport(transport, "triple_click", None, None)
+        transport.triple_click.assert_called_once()
+
+    def test_triple_click_with_coordinate_moves_then_clicks(self):
+        """triple_click with coordinate must move mouse first, then triple_click."""
+        transport = MagicMock(spec=ComputerTransport)
+        _dispatch_transport(transport, "triple_click", None, (100, 200))
+        transport.mouse_move.assert_called_once_with(100, 200)
+        transport.triple_click.assert_called_once()
+
+    def test_triple_click_no_coordinate_skips_mouse_move(self):
+        """triple_click without coordinate must NOT move the mouse first."""
+        transport = MagicMock(spec=ComputerTransport)
+        _dispatch_transport(transport, "triple_click", None, None)
+        transport.mouse_move.assert_not_called()
+        transport.triple_click.assert_called_once()
+
+
+# ---------------------------------------------------------------------------
+# TestFillNative
+# ---------------------------------------------------------------------------
+
+
+class TestFillNative:
+    """Tests for fill_native() — click, select-all, type sequence."""
+
+    def test_fill_native_calls_triple_click_then_type(self):
+        """fill_native must call triple_click then type in sequence."""
+        calls: list[tuple] = []
+
+        def mock_computer(action, text=None, coordinate=None):
+            calls.append((action, coordinate, text))
+            return
+
+        with patch("gptme.tools.computer.computer", side_effect=mock_computer):
+            fill_native((300, 200), "new text")
+
+        assert len(calls) == 3, f"Expected 3 calls, got {len(calls)}: {calls}"
+        assert calls[0] == ("triple_click", (300, 200), None), (
+            f"First call should be triple_click with coordinate, got {calls[0]}"
+        )
+        assert calls[1][0] == "type", f"Second call should be type, got {calls[1][0]}"
+        assert calls[1][2] == "new text", (
+            f"type call should carry the replacement text, got {calls[1][2]}"
+        )
+        assert calls[2][0] == "screenshot", (
+            f"Third call should be screenshot for post-fill observation, got {calls[2][0]}"
+        )
+
+    def test_fill_native_returns_list(self):
+        """fill_native always returns a list (empty when computer returns None)."""
+        with patch("gptme.tools.computer.computer", return_value=None):
+            result = fill_native((100, 100), "hello")
+        assert isinstance(result, list)
+
+    def test_fill_native_includes_messages_from_computer(self):
+        """fill_native collects non-None messages returned by computer()."""
+        msg = MagicMock()
+
+        def mock_computer(action, text=None, coordinate=None):
+            if action == "type":
+                return msg
+            return None
+
+        with patch("gptme.tools.computer.computer", side_effect=mock_computer):
+            result = fill_native((100, 100), "hello")
+
+        assert msg in result, "type result message must be in fill_native return value"
+
+    def test_fill_native_coordinate_is_passed_to_triple_click(self):
+        """The coordinate argument must be forwarded to triple_click unchanged."""
+        seen: list[tuple] = []
+
+        def mock_computer(action, text=None, coordinate=None):
+            seen.append((action, coordinate))
+            return
+
+        with patch("gptme.tools.computer.computer", side_effect=mock_computer):
+            fill_native((760, 45), "https://example.com")
+
+        assert seen[0] == ("triple_click", (760, 45)), (
+            f"triple_click must receive the exact coordinate, got {seen[0]}"
+        )

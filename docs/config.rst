@@ -83,6 +83,24 @@ The ``prompt`` section contains options included in both interactive and non-int
 
 The ``env`` section contains environment variables that gptme will fall back to if they are not set in the shell environment. This is useful for setting the default model and API keys for :doc:`providers`. It can also be used to set default tool configuration options, see :doc:`custom_tool` for more information.
 
+.. note::
+
+   API keys and other secrets belong in :ref:`config.local.toml <global-config-local>`, not in
+   ``config.toml``. That lets you keep ``config.toml`` in dotfiles or version control without
+   exposing your keys. The webui setup wizard already writes keys to ``config.local.toml``.
+
+The ``settings`` section contains user-level CLI defaults. Currently supported:
+
+- ``gear``: Default autonomy preset for new conversations. Gear ``0`` is read-only
+  observe mode, gear ``1`` is the interactive default, gear ``2`` allows file edits
+  while excluding shell/network tools by default, gear ``3`` is fully autonomous,
+  and gear ``4`` adds subagent orchestration.
+
+.. code-block:: toml
+
+    [settings]
+    gear = 2
+
 .. _how-model-selection-works:
 
 How model selection works
@@ -224,7 +242,8 @@ This file currently supports a few options:
 - ``files``, a list of paths that gptme will always include in the context. If no ``gptme.toml`` is present or if the ``files`` option is unset, gptme will automatically look for common project files, such as: ``README.md``, ``pyproject.toml``, ``package.json``, ``Cargo.toml``, ``Makefile``, ``.cursor/rules/**.mdc``, ``CLAUDE.md``, ``GEMINI.md``.
 - ``prompt``, a string that will be included in the system prompt with a ``# Current Project`` header.
 - ``base_prompt``, a string that will be used as the base prompt for the project. This will override the global base prompt ("You are gptme v{__version__}, a general-purpose AI assistant powered by LLMs. [...]"). It can be useful to change the identity of the assistant and override some default behaviors.
-- ``context_cmd``, a command used to generate context to include when constructing the system prompt. The command will be run in the workspace root and should output a string that will be included in the system prompt. Examples can be ``git status -v`` or ``scripts/context.sh``.
+- ``context_cmd``, a command used to generate context to include when constructing the system prompt. The command will be run in the workspace root and should output a string that will be included in the system prompt. Examples can be ``git status -v`` or ``scripts/context.sh``. For new conversations where the first user message is known at context-construction time, it is available in the ``GPTME_PROMPT_INITIAL`` environment variable, enabling query-dependent retrieval without interpolating untrusted prompt text into the shell command. The variable is unset when no initial prompt exists or when it exceeds the safe process-environment size. For example, ``context_cmd = 'my-retriever --query-env GPTME_PROMPT_INITIAL'`` lets a retriever read the query directly from its process environment.
+- ``settings``, a dictionary of project-local CLI defaults. ``settings.gear`` accepts the same 0-4 autonomy presets as ``gptme --gear`` and overrides the global ``[settings].gear`` default for conversations started in this workspace.
 
   .. warning::
 

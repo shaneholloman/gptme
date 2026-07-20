@@ -1,6 +1,7 @@
 import type { ReactNode } from 'react';
 import {
   Cpu,
+  GitBranch,
   Globe,
   FolderOpen,
   LayoutDashboard,
@@ -11,13 +12,13 @@ import {
 import type { LucideIcon } from 'lucide-react';
 import type { RightSidebarPanelId } from '@/types/sidebar';
 import { ArtifactsPanel } from './ArtifactsPanel';
+import { BranchMapPanel } from './BranchMapPanel';
 import { BrowserPreview } from './BrowserPreview';
+import { ComputerPreview } from './ComputerPreview';
 import { ConversationSettings } from './ConversationSettings';
 import { FunctionBrowserPanel } from './FunctionBrowserPanel';
 import { PanelsPanel } from './PanelsPanel';
 import { WorkspaceExplorer } from './workspace/WorkspaceExplorer';
-
-const VNC_URL = 'http://localhost:6080/vnc.html';
 
 interface RightSidebarPanelRenderProps {
   conversationId: string;
@@ -50,6 +51,12 @@ export const rightSidebarPanels: RightSidebarPanelDefinition[] = [
     render: ({ conversationId }) => <ArtifactsPanel conversationId={conversationId} />,
   },
   {
+    id: 'branches',
+    label: 'Branches',
+    icon: GitBranch,
+    render: ({ conversationId }) => <BranchMapPanel conversationId={conversationId} />,
+  },
+  {
     id: 'panels',
     label: 'Panels',
     icon: LayoutDashboard,
@@ -71,14 +78,7 @@ export const rightSidebarPanels: RightSidebarPanelDefinition[] = [
     id: 'computer',
     label: 'Computer',
     icon: Monitor,
-    render: () => (
-      <iframe
-        src={VNC_URL}
-        className="h-full w-full rounded-md border-0"
-        allow="clipboard-read; clipboard-write"
-        title="VNC Viewer"
-      />
-    ),
+    render: () => <ComputerPreview />,
   },
 ];
 

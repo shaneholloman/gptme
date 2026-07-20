@@ -1,3 +1,4 @@
+import importlib
 import os
 import random
 import signal
@@ -81,8 +82,11 @@ def _write_conversation(
 def test_help(runner: CliRunner):
     result = runner.invoke(cli.main, ["--help"])
     assert result.exit_code == 0
-    assert "gptme-util skills list" in result.output
-    assert "gptme-util skills show NAME" in result.output
+    assert "gptme skills list" in result.output
+    assert "gptme skills show NAME" in result.output
+    assert "Available tools:" in result.output
+    # plugin loading during help rendering should not leak status lines
+    assert "Using plugins" not in result.output
 
 
 def test_discover_gptme_plugins_finds_external_binaries(
@@ -171,16 +175,16 @@ def test_show_prompt_stats_exits_before_chat(monkeypatch, tmp_path: Path, runner
             workspace=tmp_path,
             stream=False,
             agent=None,
+            gear=None,
         ),
         project=None,
     )
     seen: dict[str, Any] = {}
 
-    monkeypatch.setattr(cli, "setup_config_from_cli", lambda **_: fake_config)
-    monkeypatch.setattr(cli, "init_tools", lambda _: [])
+    monkeypatch.setattr("gptme.config.setup_config_from_cli", lambda **_: fake_config)
+    monkeypatch.setattr("gptme.tools.init_tools", lambda _: [])
     monkeypatch.setattr(
-        cli,
-        "get_prompt_stats",
+        "gptme.prompts.get_prompt_stats",
         lambda **kwargs: (
             seen.update(kwargs=kwargs)
             or SimpleNamespace(
@@ -194,23 +198,28 @@ def test_show_prompt_stats_exits_before_chat(monkeypatch, tmp_path: Path, runner
         ),
     )
     monkeypatch.setattr(
-        cli,
-        "format_prompt_stats",
+        "gptme.prompts.format_prompt_stats",
         lambda stats, header=None, extra_sections=None: "prompt-stats-output",
     )
-    monkeypatch.setattr(cli, "chat", lambda *args, **kwargs: pytest.fail("chat ran"))
     monkeypatch.setattr(
-        cli,
-        "init_telemetry",
+        importlib.import_module("gptme.chat"),
+        "chat",
+        lambda *args, **kwargs: pytest.fail("chat ran"),
+    )
+    monkeypatch.setattr(
+        "gptme.telemetry.init_telemetry",
         lambda **kwargs: pytest.fail("telemetry should not start for prompt stats"),
     )
 
-    result = runner.invoke(cli.main, ["--show-prompt-stats"], input="")
+    result = runner.invoke(
+        cli.main, ["--show-prompt-stats", "query-dependent stats"], input=""
+    )
 
     assert result.exit_code == 0
     assert "prompt-stats-output" in result.output
     assert seen["kwargs"]["workspace"] is not None
     assert seen["kwargs"]["model"] == "local/test"
+    assert seen["kwargs"]["initial_prompt"] == "query-dependent stats"
 
 
 def test_no_workspace_flag_wires_correctly(monkeypatch, tmp_path: Path, runner):
@@ -229,16 +238,16 @@ def test_no_workspace_flag_wires_correctly(monkeypatch, tmp_path: Path, runner):
             workspace=tmp_path,
             stream=False,
             agent=None,
+            gear=None,
         ),
         project=None,
     )
     seen: dict[str, Any] = {}
 
-    monkeypatch.setattr(cli, "setup_config_from_cli", lambda **_: fake_config)
-    monkeypatch.setattr(cli, "init_tools", lambda _: [])
+    monkeypatch.setattr("gptme.config.setup_config_from_cli", lambda **_: fake_config)
+    monkeypatch.setattr("gptme.tools.init_tools", lambda _: [])
     monkeypatch.setattr(
-        cli,
-        "get_prompt_stats",
+        "gptme.prompts.get_prompt_stats",
         lambda **kwargs: (
             seen.update(kwargs=kwargs)
             or SimpleNamespace(
@@ -252,12 +261,15 @@ def test_no_workspace_flag_wires_correctly(monkeypatch, tmp_path: Path, runner):
         ),
     )
     monkeypatch.setattr(
-        cli,
-        "format_prompt_stats",
+        "gptme.prompts.format_prompt_stats",
         lambda stats, header=None, extra_sections=None: "prompt-stats-output",
     )
-    monkeypatch.setattr(cli, "chat", lambda *args, **kwargs: pytest.fail("chat ran"))
-    monkeypatch.setattr(cli, "init_telemetry", lambda **kwargs: None)
+    monkeypatch.setattr(
+        importlib.import_module("gptme.chat"),
+        "chat",
+        lambda *args, **kwargs: pytest.fail("chat ran"),
+    )
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
 
     result = runner.invoke(
         cli.main, ["--no-workspace", "--show-prompt-stats"], input=""
@@ -392,7 +404,7 @@ def test_name_defaults_to_random_for_empty_or_whitespace(
         selected_logdirs.append(chat_logdir)
 
     monkeypatch.setattr(cli, "get_logdir", fake_get_logdir)
-    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(importlib.import_module("gptme.chat"), "chat", fake_chat)
 
     result = runner.invoke(
         cli.main,
@@ -429,7 +441,7 @@ def test_name_empty_before_output_format(
         selected_logdirs.append(chat_logdir)
 
     monkeypatch.setattr(cli, "get_logdir", fake_get_logdir)
-    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(importlib.import_module("gptme.chat"), "chat", fake_chat)
 
     result = runner.invoke(
         cli.main,
@@ -481,9 +493,11 @@ def test_model_allows_nested_path_through_validation_block(
         called["get_prompt"] = True
         return []
 
-    monkeypatch.setattr(cli, "get_prompt", _fake_get_prompt)
-    monkeypatch.setattr(cli, "chat", lambda *args, **kwargs: None)
-    monkeypatch.setattr(cli, "init_telemetry", lambda **kwargs: None)
+    monkeypatch.setattr("gptme.prompts.get_prompt", _fake_get_prompt)
+    monkeypatch.setattr(
+        importlib.import_module("gptme.chat"), "chat", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
 
     result = runner.invoke(
         cli.main,
@@ -506,12 +520,15 @@ def test_model_rejects_unknown_provider_before_context_cmd(
     monkeypatch.setenv("HOME", str(tmp_path))
     monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
     monkeypatch.setattr(
-        cli,
-        "get_prompt",
+        "gptme.prompts.get_prompt",
         lambda **kwargs: pytest.fail("get_prompt was called before model validation"),
     )
-    monkeypatch.setattr(cli, "chat", lambda *args, **kwargs: pytest.fail("chat ran"))
-    monkeypatch.setattr(cli, "init_telemetry", lambda **kwargs: None)
+    monkeypatch.setattr(
+        importlib.import_module("gptme.chat"),
+        "chat",
+        lambda *args, **kwargs: pytest.fail("chat ran"),
+    )
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
 
     result = runner.invoke(
         cli.main,
@@ -591,7 +608,9 @@ def test_get_logdir_resume_named_conversation_skips_conversation_scan(
     def fail_get_user_conversations(*args, **kwargs):
         raise AssertionError("named resume should not scan conversation metadata")
 
-    monkeypatch.setattr(cli, "get_user_conversations", fail_get_user_conversations)
+    monkeypatch.setattr(
+        "gptme.logmanager.get_user_conversations", fail_get_user_conversations
+    )
 
     assert cli.get_logdir_resume(conv_id) == conv_dir
 
@@ -654,7 +673,7 @@ def test_resume_with_workspace_uses_matching_conversation(
     def fake_chat(prompt_msgs, initial_msgs, logdir, *args, **kwargs):
         selected_logdirs.append(logdir)
 
-    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(importlib.import_module("gptme.chat"), "chat", fake_chat)
 
     result = runner.invoke(
         cli.main,
@@ -686,7 +705,7 @@ def test_resume_without_explicit_workspace_uses_cwd(
     def fake_chat(prompt_msgs, initial_msgs, logdir, *args, **kwargs):
         selected_logdirs.append(logdir)
 
-    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(importlib.import_module("gptme.chat"), "chat", fake_chat)
     monkeypatch.setattr(cli.Path, "cwd", classmethod(lambda cls: workspace_a))
 
     result = runner.invoke(
@@ -720,7 +739,7 @@ def test_resume_with_log_workspace_uses_global_latest(
     def fake_chat(prompt_msgs, initial_msgs, logdir, *args, **kwargs):
         selected_logdirs.append(logdir)
 
-    monkeypatch.setattr(cli, "chat", fake_chat)
+    monkeypatch.setattr(importlib.import_module("gptme.chat"), "chat", fake_chat)
     monkeypatch.setattr(cli.Path, "cwd", classmethod(lambda cls: workspace_a))
 
     result = runner.invoke(
@@ -1195,6 +1214,7 @@ def test_fileblock(args: list[str], runner: CliRunner):
     assert content == 'print("hello world")\n'
 
 
+@pytest.mark.timeout(30)
 def test_shell(args: list[str], runner: CliRunner):
     args.append("/shell echo 'yes'")
     result = runner.invoke(cli.main, args)
@@ -1610,12 +1630,14 @@ def test_click_exception_inside_chat_exits_2(
     (logdir / "conversation.jsonl").write_text('{"role":"user","content":"hello"}\n')
 
     monkeypatch.setattr(cli, "get_logdir", lambda name: logdir)
-    monkeypatch.setattr(cli, "init_telemetry", lambda **kwargs: None)
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
 
     def _raise_usage_error(*args, **kwargs):
         raise click.UsageError("simulated usage error from inside chat")
 
-    monkeypatch.setattr(cli, "chat", _raise_usage_error)
+    monkeypatch.setattr(
+        importlib.import_module("gptme.chat"), "chat", _raise_usage_error
+    )
 
     result = runner.invoke(
         cli.main, ["--name", "test-conv-exit2", "--non-interactive", "hello"]
@@ -1663,7 +1685,7 @@ class TestPluginDiscovery:
         def _early_exit(*args, **kwargs):
             raise SystemExit(1)
 
-        monkeypatch.setattr("gptme.cli.main.setup_config_from_cli", _early_exit)
+        monkeypatch.setattr("gptme.config.setup_config_from_cli", _early_exit)
 
         runner.invoke(cli.main, ["sessions"])
 

@@ -119,7 +119,7 @@ templates_path = ["_templates"]
 exclude_patterns = ["_build", "Thumbs.db", ".DS_Store", "lessons/**"]
 
 extlinks = {
-    "issue": ("https://github.com/gptme/gptme/issues/%s", "issue #"),
+    "issue": ("https://github.com/gptme/gptme/issues/%s", "issue #%s"),
 }
 
 # Prefix each section label with the name of the document it is in, followed by a colon.
@@ -156,7 +156,9 @@ nitpick_ignore = [
     # Phase 1 async subagent types
     ("py:class", "gptme.tools.subagent.ReturnType"),
     ("py:class", "gptme.tools.subagent.BatchJob"),
+    ("py:class", "gptme.tools.subagent.SubagentBudget"),
     ("py:class", "gptme.tools.subagent.types.SubtaskDef"),
+    ("py:class", "gptme.tools.subagent.types.SubagentBudget"),
     ("py:class", "gptme.tools.subagent.batch.BatchJob"),
     # Hook confirmation system types
     ("py:class", "gptme.hooks.confirm.ToolConfirmHook"),

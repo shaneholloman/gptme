@@ -8,16 +8,19 @@ subagent() function in api.py.
 """
 
 import logging
+import os
 import random
 import string
 import subprocess
 import sys
 import tempfile
 import threading
+import time
 import uuid
 from pathlib import Path
 from typing import TYPE_CHECKING, Literal
 
+from ...llm.retry_abort import bind_thread_generation, release_thread
 from ...message import Message
 from .. import clear_tools, get_tools, load_tool, set_tools
 from .._allowlist import (
@@ -26,9 +29,17 @@ from .._allowlist import (
     tool_matches_allowlist,
 )
 from .concurrency import get_slot_sem
+from .hooks import notify_completion, notify_progress
+from .types import (
+    ReturnType,
+    set_subagent_result_if_absent,
+    update_subagent_result_with_branch,
+)
 
 if TYPE_CHECKING:
-    from .types import ReturnType, Status, Subagent, SubtaskDef
+    from collections.abc import Callable
+
+    from .types import Status, Subagent, SubtaskDef
 
 logger = logging.getLogger(__name__)
 
@@ -40,13 +51,14 @@ _thread_local = threading.local()
 
 
 def get_current_agent_id() -> str | None:
-    """Return the agent_id of the currently running subagent thread, or None.
+    """Return the agent_id of the currently running subagent, or None.
 
-    Set by _create_subagent_thread before calling chat(). Used by the progress
-    tool to identify which subagent is sending a progress update.
-    Only populated in thread-mode subagents.
+    Thread-mode subagents: set via _create_subagent_thread (thread-local).
+    Subprocess-mode subagents: set via GPTME_SUBAGENT_AGENT_ID env var.
     """
-    return getattr(_thread_local, "agent_id", None)
+    return getattr(_thread_local, "agent_id", None) or os.environ.get(
+        "GPTME_SUBAGENT_AGENT_ID"
+    )
 
 
 def _ensure_subagent_signal_tools_loaded() -> None:
@@ -147,7 +159,7 @@ def _create_subagent_thread(
     context_include: list[str] | None,
     workspace: Path,
     target: str = "parent",
-    output_schema: type | None = None,
+    output_schema: "type | dict | None" = None,
     profile_name: str | None = None,
     agent_id: str | None = None,
     redact_secrets: bool = True,
@@ -213,7 +225,10 @@ def _create_subagent_thread(
 
     from ...profiles import get_profile  # fmt: skip
     from ...prompts import get_prompt  # fmt: skip
-    from .hooks import _get_complete_instruction  # fmt: skip
+    from .hooks import (
+        _get_complete_instruction,  # fmt: skip
+        _subagent_control_hook,  # fmt: skip
+    )
 
     # Resolve profile if specified
     profile = get_profile(profile_name) if profile_name else None
@@ -231,6 +246,14 @@ def _create_subagent_thread(
 
     prepare_execution_environment(workspace=workspace, tools=None)
     _ensure_subagent_signal_tools_loaded()
+
+    # Register the control hook in this child thread's ContextVar context.
+    # Hook registrations use a ContextVar — child threads start with an empty
+    # registry and do not inherit the parent's registrations, so registering
+    # at module level is not sufficient: the child never sees those hooks.
+    from ...hooks import HookType, register_hook  # fmt: skip
+
+    register_hook("subagent-control", HookType.STEP_PRE, _subagent_control_hook, 0)
 
     # Get tools, filtered by profile if applicable
     if tool_allowlist is not None:
@@ -412,6 +435,7 @@ def _run_subagent_subprocess(
     context_mode: Literal["full", "selective"] | None = None,
     context_include: list[str] | None = None,
     output_schema: str | None = None,
+    output_schema_dict: dict | None = None,
     profile: str | None = None,
 ) -> subprocess.Popen:
     """Run a subagent in a subprocess for output isolation.
@@ -430,7 +454,11 @@ def _run_subagent_subprocess(
             "files", "cmd", and "all" are still accepted in subprocess mode.
             "agent" and "tools" are ignored here because the CLI already
             includes them.
-        output_schema: JSON schema for structured output
+        output_schema: ``module:ClassName`` reference for structured output (Pydantic models).
+            Passed directly to the CLI's ``--output-schema`` flag.
+        output_schema_dict: Pre-parsed JSON Schema dict (from plain-dict callers).
+            Injected into the prompt via ``_get_complete_instruction`` rather than
+            the CLI flag, because the CLI only accepts ``module:ClassName`` format.
         profile: Agent profile name to apply via --agent-profile flag
 
     Returns:
@@ -457,14 +485,14 @@ def _run_subagent_subprocess(
         profile_obj = get_profile(profile)
         if profile_obj and profile_obj.tools is not None:
             tool_allowlist = list(profile_obj.tools)
-            for tool_name in ("complete", "clarify"):
+            for tool_name in ("complete", "clarify", "progress"):
                 if tool_name not in tool_allowlist:
                     tool_allowlist.append(tool_name)
             cmd.extend(["--tools", ",".join(tool_allowlist)])
         else:
-            cmd.extend(["--tools", "+complete,+clarify"])
+            cmd.extend(["--tools", "+complete,+clarify,+progress"])
     else:
-        cmd.extend(["--tools", "+complete,+clarify"])
+        cmd.extend(["--tools", "+complete,+clarify,+progress"])
 
     # Map context_mode/context_include to the --context CLI flag
     if context_mode == "selective" and context_include:
@@ -504,11 +532,19 @@ def _run_subagent_subprocess(
         )
         prompt = prompt + memory_section
 
-    # Add completion instruction to the prompt for subprocess mode
-    # (In thread mode, this is added as a system message)
+    # Progress file for subprocess-mode progress delivery.
+    # The subprocess writes JSON lines here; _monitor_subprocess polls and
+    # delivers them to the parent via notify_progress().
+    progress_file = logdir / "progress.jsonl"
+
+    # Add completion instruction to the prompt for subprocess mode.
+    # (In thread mode, this is added as a system message.)
+    # Subprocess mode supports progress via the file channel, so enable it.
+    # Pass output_schema_dict (plain-dict callers) so the schema hint is
+    # injected here — the CLI --output-schema flag only accepts module:ClassName.
     complete_section = (
         "\n\n[Completion Instructions]\n"
-        f"{_get_complete_instruction('orchestrator', supports_progress=False)}\n"
+        f"{_get_complete_instruction('orchestrator', supports_progress=True, output_schema=output_schema_dict)}\n"
     )
     prompt = prompt + complete_section
 
@@ -521,6 +557,11 @@ def _run_subagent_subprocess(
         tmpf.write(prompt)
         tmpfile_path = Path(tmpf.name)
 
+    # Environment for the subprocess: convey agent identity and progress channel.
+    env = os.environ.copy()
+    env["GPTME_SUBAGENT_AGENT_ID"] = logdir.name.removeprefix("subagent-")
+    env["GPTME_PROGRESS_FILE"] = str(progress_file)
+
     try:
         with open(tmpfile_path) as stdin_file:
             process = subprocess.Popen(
@@ -529,6 +570,7 @@ def _run_subagent_subprocess(
                 stdout=subprocess.DEVNULL,
                 stderr=subprocess.DEVNULL,
                 cwd=workspace,
+                env=env,
                 text=True,
             )
     finally:
@@ -560,17 +602,134 @@ def _summarize_result(result: "ReturnType", max_chars: int = 200) -> str:
     return text[: max_chars - 3] + "..."
 
 
-def _cleanup_isolation(subagent: "Subagent") -> None:
-    """Clean up worktree or temp directory after subagent completes."""
+def _cleanup_isolation(subagent: "Subagent") -> str | None:
+    """Clean up worktree or temp directory after subagent completes.
+
+    For ``isolation_mode="worktree"`` subagents, uses smart cleanup:
+    - No local changes → remove directory AND branch (full cleanup).
+    - Local changes → preserve branch, remove directory only.
+
+    Returns:
+        The preserved branch name when changes exist and smart cleanup is
+        active; ``None`` otherwise.
+    """
     if not subagent.isolated or not subagent.worktree_path:
-        return
+        return None
 
     from ...util.git_worktree import cleanup_worktree
 
     try:
-        cleanup_worktree(subagent.worktree_path, subagent.repo_path)
+        # Smart cleanup: preserve branch when isolation="worktree" was used
+        # and the worktree has local changes so the orchestrator can merge them.
+        keep_if_changed = subagent.isolation_mode == "worktree"
+        preserved_branch = cleanup_worktree(
+            subagent.worktree_path,
+            subagent.repo_path,
+            keep_branch_if_changed=keep_if_changed,
+        )
+        if preserved_branch:
+            logger.info(
+                f"Subagent {subagent.agent_id!r}: changes preserved on branch "
+                f"{preserved_branch!r} — merge with: git merge {preserved_branch}"
+            )
+        return preserved_branch
     except Exception as e:
         logger.warning(f"Failed to cleanup isolation for {subagent.agent_id}: {e}")
+        return None
+
+
+def _drain_progress_file(
+    progress_file: "Path",
+    file_pos: int,
+    default_agent_id: str,
+    notify_fn: "Callable[[str, str], None]",
+) -> int:
+    """Read new progress entries from progress_file and deliver them via notify_fn.
+
+    Reads from ``file_pos`` forward, advancing only past complete
+    newline-terminated lines. Stops (without advancing) on any incomplete line
+    at EOF so the partial write can be retried on the next poll.
+
+    Args:
+        progress_file: Path to the ``progress.jsonl`` file written by the child.
+        file_pos: Byte offset to start reading from.
+        default_agent_id: Used when an entry omits ``agent_id``.
+        notify_fn: Callable with signature ``(agent_id: str, message: str)``.
+
+    Returns:
+        Updated file_pos (advanced past every complete line that was processed).
+    """
+    import json
+
+    if not progress_file.exists():
+        return file_pos
+    try:
+        with open(progress_file) as f:
+            f.seek(file_pos)
+            while True:
+                raw_line = f.readline()
+                if not raw_line:
+                    break  # EOF — no new content
+                if not raw_line.endswith("\n"):
+                    # Incomplete line at EOF: partial write in progress.
+                    # Don't advance file_pos; retry next poll when the write completes.
+                    break
+                stripped = raw_line.strip()
+                if not stripped:
+                    file_pos = f.tell()
+                    continue
+                try:
+                    entry = json.loads(stripped)
+                    agent_id = entry.get("agent_id", default_agent_id)
+                    message = entry.get("message", "")
+                    if message:
+                        notify_fn(agent_id, message)
+                        logger.debug(
+                            f"Delivered subprocess progress for '{agent_id}': {message[:80]}"
+                        )
+                except json.JSONDecodeError:
+                    logger.debug(
+                        f"Skipping unparseable progress line: {stripped[:80]!r}"
+                    )
+                # Advance past this complete line (parsed or corrupt) so
+                # we don't re-process it on the next poll.
+                file_pos = f.tell()
+    except OSError:
+        pass  # file not yet created or already removed
+    return file_pos
+
+
+def _poll_subprocess_progress(
+    subagent: "Subagent", stop_event: threading.Event
+) -> None:
+    """Poll the progress file for a subprocess-mode subagent and deliver updates.
+
+    Runs in a background thread alongside _monitor_subprocess. Reads JSON lines
+    from ``logdir/progress.jsonl`` (written by the subprocess via the progress
+    tool's file channel) and calls ``notify_progress`` so the parent receives
+    ⏳ system messages via the LOOP_CONTINUE hook.
+
+    Args:
+        subagent: The subagent being monitored.
+        stop_event: Set by _monitor_subprocess after the process exits. The poll
+            loop runs one final drain pass after the event is set to catch any
+            progress updates written in the last moments before exit.
+    """
+    progress_file = subagent.logdir / "progress.jsonl"
+    file_pos = 0
+    POLL_INTERVAL = 0.5
+
+    def _drain() -> None:
+        nonlocal file_pos
+        file_pos = _drain_progress_file(
+            progress_file, file_pos, subagent.agent_id, notify_progress
+        )
+
+    while not stop_event.is_set():
+        _drain()
+        time.sleep(POLL_INTERVAL)
+    # Final drain after the process exits to catch last-moment writes.
+    _drain()
 
 
 def _monitor_subprocess(
@@ -581,15 +740,24 @@ def _monitor_subprocess(
     Runs in a background thread to enable non-blocking operation.
     Subprocess stdout/stderr are sent to DEVNULL since results are read
     from the conversation log, not the process pipes.
-    """
-    from .hooks import notify_completion
-    from .types import (
-        ReturnType,
-        set_subagent_result_if_absent,
-    )
 
+    Also starts a progress-polling thread that reads ``logdir/progress.jsonl``
+    written by the subprocess-mode ``progress`` tool and delivers intermediate
+    updates to the parent via ``notify_progress``.
+    """
     if not subagent.process:
         return
+
+    # Start progress polling in a background thread so the parent receives
+    # ⏳ updates while the subprocess is still running.
+    progress_stop = threading.Event()
+    progress_thread = threading.Thread(
+        target=_poll_subprocess_progress,
+        args=(subagent, progress_stop),
+        daemon=True,
+        name=f"progress-poll-{subagent.agent_id}",
+    )
+    progress_thread.start()
 
     # Track whether the process was killed due to our timeout (vs external SIGKILL)
     _timed_out = False
@@ -604,6 +772,10 @@ def _monitor_subprocess(
         _timed_out = True
         subagent.process.kill()
         subagent.process.wait()  # reap the killed process
+
+    # Stop the progress-poll thread and let it do a final drain.
+    progress_stop.set()
+    progress_thread.join(timeout=2.0)
 
     input_tokens: int | None = None
     output_tokens: int | None = None
@@ -629,6 +801,18 @@ def _monitor_subprocess(
         status = "failure"
         result = f"Process exited with code {subagent.process.returncode}"
 
+    # Clean up worktree isolation; capture preserved branch so it can be
+    # included in the result that callers receive via subagent_wait() / subagent_parallel().
+    preserved_branch = _cleanup_isolation(subagent)
+    # Skip appending human-readable branch text when output_schema is set —
+    # the result string is JSON that callers parse, and appending text after
+    # it would break that parse.
+    if preserved_branch and isinstance(result, str) and not subagent.output_schema:
+        result = (
+            f"{result}\n\nChanges preserved on branch {preserved_branch!r}"
+            f" — merge with: git merge {preserved_branch}"
+        )
+
     # Cache the result in module-level dict (Subagent is frozen)
     final_result = ReturnType(
         status,
@@ -637,7 +821,15 @@ def _monitor_subprocess(
         output_tokens=output_tokens,
     )
     if not set_subagent_result_if_absent(subagent.agent_id, final_result):
-        _cleanup_isolation(subagent)
+        # Timeout/cancel won the cache race. Patch the stored result with
+        # branch info (mirrors the thread-mode fallback in api.py) so
+        # callers can still find preserved work.
+        if preserved_branch:
+            update_subagent_result_with_branch(
+                subagent.agent_id,
+                preserved_branch,
+                has_output_schema=bool(subagent.output_schema),
+            )
         return
 
     # Notify via hook system (fire-and-forget-then-get-alerted pattern)
@@ -646,9 +838,6 @@ def _monitor_subprocess(
         notify_completion(subagent.agent_id, status, summary)
     except Exception as e:
         logger.warning(f"Failed to notify subagent completion: {e}")
-
-    # Clean up worktree isolation
-    _cleanup_isolation(subagent)
 
 
 def _run_planner(
@@ -663,6 +852,7 @@ def _run_planner(
     redact_secrets: bool = True,
     context_window: int | None = None,
     workdir: Path | None = None,
+    parent_logdir: Path | None = None,
 ) -> None:
     """Run a planner that delegates work to multiple executor subagents.
 
@@ -798,6 +988,7 @@ def _run_planner(
                 worktree_path=worktree_path,
                 repo_path=repo_path,
                 role=subtask_role,
+                parent_logdir=parent_logdir,
             )
 
             # Subprocess mode: a combined thread acquires the concurrency slot before
@@ -808,6 +999,9 @@ def _run_planner(
                 _workspace=workspace,
                 _profile=resolved_profile,
             ):
+                # Bind retry generation at thread birth so test-teardown
+                # interrupts abort backoffs even post-teardown (see retry_abort).
+                bind_thread_generation()
                 _sem = get_slot_sem()
                 _sem.acquire()
                 try:
@@ -850,6 +1044,7 @@ def _run_planner(
                     object.__setattr__(_sa, "process", process)
                     _monitor_subprocess(_sa)
                 finally:
+                    release_thread()
                     _sem.release()
 
             monitor_t = threading.Thread(target=_run_executor_subprocess, daemon=True)
@@ -877,6 +1072,7 @@ def _run_planner(
                 worktree_path=worktree_path,
                 repo_path=repo_path,
                 role=subtask_role,
+                parent_logdir=parent_logdir,
             )
 
             def run_executor(
@@ -887,6 +1083,9 @@ def _run_planner(
                 subtask_profile=resolved_profile,
                 cleanup_subagent=cleanup_sa,
             ):
+                # Bind retry generation at thread birth so test-teardown
+                # interrupts abort backoffs even post-teardown (see retry_abort).
+                bind_thread_generation()
                 _sem = get_slot_sem()
                 _sem.acquire()
                 try:
@@ -911,6 +1110,7 @@ def _run_planner(
                         context_window=context_window,
                     )
                 finally:
+                    release_thread()
                     try:
                         _cleanup_isolation(cleanup_subagent)
                     except Exception:
@@ -935,6 +1135,7 @@ def _run_planner(
                 worktree_path=worktree_path,
                 repo_path=repo_path,
                 role=subtask_role,
+                parent_logdir=parent_logdir,
             )
             # Register subagent BEFORE starting thread to avoid race condition
             # (matches pattern in api.py — thread closure may look up _subagents)

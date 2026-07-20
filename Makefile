@@ -72,6 +72,10 @@ eval: ## Run evaluation suite
 typecheck: ## Run mypy type checking
 	poetry run mypy ${SRCDIRS} $(if $(EXCLUDES),$(foreach EXCLUDE,$(EXCLUDES),--exclude $(EXCLUDE)))
 
+typecheck-coverage: ## Run mypy type checking with Cobertura XML coverage report
+	mkdir -p .mypy_coverage_report
+	poetry run mypy ${SRCDIRS} $(if $(EXCLUDES),$(foreach EXCLUDE,$(EXCLUDES),--exclude $(EXCLUDE))) --cobertura-xml-report .mypy_coverage_report
+
 RUFF_ARGS=${SRCDIRS} $(foreach EXCLUDE,$(EXCLUDES),--exclude $(EXCLUDE))
 
 pre-commit:  ## Run pre-commit hooks
@@ -185,7 +189,7 @@ dist/CHANGELOG.md: ./scripts/build_changelog.py
 		VERSION=$$GIT_VERSION; \
 	fi && \
 	make docs/releases/$${VERSION}.md && \
-	cp docs/releases/$${VERSION}.md $@
+	tail -n +3 docs/releases/$${VERSION}.md > $@  # strip "# vX.Y.Z" page title — the GH release title already shows the version
 
 docs/releases/%.md: ./scripts/build_changelog.py
 	@mkdir -p docs/changelog
@@ -325,9 +329,17 @@ bench-import:  ## Benchmark import time
 	@#time poetry run python -X importtime -m gptme --model openrouter --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n
 	@#time poetry run python -X importtime -m gptme --model anthropic --non-interactive 2>&1 | grep "import time" | cut -d'|' -f 2- | sort -n
 
-bench-startup:  ## Benchmark startup time
+bench-startup:  ## Benchmark startup time (import + full start/exit cycle)
+	@# Invoke the venv binaries directly: `poetry run` adds 1-3s of wrapper
+	@# overhead per invocation, which would drown out what we're measuring.
+	@# `< /dev/null` closes stdin so the piped-stdin grace period isn't hit.
 	@echo "Benchmarking startup time for gptme"
-	hyperfine "poetry run gptme '/exit'" -M 5 || poetry run gptme '/exit' || exit 1
+	@VENV=$$(poetry env info --path) && \
+	hyperfine --warmup 2 -M 10 \
+		-n "import gptme.cli.main" "$$VENV/bin/python -c 'from gptme.cli.main import main'" \
+		-n "gptme --help" "$$VENV/bin/gptme --help" \
+		-n "full start/exit cycle" "$$VENV/bin/gptme '/exit' < /dev/null" \
+	|| "$$VENV/bin/gptme" '/exit' < /dev/null || exit 1
 
 help:  ## Show this help message
 	@echo $(MAKEFILE_LIST)
@@ -346,7 +358,7 @@ tauri-build: ## Build the gptme-tauri desktop app
 	cd webui && npm install && npm run build
 	cd tauri && npm install && \
 	if [ "$$(uname)" = "Linux" ]; then \
-		NO_STRIP=true npm run tauri build; \
+		./scripts/build-appimage.sh; \
 	else \
 		npm run tauri build; \
 	fi

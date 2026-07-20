@@ -406,7 +406,7 @@ def test_subagent_execution_mode_field():
 @patch("gptme.tools.subagent.execution._create_subagent_thread")
 def test_subagent_status_returns_dict(mock_create_thread: MagicMock):
     """Test that subagent_status returns a dictionary."""
-    from gptme.tools.subagent import subagent, subagent_status
+    from gptme.tools.subagent import _subagents_lock, subagent, subagent_status
 
     # First create a subagent (thread mocked to avoid real API calls in no-extras CI)
     subagent(agent_id="test-status-agent", prompt="Simple test")
@@ -415,6 +415,16 @@ def test_subagent_status_returns_dict(mock_create_thread: MagicMock):
     status = subagent_status("test-status-agent")
     assert isinstance(status, dict)
     assert "status" in status
+
+    # Join the spawned thread while the patch is still active, so the mock (not
+    # the real _create_subagent_thread) is what the thread's call-time lookup
+    # resolves to — otherwise the patch reverting before the thread reaches
+    # that lookup lets the real function run and leak past teardown.
+    with _subagents_lock:
+        sa = next(s for s in _subagents if s.agent_id == "test-status-agent")
+    assert sa.thread is not None
+    sa.thread.join(timeout=5.0)
+    assert not sa.thread.is_alive()
 
 
 def test_subagent_status_unknown_agent():
@@ -569,16 +579,43 @@ def test_subagent_wait_basic():
 @pytest.mark.eval
 def test_subagent_read_log_returns_string():
     """Test that subagent_read_log returns a string with log content."""
-    from gptme.tools.subagent import subagent, subagent_read_log
+    from gptme.logmanager import Log
+    from gptme.message import Message
+    from gptme.tools.subagent import _subagents_lock, subagent, subagent_read_log
 
-    # Create a subagent first
-    subagent(agent_id="test-log-agent", prompt="Log test task")
+    def _write_fake_log(*, logdir, prompt, **_kwargs):
+        """Stand-in for _create_subagent_thread: write a minimal real
+        conversation log to logdir instead of making a real (keyless) LLM
+        call, so subagent_read_log() still has content to read back."""
+        Log(
+            [
+                Message("system", "Test system prompt"),
+                Message("user", prompt),
+                Message("assistant", "Fake subagent response for read-log test"),
+            ]
+        ).write_jsonl(logdir / "conversation.jsonl")
+
+    with patch(
+        "gptme.tools.subagent.execution._create_subagent_thread",
+        side_effect=_write_fake_log,
+    ):
+        # Create a subagent first
+        subagent(agent_id="test-log-agent", prompt="Log test task")
+
+        # Join the thread while the patch is still active — otherwise the
+        # patch can revert before the background thread's call-time lookup
+        # of _create_subagent_thread, letting the real function run instead.
+        with _subagents_lock:
+            sa = next(s for s in _subagents if s.agent_id == "test-log-agent")
+        assert sa.thread is not None
+        sa.thread.join(timeout=5.0)
+        assert not sa.thread.is_alive()
 
     # Read the log
     result = subagent_read_log("test-log-agent")
     assert isinstance(result, str)
-    # The result should contain some log content
-    assert len(result) > 0
+    # The result should contain the content we wrote, not just any text
+    assert "Fake subagent response for read-log test" in result
 
 
 # Subprocess mode execution tests (per Erik's review comment)
@@ -597,9 +634,18 @@ def test_subprocess_mode_creates_process():
     mock_process = MagicMock()
     mock_process.poll.return_value = None  # Process still running
 
-    with patch(
-        "gptme.tools.subagent.execution._run_subagent_subprocess",
-        return_value=mock_process,
+    # Also mock _monitor_subprocess: it spawns a daemon progress-polling thread
+    # that does lazy imports (sys.modules mutation) and can race with
+    # patch.__exit__ iterating sys.modules under xdist, causing
+    # RuntimeError: dictionary changed size during iteration.
+    # sa.process is assigned before _monitor_subprocess is called, so
+    # mocking it out does not affect what this test actually verifies.
+    with (
+        patch(
+            "gptme.tools.subagent.execution._run_subagent_subprocess",
+            return_value=mock_process,
+        ),
+        patch("gptme.tools.subagent.execution._monitor_subprocess"),
     ):
         subagent(
             agent_id="test-subprocess",
@@ -635,9 +681,17 @@ def test_subprocess_mode_command_construction():
 
     _subagents.clear()
 
-    with patch(
-        "gptme.tools.subagent.execution._run_subagent_subprocess",
-        return_value=MagicMock(),
+    with (
+        patch(
+            "gptme.tools.subagent.execution._run_subagent_subprocess",
+            return_value=MagicMock(),
+        ),
+        # _monitor_subprocess spawns a progress-polling thread that sleeps 0.5s
+        # per iteration; without this mock the launcher thread can outlive the
+        # 1.0s join timeout in _wait_for_new_subagent_threads, causing a
+        # flaky is_alive() assertion.  This test only verifies command
+        # construction / execution_mode, not monitoring behaviour.
+        patch("gptme.tools.subagent.execution._monitor_subprocess"),
     ):
         subagent(
             agent_id="test-cmd",
@@ -779,7 +833,7 @@ def test_subprocess_command_includes_required_flags():
     assert "--model" in cmd
     assert "test-model" in cmd
     assert "--tools" in cmd
-    assert cmd[cmd.index("--tools") + 1] == "+complete,+clarify"
+    assert cmd[cmd.index("--tools") + 1] == "+complete,+clarify,+progress"
     assert "Test task" not in cmd  # Prompt passed via stdin, not argv
 
 
@@ -817,7 +871,7 @@ def test_subprocess_profile_preserves_profile_tools_and_adds_clarify():
     assert captured_cmd[captured_cmd.index("--agent-profile") + 1] == "explorer"
     assert "--tools" in captured_cmd
     assert captured_cmd[captured_cmd.index("--tools") + 1] == (
-        "read,chats,complete,clarify"
+        "read,chats,complete,clarify,progress"
     )
 
 
@@ -852,11 +906,14 @@ def test_subprocess_no_profile_includes_complete_and_clarify():
             )
 
     assert "--tools" in captured_cmd
-    assert captured_cmd[captured_cmd.index("--tools") + 1] == "+complete,+clarify"
+    assert (
+        captured_cmd[captured_cmd.index("--tools") + 1]
+        == "+complete,+clarify,+progress"
+    )
 
 
 def test_subprocess_profile_without_toollist_includes_complete_and_clarify():
-    """Profile with no tools list must fall back to +complete,+clarify."""
+    """Profile with no tools list must fall back to +complete,+clarify,+progress."""
     import tempfile
     from pathlib import Path
 
@@ -896,7 +953,176 @@ def test_subprocess_profile_without_toollist_includes_complete_and_clarify():
             )
 
     assert "--tools" in captured_cmd
-    assert captured_cmd[captured_cmd.index("--tools") + 1] == "+complete,+clarify"
+    assert (
+        captured_cmd[captured_cmd.index("--tools") + 1]
+        == "+complete,+clarify,+progress"
+    )
+
+
+def test_subprocess_sets_progress_env_vars():
+    """Subprocess must receive GPTME_SUBAGENT_AGENT_ID and GPTME_PROGRESS_FILE env vars."""
+    import tempfile
+    from pathlib import Path
+
+    from gptme.tools.subagent.execution import _run_subagent_subprocess
+
+    captured_env: dict[str, str] = {}
+
+    def fake_popen(cmd, **kwargs):
+        captured_env.update(kwargs.get("env") or {})
+        mock = MagicMock()
+        mock.poll.return_value = None
+        mock.args = cmd
+        return mock
+
+    with tempfile.TemporaryDirectory() as tmpdir:
+        logdir = Path(tmpdir) / "subagent-test-agent"
+        logdir.mkdir()
+
+        with patch("gptme.tools.subagent.execution.subprocess.Popen", fake_popen):
+            _run_subagent_subprocess(
+                prompt="Test progress env",
+                logdir=logdir,
+                model=None,
+                workspace=Path(tmpdir),
+            )
+
+    assert "GPTME_SUBAGENT_AGENT_ID" in captured_env
+    assert captured_env["GPTME_SUBAGENT_AGENT_ID"] == "test-agent"
+    assert "GPTME_PROGRESS_FILE" in captured_env
+    assert captured_env["GPTME_PROGRESS_FILE"].endswith("progress.jsonl")
+
+
+def test_progress_tool_file_delivery(tmp_path):
+    """progress tool writes to file channel when running in subprocess env."""
+    import json
+    import os
+    from unittest.mock import patch
+
+    from gptme.tools.progress import execute_progress
+
+    progress_file = tmp_path / "progress.jsonl"
+    env = {
+        "GPTME_SUBAGENT_AGENT_ID": "sub-1",
+        "GPTME_PROGRESS_FILE": str(progress_file),
+    }
+
+    # Patch at the source so execute_progress's local import resolves to None
+    with (
+        patch.dict(os.environ, env, clear=False),
+        patch("gptme.tools.subagent.execution.get_current_agent_id", return_value=None),
+    ):
+        messages = list(execute_progress("Phase 1 done, starting phase 2", None, None))
+
+    assert len(messages) == 1
+    assert (
+        "parent" in messages[0].content.lower()
+        or "file channel" in messages[0].content.lower()
+    )
+    assert progress_file.exists()
+    lines = [
+        json.loads(line) for line in progress_file.read_text().strip().splitlines()
+    ]
+    assert len(lines) == 1
+    assert lines[0]["agent_id"] == "sub-1"
+    assert "Phase 1 done" in lines[0]["message"]
+
+
+def test_progress_tool_no_env_gives_graceful_message():
+    """progress tool gives clear message when not in a managed subagent context."""
+    import os
+    from unittest.mock import patch
+
+    from gptme.tools.progress import execute_progress
+
+    clean_env = {
+        k: v
+        for k, v in os.environ.items()
+        if k not in ("GPTME_SUBAGENT_AGENT_ID", "GPTME_PROGRESS_FILE")
+    }
+
+    with (
+        patch.dict(os.environ, clean_env, clear=True),
+        patch("gptme.tools.subagent.execution.get_current_agent_id", return_value=None),
+    ):
+        messages = list(execute_progress("some progress", None, None))
+
+    assert len(messages) == 1
+    assert "not" in messages[0].content.lower()
+
+
+def test_poll_subprocess_progress_delivers_via_notify(tmp_path):
+    """_poll_subprocess_progress reads progress.jsonl and calls notify_progress."""
+    import json
+    import threading
+    from unittest.mock import MagicMock, patch
+
+    from gptme.tools.subagent.execution import _poll_subprocess_progress
+
+    progress_file = tmp_path / "progress.jsonl"
+    delivered: list[tuple[str, str]] = []
+
+    def fake_notify(agent_id, message):
+        delivered.append((agent_id, message))
+
+    # Write a progress entry to the file before polling starts
+    entry = json.dumps({"agent_id": "poll-agent", "message": "Step 1 done"})
+    progress_file.write_text(entry + "\n")
+
+    stop_event = threading.Event()
+
+    # Create a minimal fake subagent object with the fields _poll_subprocess_progress needs
+    mock_sa = MagicMock()
+    mock_sa.agent_id = "poll-agent"
+    mock_sa.logdir = tmp_path
+
+    with patch("gptme.tools.subagent.execution.notify_progress", fake_notify):
+        # Set stop immediately so the loop exits after the final drain
+        stop_event.set()
+        _poll_subprocess_progress(mock_sa, stop_event)
+
+    assert len(delivered) >= 1
+    assert delivered[0] == ("poll-agent", "Step 1 done")
+
+
+def test_drain_progress_file_partial_write_retry(tmp_path):
+    """_drain_progress_file retries partial (no-newline) lines on the next call.
+
+    Regression test: the old code advanced file_pos unconditionally after the
+    loop, silently skipping any line that raised JSONDecodeError — including
+    partial writes that would have been complete on the next poll.
+    """
+    import json
+
+    from gptme.tools.subagent.execution import _drain_progress_file
+
+    progress_file = tmp_path / "progress.jsonl"
+    delivered: list[tuple[str, str]] = []
+
+    def fake_notify(agent_id: str, message: str) -> None:
+        delivered.append((agent_id, message))
+
+    complete = json.dumps({"agent_id": "a", "message": "done"})
+    partial = '{"agent_id": "a", "message": "in-flight'  # missing closing } and \n
+
+    # First poll: one complete line + one partial (no trailing newline)
+    progress_file.write_text(complete + "\n" + partial)
+    pos = _drain_progress_file(progress_file, 0, "a", fake_notify)
+
+    assert len(delivered) == 1, "only the complete line should be delivered"
+    assert delivered[0] == ("a", "done")
+
+    # file_pos must be just after the complete line, not at EOF
+    assert pos == len(complete) + 1, "file_pos should not advance past the partial line"
+
+    # Second poll: the write completes (partial line now has its closing bytes + \n)
+    full_second = json.dumps({"agent_id": "a", "message": "in-flight-complete"})
+    # Overwrite the file with both lines fully written
+    progress_file.write_text(complete + "\n" + full_second + "\n")
+    pos = _drain_progress_file(progress_file, pos, "a", fake_notify)
+
+    assert len(delivered) == 2, "second poll should pick up the now-complete line"
+    assert delivered[1] == ("a", "in-flight-complete")
 
 
 @pytest.mark.slow
@@ -1070,7 +1296,7 @@ def test_subprocess_monitor_timeout():
         timeout=2,  # 2 second timeout for test
     )
 
-    with patch("gptme.tools.subagent.hooks.notify_completion"):
+    with patch("gptme.tools.subagent.execution.notify_completion"):
         _monitor_subprocess(sa)
 
     # Verify: process was killed
@@ -1099,14 +1325,18 @@ def test_subprocess_timeout_passed_to_subagent():
     _subagents.clear()
 
     # Mock the subprocess so we don't start a real gptme process.
-    # _monitor_subprocess calls process.wait() which would block for `timeout`
-    # seconds on a real process, causing the test to time out in teardown.
+    # Also mock _monitor_subprocess: it spawns a progress-polling thread that
+    # sleeps 0.5s per iteration and can outlive the 1.0s join timeout in
+    # _wait_for_new_subagent_threads on a loaded CI runner.
     mock_process = MagicMock()
     mock_process.returncode = 0
 
-    with patch(
-        "gptme.tools.subagent.execution._run_subagent_subprocess",
-        return_value=mock_process,
+    with (
+        patch(
+            "gptme.tools.subagent.execution._run_subagent_subprocess",
+            return_value=mock_process,
+        ),
+        patch("gptme.tools.subagent.execution._monitor_subprocess"),
     ):
         subagent(
             agent_id="timeout-param-test",
@@ -1575,10 +1805,13 @@ def test_subprocess_mode_with_profile():
 
     _subagents.clear()
 
-    with patch(
-        "gptme.tools.subagent.execution._run_subagent_subprocess",
-        return_value=MagicMock(),
-    ) as mock_run:
+    with (
+        patch(
+            "gptme.tools.subagent.execution._run_subagent_subprocess",
+            return_value=MagicMock(),
+        ) as mock_run,
+        patch("gptme.tools.subagent.execution._monitor_subprocess"),
+    ):
         subagent(
             agent_id="test-subprocess-profile",
             prompt="Explore task",
@@ -1674,6 +1907,8 @@ def test_create_subagent_thread_profile_glob_filters_tools(tmp_path):
         ToolSpec(name="complete", desc=""),
         ToolSpec(name="clarify", desc=""),
     ]
+
+    import gptme.chat  # noqa: F401 — must import before patch.object on sys.modules["gptme.chat"]
 
     mock_prompt = MagicMock(return_value=[])
     mock_chat = MagicMock()
@@ -1960,7 +2195,7 @@ def test_cancelled_queued_acp_does_not_launch_after_slot_frees():
         assert cleanup_calls == ["test-acp-cancelled"]
 
     with _subagent_results_lock:
-        assert _subagent_results["test-acp-cancelled"].status == "failure"
+        assert _subagent_results["test-acp-cancelled"].status == "cancelled"
         assert (
             _subagent_results["test-acp-cancelled"].result
             == "Cancelled by orchestrator"
@@ -3347,3 +3582,451 @@ def test_batch_job_wait_any_already_done():
     assert first_id == "x"
     assert result["status"] == "success"
     assert result["result"] == "cached result"
+
+
+# ── output_schema dict support ─────────────────────────────────────────────────
+
+
+def test_dict_to_jsonschema_plain_type_mapping():
+    """_dict_to_jsonschema converts {field: type} to a JSON Schema object."""
+    from gptme.tools.subagent.hooks import _dict_to_jsonschema
+
+    schema = _dict_to_jsonschema({"score": int, "summary": str, "ratio": float})
+    assert schema["type"] == "object"
+    assert schema["properties"]["score"] == {"type": "integer"}
+    assert schema["properties"]["summary"] == {"type": "string"}
+    assert schema["properties"]["ratio"] == {"type": "number"}
+    assert set(schema["required"]) == {"score", "summary", "ratio"}
+
+
+def test_dict_to_jsonschema_passthrough_for_raw_schema():
+    """_dict_to_jsonschema leaves an existing JSON Schema dict unchanged."""
+    from gptme.tools.subagent.hooks import _dict_to_jsonschema
+
+    raw = {"type": "object", "properties": {"x": {"type": "integer"}}}
+    assert _dict_to_jsonschema(raw) is raw
+
+
+def test_get_complete_instruction_dict_schema_hint():
+    """When output_schema is a plain dict, the instruction contains the field names."""
+    from gptme.tools.subagent.hooks import _get_complete_instruction
+
+    instruction = _get_complete_instruction(
+        output_schema={"score": int, "summary": str}
+    )
+    assert '"score"' in instruction
+    assert '"summary"' in instruction
+    assert '"integer"' in instruction
+    assert '"string"' in instruction
+    # Should NOT fall back to the generic/uninformative hint
+    assert '{"type": "object"}' not in instruction
+
+
+def test_get_complete_instruction_no_schema_unchanged():
+    """Without output_schema the instruction uses the default 'Your complete answer here.'."""
+    from gptme.tools.subagent.hooks import _get_complete_instruction
+
+    instruction = _get_complete_instruction()
+    assert "Your complete answer here." in instruction
+    assert "JSON" not in instruction
+
+
+def test_output_schema_dict_stored_on_subagent():
+    """subagent() accepts a plain-dict output_schema and stores it on the Subagent object."""
+    from unittest.mock import patch
+
+    initial_count = len(_subagents)
+    with patch("gptme.tools.subagent.execution._create_subagent_thread") as mock_thread:
+        mock_thread.return_value = MagicMock()
+        subagent(
+            agent_id="schema-test",
+            prompt="Return JSON",
+            output_schema={"score": int, "label": str},
+        )
+
+        new_agents = _subagents[initial_count:]
+        assert new_agents, "Subagent should have been registered"
+        sa = next(a for a in new_agents if a.agent_id == "schema-test")
+        assert sa.output_schema == {"score": int, "label": str}
+
+        # Join the thread while the patch is still active: the background
+        # thread looks up _create_subagent_thread by attribute at call time,
+        # so joining outside the `with` block risks the patch reverting
+        # first and the real (network-calling) function running instead.
+        assert sa.thread is not None
+        sa.thread.join(timeout=5.0)
+        assert not sa.thread.is_alive()
+
+
+def test_dict_to_jsonschema_passthrough_ref_schema():
+    """_dict_to_jsonschema passes through $ref and oneOf JSON Schema dicts unchanged."""
+    from gptme.tools.subagent.hooks import _dict_to_jsonschema
+
+    ref_schema = {"$ref": "#/$defs/Foo"}
+    assert _dict_to_jsonschema(ref_schema) is ref_schema
+
+    one_of_schema = {"oneOf": [{"type": "string"}, {"type": "null"}]}
+    assert _dict_to_jsonschema(one_of_schema) is one_of_schema
+
+    any_of_schema = {"anyOf": [{"type": "integer"}, {"type": "string"}]}
+    assert _dict_to_jsonschema(any_of_schema) is any_of_schema
+
+
+def test_dict_to_jsonschema_passthrough_extended_keywords():
+    """_dict_to_jsonschema passes through dicts with const, patternProperties, etc."""
+    from gptme.tools.subagent.hooks import _dict_to_jsonschema
+
+    # const — literal value constraint
+    const_schema = {"const": "approved"}
+    assert _dict_to_jsonschema(const_schema) is const_schema
+
+    # patternProperties — regex-keyed property schema
+    pattern_schema = {"patternProperties": {"^S_": {"type": "string"}}}
+    assert _dict_to_jsonschema(pattern_schema) is pattern_schema
+
+    # dependentRequired — conditional required fields
+    dep_schema = {"dependentRequired": {"credit_card": ["billing_address"]}}
+    assert _dict_to_jsonschema(dep_schema) is dep_schema
+
+    # then/else — if/then/else conditional
+    if_then_schema = {"if": {"properties": {"foo": {}}}, "then": {"required": ["bar"]}}
+    assert _dict_to_jsonschema(if_then_schema) is if_then_schema
+
+
+def test_dict_to_jsonschema_passthrough_non_keyword_json_schemas():
+    """_dict_to_jsonschema passes through valid JSON Schemas that don't use the old keyword set.
+
+    Greptile P1 finding: schemas using keywords like `items`, `minimum`, `format`,
+    `required`, or `additionalProperties` were not in the previous keyword guard and
+    would be incorrectly converted as if they were {field: python_type} maps.
+    """
+    from gptme.tools.subagent.hooks import _dict_to_jsonschema
+
+    # array schema — uses `items`, not in the old keyword set
+    array_schema = {"items": {"type": "string"}}
+    assert _dict_to_jsonschema(array_schema) is array_schema
+
+    # numeric constraint — `minimum` value is an int but NOT a Python type object
+    num_schema = {"minimum": 0, "maximum": 100}
+    assert _dict_to_jsonschema(num_schema) is num_schema
+
+    # format constraint
+    format_schema = {"format": "email"}
+    assert _dict_to_jsonschema(format_schema) is format_schema
+
+    # required-only constraint (no properties/type)
+    req_schema = {"required": ["name", "age"]}
+    assert _dict_to_jsonschema(req_schema) is req_schema
+
+    # additionalProperties constraint
+    addl_schema = {"additionalProperties": False}
+    assert _dict_to_jsonschema(addl_schema) is addl_schema
+
+    # string constraint — pattern
+    str_schema = {"minLength": 1, "maxLength": 100}
+    assert _dict_to_jsonschema(str_schema) is str_schema
+
+
+def test_subprocess_output_schema_dict_via_prompt():
+    """subprocess mode routes a plain-dict schema via output_schema_dict (not the CLI flag).
+
+    The CLI --output-schema flag only accepts 'module:ClassName' format, so plain-dict
+    schemas must be injected via the prompt instruction, not as a CLI arg.
+    """
+    from unittest.mock import MagicMock, patch
+
+    captured: list[dict] = []
+
+    def fake_run_subprocess(**kwargs):
+        captured.append(
+            {
+                "output_schema": kwargs.get("output_schema"),
+                "output_schema_dict": kwargs.get("output_schema_dict"),
+            }
+        )
+        return MagicMock()
+
+    initial_count = len(_subagents)
+    with (
+        patch(
+            "gptme.tools.subagent.execution._run_subagent_subprocess",
+            side_effect=fake_run_subprocess,
+        ),
+        patch("gptme.tools.subagent.execution._monitor_subprocess"),
+    ):
+        subagent(
+            agent_id="subprocess-schema-test",
+            prompt="Return JSON",
+            output_schema={"score": int, "summary": str},
+            use_subprocess=True,
+        )
+        _wait_for_new_subagent_threads(initial_count)
+
+    assert captured, "subprocess launcher should have called _run_subagent_subprocess"
+    call = captured[0]
+    # Plain dict schemas must NOT be passed via the CLI --output-schema flag
+    # (that flag only accepts module:ClassName; passing JSON crashes the subprocess)
+    assert call["output_schema"] is None, (
+        "output_schema (CLI flag) must be None for plain-dict schemas"
+    )
+    # The parsed schema dict should be routed via output_schema_dict for prompt injection
+    schema_dict = call["output_schema_dict"]
+    assert schema_dict is not None, "output_schema_dict must not be None"
+    assert schema_dict["type"] == "object"
+    assert schema_dict["properties"]["score"] == {"type": "integer"}
+    assert schema_dict["properties"]["summary"] == {"type": "string"}
+
+
+def test_subprocess_pydantic_schema_via_prompt():
+    """subprocess mode routes a Pydantic model schema via output_schema_dict (not the CLI flag).
+
+    The CLI --output-schema flag only accepts 'module:ClassName' format and tries to
+    import it. Passing a JSON schema string there crashes the child process. Pydantic
+    schemas must be injected via the prompt instruction, same as plain-dict schemas.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from pydantic import BaseModel
+
+    class MyResult(BaseModel):
+        score: int
+        summary: str
+
+    captured: list[dict] = []
+
+    def fake_run_subprocess(**kwargs):
+        captured.append(
+            {
+                "output_schema": kwargs.get("output_schema"),
+                "output_schema_dict": kwargs.get("output_schema_dict"),
+            }
+        )
+        return MagicMock()
+
+    initial_count = len(_subagents)
+    with (
+        patch(
+            "gptme.tools.subagent.execution._run_subagent_subprocess",
+            side_effect=fake_run_subprocess,
+        ),
+        patch("gptme.tools.subagent.execution._monitor_subprocess"),
+    ):
+        subagent(
+            agent_id="subprocess-pydantic-schema-test",
+            prompt="Return JSON",
+            output_schema=MyResult,
+            use_subprocess=True,
+        )
+        _wait_for_new_subagent_threads(initial_count)
+
+    assert captured, "subprocess launcher should have called _run_subagent_subprocess"
+    call = captured[0]
+    # Pydantic schemas must NOT be passed via the CLI --output-schema flag
+    # (that flag only accepts module:ClassName; passing JSON crashes the subprocess)
+    assert call["output_schema"] is None, (
+        "output_schema (CLI flag) must be None for Pydantic model schemas"
+    )
+    # The Pydantic JSON Schema should be routed via output_schema_dict for prompt injection
+    schema_dict = call["output_schema_dict"]
+    assert schema_dict is not None, "output_schema_dict must not be None"
+    assert schema_dict["type"] == "object"
+    assert "score" in schema_dict.get("properties", {})
+    assert "summary" in schema_dict.get("properties", {})
+
+
+def test_session_end_teardown_cancels_running_subagents():
+    """SESSION_END hook cancels orphaned subagents but skips finished ones."""
+    from unittest.mock import MagicMock, patch
+
+    from gptme.tools.subagent.hooks import _session_end_subagent_cleanup
+    from gptme.tools.subagent.types import (
+        ReturnType,
+        Subagent,
+        _subagent_results,
+        _subagent_results_lock,
+        _subagents,
+        _subagents_lock,
+    )
+
+    init_count = len(_subagents)
+    with _subagent_results_lock:
+        _subagent_results.clear()
+
+    # Track cancel calls
+    cancelled: list[str] = []
+
+    def tracking_cancel(aid: str) -> str:
+        cancelled.append(aid)
+        return f"cancelled {aid}"
+
+    session_logdir = Path.cwd() / "test-session-a"
+    other_logdir = Path.cwd() / "test-session-b"
+
+    manager_mock = MagicMock()
+    manager_mock.logdir = session_logdir
+
+    # --- Running subagent owned by this session (no cached result, thread alive) ---
+    running_mock = MagicMock()
+    running_mock.is_alive.return_value = True
+
+    with _subagents_lock:
+        _subagents.append(
+            Subagent(
+                agent_id="test-running",
+                prompt="test",
+                thread=running_mock,
+                logdir=session_logdir,
+                model="fake",
+                parent_logdir=session_logdir,
+            )
+        )
+
+    # --- Terminated subagent (has cached result, thread still alive) ---
+    done_mock = MagicMock()
+    done_mock.is_alive.return_value = True
+
+    with _subagents_lock:
+        _subagents.append(
+            Subagent(
+                agent_id="test-done",
+                prompt="test",
+                thread=done_mock,
+                logdir=session_logdir,
+                model="fake",
+                parent_logdir=session_logdir,
+            )
+        )
+    with _subagent_results_lock:
+        _subagent_results["test-done"] = ReturnType("success", "already done")
+
+    # --- Dead subagent (thread dead, no cached result) ---
+    dead_mock = MagicMock()
+    dead_mock.is_alive.return_value = False
+
+    with _subagents_lock:
+        _subagents.append(
+            Subagent(
+                agent_id="test-dead",
+                prompt="test",
+                thread=dead_mock,
+                logdir=session_logdir,
+                model="fake",
+                parent_logdir=session_logdir,
+            )
+        )
+
+    # --- Running subagent owned by a DIFFERENT session (must NOT be cancelled) ---
+    other_session_mock = MagicMock()
+    other_session_mock.is_alive.return_value = True
+
+    with _subagents_lock:
+        _subagents.append(
+            Subagent(
+                agent_id="test-other-session",
+                prompt="test",
+                thread=other_session_mock,
+                logdir=other_logdir,
+                model="fake",
+                parent_logdir=other_logdir,
+            )
+        )
+
+    with patch("gptme.tools.subagent.api.subagent_cancel", side_effect=tracking_cancel):
+        list(_session_end_subagent_cleanup(manager_mock))
+
+    # Verify: only the running subagent with no terminal result was cancelled
+    assert "test-running" in cancelled, (
+        "running subagent with no result should be cancelled"
+    )
+    assert "test-done" not in cancelled, (
+        "subagent with cached result should NOT be cancelled"
+    )
+    assert "test-dead" not in cancelled, "not-running subagent should NOT be cancelled"
+    assert "test-other-session" not in cancelled, (
+        "subagent from a different session must NOT be cancelled"
+    )
+
+    # Cleanup
+    with _subagents_lock:
+        _subagents[:] = _subagents[:init_count]
+    with _subagent_results_lock:
+        _subagent_results.clear()
+
+
+def test_session_end_teardown_cancels_planner_executors():
+    """SESSION_END hook cancels planner executor subagents when parent_logdir is propagated.
+
+    _run_planner now propagates parent_logdir to every executor Subagent it
+    creates, so the SESSION_END hook can scope cancellation to the correct
+    session even for planner-spawned workers.
+    """
+    from unittest.mock import MagicMock, patch
+
+    from gptme.tools.subagent.hooks import _session_end_subagent_cleanup
+    from gptme.tools.subagent.types import (
+        Subagent,
+        _subagent_results,
+        _subagent_results_lock,
+        _subagents,
+        _subagents_lock,
+    )
+
+    init_count = len(_subagents)
+    with _subagent_results_lock:
+        _subagent_results.clear()
+
+    cancelled: list[str] = []
+
+    def tracking_cancel(aid: str) -> str:
+        cancelled.append(aid)
+        return f"cancelled {aid}"
+
+    session_logdir = Path.cwd() / "test-planner-parent-session"
+
+    manager_mock = MagicMock()
+    manager_mock.logdir = session_logdir
+
+    # Simulate two planner executor subagents created by _run_planner
+    # with parent_logdir propagated from the parent session (the fix in execution.py)
+    exec1_mock = MagicMock()
+    exec1_mock.is_alive.return_value = True
+    exec2_mock = MagicMock()
+    exec2_mock.is_alive.return_value = True
+
+    with _subagents_lock:
+        _subagents.append(
+            Subagent(
+                agent_id="test-planner-exec-scout",
+                prompt="explore the codebase",
+                thread=exec1_mock,
+                logdir=session_logdir / "exec-scout",
+                model="fake",
+                parent_logdir=session_logdir,
+            )
+        )
+        _subagents.append(
+            Subagent(
+                agent_id="test-planner-exec-implement",
+                prompt="implement the feature",
+                thread=exec2_mock,
+                logdir=session_logdir / "exec-implement",
+                model="fake",
+                parent_logdir=session_logdir,
+            )
+        )
+
+    with patch("gptme.tools.subagent.api.subagent_cancel", side_effect=tracking_cancel):
+        list(_session_end_subagent_cleanup(manager_mock))
+
+    assert "test-planner-exec-scout" in cancelled, (
+        "planner executor subagent should be cancelled when parent session ends"
+    )
+    assert "test-planner-exec-implement" in cancelled, (
+        "all planner executor subagents should be cancelled when parent session ends"
+    )
+
+    # Cleanup
+    with _subagents_lock:
+        _subagents[:] = _subagents[:init_count]
+    with _subagent_results_lock:
+        _subagent_results.clear()

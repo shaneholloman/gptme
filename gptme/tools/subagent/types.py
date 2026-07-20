@@ -30,7 +30,15 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
-Status = Literal["running", "success", "failure", "clarification_needed", "timeout"]
+Status = Literal[
+    "running",
+    "success",
+    "failure",
+    "clarification_needed",
+    "timeout",
+    "budget_exceeded",
+    "cancelled",
+]
 Role = Literal["general", "explore", "implement", "verify"]
 
 # Role → profile name mapping
@@ -129,6 +137,42 @@ def set_subagent_result_if_absent(agent_id: str, result: "ReturnType") -> bool:
         return True
 
 
+def update_subagent_result_with_branch(
+    agent_id: str, branch: str, has_output_schema: bool = False
+) -> None:
+    """Amend a cached result to include a preserved branch name.
+
+    Called when the normal-completion thread loses the set_subagent_result_if_absent
+    race to a timeout/cancel watchdog. Cleanup already ran and found a preserved
+    branch; without this patch the caller's stored result would have no branch name.
+
+    When ``has_output_schema`` is True, the cached result string is JSON that
+    callers parse — appending human-readable text would break that parse, so
+    the branch is logged only (via ``_cleanup_isolation``) and not patched in.
+    """
+    if has_output_schema:
+        return
+    suffix = (
+        f"\n\nChanges preserved on branch {branch!r} — merge with: git merge {branch}"
+    )
+    with _subagent_results_lock:
+        existing = _subagent_results.get(agent_id)
+        if existing is None:
+            return
+        if isinstance(existing.result, str):
+            amended: str | None = existing.result + suffix
+        elif existing.result is None:
+            amended = suffix.lstrip("\n")
+        else:
+            return  # structured (dict) result — cannot amend inline
+        _subagent_results[agent_id] = ReturnType(
+            existing.status,
+            amended,
+            input_tokens=existing.input_tokens,
+            output_tokens=existing.output_tokens,
+        )
+
+
 # ---------------------------------------------------------------------------
 # Data classes
 # ---------------------------------------------------------------------------
@@ -142,6 +186,62 @@ class ReturnType:
     # None means unavailable (e.g. cached terminal result, pre-budget-tracking log).
     input_tokens: int | None = None
     output_tokens: int | None = None
+
+
+@dataclass
+class SubagentBudget:
+    """Fleet-wide output-token budget tracker. Thread-safe.
+
+    Pass a shared instance to ``subagent_parallel()`` or ``subagent_pipeline()``
+    to gate new agent spawns when the budget is exhausted. Agents that are already
+    running when the budget hits zero are allowed to complete normally — only new
+    spawns are blocked.
+
+    Tracks output tokens only (the expensive marginal cost), matching the
+    Claude Code Workflow ``budget.spent()`` semantics.
+
+    Example::
+
+        from gptme.tools.subagent import subagent_parallel, SubagentBudget
+
+        budget = SubagentBudget(total=200_000)   # 200k output tokens
+        results = subagent_parallel(tasks, budget=budget)
+        # Items spawned after the budget was exhausted have status="budget_exceeded"
+
+    Dynamic loop pattern (accumulate until budget runs out)::
+
+        budget = SubagentBudget(total=500_000)
+        findings = []
+        while not budget.exhausted():
+            batch_results = subagent_parallel(next_batch, budget=budget)
+            findings.extend(r["result"] for r in batch_results if r["status"] == "success")
+    """
+
+    total: int | None = None  # None = unlimited
+    _spent: int = field(default=0, init=False, repr=False)
+    _lock: threading.Lock = field(
+        default_factory=threading.Lock, init=False, repr=False
+    )
+
+    def record(self, output_tokens: int) -> None:
+        """Add output_tokens to the spent counter."""
+        with self._lock:
+            self._spent += output_tokens
+
+    def spent(self) -> int:
+        """Return total output tokens spent so far."""
+        with self._lock:
+            return self._spent
+
+    def remaining(self) -> float:
+        """Return remaining token budget, or ``float('inf')`` when total is None."""
+        if self.total is None:
+            return float("inf")
+        return max(0, self.total - self.spent())
+
+    def exhausted(self) -> bool:
+        """Return True when a finite budget has been fully consumed."""
+        return self.total is not None and self.remaining() <= 0
 
 
 def clarification_result_from_content(content: str) -> ReturnType | None:
@@ -183,17 +283,23 @@ class Subagent:
     context_mode: Literal["full", "selective"] = "full"
     context_include: list[str] | None = None
     profile: str | None = None
-    output_schema: type | None = None
+    output_schema: "type | dict | None" = None
     use_acp: bool = False
     # Subprocess mode fields
     process: subprocess.Popen | None = None
     execution_mode: Literal["thread", "subprocess", "acp"] = "thread"
     # ACP mode fields
     acp_command: str | None = None
+    # Working directory: the resolved path passed via workdir=; None means cwd at spawn time.
+    # Stored so subagent_reply() can re-spawn in the same directory.
+    workdir: Path | None = None
     # Worktree isolation fields
     isolated: bool = False
     worktree_path: Path | None = None
     repo_path: Path | None = None
+    # String isolation mode ("worktree" or None). When set, cleanup uses smart
+    # behaviour: auto-remove if unchanged, preserve branch if changes exist.
+    isolation_mode: str | None = None
     # Maximum time (seconds) the subprocess monitor will wait before killing
     timeout: int = 1800  # 30 minutes
     role: Role | None = None
@@ -208,6 +314,16 @@ class Subagent:
     started_at: float = field(default_factory=time.time)
     # Wall-clock limit in seconds; when set, a watchdog auto-cancels after this time
     max_time: float | None = None
+    # Logdir of the parent session that spawned this subagent.
+    # Used by SESSION_END cleanup to scope cancellation to the correct session and
+    # prevent cross-conversation interference in multi-session server deployments.
+    parent_logdir: Path | None = field(default=None)
+    # In-memory fallback cancellation signal for thread mode.
+    # Set by subagent_cancel() when the control-file write fails (OSError), so the
+    # STEP_PRE checkpoint hook can still stop the thread without the file.
+    cancel_event: threading.Event = field(
+        default_factory=threading.Event, init=False, repr=False
+    )
 
     def _normalize_json_result(self, result: str) -> str:
         """Normalize a complete-block result as canonical JSON.

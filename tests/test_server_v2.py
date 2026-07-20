@@ -548,6 +548,102 @@ def test_v2_user_config_file_patch_rejects_invalid_key(client: FlaskClient):
     assert "dotted path" in response.get_json()["error"]
 
 
+# ---------------------------------------------------------------------------
+# Unit tests for _redact_secrets / _restore_redacted_secrets
+# ---------------------------------------------------------------------------
+
+
+def test_redact_secrets_double_quoted():
+    from gptme.server.api_v2 import _redact_secrets
+
+    content = '[openai]\nOPENAI_API_KEY = "sk-abc123"\n'
+    redacted = _redact_secrets(content)
+    assert "sk-abc123" not in redacted
+    assert '***"' in redacted or '"***"' in redacted
+
+
+def test_redact_secrets_single_quoted():
+    """Secrets in single-quoted TOML strings must also be redacted."""
+    from gptme.server.api_v2 import _redact_secrets
+
+    content = "[openai]\nOPENAI_API_KEY = 'sk-abc123'\n"
+    redacted = _redact_secrets(content)
+    assert "sk-abc123" not in redacted
+
+
+def test_redact_secrets_preserves_non_secret_keys():
+    from gptme.server.api_v2 import _redact_secrets
+
+    content = '[env]\nMODEL = "anthropic/claude-3"\n'
+    assert _redact_secrets(content) == content
+
+
+def test_restore_redacted_secrets_section_scoped():
+    """Keys with the same bare name in different sections restore independently."""
+    from gptme.server.api_v2 import _redact_secrets, _restore_redacted_secrets
+
+    original = (
+        '[openai]\napi_key = "key-openai"\n[anthropic]\napi_key = "key-anthropic"\n'
+    )
+    redacted = _redact_secrets(original)
+    restored = _restore_redacted_secrets(redacted, original)
+    assert restored == original
+
+
+def test_restore_redacted_secrets_single_quoted():
+    """Single-quoted secrets survive a redact → restore round-trip."""
+    from gptme.server.api_v2 import _redact_secrets, _restore_redacted_secrets
+
+    original = "[openai]\napi_key = 'sk-real'\n"
+    redacted = _redact_secrets(original)
+    assert "sk-real" not in redacted
+    restored = _restore_redacted_secrets(redacted, original)
+    assert restored == original
+
+
+def test_restore_redacted_secrets_repeated_array_of_tables():
+    """Repeated [[section]] tables each restore their own secret, not the last one."""
+    from gptme.server.api_v2 import _redact_secrets, _restore_redacted_secrets
+
+    original = (
+        "[[providers]]\n"
+        'name = "openai"\n'
+        'api_key = "key-openai"\n'
+        "\n"
+        "[[providers]]\n"
+        'name = "anthropic"\n'
+        'api_key = "key-anthropic"\n'
+    )
+    redacted = _redact_secrets(original)
+    assert "key-openai" not in redacted
+    assert "key-anthropic" not in redacted
+    restored = _restore_redacted_secrets(redacted, original)
+    assert restored == original
+
+
+def test_redact_secrets_quoted_key_name():
+    """Secrets under quoted TOML key names must also be redacted."""
+    from gptme.server.api_v2 import _redact_secrets, _restore_redacted_secrets
+
+    # Double-quoted key with double-quoted value
+    original_dq = '[env]\n"OPENAI_API_KEY" = "sk-real"\n'
+    redacted_dq = _redact_secrets(original_dq)
+    assert "sk-real" not in redacted_dq, "double-quoted key: value should be redacted"
+    restored_dq = _restore_redacted_secrets(redacted_dq, original_dq)
+    assert restored_dq == original_dq, (
+        "double-quoted key: round-trip should restore value"
+    )
+
+    # Single-quoted key with double-quoted value
+    original_sq = "[env]\n'ANTHROPIC_API_KEY' = \"sk-real2\"\n"
+    redacted_sq = _redact_secrets(original_sq)
+    assert "sk-real2" not in redacted_sq, "single-quoted key: value should be redacted"
+    restored_sq = _restore_redacted_secrets(redacted_sq, original_sq)
+    assert restored_sq == original_sq, (
+        "single-quoted key: round-trip should restore value"
+    )
+
+
 @pytest.mark.parametrize(
     "endpoint", ["/api/v2/user/api-key", "/api/v2/user/default-model"]
 )
@@ -700,7 +796,7 @@ def test_external_session_provider_get_session_searches_beyond_list_limit():
                 "messages": [{"role": "user", "content": "hello"}],
             }
 
-    provider._read_transcript = lambda path: _Transcript()  # type: ignore[assignment]
+    provider._read_transcript = lambda path: _Transcript()
 
     result = provider.get_session(_make_external_session_id(str(late_path)), days=30)
 
@@ -740,7 +836,7 @@ def test_external_session_provider_list_sessions_skips_unreadable_transcripts():
             raise ValueError("broken transcript")
         return _Transcript(path)
 
-    provider._read_transcript = _read_transcript  # type: ignore[assignment]
+    provider._read_transcript = _read_transcript
 
     result = provider.list_sessions(limit=10, days=30)
 
@@ -762,7 +858,7 @@ def test_external_session_provider_get_session_skips_unreadable_matching_transcr
     def _read_transcript(path: Path) -> Any:
         raise ValueError(f"cannot read {path}")
 
-    provider._read_transcript = _read_transcript  # type: ignore[assignment]
+    provider._read_transcript = _read_transcript
 
     result = provider.get_session(_make_external_session_id(str(bad_path)), days=30)
 
@@ -1026,7 +1122,7 @@ def test_external_session_list_then_get_roundtrip(client: FlaskClient, monkeypat
                 "messages": [{"role": "user", "content": "hello"}],
             }
 
-    provider._read_transcript = lambda path: _Transcript()  # type: ignore[assignment]
+    provider._read_transcript = lambda path: _Transcript()
     monkeypatch.setattr(
         "gptme.server.api_v2.get_external_session_provider", lambda: provider
     )
@@ -1085,16 +1181,16 @@ def test_external_session_gptme_directory_roundtrip(tmp_path: Path):
 
     provider = ExternalSessionProvider.__new__(ExternalSessionProvider)
     # Simulate discover_gptme_sessions returning directory paths
-    provider._discover_gptme_sessions = lambda start, end: [session_dir]  # type: ignore[attr-defined]
-    provider._discover_cc_sessions = lambda start, end: []  # type: ignore[attr-defined]
-    provider._discover_codex_sessions = lambda start, end: []  # type: ignore[attr-defined]
-    provider._discover_copilot_sessions = lambda start, end: []  # type: ignore[attr-defined]
+    provider._discover_gptme_sessions = lambda start, end: [session_dir]
+    provider._discover_cc_sessions = lambda start, end: []
+    provider._discover_codex_sessions = lambda start, end: []
+    provider._discover_copilot_sessions = lambda start, end: []
 
-    from gptme_sessions.transcript import (  # type: ignore[import-not-found]
+    from gptme_sessions.transcript import (
         read_transcript,
     )
 
-    provider._read_transcript = read_transcript  # type: ignore[assignment]
+    provider._read_transcript = read_transcript
 
     # List: should succeed (not IsADirectoryError) and return a session
     items = provider.list_sessions(limit=10, days=7)
@@ -1123,16 +1219,16 @@ def test_external_session_gptme_directory_no_jsonl_skipped(tmp_path: Path):
     session_dir.mkdir()
 
     provider = ExternalSessionProvider.__new__(ExternalSessionProvider)
-    provider._discover_gptme_sessions = lambda start, end: [session_dir]  # type: ignore[attr-defined]
-    provider._discover_cc_sessions = lambda start, end: []  # type: ignore[attr-defined]
-    provider._discover_codex_sessions = lambda start, end: []  # type: ignore[attr-defined]
-    provider._discover_copilot_sessions = lambda start, end: []  # type: ignore[attr-defined]
+    provider._discover_gptme_sessions = lambda start, end: [session_dir]
+    provider._discover_cc_sessions = lambda start, end: []
+    provider._discover_codex_sessions = lambda start, end: []
+    provider._discover_copilot_sessions = lambda start, end: []
 
-    from gptme_sessions.transcript import (  # type: ignore[import-not-found]
+    from gptme_sessions.transcript import (
         read_transcript,
     )
 
-    provider._read_transcript = read_transcript  # type: ignore[assignment]
+    provider._read_transcript = read_transcript
 
     # Should return 0 items — the directory is skipped early, not propagated as an error
     items = provider.list_sessions(limit=10, days=7)
@@ -1213,7 +1309,7 @@ def test_v2_server_health_yellow(client: FlaskClient, monkeypatch):
     # Verify generating slot has elapsed time
     gen_slot = next(s for s in data["slots"] if s["generating"])
     assert gen_slot["elapsed_seconds"] is not None
-    assert gen_slot["elapsed_seconds"] >= 0  # type: ignore[operator]
+    assert gen_slot["elapsed_seconds"] >= 0
 
 
 def test_v2_server_health_red(client: FlaskClient, monkeypatch):

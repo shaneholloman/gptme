@@ -144,11 +144,19 @@ jobs:
   # ── Prepare ───────────────────────────────────────────────────────────
   # Only for schedule/dispatch. Bumps version, generates changelog, creates
   # the GitHub release via publish_release.sh.
+  #
+  # Uses the `release` environment's SSH_PRIVATE_KEY (a read-write deploy
+  # key) for git pushes, so the version-bump commit and tag can bypass the
+  # branch ruleset that blocks direct pushes to master (deploy keys are a
+  # bypass actor on the ruleset; GITHUB_TOKEN is not). Note: unlike
+  # GITHUB_TOKEN pushes, deploy-key pushes trigger `push` workflows, so CI
+  # runs on the version-bump commit.
   prepare:
     name: Create release
     needs: check
     if: needs.check.outputs.should_release == 'true'
     runs-on: ubuntu-latest
+    environment: release
     outputs:
       tag: ${{ steps.version.outputs.tag }}
     steps:
@@ -156,7 +164,9 @@ jobs:
         with:
           ref: master
           fetch-depth: 0
-          token: ${{ secrets.GITHUB_TOKEN }}
+          # Clone over SSH and persist the deploy key so the pushes in
+          # publish_release.sh (branch + tag) authenticate with it.
+          ssh-key: ${{ secrets.SSH_PRIVATE_KEY }}
 
       - name: Configure git
         run: |
@@ -188,13 +198,51 @@ jobs:
           fi
 
           echo "Generating changelog: ${SINCE}...${TAG}"
-          python3 scripts/build_changelog.py \
-            --range "${SINCE}...${TAG}" \
-            --project-title gptme \
-            --org gptme \
-            --repo gptme \
-            --output /tmp/changelog.md \
-            --add-version-header
+          if [ "$PRERELEASE" = "true" ]; then
+            # Dev releases only get a GitHub release body. No version header —
+            # the release title already shows the version.
+            python3 scripts/build_changelog.py \
+              --range "${SINCE}...${TAG}" \
+              --project-title gptme \
+              --org gptme \
+              --repo gptme \
+              --output /tmp/changelog.md \
+              --demote-headings
+          else
+            # Stable releases: generate the docs page (version header as page
+            # title), commit it into the version-bump commit (mirrors what
+            # `make release` does), and derive the GitHub release body from it
+            # by stripping the header.
+            python3 scripts/build_changelog.py \
+              --range "${SINCE}...${TAG}" \
+              --project-title gptme \
+              --org gptme \
+              --repo gptme \
+              --output "docs/releases/${TAG}.md" \
+              --add-version-header
+
+            # Insert new version at top of changelog toctree (same as `make release`)
+            grep -q "releases/${TAG}.md" docs/changelog.rst || {
+              awk '/^   releases\// && !done { \
+                print "   releases/'"${TAG}"'.md"; \
+                done=1; \
+              } \
+              {print}' docs/changelog.rst > docs/changelog.rst.tmp
+              mv docs/changelog.rst.tmp docs/changelog.rst
+            }
+            # Verify the insertion actually happened (awk inserts nothing if no
+            # 'releases/' entry exists to anchor on)
+            grep -q "releases/${TAG}.md" docs/changelog.rst || {
+              echo "::error::Failed to insert releases/${TAG}.md into docs/changelog.rst toctree"
+              exit 1
+            }
+
+            git add docs/changelog.rst "docs/releases/${TAG}.md"
+            git commit --amend --no-edit
+            git tag -f "${TAG}"
+
+            tail -n +3 "docs/releases/${TAG}.md" > /tmp/changelog.md
+          fi
 
           echo "--- Generated changelog preview ---"
           head -50 /tmp/changelog.md
@@ -220,6 +268,10 @@ jobs:
       !cancelled() &&
       (needs.prepare.result == 'success' || github.event_name == 'release')
     runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      actions: write
+      id-token: write  # Required for Trusted Publisher (OIDC) PyPI publishing
     env:
       TAG: ${{ needs.prepare.outputs.tag || github.event.release.tag_name || github.ref_name }}
 
@@ -264,6 +316,22 @@ jobs:
         POETRY_PYPI_TOKEN_PYPI: ${{ secrets.PYPI_TOKEN }}
       run: poetry publish
 
+    - name: Build gptme-acp shim
+      continue-on-error: true
+      run: |
+        pip install build
+        cd packages/gptme-acp
+        python -m build
+
+    - name: Publish gptme-acp shim to PyPI
+      uses: pypa/gh-action-pypi-publish@release/v1
+      with:
+        packages-dir: packages/gptme-acp/dist/
+        # Uses OIDC Trusted Publisher — no token needed.
+        # Requires a pending trusted publisher configured at:
+        #   https://pypi.org/manage/account/publishing/
+        # with: owner=gptme, repo=gptme, workflow=release.yml
+
     - name: Upload packages to GitHub release
       env:
         GH_TOKEN: ${{ github.token }}
@@ -275,6 +343,10 @@ jobs:
           sleep 5
         done
         gh release upload "$TAG" dist/*.whl dist/*.tar.gz --clobber
+        # Upload shim artifacts if the shim was built successfully
+        if ls packages/gptme-acp/dist/*.whl 2>/dev/null; then
+          gh release upload "$TAG" packages/gptme-acp/dist/*.whl packages/gptme-acp/dist/*.tar.gz --clobber
+        fi
 
     - name: Trigger artifact builds
       env:

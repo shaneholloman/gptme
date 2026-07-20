@@ -44,6 +44,10 @@ jobs:
 
       - name: Install Linux dependencies
         run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
             librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
@@ -79,6 +83,10 @@ jobs:
 
       - name: Install Linux dependencies
         run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
             librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
@@ -123,6 +131,10 @@ jobs:
 
       - name: Install Linux dependencies
         run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
             librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf \
@@ -282,6 +294,10 @@ jobs:
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-24.04'
         run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
             librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
@@ -356,7 +372,7 @@ jobs:
           "
 
       - name: Build the app
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         with:
@@ -380,6 +396,10 @@ jobs:
       - name: Install system dependencies (Linux)
         if: runner.os == 'Linux'
         run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y python3-dev build-essential libffi-dev
 
@@ -418,6 +438,7 @@ jobs:
         with:
           name: sidecar-${{ matrix.os }}
           path: tauri/bins/gptme-server-*
+          overwrite: true
 
   release:
     name: Release (${{ matrix.platform }})
@@ -431,8 +452,10 @@ jobs:
       needs.build.result == 'success' &&
       (startsWith(github.ref, 'refs/tags/v') || inputs.tag != '')
     needs: [lint, test, build, build-sidecar]
+    environment: tauri-autoupdater-signing
     env:
       HAS_APPLE_SIGNING: ${{ secrets.APPLE_CERTIFICATE != '' && secrets.APPLE_CERTIFICATE_PASSWORD != '' && secrets.KEYCHAIN_PASSWORD != '' && secrets.APPLE_ID != '' && secrets.APPLE_ID_PASSWORD != '' && secrets.APPLE_TEAM_ID != '' }}
+      HAS_TAURI_SIGNING: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY != '' }}
     strategy:
       fail-fast: false
       matrix:
@@ -456,6 +479,10 @@ jobs:
       - name: Install Linux dependencies
         if: matrix.platform == 'ubuntu-24.04'
         run: |
+          # GitHub's Ubuntu runner image can ship Microsoft-hosted apt sources that 403.
+          sudo rm -f /etc/apt/sources.list.d/microsoft*.list /etc/apt/sources.list.d/azure-cli*.list
+          # Also clean from /etc/apt/sources.list when configured directly
+          sudo sed -i '/packages\.microsoft\.com/d' /etc/apt/sources.list 2>/dev/null || true
           sudo apt-get update
           sudo apt-get install -y libgtk-3-dev libwebkit2gtk-4.1-dev libayatana-appindicator3-dev \
             librsvg2-dev libjavascriptcoregtk-4.1-dev libsoup-3.0-dev patchelf
@@ -632,9 +659,40 @@ jobs:
           print(f"Tauri semver version: {semver_version}")
           PY
 
+      # Resolve the existing GitHub release (created by release.yml with a
+      # proper changelog) and pass its ID to tauri-action. With releaseId,
+      # tauri-action only uploads assets; with tagName/releaseName/releaseBody,
+      # tauri-action@v1 PATCHes existing published releases and overwrites the
+      # changelog with the placeholder body (regression vs @v0, which left
+      # existing releases untouched).
+      - name: Resolve release ID
+        id: release
+        shell: bash
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          TAG="${{ inputs.tag || github.ref_name }}"
+          if ! RELEASE_ID=$(gh api "repos/${{ github.repository }}/releases/tags/${TAG}" --jq '.id'); then
+            echo "::error::No GitHub release found for tag ${TAG}. The release must be created first (release.yml does this before triggering builds)."
+            exit 1
+          fi
+          echo "id=${RELEASE_ID}" >> "$GITHUB_OUTPUT"
+
+      - name: Set updater artifacts arg
+        id: updater
+        shell: bash
+        run: |
+          # Only pass createUpdaterArtifacts when the signing key is present.
+          # Without it, Tauri requires a signing key to produce signed update artifacts.
+          if [ "$HAS_TAURI_SIGNING" = "true" ]; then
+            echo 'extra=--config {"bundle":{"createUpdaterArtifacts":true}}' >> "$GITHUB_OUTPUT"
+          else
+            echo 'extra=' >> "$GITHUB_OUTPUT"
+          fi
+
       - name: Build and publish release (signed macOS)
         if: matrix.platform == 'macos-latest' && env.HAS_APPLE_SIGNING == 'true'
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           APPLE_CERTIFICATE: ${{ secrets.APPLE_CERTIFICATE }}
@@ -643,28 +701,44 @@ jobs:
           APPLE_ID: ${{ secrets.APPLE_ID }}
           APPLE_PASSWORD: ${{ secrets.APPLE_ID_PASSWORD }}
           APPLE_TEAM_ID: ${{ secrets.APPLE_TEAM_ID }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: tauri
-          tagName: ${{ inputs.tag || github.ref_name }}
-          releaseName: 'gptme ${{ inputs.tag || github.ref_name }}'
-          releaseBody: 'Desktop app release. See the assets to download and install.'
-          releaseDraft: ${{ inputs.tag == '' }}
-          prerelease: ${{ contains(inputs.tag || github.ref_name, '.dev') || contains(inputs.tag || github.ref_name, '.a') || contains(inputs.tag || github.ref_name, '.b') || contains(inputs.tag || github.ref_name, '.rc') }}
-          args: ${{ matrix.args }}
+          releaseId: ${{ steps.release.outputs.id }}
+          args: ${{ matrix.args }} ${{ steps.updater.outputs.extra }}
 
       - name: Build and publish release (unsigned/fallback)
         if: matrix.platform != 'macos-latest' || env.HAS_APPLE_SIGNING != 'true'
-        uses: tauri-apps/tauri-action@v0
+        uses: tauri-apps/tauri-action@v1
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
         with:
           projectPath: tauri
-          tagName: ${{ inputs.tag || github.ref_name }}
-          releaseName: 'gptme ${{ inputs.tag || github.ref_name }}'
-          releaseBody: 'Desktop app release. See the assets to download and install.'
-          releaseDraft: ${{ inputs.tag == '' }}
-          prerelease: ${{ contains(inputs.tag || github.ref_name, '.dev') || contains(inputs.tag || github.ref_name, '.a') || contains(inputs.tag || github.ref_name, '.b') || contains(inputs.tag || github.ref_name, '.rc') }}
-          args: ${{ matrix.args }}
+          releaseId: ${{ steps.release.outputs.id }}
+          args: ${{ matrix.args }} ${{ steps.updater.outputs.extra }}
+
+      - name: Patch AppImage libgpg-error dependency
+        if: matrix.platform == 'ubuntu-24.04'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          APPIMAGE=$(find tauri/src-tauri/target/release/bundle/appimage -maxdepth 1 -name '*.AppImage' -print -quit)
+          if [[ -n "$APPIMAGE" ]]; then
+            TAG="${{ inputs.tag || github.ref_name }}"
+            ASSET_NAME=$(basename "$APPIMAGE")
+            # Patch first so a failed patch never leaves the release with no asset
+            bash tauri/scripts/build-appimage.sh --patch-only
+            # Replace the release asset only after patching succeeds
+            ASSET_ID=$(gh api "repos/${{ github.repository }}/releases/tags/$TAG" \
+              --jq ".assets[] | select(.name == \"$ASSET_NAME\") | .id" 2>/dev/null || true)
+            if [[ -n "$ASSET_ID" ]]; then
+              gh api -X DELETE "repos/${{ github.repository }}/releases/assets/$ASSET_ID"
+            fi
+            gh release upload --clobber "$TAG" "$APPIMAGE"
+          fi
 
   build-android:
     name: Build Android (APK/AAB)
@@ -741,6 +815,7 @@ jobs:
           path: |
             tauri/src-tauri/gen/android/app/build/outputs/apk/**/*.apk
             tauri/src-tauri/gen/android/app/build/outputs/bundle/**/*.aab
+          overwrite: true
 
   release-android:
     name: Release Android
@@ -772,7 +847,14 @@ jobs:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
+          # Rename gradle's generic output names (app-universal-release-unsigned.apk)
+          # to match the desktop bundle naming (gptme-tauri_X.Y.Z_<arch>.<ext>),
+          # e.g. gptme-tauri_0.32.0_universal-unsigned.apk. The "-release" build-type
+          # marker is dropped; "-unsigned" is kept since the APK isn't signed yet.
+          VERSION="${TAG#v}"
           find android-dist -name "*.apk" -o -name "*.aab" | while read -r f; do
-            echo "Uploading $f"
-            gh release upload "$TAG" "$f" --clobber
+            new="$(basename "$f" | sed -E "s/^app-/gptme-tauri_${VERSION}_/; s/-release//")"
+            mv "$f" "$(dirname "$f")/$new"
+            echo "Uploading $new"
+            gh release upload "$TAG" "$(dirname "$f")/$new" --clobber
           done

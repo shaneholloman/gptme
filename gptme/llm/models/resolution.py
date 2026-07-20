@@ -236,6 +236,22 @@ def get_model(model: str) -> ModelMeta:
             if provider == "openai-subscription" and ":" in model_name:
                 lookup_model_name = model_name.rsplit(":", 1)[0]
 
+            # Resolve model aliases for metadata lookup (e.g., gpt-5.6 -> gpt-5.6-sol).
+            # Metadata lookup ONLY — model_name is never rewritten. Providers accept
+            # the alias form on the wire (OpenAI serves gpt-5.6 as gpt-5.6-sol,
+            # verified live 2026-07-10; Anthropic accepts undated names like
+            # claude-haiku-4-5). Rewriting would also break openai-subscription,
+            # whose backend expects family IDs (gpt-5.6), not tier IDs.
+            if (
+                provider in MODEL_ALIASES
+                and lookup_model_name in MODEL_ALIASES[provider]
+            ):
+                canonical_name = MODEL_ALIASES[provider][lookup_model_name]
+                logger.debug(
+                    f"Resolved alias {lookup_model_name!r} -> {canonical_name!r} for provider {provider!r}"
+                )
+                lookup_model_name = canonical_name
+
             # First try static MODELS dict for performance
             if provider in MODELS and lookup_model_name in MODELS[provider]:
                 return ModelMeta(
@@ -331,6 +347,15 @@ def get_model(model: str) -> ModelMeta:
     for provider in cast(list[Provider], MODELS.keys()):
         if model in MODELS[provider]:
             return ModelMeta(provider, model, **MODELS[provider][model])
+        # Also resolve bare model aliases (e.g., gpt-5.6 -> openai/gpt-5.6-sol).
+        # Metadata only: keep the requested name (APIs accept the alias form).
+        if model in MODEL_ALIASES.get(provider, {}):
+            canonical = MODEL_ALIASES[provider][model]
+            if canonical in MODELS[provider]:
+                logger.debug(
+                    f"Resolved bare alias {model!r} -> {provider}/{canonical!r}"
+                )
+                return ModelMeta(provider, model, **MODELS[provider][canonical])
 
     # For model name without provider, also try dynamic fetching for openrouter.
     # Skip if the model name has no "/" — OpenRouter models are always
@@ -371,9 +396,9 @@ def get_recommended_model(provider: Provider) -> str:  # pragma: no cover
     if provider == "openai":
         return "gpt-5"
     if provider == "openai-subscription":
-        return "gpt-5.4"
+        return "gpt-5.6-sol"
     if provider == "openrouter":
-        return "meta-llama/llama-3.1-405b-instruct"
+        return "deepseek/deepseek-v4-pro"
     if provider == "gemini":
         return "gemini-2.5-pro"
     if provider == "anthropic":
@@ -401,7 +426,7 @@ def get_summary_model(provider: Provider) -> str | None:  # pragma: no cover
     if provider == "openai":
         return "gpt-5-mini"
     if provider == "openrouter":
-        return "meta-llama/llama-3.1-8b-instruct"
+        return "deepseek/deepseek-v4-flash"
     if provider == "gemini":
         return "gemini-2.5-flash"
     if provider == "anthropic":

@@ -3,6 +3,9 @@ from collections.abc import Iterator
 from typing import Any
 from unittest.mock import patch
 
+import pytest
+import requests
+
 from gptme.llm import llm_openai_subscription
 from gptme.llm.llm_openai_subscription import SubscriptionAuth
 from gptme.message import Message
@@ -173,6 +176,54 @@ def test_stream_builds_shared_responses_request_shape():
     assert request_json["tools"][0]["name"] == "save"
 
 
+def test_stream_preserves_both_call_ids_for_multi_tool_assistant_turn():
+    """Regression: _merge_consecutive_messages was merging adjacent tool-result
+    system messages, dropping the second call_id.  When an assistant turn
+    contains two tool calls (call_A, call_B), two system messages are produced
+    in sequence.  prune_ephemeral_messages → _merge_consecutive_messages must
+    NOT merge them, so both function_call_output items survive in the Codex
+    Responses API input.  Without the fix the API returns 400:
+    "No tool output found for function call call_B"."""
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+    init_tools(allowlist=["save"])
+    save_tool = get_tool("save")
+    assert save_tool is not None
+
+    messages = [
+        Message(role="system", content="You are concise."),
+        Message(role="user", content="Save two files."),
+        Message(
+            role="assistant",
+            content=(
+                '@save(call_A): {"path": "a.txt", "content": "a"}\n'
+                '@save(call_B): {"path": "b.txt", "content": "b"}'
+            ),
+        ),
+        Message(role="system", content="Saved a.txt", call_id="call_A"),
+        Message(role="system", content="Saved b.txt", call_id="call_B"),
+    ]
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=_make_auth()),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post", return_value=response
+        ) as mock_post,
+    ):
+        list(llm_openai_subscription.stream(messages, "gpt-5.4", tools=[save_tool]))
+
+    request_json = mock_post.call_args.kwargs["json"]
+    input_items = request_json["input"]
+
+    fc_outputs = [it for it in input_items if it.get("type") == "function_call_output"]
+    assert len(fc_outputs) == 2, (
+        f"Expected 2 function_call_output items, got {len(fc_outputs)}: {fc_outputs}"
+    )
+    output_call_ids = {it["call_id"] for it in fc_outputs}
+    assert output_call_ids == {"call_A", "call_B"}, (
+        f"Expected both call_ids to be present; got {output_call_ids}"
+    )
+
+
 def test_stream_forwards_max_tokens_as_max_output_tokens():
     """max_tokens passed to stream() must appear as max_output_tokens in the POST body."""
     response = _FakeSSEStreamResponse([{"type": "response.done"}])
@@ -213,3 +264,250 @@ def test_stream_omits_max_output_tokens_when_not_provided():
 
     request_json = mock_post.call_args.kwargs["json"]
     assert "max_output_tokens" not in request_json
+
+
+def test_stream_uses_generous_read_timeout_for_reasoning_models(monkeypatch):
+    """The read timeout applies BETWEEN stream chunks; reasoning-heavy models
+    (gpt-5.5 high, gpt-5.6-sol) can think for minutes without emitting an
+    event, and the old flat timeout=120 killed sessions mid-run after they
+    had already completed real work."""
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            return_value=response,
+        ) as mock_post,
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    timeout = mock_post.call_args.kwargs["timeout"]
+    assert timeout == (30, 600.0)
+
+
+def test_stream_read_timeout_env_override(monkeypatch):
+    monkeypatch.setenv("GPTME_SUBSCRIPTION_READ_TIMEOUT", "90")
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            return_value=response,
+        ) as mock_post,
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert mock_post.call_args.kwargs["timeout"] == (30, 90.0)
+
+
+@pytest.mark.parametrize("bad_val", ["", "abc", "0", "-1", "inf", "nan"])
+def test_stream_read_timeout_invalid_env_falls_back_to_default(monkeypatch, bad_val):
+    """Invalid or non-positive GPTME_SUBSCRIPTION_READ_TIMEOUT must fall back to 600s
+    rather than raising or passing a bad value to requests."""
+    if bad_val == "":
+        monkeypatch.delenv("GPTME_SUBSCRIPTION_READ_TIMEOUT", raising=False)
+    else:
+        monkeypatch.setenv("GPTME_SUBSCRIPTION_READ_TIMEOUT", bad_val)
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse([{"type": "response.done"}])
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            return_value=response,
+        ) as mock_post,
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert mock_post.call_args.kwargs["timeout"] == (30, 600.0)
+
+
+class _TimeoutThenEventsResponse:
+    """First iter_lines() call raises ReadTimeout (silent reasoning pause
+    exceeding the read timeout); used to simulate a retryable idle stream."""
+
+    def __init__(self) -> None:
+        self.status_code = 200
+        self.text = ""
+
+    def iter_lines(self) -> Iterator[bytes]:
+        raise requests.exceptions.ReadTimeout("read timeout=600")
+        yield b""  # pragma: no cover — makes this a generator
+
+
+class _EventThenTimeoutResponse:
+    """Emits one event, then times out — retrying here would duplicate output."""
+
+    def __init__(self) -> None:
+        self.status_code = 200
+        self.text = ""
+
+    def iter_lines(self) -> Iterator[bytes]:
+        yield f"data: {json.dumps({'type': 'response.output_text.delta', 'delta': 'partial'})}".encode()
+        raise requests.exceptions.ReadTimeout("read timeout=600")
+
+
+def test_stream_retries_idle_timeout_before_first_event():
+    """A read timeout during the thinking phase (no events yielded yet) retries
+    the request instead of dying — mirrors codex-rs stream_max_retries."""
+    auth = _make_auth()
+    ok = _FakeSSEStreamResponse(
+        [
+            {"type": "response.output_text.delta", "delta": "Done."},
+            {"type": "response.done"},
+        ]
+    )
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            side_effect=[_TimeoutThenEventsResponse(), ok],
+        ) as mock_post,
+    ):
+        output = "".join(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert output == "Done."
+    assert mock_post.call_count == 2
+
+
+def test_stream_does_not_retry_after_first_event():
+    """After partial output a re-POST would duplicate content — re-raise."""
+    auth = _make_auth()
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            return_value=_EventThenTimeoutResponse(),
+        ) as mock_post,
+        pytest.raises(requests.exceptions.ReadTimeout),
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert mock_post.call_count == 1
+
+
+def test_stream_retries_exhausted_reraises(monkeypatch):
+    monkeypatch.setenv("GPTME_SUBSCRIPTION_STREAM_RETRIES", "2")
+    auth = _make_auth()
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch(
+            "gptme.llm.llm_openai_subscription.requests.post",
+            side_effect=[
+                _TimeoutThenEventsResponse(),
+                _TimeoutThenEventsResponse(),
+                _TimeoutThenEventsResponse(),
+            ],
+        ) as mock_post,
+        pytest.raises(requests.exceptions.ReadTimeout),
+    ):
+        list(
+            llm_openai_subscription.stream(
+                [Message(role="user", content="hello")], "gpt-5.6-sol"
+            )
+        )
+
+    assert mock_post.call_count == 3  # initial + 2 retries
+
+
+def _drain_stream(events: list[dict[str, Any]]) -> tuple[str, Any]:
+    """Drain the stream generator, returning (content, return_value)."""
+    auth = _make_auth()
+    response = _FakeSSEStreamResponse(events)
+
+    with (
+        patch("gptme.llm.llm_openai_subscription.get_auth", return_value=auth),
+        patch("gptme.llm.llm_openai_subscription.requests.post", return_value=response),
+    ):
+        gen = llm_openai_subscription.stream(
+            [Message(role="user", content="hello")], "gpt-5.4"
+        )
+        parts = []
+        ret: Any = None
+        try:
+            while True:
+                parts.append(next(gen))
+        except StopIteration as e:
+            ret = e.value
+        return "".join(parts), ret
+
+
+def test_stream_returns_usage_from_response_done():
+    """response.done with usage dict must be returned as metadata by stream()."""
+    content, metadata = _drain_stream(
+        [
+            {"type": "response.output_text.delta", "delta": "Hello."},
+            {
+                "type": "response.done",
+                "response": {
+                    "usage": {
+                        "input_tokens": 100,
+                        "output_tokens": 50,
+                        "total_tokens": 150,
+                    }
+                },
+            },
+        ]
+    )
+
+    assert content == "Hello."
+    assert metadata is not None
+    assert metadata.get("usage", {}).get("input_tokens") == 100
+    assert metadata.get("usage", {}).get("output_tokens") == 50
+
+
+def test_stream_returns_none_when_response_done_has_no_usage():
+    """response.done without usage must return None so the caller falls back."""
+    _, metadata = _drain_stream([{"type": "response.done"}])
+    assert metadata is None
+
+
+def test_stream_captures_usage_without_cache_fields():
+    """Subscription responses don't have cache token fields; must not crash."""
+    _, metadata = _drain_stream(
+        [
+            {
+                "type": "response.done",
+                "response": {
+                    "usage": {
+                        "input_tokens": 200,
+                        "output_tokens": 75,
+                    }
+                },
+            }
+        ]
+    )
+    assert metadata is not None
+    usage = metadata.get("usage", {})
+    assert usage.get("input_tokens") == 200
+    assert usage.get("output_tokens") == 75
+    assert "cache_read_tokens" not in usage
+    assert "cache_creation_tokens" not in usage

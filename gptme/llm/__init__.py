@@ -155,14 +155,21 @@ def init_llm(provider: Provider):
     Args:
         provider: Provider name (built-in or custom)
     """
-    from .llm_anthropic import get_client as get_anthropic_client
-    from .llm_anthropic import init as init_anthropic
-    from .llm_openai import has_client as has_openai_client
-    from .llm_openai import init as init_openai
-    from .llm_openai_subscription import init as init_subscription
-
     global _subscription_initialized
     config = get_config()
+
+    # Provider modules are imported lazily per-branch: each pulls in its SDK
+    # (anthropic/openai, several hundred ms), so only the active provider's
+    # module should be imported at startup.
+    def has_openai_client(p) -> bool:
+        from .llm_openai import has_client
+
+        return has_client(p)
+
+    def init_openai(p, conf) -> None:
+        from .llm_openai import init
+
+        init(p, conf)
 
     # Mock provider needs no client/auth — responses are computed in-process.
     if provider == "mock":
@@ -173,9 +180,15 @@ def init_llm(provider: Provider):
     # Check if it's a custom provider (OpenAI-compatible)
     elif is_custom_provider(provider) and not has_openai_client(provider):
         init_openai(provider, config)
-    elif provider == "anthropic" and not get_anthropic_client():
-        init_anthropic(config)
+    elif provider == "anthropic":
+        from .llm_anthropic import get_client as get_anthropic_client
+        from .llm_anthropic import init as init_anthropic
+
+        if not get_anthropic_client():
+            init_anthropic(config)
     elif provider == "openai-subscription" and not _subscription_initialized:
+        from .llm_openai_subscription import init as init_subscription
+
         _subscription_initialized = init_subscription(config)
     elif (
         plugin := get_provider_plugin(str(provider))
@@ -365,7 +378,13 @@ def get_provider_from_model(model: str) -> Provider:
 
 
 def _get_base_model(model: str) -> str:
-    """Get base model name without provider prefix."""
+    """Get base model name without provider prefix.
+
+    No alias rewriting here: aliases in MODEL_ALIASES are accepted by the
+    providers' APIs (e.g. OpenAI serves gpt-5.6 as gpt-5.6-sol, verified
+    2026-07-10), so the requested name is sent as-is. Aliases are resolved
+    for metadata lookup only, in models/resolution.py.
+    """
     return model.split("/", 1)[1]
 
 
