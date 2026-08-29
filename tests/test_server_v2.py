@@ -13,6 +13,7 @@ import tomlkit
 
 from gptme.config import ChatConfig, MCPConfig
 from gptme.llm.models import ModelMeta, get_default_model
+from gptme.llm.validate import ApiKeyValidationStatus
 from gptme.prompts import get_prompt
 from gptme.tools import get_toolchain
 
@@ -38,10 +39,9 @@ def create_conversation(client: FlaskClient, config: ChatConfig | None = None):
 
     if config:
         config_dict = config.to_dict()
-        # Strip workspace from the serialized config: the server security check
-        # rejects external workspace paths (path traversal fix). Tests that pass
-        # a config only care about model/tools/system_prompt, not the workspace;
-        # the server will apply the safe @log default.
+        # Strip workspace from the serialized config: tests that pass a config
+        # only care about model/tools/system_prompt, not the workspace; let the
+        # server apply the isolated @log default instead of the test-runner cwd.
         config_dict.get("chat", {}).pop("workspace", None)
         json["config"] = config_dict
 
@@ -157,6 +157,96 @@ def test_start_tool_execution_streams_only_real_tool_output(
     assert "post hook chatter" in system_messages
 
 
+def test_start_tool_execution_uses_branch_for_reload_and_continuation(
+    v2_conv, client: FlaskClient, monkeypatch
+):
+    """Tool execution must reload from and continue on the branch used by /step.
+
+    Regression: execute_tool_thread always loaded from "main" (the default),
+    so tool execution on a non-main branch would read the wrong conversation
+    state and start the continuation step on the wrong branch.
+    """
+    import gptme.server.session_step as _step_mod
+    from gptme.logmanager import LogManager
+    from gptme.server.session_models import SessionManager, ToolExecution
+    from gptme.server.session_step import start_tool_execution
+    from gptme.tools import ToolUse
+
+    conversation_id = v2_conv["conversation_id"]
+    session_id = v2_conv["session_id"]
+    session = SessionManager.get_session(session_id)
+    assert session is not None
+
+    tool_id = "tool-branch-test"
+    session.pending_tools[tool_id] = ToolExecution(
+        tool_id=tool_id,
+        tooluse=ToolUse("shell", [], "echo hi", call_id="call-branch-1"),
+    )
+
+    # Track which branch LogManager.load was called with inside execute_tool_thread.
+    # Always delegate to the real "main" branch (which exists) so tool execution
+    # doesn't fail on a missing branch file — the test only cares that the
+    # branch argument is forwarded correctly, not that the branch file exists.
+    load_calls: list[dict] = []
+    _real_load = LogManager.load.__func__  # type: ignore[attr-defined]
+
+    @classmethod  # type: ignore[misc]
+    def _recording_load(cls, logdir, branch="main", **kwargs):
+        load_calls.append({"logdir": str(logdir), "branch": branch})
+        # Always load from "main" so the thread can proceed even when the
+        # requested branch file doesn't exist in the test conversation.
+        return _real_load(cls, logdir, branch="main", **kwargs)
+
+    monkeypatch.setattr(LogManager, "load", _recording_load)
+
+    step_thread_calls: list[dict] = []
+
+    def _recording_start_step_thread(*args, **kwargs):
+        step_thread_calls.append(kwargs)
+        return
+
+    monkeypatch.setattr(_step_mod, "_start_step_thread", _recording_start_step_thread)
+    monkeypatch.setattr(
+        "gptme.server.session_step.prepare_execution_environment",
+        lambda workspace, tools, chat_config: None,
+    )
+
+    from gptme.message import Message
+
+    def fake_execute(self, log=None, workspace=None, on_result_message=None):
+        yield Message("system", "ok")
+
+    monkeypatch.setattr("gptme.tools.base.ToolUse.execute", fake_execute)
+
+    thread = start_tool_execution(
+        conversation_id=conversation_id,
+        session=session,
+        tool_id=tool_id,
+        edited_tooluse=None,
+        model="openai/mock-model",
+        chat_config=ChatConfig(),
+        branch="feature-branch",
+    )
+    thread.join(timeout=5)
+    assert not thread.is_alive()
+
+    # execute_tool_thread must forward the branch when reloading the conversation.
+    conv_load_branches = [
+        c["branch"] for c in load_calls if conversation_id in c["logdir"]
+    ]
+    assert conv_load_branches, "LogManager.load was never called for the conversation"
+    assert all(b == "feature-branch" for b in conv_load_branches), (
+        f"Expected reload on 'feature-branch', got: {conv_load_branches}"
+    )
+
+    # The continuation step must also be started on the same branch.
+    assert step_thread_calls, "_start_step_thread was never called"
+    assert step_thread_calls[0].get("branch") == "feature-branch", (
+        f"Continuation step used branch {step_thread_calls[0].get('branch')!r},"
+        " expected 'feature-branch'"
+    )
+
+
 def test_v2_api_root_provider_configured(client: FlaskClient, monkeypatch):
     """provider_configured reflects whether get_default_model() returns a model."""
     from gptme.llm.models.types import ModelMeta
@@ -267,6 +357,29 @@ def test_webui_deploy_trigger_dispatches_workflow(client: FlaskClient, monkeypat
     }
 
 
+def stub_key_validation(
+    monkeypatch,
+    *,
+    status: str = "VALID",
+    message: str = "",
+):
+    """Stand in for the live provider call /api/v2/user/api-key makes.
+
+    The endpoint checks the key with the provider before persisting it, so
+    every save test has to say what the provider would answer. ``status`` is
+    one of the ``ApiKeyValidationStatus`` values: VALID (default), INVALID
+    (block the save), or UNREACHABLE (save but warn).
+    Patch at the api_v2 import site so the function uses the stub.
+    """
+    from gptme.llm.validate import ApiKeyValidationStatus
+
+    validation_status = ApiKeyValidationStatus[status]
+    monkeypatch.setattr(
+        "gptme.server.api_v2.validate_api_key_status",
+        lambda api_key, provider, timeout=10: (validation_status, message),
+    )
+
+
 def test_v2_user_api_key_persists_env_entry(client: FlaskClient, tmp_path, monkeypatch):
     """Saving an API key should write the provider env var into user config."""
     import gptme.config.user as user_mod
@@ -275,10 +388,15 @@ def test_v2_user_api_key_persists_env_entry(client: FlaskClient, tmp_path, monke
     monkeypatch.setattr(user_mod, "config_path", str(config_file))
     monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    stub_key_validation(monkeypatch)
 
     response = client.post(
         "/api/v2/user/api-key",
-        json={"provider": "anthropic", "api_key": "  sk-ant-test-key  "},
+        json={
+            "provider": "anthropic",
+            "api_key": "  sk-ant-test-key  ",
+            "skip_validation": True,
+        },
     )
 
     assert response.status_code == 200
@@ -307,10 +425,15 @@ def test_v2_user_api_key_applies_to_env_immediately(
     monkeypatch.setattr(user_mod, "config_path", str(config_file))
     monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    stub_key_validation(monkeypatch)
 
     response = client.post(
         "/api/v2/user/api-key",
-        json={"provider": "anthropic", "api_key": "sk-ant-live-key"},
+        json={
+            "provider": "anthropic",
+            "api_key": "sk-ant-live-key",
+            "skip_validation": True,
+        },
     )
 
     assert response.status_code == 200
@@ -329,6 +452,7 @@ def test_v2_user_api_key_persists_default_model(
     monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
     monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
     monkeypatch.delenv("MODEL", raising=False)
+    stub_key_validation(monkeypatch)
 
     response = client.post(
         "/api/v2/user/api-key",
@@ -336,6 +460,7 @@ def test_v2_user_api_key_persists_default_model(
             "provider": "anthropic",
             "api_key": "sk-ant-test-key",
             "model": "anthropic/claude-sonnet-4-7",
+            "skip_validation": True,
         },
     )
 
@@ -361,6 +486,102 @@ def test_v2_user_api_key_rejects_model_provider_mismatch(client: FlaskClient):
     assert data == {"error": "Model openai/gpt-4.1 does not match provider anthropic"}
 
 
+def test_v2_user_api_key_rejects_invalid_key(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """A key the provider rejects must not be persisted or applied."""
+    import os
+
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    stub_key_validation(
+        monkeypatch,
+        status="INVALID",
+        message="Invalid API key. Please check your key and try again.",
+    )
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "anthropic", "api_key": "sk-ant-bad-key"},
+    )
+
+    assert response.status_code == 422
+    assert response.get_json() == {
+        "error": "Invalid API key. Please check your key and try again."
+    }
+    assert not (tmp_path / "config.local.toml").exists()
+    assert os.environ.get("ANTHROPIC_API_KEY") is None
+
+
+def test_v2_user_api_key_saves_when_validation_is_non_fatal(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """A key the validator calls valid is saved even when it carries a message.
+
+    `validate_api_key` returns (True, message) for a working key whose account has
+    hit a quota. That is a valid key and must still save; the response shape is
+    unchanged.
+    """
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    stub_key_validation(
+        monkeypatch, message="API quota exhausted — credit balance too low"
+    )
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "anthropic", "api_key": "sk-ant-out-of-credit"},
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "ok"
+    assert data["provider"] == "anthropic"
+    assert data["env_var"] == "ANTHROPIC_API_KEY"
+    assert data["restart_required"] is False
+
+    saved = tomlkit.loads((tmp_path / "config.local.toml").read_text()).unwrap()
+    assert saved["env"]["ANTHROPIC_API_KEY"] == "sk-ant-out-of-credit"
+
+
+def test_v2_user_api_key_unreachable_warns_but_saves(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """An unreachable provider must not block the save; it returns a warning."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    stub_key_validation(
+        monkeypatch,
+        status="UNREACHABLE",
+        message="Request timed out. Please check your network connection.",
+    )
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "anthropic", "api_key": "sk-ant-live-key"},
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "ok"
+    assert data["warning"] == "Request timed out. Please check your network connection."
+
+    saved = tomlkit.loads((tmp_path / "config.local.toml").read_text()).unwrap()
+    assert saved["env"]["ANTHROPIC_API_KEY"] == "sk-ant-live-key"
+
+
 def test_v2_user_api_key_rejects_unknown_provider(client: FlaskClient):
     response = client.post(
         "/api/v2/user/api-key",
@@ -370,6 +591,185 @@ def test_v2_user_api_key_rejects_unknown_provider(client: FlaskClient):
     assert response.status_code == 400
     data = response.get_json()
     assert data == {"error": "Unknown provider: bogus"}
+
+
+def test_v2_user_api_key_rejects_invalid_key_via_provider(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """An invalid provider key should return 422 before persisting anything."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "gptme.server.api_v2.validate_api_key_status",
+        lambda key, provider, **kw: (
+            ApiKeyValidationStatus.INVALID,
+            "Invalid API key. Please check your key and try again.",
+        ),
+    )
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "anthropic", "api_key": "sk-ant-INVALID"},
+    )
+
+    assert response.status_code == 422
+    data = response.get_json()
+    assert "error" in data
+    assert "Invalid API key" in data["error"]
+
+    # Nothing should have been written to disk
+    local_file = tmp_path / "config.local.toml"
+    assert not local_file.exists()
+
+
+def test_v2_user_api_key_handles_validator_exception(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """An unexpected validator exception should return 502 without persisting the key."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+
+    def raise_provider_error(key, provider, timeout=10):
+        raise RuntimeError("provider unavailable")
+
+    monkeypatch.setattr(
+        "gptme.server.api_v2.validate_api_key_status", raise_provider_error
+    )
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "anthropic", "api_key": "sk-ant-test"},
+    )
+
+    assert response.status_code == 502
+    assert response.get_json() == {"error": "Provider validation failed"}
+    assert not (tmp_path / "config.local.toml").exists()
+
+
+def test_v2_user_api_key_accepts_valid_key_via_provider(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """A key that passes live validation should be persisted normally."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "gptme.server.api_v2.validate_api_key_status",
+        lambda key, provider, **kw: (ApiKeyValidationStatus.VALID, ""),
+    )
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "anthropic", "api_key": "sk-ant-VALID"},
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "ok"
+    assert "warning" not in data or data["warning"] is None
+
+    local_file = tmp_path / "config.local.toml"
+    saved = tomlkit.loads(local_file.read_text()).unwrap()
+    assert saved["env"]["ANTHROPIC_API_KEY"] == "sk-ant-VALID"
+
+
+def test_v2_user_api_key_warns_on_quota_exhausted(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """A valid but quota-exhausted key should be saved with a warning in the response."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+    monkeypatch.setattr(
+        "gptme.server.api_v2.validate_api_key_status",
+        lambda key, provider, **kw: (
+            ApiKeyValidationStatus.VALID,
+            "API quota exhausted — resets in 3 days",
+        ),
+    )
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "anthropic", "api_key": "sk-ant-QUOTA"},
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "ok"
+    assert data.get("warning") is not None
+    assert "quota" in data["warning"].lower() or "exhausted" in data["warning"].lower()
+
+
+def test_v2_user_api_key_azure_surfaces_no_validation_warning(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """Azure keys are accepted but a warning must surface — validation is a no-op there."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("AZURE_OPENAI_API_KEY", raising=False)
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={"provider": "azure", "api_key": "garbage-azure-key"},
+    )
+
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data["status"] == "ok"
+    # Key is accepted, but a warning must be present so the UI can inform the user
+    assert data.get("warning") is not None
+    assert data["warning"] != ""
+
+
+def test_v2_user_api_key_skip_validation_bypasses_live_check(
+    client: FlaskClient, tmp_path, monkeypatch
+):
+    """skip_validation=True should persist the key without calling the live validator."""
+    import gptme.config.user as user_mod
+
+    config_file = tmp_path / "config.toml"
+    monkeypatch.setattr(user_mod, "config_path", str(config_file))
+    monkeypatch.setattr("gptme.config.core.reload_config", lambda: None)
+    monkeypatch.delenv("ANTHROPIC_API_KEY", raising=False)
+
+    called = []
+
+    def fake_validate(key, provider, **kw):
+        called.append((key, provider))
+        return (
+            ApiKeyValidationStatus.INVALID,
+            "Invalid API key",
+        )  # would fail if called
+
+    monkeypatch.setattr("gptme.server.api_v2.validate_api_key_status", fake_validate)
+
+    response = client.post(
+        "/api/v2/user/api-key",
+        json={
+            "provider": "anthropic",
+            "api_key": "sk-ant-ANY",
+            "skip_validation": True,
+        },
+    )
+
+    assert response.status_code == 200
+    assert called == []  # validator was never invoked
 
 
 def test_v2_user_default_model_persists_and_applies(
@@ -768,6 +1168,133 @@ def test_v2_external_session_not_found(
     data = response.get_json()
     assert data is not None
     assert "not found" in data["error"].lower()
+
+
+# ---------------------------------------------------------------------------
+# steer_inject endpoint tests
+# ---------------------------------------------------------------------------
+
+
+class _FakeSteerableSessionProvider(_FakeExternalSessionProvider):
+    """Provider variant that supports steer_inject on session abc123."""
+
+    def __init__(self) -> None:
+        self.steered_messages: list[str] = []
+        self._steer_ok = True
+
+    def get_session(self, external_id: str, days: int = 30) -> dict[str, Any] | None:
+        if external_id != "abc123":
+            return None
+        return {
+            "id": "abc123",
+            "transcript": {
+                "session_id": "session-1",
+                "harness": "claude-code",
+                "capabilities": ["steer_inject"],
+                "trajectory_path": "/tmp/session.jsonl",
+                "messages": [{"role": "user", "content": "hi"}],
+            },
+        }
+
+    def steer_session(self, trajectory_path: str, message: str) -> bool:
+        if not self._steer_ok:
+            return False
+        self.steered_messages.append(message)
+        return True
+
+
+@pytest.fixture
+def fake_steerable_provider(monkeypatch):
+    provider = _FakeSteerableSessionProvider()
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_external_session_provider", lambda: provider
+    )
+    return provider
+
+
+def test_v2_steer_external_session_ok(client: FlaskClient, fake_steerable_provider):
+    """Steer endpoint returns 200 and records the injected message."""
+    response = client.post(
+        "/api/v2/external-sessions/abc123/steer",
+        json={"message": "hello from user"},
+    )
+    assert response.status_code == 200
+    data = response.get_json()
+    assert data is not None
+    assert data["status"] == "ok"
+    assert fake_steerable_provider.steered_messages == ["hello from user"]
+
+
+def test_v2_steer_external_session_missing_message(
+    client: FlaskClient, fake_steerable_provider
+):
+    """Steer endpoint returns 400 when message is missing or blank."""
+    response = client.post("/api/v2/external-sessions/abc123/steer", json={})
+    assert response.status_code == 400
+    data = response.get_json()
+    assert data is not None
+    assert "message" in data["error"]
+
+    response2 = client.post(
+        "/api/v2/external-sessions/abc123/steer", json={"message": "   "}
+    )
+    assert response2.status_code == 400
+
+
+def test_v2_steer_external_session_not_found(
+    client: FlaskClient, fake_steerable_provider
+):
+    """Steer endpoint returns 404 when the session doesn't exist."""
+    response = client.post(
+        "/api/v2/external-sessions/does-not-exist/steer",
+        json={"message": "hi"},
+    )
+    assert response.status_code == 404
+    data = response.get_json()
+    assert data is not None
+    assert "not found" in data["error"].lower()
+
+
+def test_v2_steer_external_session_no_capability(
+    client: FlaskClient, fake_external_session_provider
+):
+    """Steer endpoint returns 422 when session lacks steer_inject capability."""
+    # fake_external_session_provider returns a session with only ["view_transcript"]
+    response = client.post(
+        "/api/v2/external-sessions/abc123/steer",
+        json={"message": "hi"},
+    )
+    assert response.status_code == 422
+    data = response.get_json()
+    assert data is not None
+    assert "steer_inject" in data["error"]
+
+
+def test_v2_steer_external_session_unavailable(client: FlaskClient, monkeypatch):
+    """Steer endpoint returns 503 when provider is not configured."""
+    monkeypatch.setattr(
+        "gptme.server.api_v2.get_external_session_provider", lambda: None
+    )
+    response = client.post(
+        "/api/v2/external-sessions/abc123/steer",
+        json={"message": "hi"},
+    )
+    assert response.status_code == 503
+
+
+def test_v2_steer_external_session_not_implemented(
+    client: FlaskClient, fake_steerable_provider
+):
+    """Steer endpoint returns 501 when provider.steer_session returns False."""
+    fake_steerable_provider._steer_ok = False
+    response = client.post(
+        "/api/v2/external-sessions/abc123/steer",
+        json={"message": "hi"},
+    )
+    assert response.status_code == 501
+    data = response.get_json()
+    assert data is not None
+    assert "501" in str(response.status_code)
 
 
 def test_external_session_provider_get_session_searches_beyond_list_limit():
@@ -1513,12 +2040,12 @@ def test_v2_create_conversation_default_system_prompt(
     )
 
     convname = f"test-server-v2-{random.randint(0, 1000000)}"
-    # Use the default @log workspace (workspace containment requires workspace
-    # to be inside the conversation logdir; external paths like tmp_path are
-    # rejected since the security fix for path traversal via config).
+    # Explicit external workspace: creation accepts client-supplied workspace
+    # overrides (the webui workspace picker relies on this).
     response = client.put(
         f"/api/v2/conversations/{convname}",
         json={
+            "config": {"chat": {"workspace": str(tmp_path)}},
             "messages": [
                 {
                     "role": "user",
@@ -1531,37 +2058,29 @@ def test_v2_create_conversation_default_system_prompt(
     assert response.status_code == 200
     conversation_id = response.get_json()["conversation_id"]
 
-    # Fetch the config to learn the actual resolved workspace path (@log -> logdir/workspace)
-    config_resp = client.get(f"/api/v2/conversations/{conversation_id}/config")
-    assert config_resp.status_code == 200
-    from gptme.config.chat import ChatConfig  # fmt: skip
-
-    conv_config = ChatConfig.from_dict(config_resp.get_json())
-    actual_workspace = conv_config.workspace
-
     response = client.get(f"/api/v2/conversations/{conversation_id}")
     assert response.status_code == 200
     data = response.get_json()
     assert data is not None
     assert "log" in data
-    assert (
-        len(data["log"]) == 3
-    )  # System prompt + webui hint + user message (no workspace context)
-    assert data["log"][0]["role"] == "system"  # Primary system prompt
-    assert data["log"][1]["role"] == "system"  # Webui hint
-    assert data["log"][2]["role"] == "user"
-    assert data["log"][2]["content"] == "Hello, this is a test message."
 
-    # Check that the system prompt is the default one
     prompt_msgs = get_prompt(
         tools=list(get_toolchain(None)),
         interactive=True,
         tool_format="markdown",
         model=None,
         prompt="full",
-        workspace=actual_workspace,
+        workspace=tmp_path,
     )
-    assert data["log"][0]["content"] == prompt_msgs[0].content
+    assert len(data["log"]) == len(prompt_msgs) + 2
+    for actual, expected in zip(
+        data["log"][: len(prompt_msgs)], prompt_msgs, strict=True
+    ):
+        assert actual["role"] == expected.role
+        assert actual["content"] == expected.content
+    assert data["log"][-2]["role"] == "system"  # Webui hint
+    assert data["log"][-1]["role"] == "user"
+    assert data["log"][-1]["content"] == "Hello, this is a test message."
 
 
 def test_v2_create_conversation_webui_html_hint(
@@ -1954,7 +2473,7 @@ def test_v2_chat_config_update_works(client: FlaskClient):
 
     input_config.model = "openai/gpt-4o-mini"
     updated_config_dict = input_config.to_dict()
-    # Strip workspace: server security check rejects external paths (path traversal fix).
+    # Strip workspace: PATCH still enforces workspace containment (unlike create).
     updated_config_dict.get("chat", {}).pop("workspace", None)
     response = client.patch(
         f"/api/v2/conversations/{conversation_id}/config", json=updated_config_dict
@@ -2007,6 +2526,58 @@ def test_v2_chat_config_system_prompt_roundtrip_and_clear(client: FlaskClient):
         m["content"] for m in cleared_conversation["log"] if m["role"] == "system"
     ]
     assert system_prompt not in cleared_system_messages
+
+
+def test_v2_chat_config_patch_preserves_webui_html_hint(
+    client: FlaskClient, monkeypatch: pytest.MonkeyPatch
+):
+    """Renaming via config PATCH must not strip the webui HTML hint."""
+    monkeypatch.setenv("GPTME_SERVE_HTML_HINT", "true")
+    monkeypatch.setenv("GPTME_CHAT_HISTORY", "false")
+
+    convname = f"test-server-v2-rename-{random.randint(0, 1000000)}"
+    create_response = client.put(
+        f"/api/v2/conversations/{convname}",
+        json={
+            "messages": [
+                {
+                    "role": "user",
+                    "content": "Rename/config patch sweep",
+                    "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+                }
+            ],
+            "config": {"chat": {"name": "before rename"}},
+        },
+    )
+    assert create_response.status_code == 200
+    conversation_id = create_response.get_json()["conversation_id"]
+
+    hint = "Output format: you are in a web interface."
+
+    before = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    before_system_msgs = [m["content"] for m in before["log"] if m["role"] == "system"]
+    # Locate the hint by content, not by index: the system prompt is split into
+    # several messages (cache boundary, system info, date, ...) and that layout
+    # is free to change without affecting the invariant this test guards.
+    assert sum(hint in m for m in before_system_msgs) == 1
+
+    config_payload = client.get(
+        f"/api/v2/conversations/{conversation_id}/config"
+    ).get_json()
+    config_payload["chat"]["name"] = "after rename"
+    patch_response = client.patch(
+        f"/api/v2/conversations/{conversation_id}/config",
+        json=config_payload,
+    )
+    assert patch_response.status_code == 200
+
+    after = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    after_system_msgs = [m["content"] for m in after["log"] if m["role"] == "system"]
+    assert after["name"] == "after rename"
+    assert len(after_system_msgs) == len(before_system_msgs)
+    assert sum(hint in m for m in after_system_msgs) == 1
+    assert [m["role"] for m in after["log"]] == [m["role"] for m in before["log"]]
+    assert after["log"][-1]["content"] == "Rename/config patch sweep"
 
 
 def test_v2_chat_config_update_missing_conversation_returns_404(client: FlaskClient):
@@ -2188,6 +2759,353 @@ def test_v2_chat_config_patch_rejected_during_generation(client: FlaskClient):
 
     assert response.status_code == 409
     assert "generation is in progress" in response.get_json()["error"]
+
+
+def test_v2_conversation_delete_rejected_during_generation(client: FlaskClient):
+    """Conversation DELETE should return 409 when a session is actively generating."""
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+
+    with unittest.mock.patch(
+        "gptme.server.api_v2.SessionManager.get_sessions_for_conversation"
+    ) as mock_get:
+        mock_session = unittest.mock.MagicMock()
+        mock_session.generating = True
+        mock_get.return_value = [mock_session]
+
+        response = client.delete(f"/api/v2/conversations/{conversation_id}")
+
+    assert response.status_code == 409
+    assert "generation is in progress" in response.get_json()["error"]
+
+
+def test_v2_conversation_post_rejected_during_generation(client: FlaskClient):
+    """Appending a message while generation is active should not race the worker."""
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+
+    with unittest.mock.patch(
+        "gptme.server.api_v2.SessionManager.get_sessions_for_conversation"
+    ) as mock_get:
+        mock_session = unittest.mock.MagicMock()
+        mock_session.generating = True
+        mock_get.return_value = [mock_session]
+
+        response = client.post(
+            f"/api/v2/conversations/{conversation_id}",
+            json={"role": "user", "content": "This should wait"},
+        )
+
+    assert response.status_code == 409
+    assert "generation is in progress" in response.get_json()["error"]
+
+    conversation = client.get(f"/api/v2/conversations/{conversation_id}").get_json()
+    assert conversation is not None
+    assert all(msg["content"] != "This should wait" for msg in conversation["log"])
+
+
+def test_v2_conversation_command_releases_lock_while_reserved(client: FlaskClient):
+    """Slow commands reserve the conversation without retaining its lock."""
+    from gptme.server.session_models import SessionManager
+
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+    lock_was_available = False
+
+    def handle_cmd_while_probing_lock(*_args):
+        nonlocal lock_was_available
+        lock = SessionManager.conversation_lock(conversation_id)
+        acquired = lock.acquire(blocking=False)
+        lock_was_available = acquired
+        if acquired:
+            lock.release()
+        assert SessionManager.command_is_active(conversation_id)
+        return iter(())
+
+    with unittest.mock.patch(
+        "gptme.server.api_v2.handle_cmd", side_effect=handle_cmd_while_probing_lock
+    ):
+        response = client.post(
+            f"/api/v2/conversations/{conversation_id}",
+            json={"role": "user", "content": "/help"},
+        )
+
+    assert response.status_code == 200
+    assert lock_was_available
+    assert not SessionManager.command_is_active(conversation_id)
+
+
+def test_v2_step_rejected_while_conversation_command_is_active(client: FlaskClient):
+    """Generation cannot start while a synchronous command owns the log."""
+    from gptme.server.session_models import SessionManager
+
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+    session_id = conv["session_id"]
+    SessionManager.start_command(conversation_id)
+    try:
+        response = client.post(
+            f"/api/v2/conversations/{conversation_id}/step",
+            json={"session_id": session_id},
+        )
+    finally:
+        SessionManager.finish_command(conversation_id)
+
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "Generation already in progress"
+
+
+def test_v2_step_rejected_while_other_session_generating(client: FlaskClient):
+    """Step is rejected when a *different* session for the same conversation is generating."""
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+    session_id = conv["session_id"]
+
+    with unittest.mock.patch(
+        "gptme.server.api_v2_sessions.SessionManager.get_sessions_for_conversation"
+    ) as mock_get:
+        other_session = unittest.mock.MagicMock()
+        other_session.generating = True
+        mock_get.return_value = [other_session]
+
+        response = client.post(
+            f"/api/v2/conversations/{conversation_id}/step",
+            json={"session_id": session_id},
+        )
+
+    assert response.status_code == 409
+    assert response.get_json()["error"] == "Generation already in progress"
+
+
+def test_v2_rerun_rejected_while_other_session_generating(client: FlaskClient):
+    """Rerun is rejected when a *different* session for the same conversation is generating."""
+    from gptme.server.session_models import SessionManager
+
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+    session_id = conv["session_id"]
+
+    other_session = SessionManager.create_session(conversation_id)
+    other_session.generating = True
+    try:
+        response = client.post(
+            f"/api/v2/conversations/{conversation_id}/rerun",
+            json={"session_id": session_id},
+        )
+        assert response.status_code == 409
+        assert (
+            response.get_json()["error"]
+            == "Cannot rerun while generation is in progress"
+        )
+    finally:
+        other_session.generating = False
+        SessionManager.remove_session(other_session.id)
+
+
+def test_v2_tool_skip_rejected_while_other_session_generating(client: FlaskClient):
+    """Skip is rejected when a *different* session for the same conversation is generating."""
+    from gptme.server.session_models import SessionManager, ToolExecution
+    from gptme.tools import ToolUse
+
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+    session_id = conv["session_id"]
+    session = SessionManager.get_session(session_id)
+    assert session is not None
+
+    tool_id = "tool-skip-cross-session"
+    session.pending_tools[tool_id] = ToolExecution(
+        tool_id=tool_id,
+        tooluse=ToolUse("shell", [], "echo hello", call_id="call-skip-1"),
+    )
+
+    other_session = SessionManager.create_session(conversation_id)
+    other_session.generating = True
+    try:
+        response = client.post(
+            f"/api/v2/conversations/{conversation_id}/tool/confirm",
+            json={"session_id": session_id, "tool_id": tool_id, "action": "skip"},
+        )
+        assert response.status_code == 409
+        assert response.get_json()["error"] == "Generation already in progress"
+        # The pending tool must remain untouched so the client can retry
+        assert tool_id in session.pending_tools
+    finally:
+        other_session.generating = False
+        SessionManager.remove_session(other_session.id)
+        session.pending_tools.pop(tool_id, None)
+
+
+def test_v2_interrupt_stops_other_sessions_generation(client: FlaskClient):
+    """Interrupt clears generation started by a *different* session for the conversation."""
+    from gptme.server.session_models import SessionManager
+
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+    session_id = conv["session_id"]
+
+    other_session = SessionManager.create_session(conversation_id)
+    other_session.generating = True
+    other_session.generating_since = datetime.now(tz=timezone.utc)
+    try:
+        response = client.post(
+            f"/api/v2/conversations/{conversation_id}/interrupt",
+            json={"session_id": session_id},
+        )
+        assert response.status_code == 200
+        assert response.get_json()["message"] == "Interrupted"
+        assert other_session.generating is False
+        assert other_session.generating_since is None
+    finally:
+        other_session.generating = False
+        SessionManager.remove_session(other_session.id)
+
+
+def test_start_step_thread_rejected_while_other_session_generating(v2_conv):
+    """Tool-continuation steps must not start while a sibling session is generating."""
+    from gptme.server.session_models import SessionManager
+    from gptme.server.session_step import _start_step_thread
+
+    conversation_id = v2_conv["conversation_id"]
+    session = SessionManager.get_session(v2_conv["session_id"])
+    assert session is not None
+
+    other_session = SessionManager.create_session(conversation_id)
+    other_session.generating = True
+    try:
+        started = _start_step_thread(
+            conversation_id,
+            session,
+            "openai/mock-model",
+            Path("/tmp"),
+            reserved=False,
+        )
+        assert started is False
+        assert session.generating is False
+    finally:
+        other_session.generating = False
+        SessionManager.remove_session(other_session.id)
+
+
+def test_start_acp_step_thread_rejected_while_other_session_generating(v2_conv):
+    """ACP steps must not start while a sibling session is generating."""
+    from gptme.server.session_models import SessionManager
+    from gptme.server.session_step import _start_acp_step_thread
+
+    conversation_id = v2_conv["conversation_id"]
+    session = SessionManager.get_session(v2_conv["session_id"])
+    assert session is not None
+
+    other_session = SessionManager.create_session(conversation_id)
+    other_session.generating = True
+    try:
+        started = _start_acp_step_thread(
+            conversation_id=conversation_id,
+            session=session,
+            workspace=Path("/tmp"),
+            reserved=False,
+        )
+        assert started is False
+        assert session.generating is False
+    finally:
+        other_session.generating = False
+        SessionManager.remove_session(other_session.id)
+
+
+@pytest.mark.parametrize(
+    ("method", "path", "json"),
+    [
+        ("PATCH", "/messages/0", {"content": "updated"}),
+        ("DELETE", "/messages/0", None),
+        ("POST", "/fork?after_message=0", None),
+        ("DELETE", "", None),
+        ("PATCH", "/config", {"model": "openai/gpt-4o"}),
+    ],
+)
+def test_v2_mutations_rejected_while_conversation_command_is_active(
+    client: FlaskClient, method: str, path: str, json: dict | None
+):
+    """Mutations cannot race a synchronous command's log snapshot."""
+    from gptme.server.session_models import SessionManager
+
+    conversation_id = create_conversation(client)["conversation_id"]
+    SessionManager.start_command(conversation_id)
+    try:
+        response = client.open(
+            f"/api/v2/conversations/{conversation_id}{path}", method=method, json=json
+        )
+    finally:
+        SessionManager.finish_command(conversation_id)
+
+    assert response.status_code == 409
+    assert "generation is in progress" in response.get_json()["error"]
+
+
+def test_v2_conversation_delete_rechecks_existence_under_lock(client: FlaskClient):
+    """A DELETE serialized behind another deletion should return 404, not 500."""
+    from gptme.dirs import get_logs_dir
+
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+    logdir = get_logs_dir() / conversation_id
+
+    class DeleteBeforeLock:
+        def __enter__(self):
+            import shutil
+
+            shutil.rmtree(logdir)
+
+        def __exit__(self, *_args):
+            return None
+
+    with unittest.mock.patch(
+        "gptme.server.api_v2.SessionManager.conversation_lock",
+        return_value=DeleteBeforeLock(),
+    ):
+        response = client.delete(f"/api/v2/conversations/{conversation_id}")
+
+    assert response.status_code == 404
+    assert response.get_json() == {
+        "error": f"Conversation not found: {conversation_id}"
+    }
+
+
+def test_v2_chat_config_patch_loads_log_under_conversation_lock(
+    client: FlaskClient,
+):
+    """Config PATCH must not retain a stale log snapshot while waiting on /step."""
+    from gptme.logmanager import LogManager
+    from gptme.server.session_models import SessionManager
+
+    conv = create_conversation(client)
+    conversation_id = conv["conversation_id"]
+    lock = unittest.mock.MagicMock()
+    lock.held = False
+    lock.__enter__.side_effect = lambda: setattr(lock, "held", True)
+    lock.__exit__.side_effect = lambda *_: setattr(lock, "held", False)
+    real_load = LogManager.load
+    loaded_while_locked: list[bool] = []
+
+    def tracking_load(*args, **kwargs):
+        if args and args[0] == conversation_id:
+            loaded_while_locked.append(lock.held)
+        return real_load(*args, **kwargs)
+
+    with (
+        unittest.mock.patch.object(
+            SessionManager, "conversation_lock", return_value=lock
+        ),
+        unittest.mock.patch(
+            "gptme.server.api_v2.LogManager.load", side_effect=tracking_load
+        ),
+    ):
+        response = client.patch(
+            f"/api/v2/conversations/{conversation_id}/config",
+            json={"chat": {"model": "openai/gpt-4o"}},
+        )
+
+    assert response.status_code == 200
+    assert loaded_while_locked == [True]
 
 
 @pytest.mark.parametrize(
@@ -2492,6 +3410,31 @@ def test_v2_fork_conversation_rejects_out_of_range_index(client: FlaskClient):
     assert "out of range" in response.get_json()["error"]
 
 
+@pytest.mark.parametrize(
+    ("method", "path", "json"),
+    [
+        ("PATCH", "/messages/0", {"content": "updated"}),
+        ("DELETE", "/messages/0", None),
+        ("POST", "/fork?after_message=0", None),
+    ],
+)
+def test_missing_conversation_mutations_do_not_allocate_locks(
+    client: FlaskClient, method: str, path: str, json: dict | None
+):
+    """Rejected mutation requests must not grow the process-wide lock registry."""
+    from gptme.server.session_models import SessionManager
+
+    before = dict(SessionManager._conversation_locks)
+    conversation_id = f"missing-{uuid.uuid4().hex}"
+
+    response = client.open(
+        f"/api/v2/conversations/{conversation_id}{path}", method=method, json=json
+    )
+
+    assert response.status_code == 404
+    assert SessionManager._conversation_locks == before
+
+
 def test_copy_messages_for_fork_copies_only_referenced_attachments(tmp_path: Path):
     """Forking should not copy attachments excluded from the retained message slice."""
     from gptme.message import Message  # fmt: skip
@@ -2514,6 +3457,92 @@ def test_copy_messages_for_fork_copies_only_referenced_attachments(tmp_path: Pat
     fork_attachments = dest_logdir / "attachments"
     assert (fork_attachments / "keep.txt").read_text(encoding="utf-8") == "keep"
     assert not (fork_attachments / "skip.txt").exists()
+
+
+def test_copy_messages_for_fork_copies_referenced_file_snapshots(tmp_path: Path):
+    """A fork must keep the source conversation's content-addressed bytes."""
+    from gptme.logmanager import LogManager  # fmt: skip
+    from gptme.message import Message  # fmt: skip
+    from gptme.server.api_v2 import _copy_messages_for_fork  # fmt: skip
+
+    source_logdir = tmp_path / "source"
+    dest_logdir = tmp_path / "fork"
+    live_file = tmp_path / "workspace" / "bootstrap.md"
+    live_file.parent.mkdir()
+    live_file.write_text("mutated live content", encoding="utf-8")
+
+    source_files = source_logdir / "files"
+    source_files.mkdir(parents=True)
+    (source_files / "abc123.md").write_text("original snapshot", encoding="utf-8")
+    message = Message(
+        "system",
+        "bootstrap",
+        files=[live_file],
+        file_hashes={str(live_file): "abc123"},
+    )
+
+    copied = _copy_messages_for_fork([message], source_logdir, dest_logdir)
+    fork_manager = LogManager(copied, logdir=dest_logdir, lock=False)
+
+    assert fork_manager.log.messages[0].file_hashes == {str(live_file): "abc123"}
+    assert (dest_logdir / "files" / "abc123.md").read_text(encoding="utf-8") == (
+        "original snapshot"
+    )
+
+
+def test_copy_messages_for_fork_tolerates_missing_snapshot(tmp_path: Path):
+    """A fork drops stale hash entries whose snapshot is absent in the source."""
+    from gptme.message import Message  # fmt: skip
+    from gptme.server.api_v2 import _copy_messages_for_fork  # fmt: skip
+
+    source_logdir = tmp_path / "source"
+    dest_logdir = tmp_path / "fork"
+    live_file = tmp_path / "workspace" / "bootstrap.md"
+    live_file.parent.mkdir()
+    live_file.write_text("content", encoding="utf-8")
+
+    # file_hashes contains "deadbeef" but no matching snapshot exists in source.
+    source_logdir.mkdir(parents=True)
+    message = Message(
+        "system",
+        "bootstrap",
+        files=[live_file],
+        file_hashes={str(live_file): "deadbeef"},
+    )
+
+    # Stale hash must be dropped so LogManager.snapshot_message_files can
+    # re-store the live file with a fresh consistent hash instead of silently
+    # overwriting the stale one.
+    copied = _copy_messages_for_fork([message], source_logdir, dest_logdir)
+    assert copied[0].file_hashes == {}
+    assert not (dest_logdir / "files" / "deadbeef.md").exists()
+
+
+def test_copy_messages_for_fork_drops_reference_when_snapshot_and_live_file_missing(
+    tmp_path: Path,
+):
+    """When both snapshot and live file are gone, the file reference must be dropped."""
+    from gptme.message import Message  # fmt: skip
+    from gptme.server.api_v2 import _copy_messages_for_fork  # fmt: skip
+
+    source_logdir = tmp_path / "source"
+    dest_logdir = tmp_path / "fork"
+    gone_file = tmp_path / "workspace" / "deleted.md"
+    # Deliberately do NOT create gone_file — it is missing from disk.
+
+    source_logdir.mkdir(parents=True)
+    message = Message(
+        "system",
+        "ref to deleted file",
+        files=[gone_file],
+        file_hashes={str(gone_file): "deadbeef"},
+    )
+
+    copied = _copy_messages_for_fork([message], source_logdir, dest_logdir)
+    # Both hash and file reference must be dropped — live file doesn't exist,
+    # so the fork's LogManager cannot snapshot it and must not keep a dangling ref.
+    assert copied[0].file_hashes == {}
+    assert copied[0].files == []
 
 
 def test_v2_edit_message_rejects_non_string_content(client: FlaskClient):

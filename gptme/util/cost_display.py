@@ -4,9 +4,11 @@ Provides functions to gather costs from multiple sources (CostTracker, metadata,
 and display them in a consistent format.
 """
 
+import os
 from dataclasses import dataclass
 
-from ..message import Message
+from ..message import Message, is_output_json, is_output_quiet
+from . import console
 from .cost_tracker import CostTracker
 
 
@@ -65,6 +67,7 @@ class StepCost:
     cache_creation_tokens: int
     cost: float
     model: str | None = None
+    pricing_type: str = "per_token"
 
 
 @dataclass
@@ -97,6 +100,94 @@ def _format_cost(cost: float) -> str:
     if 0 < cost < 0.0001:
         return "<$0.0001"
     return f"${cost:.4f}"
+
+
+def _fmt_tokens(n: int) -> str:
+    """Format token counts compactly: 1200 → '1.2k'."""
+    if n >= 1000:
+        return f"{n / 1000:.1f}k"
+    return str(n)
+
+
+def inline_cost_text(msg: Message) -> str | None:
+    """Build the inline cost summary for an assistant message."""
+    if os.environ.get("GPTME_SHOW_COST") != "1":
+        return None
+
+    # Prefer real per-message metadata (most accurate), but only when it
+    # contains actual usage data — a metadata dict with only a "model" key
+    # (partial metadata) must fall through to CostTracker rather than printing
+    # zeros.
+    if msg.metadata:
+        usage = msg.metadata.get("usage", {})
+        input_tokens = usage.get("input_tokens", 0)
+        cache_read = usage.get("cache_read_tokens", 0)
+        cache_creation = usage.get("cache_creation_tokens", 0)
+        output_tokens = usage.get("output_tokens", 0)
+        cost = msg.metadata.get("cost", 0.0)
+        model_name = msg.metadata.get("model")
+
+        has_usage = "cost" in msg.metadata or any(
+            key in usage
+            for key in (
+                "input_tokens",
+                "output_tokens",
+                "cache_read_tokens",
+                "cache_creation_tokens",
+            )
+        )
+        if has_usage:
+            total_in = input_tokens + cache_read + cache_creation
+            cost_text = _format_cost(cost)
+
+            # Subscription providers: show "~$0 (subscription)" instead of $0.0000
+            if model_name:
+                try:
+                    from ..llm.models import get_model
+
+                    meta = get_model(model_name)
+                    if meta and meta.pricing_type == "subscription":
+                        cost_text = "~$0 (subscription)"
+                except Exception:
+                    pass
+
+            return (
+                f"[cost: {cost_text} | tokens: {_fmt_tokens(total_in)} in / "
+                f"{_fmt_tokens(output_tokens)} out]"
+            )
+
+    # Fall back to CostTracker last entry.
+    session_costs = CostTracker.get_session_costs()
+    if session_costs and session_costs.entries:
+        last = session_costs.entries[-1]
+        total_in = (
+            last.input_tokens + last.cache_read_tokens + last.cache_creation_tokens
+        )
+        cost_text = _format_cost(last.cost)
+        try:
+            from ..llm.models import get_model
+
+            meta = get_model(last.model)
+            if meta and meta.pricing_type == "subscription":
+                cost_text = "~$0 (subscription)"
+        except Exception:
+            pass
+        return (
+            f"[cost: {cost_text} | tokens: {_fmt_tokens(total_in)} in / "
+            f"{_fmt_tokens(last.output_tokens)} out]"
+        )
+    return None
+
+
+def print_inline_cost(msg: Message) -> None:
+    """Print a dim per-message cost line for the plain CLI.
+
+    The Textual TUI uses :func:`inline_cost_text` in its own render path.
+    """
+    if is_output_json() or is_output_quiet():
+        return
+    if text := inline_cost_text(msg):
+        console.print(f"[dim]{text}[/dim]")
 
 
 def gather_session_costs() -> CostData | None:
@@ -257,6 +348,8 @@ def gather_per_step_costs(messages: list[Message]) -> list[StepCost]:
     Returns one StepCost per assistant message that carries metadata.
     Steps are 1-based (first assistant message = step 1).
     """
+    from ..llm.models import get_model  # lazy import to avoid circular dep
+
     steps: list[StepCost] = []
     step_idx = 0
 
@@ -272,6 +365,14 @@ def gather_per_step_costs(messages: list[Message]) -> list[StepCost]:
             # Only include steps that have some token data
             if input_tokens > 0 or output_tokens > 0 or cache_read > 0:
                 step_idx += 1
+                model_name = msg.metadata.get("model")
+                pricing_type = "per_token"
+                if model_name:
+                    try:
+                        meta = get_model(model_name)
+                        pricing_type = meta.pricing_type
+                    except Exception:
+                        pass
                 steps.append(
                     StepCost(
                         step_index=step_idx,
@@ -280,7 +381,8 @@ def gather_per_step_costs(messages: list[Message]) -> list[StepCost]:
                         cache_read_tokens=cache_read,
                         cache_creation_tokens=cache_create,
                         cost=cost,
-                        model=msg.metadata.get("model"),
+                        model=model_name,
+                        pricing_type=pricing_type,
                     )
                 )
 
@@ -424,6 +526,11 @@ def display_costs(
                 step.input_tokens + step.cache_read_tokens + step.cache_creation_tokens
             )
             model_short = _short_model_name(step.model) if step.model else ""
+            cost_str = (
+                "subscription"
+                if step.pricing_type == "subscription"
+                else _format_cost(step.cost).rjust(9)
+            )
             console.log(
                 "  "
                 + str(step.step_index).rjust(4)
@@ -438,7 +545,7 @@ def display_costs(
                 + "  "
                 + f"{step.cache_creation_tokens:,}".rjust(8)
                 + "  "
-                + _format_cost(step.cost).rjust(9)
+                + cost_str.rjust(9)
                 + "  "
                 + model_short
             )

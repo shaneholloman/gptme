@@ -987,6 +987,62 @@ class TestExamples:
         assert "pdf" in result.lower() or "PDF" in result
 
 
+# ── Playwright Markdown response handling ────────────────────────────
+
+
+@pytest.mark.skipif(not has_playwright(), reason="playwright not installed")
+class TestPlaywrightMarkdownResponse:
+    @pytest.mark.parametrize(
+        "content_type",
+        ["text/markdown", "Text/Markdown", "text/markdown; charset=utf-8"],
+    )
+    def test_load_page_returns_markdown_with_per_call_metadata(self, content_type):
+        from gptme.tools import _browser_playwright as bp
+
+        markdown = "    indented code\n\n| a  | b |\n| -- | - |"
+        page = MagicMock()
+        page.goto.return_value.headers = {"content-type": content_type}
+        page.text_content.return_value = markdown
+        managed = MagicMock(page=page)
+
+        with (
+            patch.object(bp, "_create_page", return_value=managed),
+            patch.object(bp, "get_context_options", return_value={}),
+        ):
+            result = bp._load_page(MagicMock(), "https://example.com")
+
+        assert result == (markdown, True)
+        page.text_content.assert_called_once_with("body")
+        page.inner_text.assert_not_called()
+        managed.close.assert_called_once_with()
+
+    def test_read_url_uses_markdown_flag_from_same_load(self):
+        from gptme.tools import _browser_playwright as bp
+
+        with (
+            patch.object(
+                bp,
+                "_execute_with_retry",
+                return_value=("# Already Markdown", True),
+            ),
+            patch.object(bp, "html_to_markdown") as convert,
+        ):
+            assert bp.read_url("https://example.com") == "# Already Markdown"
+
+        convert.assert_not_called()
+
+    def test_read_url_strips_inline_data_images_from_markdown(self):
+        from gptme.tools import _browser_playwright as bp
+
+        markdown = "before ![inline](data:image/png;base64,abc123) after"
+        with patch.object(
+            bp,
+            "_execute_with_retry",
+            return_value=(markdown, True),
+        ):
+            assert bp.read_url("https://example.com") == "before  after"
+
+
 # ── _create_page (CDP tab reuse vs launched contexts) ─────────────────
 
 

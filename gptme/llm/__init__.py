@@ -15,6 +15,7 @@ from ..constants import prompt_assistant
 from ..message import (
     Message,
     MessageMetadata,
+    MessageTimings,
     format_msgs,
     is_output_json,
     is_output_quiet,
@@ -90,11 +91,12 @@ def _drain_toolbreak_stream(stream: "_StreamWithMetadata") -> None:
 PROVIDER_DEFAULT_MODELS: dict[str, str] = {
     "anthropic": "anthropic/claude-haiku-4-5",
     "openai": "openai/gpt-4o-mini",
-    "openrouter": "openrouter/anthropic/claude-haiku-4-5",
+    "openrouter": "openrouter/anthropic/claude-haiku-4.5",
     "requesty": "requesty/openai/gpt-4o-mini",
     "gemini": "gemini/gemini-2.0-flash",
     "groq": "groq/llama-3.3-70b-versatile",
     "xai": "xai/grok-3-mini",
+    "grok-subscription": "grok-subscription/grok-4.6",
     "deepseek": "deepseek/deepseek-chat",
     "moonshot": "moonshot/kimi-k2.6",
 }
@@ -282,6 +284,7 @@ def reply(
     workspace: Path | None = None,
     output_schema: type | None = None,
     on_token: Callable[[str], None] | None = None,
+    on_thinking: Callable[[bool], None] | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
@@ -329,6 +332,7 @@ def reply(
             agent_name=agent_name,
             output_schema=output_schema,
             on_token=on_token,
+            on_thinking=on_thinking,
             max_tokens=max_tokens,
             temperature=temperature,
             top_p=top_p,
@@ -444,7 +448,25 @@ def _chat_complete(
             via_gptme=True,
         )
 
-    # Providers with native constrained decoding support
+    # grok-subscription: refresh the cached OpenAI client if the token is
+    # about to expire before delegating to the shared OpenAI chat path.
+    # This mirrors the same guard in _stream() so non-streaming requests
+    # don't keep sending an expired token and receiving 401 responses.
+    if provider == "grok-subscription":
+        from .llm_grok_subscription import GROK_CLIENT_VERSION, GROK_PROXY_URL, get_auth
+        from .llm_openai import _init_openai_client
+
+        try:
+            auth = get_auth()
+            _init_openai_client(
+                "grok-subscription",
+                api_key=auth.access_token,
+                base_url=GROK_PROXY_URL,
+                default_headers={"x-grok-client-version": GROK_CLIENT_VERSION},
+            )
+        except Exception:
+            pass  # let chat_openai surface the auth error naturally
+
     # Custom providers and plugin providers are OpenAI-compatible, route through OpenAI path
     if (
         provider in PROVIDERS_OPENAI
@@ -580,6 +602,25 @@ def _stream(
         )
         return _StreamWithMetadata(gen, model, partial=gptme_partial)
 
+    # grok-subscription: refresh the cached OpenAI client if the token is
+    # about to expire before delegating to the shared OpenAI stream path.
+    # Without this, a long-running CLI or server reuses a stale client and
+    # receives 401 responses until the process is restarted.
+    if provider == "grok-subscription":
+        from .llm_grok_subscription import GROK_CLIENT_VERSION, GROK_PROXY_URL, get_auth
+        from .llm_openai import _init_openai_client
+
+        try:
+            auth = get_auth()
+            _init_openai_client(
+                "grok-subscription",
+                api_key=auth.access_token,
+                base_url=GROK_PROXY_URL,
+                default_headers={"x-grok-client-version": GROK_CLIENT_VERSION},
+            )
+        except Exception:
+            pass  # let stream_openai surface the auth error naturally
+
     # Custom providers and plugin providers are OpenAI-compatible, route through OpenAI path
     if (
         provider in PROVIDERS_OPENAI
@@ -654,6 +695,7 @@ def _reply_stream(
     agent_name: str | None = None,
     output_schema: type | None = None,
     on_token: Callable[[str], None] | None = None,
+    on_thinking: Callable[[bool], None] | None = None,
     max_tokens: int | None = None,
     temperature: float | None = None,
     top_p: float | None = None,
@@ -763,6 +805,8 @@ def _reply_stream(
                     if display_enabled:
                         rprint(f"[dim]{last_line}[/dim]", end="")
                     are_thinking = True
+                    if on_thinking is not None:
+                        on_thinking(True)
                 # Check for closing tag
                 elif last_line == "</think>" or last_line == "</thinking>":
                     # Chars were buffered in think_display_buffer, not printed;
@@ -771,6 +815,8 @@ def _reply_stream(
                     if display_enabled:
                         rprint(f"[dim]{last_line}[/dim]", end="")
                     are_thinking = False
+                    if on_thinking is not None:
+                        on_thinking(False)
                     in_think_sig = False
                     just_closed_thinking = True
                 # Suppress Anthropic think-sig comment from display.
@@ -923,6 +969,19 @@ def _reply_stream(
             # Emit as one chunk; ACP batching callback handles downstream chunking.
             # Display/ACP only — not a chunk hook event (don't speak the suffix).
             on_token(suffix)
+        # Attach partial LLM timings to stream.metadata *before* constructing
+        # the Message — the finally block runs after this return but too late
+        # to affect a Message that has already been built from stream.metadata.
+        if first_token_time:
+            _end = time.time()
+            _gen = max(_end - first_token_time, 0.001)
+            _timings: MessageTimings = {
+                "ttft_ms": round((first_token_time - start_time) * 1000, 1),
+                "gen_ms": round(_gen * 1000, 1),
+            }
+            _meta = dict(stream.metadata) if stream.metadata else {}
+            _meta["timings"] = _timings
+            stream.metadata = cast(MessageMetadata, _meta)
         return Message("assistant", output + suffix, metadata=stream.metadata)
     finally:
         # Explicitly close the underlying generator to release resources
@@ -940,6 +999,19 @@ def _reply_stream(
                 f"gen: {gen_time:.2f}s, "
                 f"tok/s: {len_tokens(output, model) / gen_time:.1f})"
             )
+            # Attach timing breakdown to message metadata so it is persisted in
+            # conversation.jsonl and available for bottleneck analysis.
+            # Reuse end_time / gen_time already computed above for the debug log.
+            # Skip if already set by the KeyboardInterrupt handler above.
+            _existing_meta = dict(stream.metadata) if stream.metadata else {}
+            if "timings" not in _existing_meta:
+                timings: MessageTimings = {
+                    "ttft_ms": round((first_token_time - start_time) * 1000, 1),
+                    "gen_ms": round(gen_time * 1000, 1),
+                }
+                meta = dict(stream.metadata) if stream.metadata else {}
+                meta["timings"] = timings
+                stream.metadata = cast(MessageMetadata, meta)
 
     return Message("assistant", output, metadata=stream.metadata)
 
@@ -1044,6 +1116,15 @@ def list_available_providers() -> list[tuple[Provider, str]]:
     if _token_path.exists() and "openai-subscription" not in seen:
         available.append((cast(Provider, "openai-subscription"), "oauth"))
         seen.add("openai-subscription")
+
+    # Grok subscription: check both gptme-stored tokens and grok CLI auth file
+    _grok_token_path = _config_dir / "gptme" / "oauth" / "grok_subscription.json"
+    _grok_cli_path = Path.home() / ".grok" / "auth.json"
+    if (
+        _grok_token_path.exists() or _grok_cli_path.exists()
+    ) and "grok-subscription" not in seen:
+        available.append((cast(Provider, "grok-subscription"), "oauth"))
+        seen.add("grok-subscription")
 
     # Include plugin providers that have their API key configured
     for plugin_name, env_var in get_plugin_api_keys().items():

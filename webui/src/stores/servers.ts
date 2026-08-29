@@ -12,6 +12,60 @@ const STORAGE_KEY = 'gptme_servers';
 const LEGACY_BASE_URL_KEY = 'gptme_baseUrl';
 const LEGACY_USER_TOKEN_KEY = 'gptme_userToken';
 
+// Vite/Playwright dev servers are not gptme-server; never treat them as the API origin.
+const DEV_SERVER_PORTS = new Set(['5173', '4173', '5701']);
+
+/**
+ * Origin of the bundled web UI when it is served by gptme-server on loopback.
+ *
+ * After gptme#3430, a standalone `gptme-server` requires a bearer token and may
+ * bind a non-5700 port. The bundled UI must talk to `window.location.origin`
+ * in that case — the hardcoded 5700 preset otherwise CORS-retries the wrong
+ * process and never recovers from the same-origin 401.
+ *
+ * Returns null for hosted pages (chat.gptme.org), Vite/Playwright dev servers,
+ * and non-loopback origins.
+ */
+export function getBundledLoopbackOrigin(
+  pageOrigin: string = typeof window !== 'undefined' ? window.location.origin : ''
+): string | null {
+  if (!pageOrigin) return null;
+  try {
+    const parsed = new URL(pageOrigin);
+    const isLoopback = ['localhost', '127.0.0.1', '[::1]'].includes(parsed.hostname);
+    if (!isLoopback) return null;
+    if (DEV_SERVER_PORTS.has(parsed.port)) return null;
+    return parsed.origin;
+  } catch {
+    return null;
+  }
+}
+
+/** Point the stock Local 5700 preset at the bundled UI origin when they differ.
+ *
+ * We match by isPreset + loopback host rather than exact default URL so that
+ * a preset that was previously retargeted and persisted (e.g. to :5799) can
+ * still be found and updated when the server restarts on a new port. */
+export function retargetPresetLocalToBundledOrigin(
+  registry: ServerRegistry,
+  pageOrigin?: string
+): void {
+  const origin = getBundledLoopbackOrigin(pageOrigin);
+  if (!origin) return;
+  const preset = registry.servers.find((s) => {
+    if (!s.isPreset) return false;
+    try {
+      const hostname = new URL(s.baseUrl).hostname;
+      return ['localhost', '127.0.0.1', '[::1]'].includes(hostname);
+    } catch {
+      return false;
+    }
+  });
+  if (!preset) return;
+  if (normalizeUrl(preset.baseUrl) === normalizeUrl(origin)) return;
+  preset.baseUrl = origin;
+}
+
 /** Apply post-parse schema normalization to a registry read from storage.
  *  Mutates and returns the object. The caller should fall back to
  *  migrateFromLegacy() if the returned registry has no servers. */
@@ -33,6 +87,7 @@ function normalizeRegistry(parsed: ServerRegistry): ServerRegistry {
   if (parsed.activeServerId && !parsed.connectedServerIds.includes(parsed.activeServerId)) {
     parsed.connectedServerIds.push(parsed.activeServerId);
   }
+  retargetPresetLocalToBundledOrigin(parsed);
   return parsed;
 }
 
@@ -70,7 +125,7 @@ export function migrateCloudPreset(registry: ServerRegistry): void {
 }
 
 function migrateFromLegacy(): ServerRegistry {
-  let baseUrl = DEFAULT_SERVER_CONFIG.baseUrl;
+  let baseUrl = getBundledLoopbackOrigin() || DEFAULT_SERVER_CONFIG.baseUrl;
   let authToken: string | null = null;
   let useAuthToken = false;
 

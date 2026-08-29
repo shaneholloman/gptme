@@ -2,7 +2,11 @@ import atexit
 import logging
 import os
 from dataclasses import replace
-from typing import cast
+from pathlib import Path
+from typing import TYPE_CHECKING, cast
+
+if TYPE_CHECKING:
+    from datetime import datetime
 
 from dotenv import load_dotenv
 from rich.console import Console
@@ -12,6 +16,7 @@ from .cli.setup import ask_for_api_key
 from .commands import init_commands
 from .config import Config, get_config
 from .hooks import init_hooks
+from .lessons.skill_commands import register_skill_commands
 from .llm import guess_provider_from_config, init_llm, is_custom_provider
 from .llm.llm_gptme import GptmeAuthError
 from .llm.models import (
@@ -79,7 +84,20 @@ def init(
         )
     init_tools(tool_allowlist)
     init_hooks(interactive=interactive, no_confirm=no_confirm, server=server)
+
+    config = get_config()
+    if script_hooks := config.get_script_hooks():
+        from .hooks.script import register_script_hooks
+
+        workspace = config.chat.workspace if config.chat is not None else None
+        if workspace is None and config.project is not None:
+            workspace = config.project._workspace
+        register_script_hooks(script_hooks, workspace or Path.cwd())
+
     init_commands()
+    # Expose skills as /skill:<name> commands (after both tools and built-in
+    # commands so bare aliases see the full registry). Never raises.
+    register_skill_commands()
 
     set_tool_format(tool_format)
     # Mark initialization done at the end so callers can retry init()
@@ -101,6 +119,9 @@ def init_model(
     interactive: bool = False,
 ):
     config = get_config()
+
+    # Save original input for provenance tracking before precedence resolution.
+    _requested_model = model
 
     # get from config
     # Precedence: explicit CLI --model > per-chat saved model > [models].default > MODEL env var.
@@ -217,6 +238,13 @@ def init_model(
 
     model_meta = _resolved_meta or get_model(model_full)
 
+    # Preserve the transport-qualified resolved model before any metadata-only
+    # alias expansion. Routed providers can encode the real backend in ModelMeta.
+    if str(provider) == "gptme" and "/" in model_meta.model:
+        resolved_model = f"gptme/{model_meta.model}"
+    else:
+        resolved_model = model_full
+
     # Apply GPTME_CONTEXT_LENGTH override (useful for local models with non-standard context)
     context_length_str = os.environ.get("GPTME_CONTEXT_LENGTH")
     if context_length_str:
@@ -230,7 +258,108 @@ def init_model(
             model_meta = replace(model_meta, context=context_length)
             logger.info(f"Context length overridden to {context_length} tokens")
 
+    # Record model selection provenance trace (Phase 0).
+    _record_selection_trace(
+        config, _requested_model, model_full, resolved_model, provider, model_meta
+    )
+
     set_default_model(model_meta)
+
+
+def _record_selection_trace(
+    config: Config,
+    requested_model: str | None,
+    model_full: str,
+    resolved_model: str,
+    provider: Provider,
+    model_meta: ModelMeta,
+) -> None:
+    """Create and store a ModelSelectionTrace for this session."""
+    from .model_attestation import create_selection_trace, set_selection_trace
+
+    # Infer source kind from the precedence chain.
+    if requested_model is not None:
+        source_kind = "cli"
+        source_value = requested_model
+    elif config.chat and config.chat.model:
+        source_kind = "chat_config"
+        source_value = config.chat.model
+    elif config.user.models.default:
+        source_kind = "models.default"
+        source_value = config.user.models.default
+    elif config.get_env("MODEL"):
+        source_kind = "MODEL"
+        source_value = config.get_env("MODEL") or model_full
+    else:
+        source_kind = "cli"
+        source_value = model_full
+
+    transport_provider = str(provider)
+    backend_provider = _backend_provider(transport_provider, resolved_model)
+    alias_name = model_full.split("/", 1)[1]
+    # Mirror get_model()'s metadata lookup normalization. The reasoning suffix
+    # remains part of the selected wire model, but it is not part of the alias key.
+    if transport_provider == "openai-subscription" and ":" in alias_name:
+        alias_name = alias_name.rsplit(":", 1)[0]
+    alias_model = MODEL_ALIASES.get(transport_provider, {}).get(alias_name)
+    alias_target = (
+        f"{transport_provider}/{alias_model}" if alias_model is not None else None
+    )
+    resolved_model = alias_target or resolved_model
+    resolution_notes = []
+    if alias_target is not None:
+        resolution_notes.append("resolved model alias for metadata lookup")
+    if resolved_model != model_full and alias_target is None:
+        resolution_notes.append("resolved backend model from provider catalog")
+
+    # Phase 1: Look up registry record for the resolved model
+    registry_record: str | None = None
+    attestation_level: str = "selection_only"
+    catalog_observed_at: datetime | None = None
+    try:
+        from model_capability_registry import (
+            lookup_model,
+        )
+
+        ref = lookup_model(model_meta.model)
+        if ref is not None:
+            registry_record = ref.record_id
+            catalog_observed_at = ref.observed_at
+            if ref.verification_status == "verified":
+                attestation_level = "provider_claim"
+    except Exception as e:
+        logger.warning("registry lookup failed for %s: %s", model_meta.model, e)
+
+    trace = create_selection_trace(
+        requested_model=source_value,
+        resolved_model=resolved_model,
+        source_kind=source_kind,  # type: ignore[arg-type]
+        source_value=source_value,
+        transport_provider=transport_provider,
+        backend_provider=backend_provider,
+        alias_target=alias_target,
+        resolution_notes=resolution_notes,
+        registry_record=registry_record,
+    )
+    # Patch attestation level and catalog_observed_at on the identity claim if available
+    if trace.identity is not None:
+        trace.identity.attestation_level = attestation_level  # type: ignore[assignment]
+        if catalog_observed_at is not None:
+            trace.identity.catalog_observed_at = catalog_observed_at
+
+    set_selection_trace(trace)
+
+
+def _backend_provider(transport_provider: str, resolved_model: str) -> str:
+    """Return the provider serving the model weights when it is knowable."""
+    parts = resolved_model.split("/")
+    if transport_provider == "gptme" and len(parts) >= 3:
+        if parts[1] == "openrouter" and len(parts) >= 4:
+            return parts[2]
+        return parts[1]
+    if transport_provider == "openrouter" and len(parts) >= 3:
+        return parts[1]
+    return transport_provider
 
 
 def _maybe_authenticate_gptme_interactively(

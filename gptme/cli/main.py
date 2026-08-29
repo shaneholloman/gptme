@@ -3,6 +3,7 @@ from __future__ import annotations
 import atexit
 import importlib
 import importlib.metadata as _ilm
+import json
 import logging
 import os
 import select
@@ -96,6 +97,88 @@ class _DynamicHelpCommand(click.Command):
     """
 
     _help_expanded = False
+
+    def parse_args(self, ctx: click.Context, args: list[str]) -> list[str]:
+        """Keep arguments after a mirrored utility command opaque to Click."""
+        # Build the set of option names that consume a following value token
+        # (non-flag options).  These must be skipped over when scanning for
+        # the first true positional so that option *values* are not mistaken
+        # for subcommands (e.g. `--model gpt-4` must not yield 'gpt-4').
+        value_opts: set[str] = set()
+        known_opts: set[str] = set()  # all known option names (flags + value-takers)
+        for param in self.params:
+            if isinstance(param, click.Option):
+                known_opts.update(param.opts)
+                if not param.is_flag and param.nargs != 0:
+                    value_opts.update(param.opts)
+
+        # Scan past leading option/value pairs to find the first positional.
+        skip_next = False
+        first_positional: str | None = None
+        for a in args:
+            if skip_next:
+                skip_next = False
+                continue
+            if a == "--":
+                # '--' is the POSIX end-of-options sentinel: the user wants
+                # everything after it treated as literal prompts, not as a
+                # utility shortcut.  Signal main() to skip util dispatch.
+                ctx.meta["util_dispatch_suppressed"] = True
+                break
+            if a == "-":
+                # '-' is gptme's MULTIPROMPT_SEPARATOR, not an option prefix.
+                # Treat as a positional; it is never a UTIL_SUBCOMMAND so the
+                # scan stops here without enabling the gptme-util forward path.
+                first_positional = a
+                break
+            if a.startswith("-"):
+                if a.startswith("--"):
+                    # Long option: --opt=val (inline) or --opt val (next token).
+                    opt_name = a.split("=")[0]
+                    if opt_name not in known_opts:
+                        # Unknown long option: with ignore_unknown_options=True,
+                        # Click treats it as a positional.  Mirror that here so
+                        # the scan doesn't skip past the real first positional.
+                        first_positional = a
+                        break
+                    if "=" not in a and opt_name in value_opts:
+                        skip_next = True
+                    continue
+                # Short option, possibly grouped (e.g. -vm where -m takes a value).
+                # Inspect flags from left to right, as Click does.  The remainder
+                # of the token becomes an attached value as soon as a value-taking
+                # option is found; otherwise every character must be a known flag.
+                chars = a[1:]
+                for idx, ch in enumerate(chars):
+                    opt_name = f"-{ch}"
+                    if opt_name not in known_opts:
+                        # With ignore_unknown_options=True, Click preserves an
+                        # unknown short option as a positional argument.  Stop
+                        # here rather than treating a later utility name as the
+                        # first positional (e.g. `-x chats list --help`).
+                        first_positional = a
+                        break
+                    if opt_name in value_opts:
+                        # No characters after the option means its value is the
+                        # next token.  Otherwise the remainder (including an '='
+                        # prefix) is the attached value.
+                        if idx == len(chars) - 1:
+                            skip_next = True
+                        break
+                if first_positional is not None:
+                    break
+                continue
+            first_positional = a
+            break
+
+        if first_positional is not None:
+            from .util import UTIL_SUBCOMMANDS
+
+            if first_positional in UTIL_SUBCOMMANDS:
+                # Otherwise eager or recognized top-level options such as --help
+                # are consumed before main() can forward them to gptme-util.
+                ctx.allow_interspersed_args = False
+        return super().parse_args(ctx, args)
 
     def _expand_dynamic_help(self) -> None:
         if self._help_expanded:
@@ -386,6 +469,23 @@ def _find_missing_explicit_local_path(prompts: list[str]) -> str | None:
     return None
 
 
+def _group_prompt_args(prompts: list[str] | tuple[str, ...]) -> list[str]:
+    """Group CLI prompt arguments on exact standalone separator arguments."""
+    if len(prompts) == 1:
+        return [prompts[0].strip()] if prompts[0].strip() else []
+
+    grouped: list[str] = []
+    current: list[str] = []
+    for prompt in prompts:
+        if prompt == MULTIPROMPT_SEPARATOR:
+            grouped.append("\n\n".join(current))
+            current = []
+        else:
+            current.append(prompt)
+    grouped.append("\n\n".join(current))
+    return [stripped for group in grouped if (stripped := group.strip())]
+
+
 def _known_tool_names() -> list[str]:
     """Names of all known built-in tools (available or not).
 
@@ -393,8 +493,24 @@ def _known_tool_names() -> list[str]:
     --help rendering) — never at module import time.
     """
     from ..tools import get_available_tools
+    from ..tools._allowlist import TOOL_PRESET_NAMES
 
-    return sorted(tool.name for tool in get_available_tools(include_mcp=False))
+    names = {tool.name for tool in get_available_tools(include_mcp=False)}
+    names.update(TOOL_PRESET_NAMES)
+    return sorted(names)
+
+
+def _known_hint_names() -> list[str]:
+    """Hint tags defined across all known built-in tools.
+
+    Imports the tool subsystem, so only call this lazily — never at module import time.
+    """
+    from ..tools import get_available_tools
+
+    hints: set[str] = set()
+    for tool in get_available_tools(include_mcp=False):
+        hints.update(tool.hints)
+    return sorted(hints)
 
 
 docstring = f"""
@@ -409,6 +525,7 @@ Examples:
   gptme "fix TODOs" main.py                  Include file or URL in context
   gptme "review" github.com/org/repo/pull/1  Include a GitHub PR in context
   gptme --tools none "what is 2+2"           No tools, just chat
+  gptme -t read-only "summarize this repo"   Read files only; no writes or execution
   gptme -t patch,save "fix typo" main.py     Only specific tools (comma-separated)
   gptme -t +subagent "plan a refactor"       Default tools + subagent
   gptme -t=-browser "summarize code"         Default tools minus browser
@@ -449,7 +566,12 @@ Run 'gptme-util --help' for all utility commands."""
 
 @click.command(
     help=docstring,
-    context_settings={"auto_envvar_prefix": "GPTME"},
+    context_settings={
+        "auto_envvar_prefix": "GPTME",
+        # Preserve option-like arguments after a positional command for gptme-*
+        # dispatch. Core gptme options still parse normally before that command.
+        "ignore_unknown_options": True,
+    },
     cls=_DynamicHelpCommand,
 )
 @click.pass_context
@@ -523,7 +645,7 @@ Run 'gptme-util --help' for all utility commands."""
     "--system",
     "prompt_system",
     default=None,
-    help="System prompt [full|short|<custom>]. Defaults to 'full', or the value of `system` in gptme.toml [prompt] if set.",
+    help="System prompt [full|full-noexamples|short|<custom>]. Defaults to 'full', or the value of `system` in gptme.toml [prompt] if set. 'full-noexamples' omits tool examples (~40% token reduction).",
 )
 @click.option(
     "-t",
@@ -538,11 +660,14 @@ Run 'gptme-util --help' for all utility commands."""
         # misleading "invalid choice" here. Resolved lazily: tool discovery
         # imports most of gptme and must not run at module import time.
         lambda: _known_tool_names() + ["none"],
-        allow_prefixes=["+", "-"],
-        extra_choices_for_prefix={"-": _known_tool_names},
-        # Only '+' is lenient: plugin tools (added via '+tool') aren't known at
-        # parse time. '-tool' exclusions stay strict against known tools so typos
-        # like '-shel' are caught early instead of being silently ignored.
+        allow_prefixes=["+", "-", "hint:"],
+        extra_choices_for_prefix={
+            "-": _known_tool_names,
+            "hint:": _known_hint_names,
+        },
+        # '+' is lenient: plugin tools (added via '+tool') aren't known at
+        # parse time. '-tool' exclusions and built-in hint tags stay strict so
+        # typos like '-shel' or 'hint:red-only' fail before tool loading.
         lenient_prefixes=["+"],
         metavar="TOOL",
     ),
@@ -599,14 +724,13 @@ Run 'gptme-util --help' for all utility commands."""
 @click.option(
     "--version",
     is_flag=True,
-    help="Show version and configuration information",
+    help="Show version. With -v/--verbose, show full configuration info.",
 )
 @click.option(
     "--version-json",
     "version_json",
     is_flag=True,
-    hidden=True,
-    help="Show version info as JSON (for scripting)",
+    help="Show version info as JSON (machine-readable, for scripting).",
 )
 @click.option(
     "--profile",
@@ -673,6 +797,15 @@ Run 'gptme-util --help' for all utility commands."""
     envvar="GPTME_INJECTION_HYGIENE",
     help="Prompt injection hygiene for tool outputs: off (disabled), warn (flag suspicious content), block (redact HIGH-severity patterns). Overrides GPTME_INJECTION_HYGIENE env var.",
 )
+@click.option(
+    "--manifest-dir",
+    "manifest_dir",
+    default=None,
+    type=click.Path(file_okay=False, path_type=Path),
+    envvar="GPTME_MANIFEST_DIR",
+    help="Write a JSON record before and after each tool call to this directory. "
+    "Records can be committed alongside session artifacts for tool-call-level attribution.",
+)
 def main(
     ctx: click.Context,
     prompts: list[str],
@@ -706,11 +839,13 @@ def main(
     no_workspace: bool,
     output_schema: str | None,
     injection_hygiene: str | None,
+    manifest_dir: Path | None,
 ):
     """Main entrypoint for the CLI."""
+    show_version = version or version_json
 
     # Dispatch: `gptme search QUERY` → chats search (discoverability alias)
-    if prompts and prompts[0] == "search" and not version and not version_json:
+    if prompts and prompts[0] == "search" and not show_version:
         from ..tools.chats import search_chats  # fmt: skip
 
         query = " ".join(prompts[1:]).strip()
@@ -725,10 +860,14 @@ def main(
 
     # gptme-util subcommand mirroring: `gptme chats [...]` → `gptme-util chats [...]`
     # Any top-level gptme-util subcommand can be invoked without typing 'gptme-util'.
-    if prompts and not version and not version_json:
+    # Suppressed when '--' was used (parse_args sets util_dispatch_suppressed).
+    if prompts and not show_version:
         from .util import UTIL_SUBCOMMANDS  # cheap: just a sorted list constant
 
-        if prompts[0] in UTIL_SUBCOMMANDS:
+        _ctx = click.get_current_context()
+        if prompts[0] in UTIL_SUBCOMMANDS and not _ctx.meta.get(
+            "util_dispatch_suppressed", False
+        ):
             if util_exec := shutil.which("gptme-util"):
                 sys.exit(subprocess.call([util_exec, *prompts]))
             else:
@@ -741,10 +880,21 @@ def main(
 
     # Plugin dispatch: `gptme CMD [args...]` → `gptme-CMD [args...]` if installed
     # Enables extensibility: `gptme sessions` works if gptme-sessions is in PATH.
-    if prompts and not version and not version_json:
+    # Suppressed after '--' for the same literal-prompt semantics as util dispatch.
+    if (
+        prompts
+        and not show_version
+        and not _ctx.meta.get("util_dispatch_suppressed", False)
+    ):
         plugin = f"gptme-{prompts[0]}"
         if plugin_path := shutil.which(plugin):
             sys.exit(subprocess.call([plugin_path, *prompts[1:]]))
+
+    # Register manifest hooks early so they are in the registry before any tool call.
+    if manifest_dir is not None:
+        from ..hooks.manifest import register_manifest_hooks  # fmt: skip
+
+        register_manifest_hooks(manifest_dir)
 
     # Defense-in-depth: handle empty/whitespace names in case Click bypasses convert()
     # (observed to occur in some Click versions when --name "" is passed)
@@ -895,7 +1045,7 @@ def main(
 
     _validate_custom_tool_paths(tool_allowlist_str)
 
-    if profile:
+    if profile and not show_version:
         import cProfile
         import pstats
 
@@ -926,15 +1076,21 @@ def main(
 
     interactive = not non_interactive
     auto_switched_noninteractive = False
-    if version or version_json:
-        from ..info import format_version_info
+    if show_version:
+        if version_json:
+            from ..info import format_version_info
 
-        print(format_version_info(verbose=verbose, output_json=version_json))
+            print(format_version_info(verbose=verbose, output_json=True))
+        elif verbose:
+            from ..info import format_version_info
 
-        # hint about utilities (non-JSON only)
-        if not version_json:
+            print(format_version_info(verbose=True, output_json=False))
             print()
             print("Utilities: gptme-util (run 'gptme-util --help' for more)")
+        else:
+            from ..__version__ import __version__
+
+            print(__version__)
         exit(0)
 
     if "PYTEST_CURRENT_TEST" in os.environ:
@@ -945,8 +1101,9 @@ def main(
     from ..chat import chat
     from ..config import ensure_workspace_dir, get_config, setup_config_from_cli
     from ..init import init_logging
-    from ..llm import get_provider_from_model
+    from ..llm import get_provider_from_model, is_custom_provider
     from ..llm import reply as llm_reply
+    from ..llm.models import PROVIDERS, get_model
     from ..message import Message
     from ..profiles import get_profile
     from ..prompts import (
@@ -1005,9 +1162,6 @@ def main(
             continue
         add_history(prompt)
 
-    # join prompts, grouped by `-` if present, since that's the separator for "chained"/multiple-round prompts
-    sep = "\n\n" + MULTIPROMPT_SEPARATOR
-
     if missing_path := _find_missing_explicit_local_path(prompts):
         raise click.UsageError(
             "Prompt looks like an explicit local path, but it does not exist: "
@@ -1035,9 +1189,9 @@ def main(
                 "Verify the module is installed and the class name is correct."
             ) from e
 
-    prompts = [
-        stripped for p in "\n\n".join(prompts).split(sep) if (stripped := p.strip())
-    ]
+    # Split only when `-` is its own CLI argument. Splitting joined text on
+    # "\n\n-" also matches Markdown list items and silently truncates turns.
+    prompts = _group_prompt_args(prompts)
     # File paths in multiprompts are expanded at runtime by include_paths() in
     # _run_chat_loop (gptme/chat.py:194), not at parse time. Each prompt from the
     # queue goes through include_paths when popped, ensuring fresh content.
@@ -1280,17 +1434,48 @@ def main(
         sys.exit(1)
 
     # Validate model early to fail fast before the expensive get_prompt() call.
-    # Only check models with a provider/ prefix; bare provider names (e.g. "anthropic")
-    # and model aliases (e.g. "gpt-4o") are left for init_model() to resolve.
-    if config.chat.model and "/" in config.chat.model:
+    # Slash-prefixed names are always checked via provider lookup — that was the
+    # original behavior, including when resuming (`gptme --resume --model
+    # badprovider/x` must still be a UsageError, not a later generic crash).
+    # Bare provider names (e.g. "anthropic") and resolvable aliases (e.g.
+    # "gpt-4o") still pass through to init_model(); unresolvable bare names used
+    # to skip this block and pay get_prompt() (workspace context_cmd, 10s+)
+    # before init_model() rejected them. Saved aliases on existing conversations
+    # may outlive the current registry, so skip the new bare-name check unless
+    # --model was explicitly passed on the command line.
+    model_from_cli = ctx.get_parameter_source("model") == ParameterSource.COMMANDLINE
+    if config.chat.model:
         try:
-            get_provider_from_model(config.chat.model)
+            if "/" in config.chat.model:
+                get_provider_from_model(config.chat.model)
+            elif (
+                (not is_existing_conversation or model_from_cli)
+                and config.chat.model not in PROVIDERS
+                and not is_custom_provider(config.chat.model)
+            ):
+                resolved = get_model(config.chat.model)
+                if resolved.provider == "unknown":
+                    raise ValueError(
+                        f"Unknown model {config.chat.model!r}. Use 'provider/model' "
+                        "with a known provider "
+                        f"(e.g. 'openai/{config.chat.model}'), or configure a "
+                        "custom provider. Run 'gptme-util models list' to see "
+                        "available models."
+                    )
         except ValueError as e:
             _cleanup_aborted_new_logdir(logdir, preexisting=logdir_preexisting)
             raise click.UsageError(f"--model: {e}") from e
 
+    if prompt_system == "full-noexamples":
+        os.environ["GPTME_NO_EXAMPLES"] = "1"
+
     if is_existing_conversation:
         logger.debug("Existing conversation found, skipping initial prompt generation")
+        if prompt_system == "full-noexamples":
+            logger.warning(
+                "--system full-noexamples has no effect when resuming an existing conversation; "
+                "the persisted system prompt is kept unchanged"
+            )
         initial_msgs = []
     else:
         # Infer context mode: --context-include / --no-workspace both imply selective mode
@@ -1484,7 +1669,12 @@ def main(
                 logger.error(
                     f"  at {last_frame.filename}:{last_frame.lineno} in {last_frame.name}"
                 )
-        sys.exit(1)
+        if not config.chat.interactive:
+            error_class, exit_code = _classify_fatal_error(e)
+            _write_terminal_error_to_log(logdir, error_class, exit_code, str(e))
+        else:
+            exit_code = 1
+        sys.exit(exit_code)
     finally:
         shutdown_telemetry()
         if get_config().get_env_bool("GPTME_EXIT_STATS"):
@@ -1630,6 +1820,83 @@ def _cleanup_aborted_new_logdir(logdir: Path, *, preexisting: bool) -> None:
         shutil.rmtree(logdir)
     except OSError:
         pass
+
+
+# Exit codes for non-interactive fatal failures (documented in docs/cli.rst).
+# These mirror POSIX sysexits.h conventions where applicable.
+EXIT_RATE_LIMIT = 75  # EX_TEMPFAIL — quota exhausted, retry later
+EXIT_AUTH_ERROR = 76  # EX_PROTOCOL — credential / permission problem
+EXIT_MODEL_UNAVAIL = 77  # EX_NOPERM   — model/service not reachable
+
+
+def _classify_fatal_error(e: BaseException) -> tuple[str, int]:
+    """Classify a fatal exception into (error_class, exit_code).
+
+    Returns a string class name and an exit code.  The default for
+    unclassified exceptions is ("generic", 1) to preserve the existing
+    behaviour.
+    """
+    etype = type(e).__name__
+    emsg = str(e)
+    emsg_lower = emsg.lower()
+
+    # Rate-limit / quota exhausted — temporary, retry later (exit 75)
+    if etype == "RateLimitError" or (
+        "429" in emsg
+        and (
+            "rate" in emsg_lower
+            or "usage_limit_reached" in emsg_lower
+            or "quota" in emsg_lower
+            or "too many requests" in emsg_lower
+        )
+    ):
+        return "rate_limit", EXIT_RATE_LIMIT
+
+    # Authentication / permission denied — needs credential update (exit 76)
+    if etype in ("AuthenticationError", "PermissionDeniedError", "GptmeAuthError") or (
+        "401" in emsg or "403" in emsg
+    ):
+        return "auth_error", EXIT_AUTH_ERROR
+
+    # Model / service unavailable — 404 or 503 response (exit 77).
+    # SDK-native: NotFoundError (404) and ServiceUnavailableError (503) match by type
+    # name.  InternalServerError covers HTTP 500/502/504 — those are generic server
+    # errors, not a predictable availability failure, so they fall through to exit 1.
+    if etype in ("NotFoundError", "ServiceUnavailableError") or (
+        "404" in emsg or "503" in emsg or "model_unavailable" in emsg_lower
+    ):
+        return "model_unavailable", EXIT_MODEL_UNAVAIL
+
+    return "generic", 1
+
+
+def _write_terminal_error_to_log(
+    logdir: Path, error_class: str, exit_code: int, message: str
+) -> None:
+    """Append a terminal error system message to the conversation log.
+
+    This gives machine-readable evidence of the failure in the same
+    ``conversation.jsonl`` that callers inspect for assistant output, instead
+    of silently ending the log at the user prompt.
+    """
+    log_file = logdir / "conversation.jsonl"
+    if not logdir.exists():
+        return
+    event = {
+        "role": "system",
+        "content": f"error: {error_class}\n{message}",
+        "timestamp": datetime.now(tz=timezone.utc).isoformat(),
+        "metadata": {
+            "error": True,
+            "error_class": error_class,
+            "exit_code": exit_code,
+        },
+    }
+    try:
+        with open(log_file, "a") as f:
+            f.write(json.dumps(event) + "\n")
+    except OSError:
+        pass  # best-effort — don't mask the original failure
 
 
 def _read_stdin() -> str:

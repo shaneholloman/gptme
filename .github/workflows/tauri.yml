@@ -157,7 +157,7 @@ jobs:
           key: ${{ runner.os }}-${{ runner.arch }}-tauri-driver-${{ env.TAURI_DRIVER_VERSION }}
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 'lts/*'
           cache: 'npm'
@@ -311,7 +311,7 @@ jobs:
           workspaces: 'tauri/src-tauri -> target'
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 'lts/*'
           cache: 'npm'
@@ -407,7 +407,7 @@ jobs:
         run: pipx install poetry
 
       - name: Set up Python
-        uses: actions/setup-python@v6
+        uses: actions/setup-python@v7
         with:
           python-version: '3.13'
           cache: 'poetry'
@@ -420,6 +420,10 @@ jobs:
 
       - name: Build PyInstaller executable
         shell: bash
+        # Tauri bundles webui/dist itself via frontendDist. Keep the API sidecar
+        # lean instead of embedding a second copy of the same frontend.
+        env:
+          GPTME_PYINSTALLER_EXCLUDE_WEBUI: '1'
         run: make build-server-exe
 
       - name: Place sidecar with Rust target triple
@@ -498,7 +502,7 @@ jobs:
           workspaces: 'tauri/src-tauri -> target'
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 'lts/*'
           cache: 'npm'
@@ -773,7 +777,7 @@ jobs:
           workspaces: 'tauri/src-tauri -> target'
 
       - name: Set up Node.js
-        uses: actions/setup-node@v6
+        uses: actions/setup-node@v7
         with:
           node-version: 'lts/*'
           cache: 'npm'
@@ -828,6 +832,12 @@ jobs:
       (startsWith(github.ref, 'refs/tags/v') || inputs.tag != '')
     needs: [lint, test, build, build-android]
     runs-on: ubuntu-latest
+    environment: tauri-autoupdater-signing
+    env:
+      # True only when the Android signing key, credentials, and pinned
+      # certificate identity are provisioned. PR jobs never reach this job
+      # (gated by tag/inputs.tag above), so these secrets stay release-only.
+      HAS_ANDROID_SIGNING: ${{ secrets.ANDROID_KEYSTORE != '' && secrets.ANDROID_KEY_ALIAS != '' && secrets.ANDROID_KEY_PASSWORD != '' && secrets.ANDROID_STORE_PASSWORD != '' && vars.ANDROID_CERT_SHA256 != '' }}
     permissions:
       contents: write
 
@@ -836,21 +846,166 @@ jobs:
         with:
           ref: ${{ inputs.tag || github.ref }}
 
+      - name: Set up JDK 21
+        uses: actions/setup-java@03ad4de0992f5dab5e18fcb136590ce7c4a0ac95 # v5
+        with:
+          distribution: 'temurin'
+          java-version: '21'
+
       - name: Download Android artifacts
         uses: actions/download-artifact@v4
         with:
           name: android-build
           path: android-dist
 
+      - name: Require Android signing configuration
+        if: env.HAS_ANDROID_SIGNING != 'true'
+        run: |
+          echo "::error::Android release signing is not fully configured."
+          echo "::error::Provision the four ANDROID_* secrets and ANDROID_CERT_SHA256 environment variable."
+          exit 1
+
+      # Signing strategy is shared with ActivityWatch/aw-android
+      # (scripts/sign_apk.sh + .github/workflows/build.yml there): zipalign,
+      # then apksigner for APKs and jarsigner for AABs, passwords via env.
+      # Keep the two implementations consistent when changing either.
+      # See docs/contributing.rst "Android release signing" for provisioning.
+      - name: Sign Android APK and AAB
+        env:
+          ANDROID_KEYSTORE: ${{ secrets.ANDROID_KEYSTORE }}
+          ANDROID_KEY_ALIAS: ${{ secrets.ANDROID_KEY_ALIAS }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.ANDROID_KEY_PASSWORD }}
+          ANDROID_STORE_PASSWORD: ${{ secrets.ANDROID_STORE_PASSWORD }}
+        run: |
+          # Decode the keystore with restrictive permissions and guarantee
+          # removal even when signing fails partway through.
+          KEYSTORE=$(mktemp)
+          trap 'rm -f "$KEYSTORE"' EXIT
+          chmod 600 "$KEYSTORE"
+          printf '%s' "$ANDROID_KEYSTORE" | base64 --decode > "$KEYSTORE"
+
+          # Locate apksigner/zipalign from the newest installed build-tools version.
+          BUILD_TOOLS_DIR=$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d -print | sort -V | tail -1)
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+          ZIPALIGN="${BUILD_TOOLS_DIR}/zipalign"
+          test -x "$APKSIGNER"
+          test -x "$ZIPALIGN"
+
+          # Sign every unsigned APK produced by Gradle (v2/v3 scheme via apksigner).
+          mapfile -d '' unsigned_apks < <(find android-dist -name "*-unsigned.apk" -print0)
+          mapfile -d '' unsigned_aabs < <(find android-dist -name "*.aab" -print0)
+          if [ "${#unsigned_apks[@]}" -eq 0 ] || [ "${#unsigned_aabs[@]}" -eq 0 ]; then
+            echo "::error::Expected at least one unsigned APK and AAB to sign."
+            exit 1
+          fi
+
+          for apk in "${unsigned_apks[@]}"; do
+            signed="${apk/-unsigned/}"
+            # zipalign must run before apksigner (which preserves alignment);
+            # Gradle's unsigned output is not guaranteed to be aligned.
+            "$ZIPALIGN" -p 4 "$apk" "$apk.aligned"
+            mv "$apk.aligned" "$apk"
+            "$APKSIGNER" sign \
+              --ks "$KEYSTORE" \
+              --ks-key-alias "$ANDROID_KEY_ALIAS" \
+              --ks-pass env:ANDROID_STORE_PASSWORD \
+              --key-pass env:ANDROID_KEY_PASSWORD \
+              --out "$signed" \
+              "$apk"
+            rm "$apk"
+            echo "Signed APK: $signed"
+          done
+
+          # Sign AAB bundles with jarsigner (apksigner does not support AABs;
+          # v1 JAR signing is required for AABs distributed outside the Play Store).
+          for aab in "${unsigned_aabs[@]}"; do
+            jarsigner \
+              -keystore "$KEYSTORE" \
+              -storepass:env ANDROID_STORE_PASSWORD \
+              -keypass:env ANDROID_KEY_PASSWORD \
+              -digestalg SHA-256 \
+              -sigalg SHA256withRSA \
+              "$aab" \
+              "$ANDROID_KEY_ALIAS"
+            echo "Signed AAB: $aab"
+          done
+
+      - name: Verify Android signatures and certificate identity
+        env:
+          EXPECTED_CERT_SHA256: ${{ vars.ANDROID_CERT_SHA256 }}
+        run: |
+          BUILD_TOOLS_DIR=$(find "${ANDROID_HOME}/build-tools" -mindepth 1 -maxdepth 1 -type d -print | sort -V | tail -1)
+          APKSIGNER="${BUILD_TOOLS_DIR}/apksigner"
+          test -x "$APKSIGNER"
+          EXPECTED_CERT_SHA256=$(printf '%s' "$EXPECTED_CERT_SHA256" | tr '[:lower:]' '[:upper:]' | tr -d ':[:space:]')
+
+          mapfile -d '' apks < <(find android-dist -name "*.apk" ! -name "*-unsigned*" -print0)
+          mapfile -d '' aabs < <(find android-dist -name "*.aab" -print0)
+          if [ "${#apks[@]}" -eq 0 ] || [ "${#aabs[@]}" -eq 0 ]; then
+            echo "::error::Expected at least one signed APK and AAB before upload."
+            exit 1
+          fi
+
+          for apk in "${apks[@]}"; do
+            echo "Verifying APK: $apk"
+            "$APKSIGNER" verify --verbose "$apk"
+            # Label format varies across build-tools versions:
+            #   <=36: "Signer #1 certificate SHA-256 digest: <hex>"
+            #   37+:  "V3.0 Signer: certificate SHA-256 digest: <hex>"
+            # Match only *certificate* digests (not public-key digests) and
+            # dedupe: with one signing key every line carries the same value;
+            # multiple distinct certs concatenate and fail the comparison.
+            PRINT_CERTS_OUT=$("$APKSIGNER" verify --print-certs "$apk")
+            ACTUAL_CERT_SHA256=$(printf '%s\n' "$PRINT_CERTS_OUT" \
+              | sed -n 's/.*certificate SHA-256 digest: *//p' \
+              | tr '[:lower:]' '[:upper:]' | tr -d ':' \
+              | sort -u | tr -d '[:space:]')
+            if [ -z "$ACTUAL_CERT_SHA256" ]; then
+              echo "::error::Could not extract certificate SHA-256 fingerprint from: $apk"
+              printf '%s\n' "$PRINT_CERTS_OUT" | sed 's/^/  /'
+              exit 1
+            fi
+            if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
+              echo "::error::APK signer certificate does not match ANDROID_CERT_SHA256: $apk"
+              echo "::error::  expected: $EXPECTED_CERT_SHA256"
+              echo "::error::  actual:   $ACTUAL_CERT_SHA256"
+              exit 1
+            fi
+          done
+
+          for aab in "${aabs[@]}"; do
+            echo "Verifying AAB: $aab"
+            # No -strict: Android upload keys are self-signed, so PKIX chain
+            # validation can never pass (exit 4). Identity is enforced by
+            # pinning the signer certificate fingerprint below, like the APK.
+            VERIFY_OUT=$(jarsigner -verify "$aab")
+            printf '%s\n' "$VERIFY_OUT"
+            if ! printf '%s' "$VERIFY_OUT" | grep -q "jar verified"; then
+              echo "::error::AAB signature verification failed: $aab"
+              exit 1
+            fi
+            ACTUAL_CERT_SHA256=$(keytool -printcert -jarfile "$aab" \
+              | sed -n 's/^[[:space:]]*SHA256: //p' \
+              | tr '[:lower:]' '[:upper:]' | tr -d ':' \
+              | sort -u | tr -d '[:space:]')
+            if [ "$ACTUAL_CERT_SHA256" != "$EXPECTED_CERT_SHA256" ]; then
+              echo "::error::AAB signer certificate does not match ANDROID_CERT_SHA256: $aab"
+              echo "::error::  expected: $EXPECTED_CERT_SHA256"
+              echo "::error::  actual:   $ACTUAL_CERT_SHA256"
+              exit 1
+            fi
+          done
+          echo "All Android artifacts passed signature and identity verification."
+
       - name: Upload APK/AAB to release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           TAG: ${{ inputs.tag || github.ref_name }}
         run: |
-          # Rename gradle's generic output names (app-universal-release-unsigned.apk)
-          # to match the desktop bundle naming (gptme-tauri_X.Y.Z_<arch>.<ext>),
-          # e.g. gptme-tauri_0.32.0_universal-unsigned.apk. The "-release" build-type
-          # marker is dropped; "-unsigned" is kept since the APK isn't signed yet.
+          # Rename Gradle's generic output names to match desktop bundle naming:
+          #   app-universal-release.apk  →  gptme-tauri_X.Y.Z_universal.apk
+          # The "-release" build-type marker is always dropped. This job fails
+          # before reaching upload unless signing and verification succeeded.
           VERSION="${TAG#v}"
           find android-dist -name "*.apk" -o -name "*.aab" | while read -r f; do
             new="$(basename "$f" | sed -E "s/^app-/gptme-tauri_${VERSION}_/; s/-release//")"

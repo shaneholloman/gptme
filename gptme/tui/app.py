@@ -11,35 +11,60 @@ import contextvars
 import io
 import logging
 import os.path
+import re
 import sys
+
+try:
+    import termios
+except ImportError:
+    termios = None  # type: ignore[assignment]
 import threading
 from pathlib import Path
 from typing import IO, cast
 
+from rich.console import Console as RichConsole
+from rich.control import Control
+from rich.markdown import Markdown as RichMarkdown
+from rich.markup import escape as markup_escape
+from rich.padding import Padding
+from rich.panel import Panel
 from rich.syntax import Syntax
 from rich.text import Text
 from textual import events
 from textual.app import App, ComposeResult
 from textual.binding import Binding
 from textual.containers import Vertical, VerticalScroll
+from textual.filter import ANSIToTruecolor
 from textual.message import Message as TextualMessage
 from textual.screen import ModalScreen
 from textual.widget import Widget
-from textual.widgets import Collapsible, Markdown, Static, TextArea
+from textual.widgets import (
+    Collapsible,
+    Markdown,
+    Static,
+    TextArea,
+)
 from textual.worker import Worker, WorkerState
 
 from ..chat import step
+from ..commands import execute_cmd, get_command_completer, get_user_commands
 from ..constants import DECLINED_CONTENT, INTERRUPT_CONTENT
+from ..dirs import get_pt_history_file
 from ..hooks import HookType, register_hook, unregister_hook
 from ..hooks.cli_confirm import _get_lang_for_tool
 from ..hooks.confirm import ConfirmationResult
 from ..llm.models import ModelMeta, get_default_model
 from ..logmanager import LogManager
 from ..message import Message
+from ..prompt_queue import drain_prompt_queue
 from ..tools import ToolFormat, ToolUse
 from ..tools.base import ToolUse as ToolUseType
+from ..tools.base import get_tool_format
 from ..tools.complete import SessionCompleteException
-from ..util.context import include_paths
+from ..util.content import is_message_command
+from ..util.context import extract_urls, include_paths
+from ..util.cost_display import inline_cost_text
+from ..util.history import append_history, load_history
 from ..util.tokens import len_tokens
 
 logger = logging.getLogger(__name__)
@@ -59,6 +84,240 @@ def _summarize(content: str, maxlen: int = 80) -> str:
         first = first[: maxlen - 1] + "…"
     n = len(lines)
     return f"{first} ({n} line{'s' if n != 1 else ''})"
+
+
+_THINK_RE = re.compile(r"<think(?:ing)?>(.*?)</think(?:ing)?>", re.DOTALL)
+_THINK_SIG_RE = re.compile(r"<!--\s*think-sig:.*?-->\s*", re.DOTALL)
+
+# Matches the `tool` format: @tool_name(call_id): {...json...}. Calls end at
+# the next tool-call header, any following prose (indented or not), or the end
+# of the message. JSON string braces are handled by parsing the captured body.
+_TOOL_CALL_RE = re.compile(
+    r"^(@(\w+)\([^)]*\)):\s*(\{.*?\})(?=\n@\w+\([^)]*\):|\n|\Z)",
+    re.MULTILINE | re.DOTALL,
+)
+
+# Matches XML tool-call blocks (<tool-use>...</tool-use> or <function_calls>...</function_calls>).
+_XML_TOOLUSE_RE = re.compile(
+    r"(<tool-use>.*?</tool-use>|<function_calls>.*?</function_calls>)",
+    re.DOTALL | re.IGNORECASE,
+)
+
+
+def _split_thinking(content: str) -> list[tuple[bool, str]]:
+    """Split message content into (is_thinking, text) segments.
+
+    Detects <think>/<thinking> blocks and separates them from normal content
+    so the TUI can render them in collapsible sections.
+    """
+    segments: list[tuple[bool, str]] = []
+    last_end = 0
+    for m in _THINK_RE.finditer(content):
+        before = content[last_end : m.start()]
+        if before.strip():
+            segments.append((False, before))
+        inner = _THINK_SIG_RE.sub("", m.group(1)).strip()
+        if inner:
+            segments.append((True, inner))
+        last_end = m.end()
+    tail = content[last_end:]
+    if tail.strip():
+        segments.append((False, tail))
+    return segments
+
+
+def _split_tool_calls(text: str) -> list[tuple[bool, str]]:
+    """Split a text block into (is_toolcall, segment) pairs.
+
+    Detects ``@tool_name(call_id): {...}`` lines emitted by the ``tool``
+    format so they can be rendered as collapsible blocks instead of raw JSON.
+    """
+    segments: list[tuple[bool, str]] = []
+    last_end = 0
+    for m in _TOOL_CALL_RE.finditer(text):
+        before = text[last_end : m.start()]
+        if before.strip():
+            segments.append((False, before))
+        segments.append((True, m.group(0)))
+        last_end = m.end()
+    tail = text[last_end:]
+    if tail.strip():
+        segments.append((False, tail))
+    return segments or [(False, text)]
+
+
+def _tool_call_renderable(call_text: str) -> tuple[str, str, str]:
+    """Parse a tool-format line into (title, code, lang) for a Collapsible."""
+    import json  # local import — json not used elsewhere in this module
+
+    m = _TOOL_CALL_RE.match(call_text.strip())
+    if not m:
+        return call_text, call_text, "text"
+    tool_name = m.group(2)
+    json_body = m.group(3)
+    try:
+        args = json.loads(json_body)
+        code: str = args.get("code") or args.get("command") or json_body
+    except Exception:
+        code = json_body
+    first_line = code.split("\n")[0].strip()
+    if len(first_line) > 55:
+        first_line = first_line[:54] + "…"
+    suffix = "…" if ("\n" in code or len(code) > 60) else ""
+    title = f"▶ {tool_name}: {first_line}{suffix}" if first_line else f"▶ {tool_name}"
+    lang = "python" if tool_name in ("ipython", "python") else "bash"
+    return title, code, lang
+
+
+def _split_markdown_tool_calls(content: str) -> list[tuple[bool, str]]:
+    """Split content into (is_tool, segment) pairs for markdown-format tool codeblocks.
+
+    Uses Codeblock.iter_from_markdown to find tool codeblocks (identified by their
+    language tag) and splits the raw content at those boundaries so they can be
+    rendered as collapsible sections instead of inline code fences.
+    """
+    from ..codeblock import Codeblock
+    from ..tools.base import ToolUse as _ToolUse
+
+    # Collect (start_line, codeblock) pairs for tool-call codeblocks.
+    tool_blocks: list[tuple[int, Codeblock]] = [
+        (cb.start, cb)
+        for cb in Codeblock.iter_from_markdown(content)
+        if cb.start is not None and _ToolUse._from_codeblock(cb) is not None
+    ]
+
+    if not tool_blocks:
+        return [(False, content)]
+
+    lines = content.split("\n")
+    segments: list[tuple[bool, str]] = []
+    prose_lines: list[str] = []
+    i = 0
+    # Build a dict for O(1) lookup by start line
+    blocks_by_line = dict(tool_blocks)
+
+    while i < len(lines):
+        cb = blocks_by_line.get(i)
+        if cb is not None:
+            if prose_lines:
+                prose = "\n".join(prose_lines).strip()
+                if prose:
+                    segments.append((False, prose))
+                prose_lines = []
+            cb_text = f"{cb.fence}{cb.lang}\n{cb.content}\n{cb.fence}"
+            segments.append((True, cb_text))
+            # Skip: 1 opening-fence line + N content lines + 1 closing-fence line
+            n_content = len(cb.content.splitlines()) if cb.content else 0
+            closing_line_idx = i + 1 + n_content
+            # When the closing fence is also an adjacent opening fence (e.g. ``````lang),
+            # _extract_codeblocks normalizes it in-place and keeps start_line pointing at
+            # that same raw line. Don't advance past it so the next block can be matched.
+            adjacent_opening = (
+                closing_line_idx < len(lines)
+                and lines[closing_line_idx].startswith(cb.fence)
+                and bool(
+                    re.match(r"^`{3,}\S", lines[closing_line_idx][len(cb.fence) :])
+                )
+            )
+            i = closing_line_idx if adjacent_opening else closing_line_idx + 1
+        else:
+            prose_lines.append(lines[i])
+            i += 1
+
+    if prose_lines:
+        prose = "\n".join(prose_lines).strip()
+        if prose:
+            segments.append((False, prose))
+
+    return segments or [(False, content)]
+
+
+def _split_xml_tool_calls(content: str) -> list[tuple[bool, str]]:
+    """Split content into (is_tool, segment) pairs for XML-format tool-call blocks."""
+    segments: list[tuple[bool, str]] = []
+    last_end = 0
+    for m in _XML_TOOLUSE_RE.finditer(content):
+        before = content[last_end : m.start()]
+        if before.strip():
+            segments.append((False, before))
+        segments.append((True, m.group(0)))
+        last_end = m.end()
+    tail = content[last_end:]
+    if tail.strip():
+        segments.append((False, tail))
+    return segments or [(False, content)]
+
+
+def _markdown_tool_renderable(segment: str) -> tuple[str, str, str]:
+    """Parse a markdown tool codeblock into (title, code, lang) for a Collapsible."""
+    from ..codeblock import Codeblock
+
+    cb = Codeblock.from_markdown(segment)
+    code = cb.content.strip()
+    tool_name = cb.lang.split()[0] if cb.lang else "tool"
+    first_line = code.split("\n")[0].strip()
+    if len(first_line) > 55:
+        first_line = first_line[:54] + "…"
+    suffix = "…" if ("\n" in code or len(code) > 60) else ""
+    title = f"▶ {tool_name}: {first_line}{suffix}" if first_line else f"▶ {tool_name}"
+    lang = "python" if tool_name in ("ipython", "python") else "bash"
+    return title, code, lang
+
+
+def _xml_tool_renderables(segment: str) -> list[tuple[str, str, str]]:
+    """Parse an XML tool-call block into (title, code, lang) tuples, one per invoke."""
+    from ..tools.base import ToolUse as _ToolUse
+
+    tool_uses = list(_ToolUse._iter_from_xml(segment))
+    if not tool_uses:
+        return [("▶ tool", segment, "xml")]
+    result = []
+    for tu in tool_uses:
+        tool_name = tu.tool
+        code = (tu.content or "").strip()
+        first_line = code.split("\n")[0].strip()
+        if len(first_line) > 55:
+            first_line = first_line[:54] + "…"
+        suffix = "…" if ("\n" in code or len(code) > 60) else ""
+        title = (
+            f"▶ {tool_name}: {first_line}{suffix}" if first_line else f"▶ {tool_name}"
+        )
+        lang = "python" if tool_name in ("ipython", "python") else "bash"
+        result.append((title, code, lang))
+    return result
+
+
+def _split_all_tool_calls(text: str) -> list[tuple[bool, str, str]]:
+    """Split *text* on all three tool-call formats in priority order.
+
+    Returns ``(is_tool, fmt, segment)`` triples where ``fmt`` is ``"tool"``,
+    ``"xml"``, ``"markdown"``, or ``"prose"``.  Non-tool prose from each
+    parser is fed into the next parser, so mixed-format segments are handled
+    correctly: e.g. a segment that contains both ``@tool`` calls and XML
+    ``<function_calls>`` blocks renders all of them as collapsibles.
+    """
+    out: list[tuple[bool, str, str]] = []
+    for is_t, seg1 in _split_tool_calls(text):
+        if is_t:
+            out.append((True, "tool", seg1))
+        else:
+            for is_x, seg2 in _split_xml_tool_calls(seg1):
+                if is_x:
+                    out.append((True, "xml", seg2))
+                else:
+                    for is_m, seg3 in _split_markdown_tool_calls(seg2):
+                        if is_m:
+                            out.append((True, "markdown", seg3))
+                        elif seg3.strip():
+                            out.append((False, "prose", seg3))
+    return out or [(False, "prose", text)]
+
+
+def _has_tool_calls(text: str) -> bool:
+    """Return True if *text* contains any tool call in any supported format."""
+    if _TOOL_CALL_RE.search(text) or _XML_TOOLUSE_RE.search(text):
+        return True
+    return any(is_tool for is_tool, _ in _split_markdown_tool_calls(text))
 
 
 class UserMessage(Vertical):
@@ -83,7 +342,52 @@ class AssistantMessage(Vertical):
 
     def compose(self) -> ComposeResult:
         yield Static(Text("Assistant"), classes="role")
-        yield Markdown(self.content)
+        think_segs = _split_thinking(self.content)
+        has_thinking = any(is_think for is_think, _ in think_segs)
+        has_tool_calls = any(
+            not is_think and _has_tool_calls(text) for is_think, text in think_segs
+        )
+
+        if not has_thinking and not has_tool_calls:
+            yield Markdown(self.content)
+            return
+
+        for is_think, text in think_segs:
+            if is_think:
+                yield Collapsible(
+                    Markdown(text),
+                    title="Thinking",
+                    collapsed=True,
+                    classes="thinking-block",
+                )
+            else:
+                for is_tool, fmt, seg in _split_all_tool_calls(text):
+                    if not is_tool:
+                        yield Markdown(seg)
+                    elif fmt == "tool":
+                        title, code, lang = _tool_call_renderable(seg)
+                        yield Collapsible(
+                            Static(Syntax(code, lang, theme="ansi_dark")),
+                            title=title,
+                            collapsed=True,
+                            classes="tool-call-block",
+                        )
+                    elif fmt == "xml":
+                        for title, code, lang in _xml_tool_renderables(seg):
+                            yield Collapsible(
+                                Static(Syntax(code, lang, theme="ansi_dark")),
+                                title=title,
+                                collapsed=True,
+                                classes="tool-call-block",
+                            )
+                    else:  # markdown
+                        title, code, lang = _markdown_tool_renderable(seg)
+                        yield Collapsible(
+                            Static(Syntax(code, lang, theme="ansi_dark")),
+                            title=title,
+                            collapsed=True,
+                            classes="tool-call-block",
+                        )
 
 
 class SystemMessage(Vertical):
@@ -107,7 +411,7 @@ class StreamingMessage(Vertical):
     def __init__(self) -> None:
         super().__init__(classes="message assistant streaming")
         self._buffer = ""
-        self._body = Static(Text(""))
+        self._body = Static(Text("Generating…"), classes="progress-placeholder")
 
     def compose(self) -> ComposeResult:
         yield Static(Text("Assistant"), classes="role")
@@ -117,6 +421,27 @@ class StreamingMessage(Vertical):
         self._buffer += token
         self._body.update(Text(self._buffer))
 
+    def set_thinking(self, is_thinking: bool) -> None:
+        """Update the placeholder when the model transitions in/out of thinking."""
+        if not self._buffer:
+            label = "Thinking…" if is_thinking else "Generating…"
+            self._body.update(Text(label))
+
+
+class ToolPlaceholder(Vertical):
+    """Transient widget shown in the chat while a tool is running."""
+
+    def __init__(self) -> None:
+        super().__init__(classes="message system tool-placeholder")
+        self._body = Static(Text("Running tool…"), classes="progress-placeholder")
+
+    def compose(self) -> ComposeResult:
+        yield Static(Text("Tool"), classes="role")
+        yield self._body
+
+    def set_tool(self, tool_name: str) -> None:
+        self._body.update(Text(f"Running {tool_name}…"))
+
 
 class InfoMessage(Static):
     """Dim informational line (help text, errors, hints)."""
@@ -125,10 +450,52 @@ class InfoMessage(Static):
         super().__init__(Text(content), classes="info" + (" error" if error else ""))
 
 
+class CostMessage(Static):
+    """Dim per-message cost line rendered by the Textual TUI."""
+
+    def __init__(self, content: str):
+        super().__init__(Text(content, style="dim"), classes="cost")
+
+
+class BouncingError(Static):
+    """An opt-in error line that briefly draws attention to recovery hints."""
+
+    DEFAULT_CSS = """
+    BouncingError {
+        border-left: tall $error;
+        color: $error;
+        padding: 0 1;
+    }
+    """
+
+    def __init__(self, content: str):
+        super().__init__(Text(content), classes="info error")
+        self.error_text = content
+
+    def on_mount(self) -> None:
+        self.styles.animate("background", "#ff6600", duration=0.1)
+        self.set_timer(
+            0.1,
+            lambda: self.styles.animate("background", "transparent", duration=0.2),
+        )
+        self.styles.animate("opacity", 0.7, duration=0.06)
+        self.set_timer(
+            0.06,
+            lambda: self.styles.animate("opacity", 1.0, duration=0.18),
+        )
+        self.set_timer(0.3, self._show_recovery)
+
+    def _show_recovery(self) -> None:
+        self.update(
+            Text.from_markup(
+                f"{markup_escape(self.error_text)}\\n[dim]Recovery:[/dim] edit the command and resubmit, "
+                "or retry the action."
+            )
+        )
+
+
 def renderables_for_message(msg: Message, expanded: bool = False) -> list:
     """Rich renderables for a message, for native-scrollback (inline) mode."""
-    from rich.markdown import Markdown as RichMarkdown
-    from rich.padding import Padding
 
     content = msg.content.strip()
     if msg.role == "user":
@@ -138,11 +505,54 @@ def renderables_for_message(msg: Message, expanded: bool = False) -> list:
             Text(),
         ]
     if msg.role == "assistant":
-        return [
-            Text("Assistant", style="bold blue"),
-            Padding(RichMarkdown(content), (0, 0, 0, 2)),
-            Text(),
-        ]
+        items: list = [Text("Assistant", style="bold blue")]
+        think_segs = _split_thinking(content)
+        has_tool_calls = any(
+            not is_think and _has_tool_calls(t) for is_think, t in think_segs
+        )
+        has_thinking = any(is_think for is_think, _ in think_segs)
+
+        if not has_tool_calls and not has_thinking:
+            items.append(Padding(RichMarkdown(content), (0, 0, 0, 2)))
+        else:
+            for is_think, text in think_segs:
+                if is_think:
+                    items.append(
+                        Panel(RichMarkdown(text), title="Thinking", expand=False)
+                    )
+                else:
+                    for is_tool, fmt, seg in _split_all_tool_calls(text):
+                        if not is_tool:
+                            items.append(Padding(RichMarkdown(seg), (0, 0, 0, 2)))
+                        elif fmt == "tool":
+                            title, code, lang = _tool_call_renderable(seg)
+                            items.append(
+                                Panel(
+                                    Syntax(code, lang, theme="ansi_dark"),
+                                    title=title,
+                                    expand=False,
+                                )
+                            )
+                        elif fmt == "xml":
+                            for title, code, lang in _xml_tool_renderables(seg):
+                                items.append(
+                                    Panel(
+                                        Syntax(code, lang, theme="ansi_dark"),
+                                        title=title,
+                                        expand=False,
+                                    )
+                                )
+                        else:  # markdown
+                            title, code, lang = _markdown_tool_renderable(seg)
+                            items.append(
+                                Panel(
+                                    Syntax(code, lang, theme="ansi_dark"),
+                                    title=title,
+                                    expand=False,
+                                )
+                            )
+        items.append(Text())
+        return items
     # system/tool output: compact summary line, optionally expanded
     renderables: list = [Text(f"▶ {_summarize(content)}", style="dim")]
     if expanded:
@@ -153,7 +563,6 @@ def renderables_for_message(msg: Message, expanded: bool = False) -> list:
 
 def complete_input(text: str) -> list[str]:
     """Full-line completion candidates, reusing the CLI command completers."""
-    from ..commands import get_command_completer, get_user_commands
 
     if not text.startswith("/"):
         return []
@@ -181,30 +590,79 @@ def complete_input(text: str) -> list[str]:
         return []
 
 
+def _load_pt_history(path: Path) -> list[str]:
+    """Read a prompt-toolkit history file; return entries oldest-first."""
+    return load_history(path)
+
+
+def _append_pt_history(path: Path, text: str) -> None:
+    """Append one entry under the lock shared with the CLI."""
+    append_history(path, text)
+
+
 class ChatInput(TextArea):
     """Multi-line input: Enter submits, Alt+Enter/Ctrl+J inserts a newline,
-    Tab completes slash-commands."""
+    Tab completes slash-commands, Up/Down navigates history."""
 
     class Submitted(TextualMessage):
         def __init__(self, value: str) -> None:
             super().__init__()
             self.value = value
 
+    class CompletionsChanged(TextualMessage):
+        """Posted when the tab-completion candidate list changes.
+        candidates=[] means hide the overlay."""
+
+        def __init__(self, candidates: list[str], selected: int) -> None:
+            super().__init__()
+            self.candidates = candidates
+            self.selected = selected
+
     def __init__(self, **kwargs) -> None:
         super().__init__(**kwargs)
         self._tab_candidates: list[str] = []
         self._tab_index = -1
         self._tab_last = ""
+        self._history_file = get_pt_history_file()
+        self._history: list[str] = _load_pt_history(self._history_file)
+        self._history_idx = -1  # -1 = not browsing; 0 = most recent
+        self._history_saved = ""  # text buffered when browsing started
+        self._history_edits: dict[str, str] = {}
+        self._history_filter: list[str] = []  # prefix-filtered view; empty = unfiltered
+
+    def _push_history(self, text: str) -> None:
+        """Record a submitted entry and persist it to the shared history file."""
+        if text and (not self._history or self._history[-1] != text):
+            self._history.append(text)
+            try:
+                _append_pt_history(self._history_file, text)
+            except OSError as e:
+                logger.warning(
+                    "failed to persist history to %s: %s", self._history_file, e
+                )
+        self._history_idx = -1
+        self._history_saved = ""
+        self._history_edits.clear()
+        self._history_filter = []
+
+    def _clear_completions(self) -> None:
+        """Clear tab completion state and hide the overlay."""
+        if self._tab_candidates:
+            self._tab_candidates = []
+            self._tab_index = -1
+            self.post_message(self.CompletionsChanged([], -1))
 
     async def _on_key(self, event: events.Key) -> None:
         if event.key == "enter":
             event.stop()
             event.prevent_default()
+            self._clear_completions()
             self.post_message(self.Submitted(self.text))
             return
         if event.key in ("alt+enter", "shift+enter", "ctrl+j"):
             event.stop()
             event.prevent_default()
+            self._clear_completions()
             self.insert("\n")
             return
         if event.key == "tab":
@@ -212,6 +670,63 @@ class ChatInput(TextArea):
             event.stop()
             event.prevent_default()
             self._cycle_completion()
+            return
+        # Any non-Tab key dismisses the completion overlay
+        if self._tab_candidates:
+            self._clear_completions()
+        if event.key == "up":
+            row, _ = self.cursor_location
+            if row == 0 and self._history:
+                event.stop()
+                event.prevent_default()
+                history = self._history_filter or self._history
+                if self._history_idx == -1:
+                    self._history_saved = self.text
+                    # Build prefix-filtered view on first Up press
+                    prefix = self.text
+                    self._history_filter = (
+                        [e for e in self._history if e.startswith(prefix)]
+                        if prefix
+                        else []
+                    )
+                    history = self._history_filter or self._history
+                else:
+                    orig = history[-(self._history_idx + 1)]
+                    self._history_edits[orig] = self.text
+                new_idx = self._history_idx + 1
+                if new_idx < len(history):
+                    self._history_idx = new_idx
+                    orig = history[-(new_idx + 1)]
+                    self._set_text(self._history_edits.get(orig, orig))
+                return
+        if event.key == "down":
+            lines = self.text.split("\n")
+            row, _ = self.cursor_location
+            if row == len(lines) - 1 and self._history_idx >= 0:
+                event.stop()
+                event.prevent_default()
+                history = self._history_filter or self._history
+                orig = history[-(self._history_idx + 1)]
+                self._history_edits[orig] = self.text
+                new_idx = self._history_idx - 1
+                if new_idx < 0:
+                    self._history_idx = -1
+                    self._history_filter = []
+                    self._set_text(self._history_saved)
+                else:
+                    self._history_idx = new_idx
+                    orig = history[-(new_idx + 1)]
+                    self._set_text(self._history_edits.get(orig, orig))
+                return
+        if event.key == "alt+left":
+            event.stop()
+            event.prevent_default()
+            self.action_cursor_word_left()
+            return
+        if event.key == "alt+right":
+            event.stop()
+            event.prevent_default()
+            self.action_cursor_word_right()
             return
         await super()._on_key(event)
 
@@ -242,6 +757,13 @@ class ChatInput(TextArea):
                 self._tab_index = 0
                 self._set_text(candidates[0])
         self._tab_last = self.text
+        # Notify the app to show/update the completion overlay
+        if len(self._tab_candidates) > 1:
+            self.post_message(
+                self.CompletionsChanged(self._tab_candidates, self._tab_index)
+            )
+        else:
+            self.post_message(self.CompletionsChanged([], -1))
 
 
 class ConfirmScreen(ModalScreen[ConfirmationResult]):
@@ -290,12 +812,50 @@ class ConfirmScreen(ModalScreen[ConfirmationResult]):
         self.dismiss(ConfirmationResult.confirm())
 
 
+class UrlConfirmScreen(ModalScreen):
+    """Modal asking the user to confirm fetching URLs found in their message."""
+
+    BINDINGS = [
+        Binding("y,enter", "confirm", "Fetch URL(s)"),
+        Binding("n,escape", "skip", "Skip"),
+    ]
+
+    def __init__(self, urls: list[str]) -> None:
+        super().__init__()
+        self.urls = urls
+
+    def compose(self) -> ComposeResult:
+        title = "Fetch URL?" if len(self.urls) == 1 else f"Fetch {len(self.urls)} URLs?"
+        body = (
+            "\n".join(self.urls)
+            if len(self.urls) == 1
+            else "\n".join(f"{i + 1}. {url}" for i, url in enumerate(self.urls))
+        )
+        with Vertical(id="confirm-dialog"):
+            yield Static(Text(title, style="bold"), id="confirm-title")
+            with VerticalScroll(id="confirm-preview"):
+                yield Static(body)
+            yield Static(
+                Text("[y/enter] fetch   [n/esc] skip"),
+                id="confirm-help",
+            )
+
+    def action_confirm(self) -> None:
+        self.dismiss(self.urls)
+
+    def action_skip(self) -> None:
+        self.dismiss([])
+
+
 class GptmeApp(App):
     """gptme TUI: streaming chat with live input, queueing and collapsible output."""
 
     TITLE = "gptme"
 
     CSS = """
+    Screen {
+        background: ansi_default;
+    }
     Screen:inline {
         height: auto;
         max-height: 40%;
@@ -304,13 +864,16 @@ class GptmeApp(App):
         height: auto;
         max-height: 8;
         margin: 0 1;
+        background: ansi_default;
     }
     #chat {
         padding: 0 1;
+        background: ansi_default;
     }
     .message {
         height: auto;
         margin: 1 0 0 0;
+        background: transparent;
     }
     .message > .role {
         color: $text-muted;
@@ -342,11 +905,30 @@ class GptmeApp(App):
         padding: 0;
         background: transparent;
     }
+    .thinking-block {
+        border: none;
+        padding: 0;
+        background: transparent;
+        color: $text-muted;
+    }
+    .thinking-block CollapsibleTitle {
+        color: $text-muted;
+    }
+    .thinking-block Markdown {
+        color: $text-muted;
+        margin-bottom: 1;
+    }
     /* compact markdown: the widget defaults add blank lines around
        codeblocks (MarkdownFence margin 1 0) and after the last block */
     .message Markdown {
         padding: 0;
         background: transparent;
+    }
+    .message Static {
+        background: transparent;
+    }
+    .message > .progress-placeholder {
+        color: $text-muted;
     }
     .message MarkdownFence {
         margin: 0;
@@ -358,29 +940,39 @@ class GptmeApp(App):
         color: $text-muted;
         margin: 1 0 0 1;
     }
+    .cost {
+        color: $text-muted;
+        margin: 0 0 0 2;
+    }
     .info.error {
         color: $error;
     }
     #bottom {
         dock: bottom;
         height: auto;
+        background: ansi_default;
     }
     #input {
         margin: 1 1 0 1;
         height: auto;
         max-height: 10;
+        background: ansi_default;
     }
     #input-hint {
         height: 1;
-        margin: 0 1;
+        margin: 0 3;
         color: $text-muted;
+        background: ansi_default;
     }
     #status {
         height: 1;
         margin-top: 1;
         padding: 0 1;
-        background: $surface;
         color: $text-muted;
+        background: ansi_default;
+    }
+    Screen:inline #status {
+        margin-top: 0;
     }
     ConfirmScreen {
         align: center middle;
@@ -401,6 +993,15 @@ class GptmeApp(App):
     #confirm-help {
         color: $text-muted;
     }
+    #completions {
+        display: none;
+        height: auto;
+        max-height: 10;
+        margin: 0 1;
+        padding: 0 1;
+        background: $surface;
+        border: round $primary;
+    }
     """
 
     BINDINGS = [
@@ -417,13 +1018,22 @@ class GptmeApp(App):
         workspace: Path | None = None,
         auto_confirm: bool = False,
         inline: bool = False,
+        experimental_jelly_errors: bool = False,
     ):
         super().__init__()
+        # Keep Textual's truecolor theme, but preserve ANSI default through the
+        # final output filter so terminal foreground/background remain native.
+        self._filters = [
+            filter_
+            for filter_ in self._filters
+            if not isinstance(filter_, ANSIToTruecolor)
+        ]
         self.manager = manager
         self.tool_format: ToolFormat = tool_format
         self.workspace = workspace or manager.workspace
         self.auto_confirm = auto_confirm
         self.inline = inline
+        self.experimental_jelly_errors = experimental_jelly_errors
         self._stream_text = ""
         # Snapshot the caller's context (default model, output format, …) so
         # worker threads see it — gptme stores this state in ContextVars,
@@ -438,6 +1048,7 @@ class GptmeApp(App):
         self._interrupt_event = threading.Event()
         self._quitting = False
         self._stream_widget: StreamingMessage | None = None
+        self._tool_placeholder: ToolPlaceholder | None = None
         self._outputs_expanded = False
         self._stdio_sink: IO[str] | None = None
         self._real_stdout: IO[str] | None = None
@@ -457,16 +1068,17 @@ class GptmeApp(App):
             yield Static(id="live")
             yield ChatInput(id="input")
             yield Static(
-                Text("Type a message… (Enter to send, Alt+Enter for newline)"),
+                Text("Type a message… (Enter to send, Ctrl+J / Alt+Enter for newline)"),
                 id="input-hint",
             )
             yield Static(id="status")
             return
         yield VerticalScroll(id="chat")
         with Vertical(id="bottom"):
+            yield Static("", id="completions")
             yield ChatInput(id="input")
             yield Static(
-                Text("Type a message… (Enter to send, Alt+Enter for newline)"),
+                Text("Type a message… (Enter to send, Ctrl+J / Alt+Enter for newline)"),
                 id="input-hint",
             )
             yield Static(id="status")
@@ -486,8 +1098,6 @@ class GptmeApp(App):
         # the terminal to cooked/echo mode — which would otherwise echo
         # mouse-tracking reports as garbage input.
         try:
-            import termios
-
             self._term_attrs = termios.tcgetattr(sys.__stdin__.fileno())  # type: ignore[union-attr]
         except Exception:
             self._term_attrs = None
@@ -505,6 +1115,9 @@ class GptmeApp(App):
         if not self.inline:
             # inline mode prints history to the terminal before the app starts
             self._render_history()
+            # prevent the chat scroll area from stealing focus; input is always
+            # the active widget for keyboard input
+            self.query_one("#chat", VerticalScroll).can_focus = False
         self.query_one("#input", ChatInput).focus()
         self._update_status()
         # watchdog: tools can reset the tty at any point during execution
@@ -557,8 +1170,6 @@ class GptmeApp(App):
         driver = self._driver
         if driver is None:
             return
-        from rich.console import Console as RichConsole
-        from rich.control import Control
 
         buf = io.StringIO()
         console = RichConsole(
@@ -585,18 +1196,29 @@ class GptmeApp(App):
         self.refresh()
 
     def _show_message(self, msg: Message) -> None:
+        cost_text = inline_cost_text(msg) if msg.role == "assistant" else None
         if self.inline:
-            self._print_above(*renderables_for_message(msg, self._outputs_expanded))
+            renderables = renderables_for_message(msg, self._outputs_expanded)
+            if cost_text:
+                renderables.insert(-1, Text(cost_text, style="dim"))
+            self._print_above(*renderables)
             return
         widget = self._widget_for(msg)
         if widget:
             self._mount_in_chat(widget)
+        if cost_text:
+            self._mount_in_chat(CostMessage(cost_text))
 
     def _show_info(self, text: str, error: bool = False) -> None:
         if self.inline:
             self._print_above(Text(text, style="red" if error else "bright_black"))
             return
-        self._mount_in_chat(InfoMessage(text, error=error))
+        widget: Widget
+        if error and self.experimental_jelly_errors:
+            widget = BouncingError(text)
+        else:
+            widget = InfoMessage(text, error=error)
+        self._mount_in_chat(widget)
 
     def _mount_in_chat(self, widget: Widget) -> None:
         chat = self.query_one("#chat", VerticalScroll)
@@ -616,8 +1238,6 @@ class GptmeApp(App):
         if self._term_attrs is None:
             return
         with contextlib.suppress(Exception):
-            import termios
-
             fd = sys.__stdin__.fileno()  # type: ignore[union-attr]
             if termios.tcgetattr(fd) != self._term_attrs:
                 termios.tcsetattr(fd, termios.TCSANOW, self._term_attrs)
@@ -644,9 +1264,41 @@ class GptmeApp(App):
 
     # -------------------------------------------------------------- input
 
-    def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
+    def on_chat_input_completions_changed(
+        self, event: ChatInput.CompletionsChanged
+    ) -> None:
+        """Show or hide the tab-completion overlay above the input."""
+        try:
+            w = self.query_one("#completions", Static)
+        except Exception:
+            return
+        candidates = event.candidates
+        if len(candidates) <= 1:
+            w.display = False
+            return
+        max_visible = 8
+        start = max(
+            0,
+            min(
+                event.selected - max_visible // 2,
+                len(candidates) - max_visible,
+            ),
+        )
+        visible = candidates[start : start + max_visible]
+        t = Text()
+        for i, c in enumerate(visible, start=start):
+            prefix = "▶ " if i == event.selected else "  "
+            style = "bold" if i == event.selected else "dim"
+            t.append(f"{prefix}{c}\n", style=style)
+        w.update(t)
+        w.display = True
+
+    async def on_chat_input_submitted(self, event: ChatInput.Submitted) -> None:
         text = event.value.strip()
-        self.query_one("#input", ChatInput).text = ""
+        chat_input = self.query_one("#input", ChatInput)
+        chat_input.text = ""
+        if text:
+            chat_input._push_history(text)
         logger.debug(
             "input submitted: %r (generating=%s, queue=%d)",
             text[:80],
@@ -658,7 +1310,6 @@ class GptmeApp(App):
             if not self.generating and self._can_resume():
                 self._start_generation()
             return
-        from ..util.content import is_message_command
 
         if is_message_command(text):
             # a real /command; paths like /tmp/foo.md fall through to _submit,
@@ -675,7 +1326,7 @@ class GptmeApp(App):
                 self._mount_in_chat(widget)
             self._update_status()
         else:
-            self._submit(text)
+            await self._submit(text)
 
     def _can_resume(self) -> bool:
         last = next((m for m in reversed(self.manager.log) if not m.hide), None)
@@ -687,7 +1338,6 @@ class GptmeApp(App):
 
     def _handle_command(self, text: str) -> None:
         """Run a slash-command through the CLI command registry."""
-        from ..commands import execute_cmd
 
         cmd = text.split()[0].lstrip("/")
         if cmd in ("quit", "q"):  # TUI-local alias for /exit
@@ -738,6 +1388,8 @@ class GptmeApp(App):
             sys.stdin = real_stdin
 
         self._model = self._chat_ctx.run(get_default_model)
+        # Sync tool format — /model may have called set_tool_format()
+        self.tool_format = get_tool_format()
         if self.manager.log.messages != before:
             # command changed the log (undo, appended messages, …): re-render
             self._rebuild_chat()
@@ -746,7 +1398,27 @@ class GptmeApp(App):
         if not handled:
             logger.warning("Command %r not handled by registry", text)
             self._show_info(f"Unknown command: /{cmd}")
+        else:
+            # Commands like /skill:<name> queue a follow-up user prompt.
+            # Drain it and start a turn, matching the CLI chat loop.
+            self._drain_command_queued_prompts()
         self._update_status()
+
+    def _drain_command_queued_prompts(self) -> None:
+        """Turn durable prompts queued by a command into a TUI user turn.
+
+        Skill commands write to the durable prompt queue instead of yielding a
+        message. The CLI drains that queue at the top of its chat loop; without
+        this, the prompt sits until a CLI session opens the same log.
+        """
+        drained = drain_prompt_queue(self.manager.logdir)
+        if not drained:
+            return
+        first, *rest = drained
+        self.manager.append(first)
+        self._show_message(first)
+        self.prompt_queue.extend(msg.content for msg in rest)
+        self._start_generation()
 
     def _rebuild_chat(self) -> None:
         if self.inline:
@@ -756,9 +1428,15 @@ class GptmeApp(App):
         chat.remove_children()
         self._render_history()
 
-    def _submit(self, text: str) -> None:
+    async def _submit(self, text: str) -> None:
         msg = Message("user", text, quiet=True)
-        msg = include_paths(msg, self.workspace)
+        # Confirm before fetching any URLs, matching CLI behavior (TUI can't
+        # use prompt_toolkit's sync dialog inside the running event loop).
+        pre_confirmed_urls: list[str] | None = None
+        urls = extract_urls(text)
+        if urls:
+            pre_confirmed_urls = await self.push_screen_wait(UrlConfirmScreen(urls))
+        msg = include_paths(msg, self.workspace, pre_confirmed_urls=pre_confirmed_urls)
         self.manager.append(msg)
         self._show_message(msg)
         self._start_generation()
@@ -799,6 +1477,7 @@ class GptmeApp(App):
                         workspace=self.workspace,
                         logdir=manager.logdir,
                         on_token=self._on_token,
+                        on_thinking=self._on_thinking,
                     ):
                         # each yield may follow a tool execution that reset
                         # the tty (e.g. ipython init) — reassert raw mode
@@ -854,8 +1533,27 @@ class GptmeApp(App):
             raise KeyboardInterrupt
         self.call_from_thread(self._on_stream_token, token)
 
+    def _on_thinking(self, is_thinking: bool) -> None:
+        # called from the worker thread when thinking state changes
+        self.call_from_thread(self._set_stream_thinking, is_thinking)
+
+    def _set_stream_thinking(self, is_thinking: bool) -> None:
+        if self._stream_widget is not None:
+            self._stream_widget.set_thinking(is_thinking)
+        if self.inline and not self._stream_text:
+            label = "Thinking…" if is_thinking else "Generating…"
+            with contextlib.suppress(Exception):
+                self.query_one("#live", Static).update(Text(label, style="dim"))
+
     def _begin_stream(self) -> None:
+        # A new model step starts only after the previous tool batch finished.
+        self._clear_tool_placeholder()
         self._set_state("generating")
+        if self.inline:
+            self.query_one("#live", Static).update(Text("Generating…", style="dim"))
+        elif self._stream_widget is None:
+            self._stream_widget = StreamingMessage()
+            self._mount_in_chat(self._stream_widget)
 
     def _on_stream_token(self, token: str) -> None:
         if self.inline:
@@ -883,16 +1581,42 @@ class GptmeApp(App):
             self._stream_widget.remove()
             self._stream_widget = None
 
+    def _show_tool_placeholder(self) -> None:
+        if self.inline:
+            self.query_one("#live", Static).update(Text("Running tool…", style="dim"))
+            return
+        if self._tool_placeholder is not None:
+            return
+        self._tool_placeholder = ToolPlaceholder()
+        self._mount_in_chat(self._tool_placeholder)
+
+    def _clear_tool_placeholder(self) -> None:
+        if self.inline:
+            self.query_one("#live", Static).update("")
+            return
+        if self._tool_placeholder is not None:
+            self._tool_placeholder.remove()
+            self._tool_placeholder = None
+
     def _on_step_message(self, msg: Message) -> None:
         if msg.role == "assistant":
             # replace the live stream view with the final rendering
             self._clear_stream_view()
+        if msg.role == "system":
+            # Keep the indicator at the bottom while results and hook messages
+            # arrive. The next model step or worker completion ends the batch.
+            self._clear_tool_placeholder()
         self._show_message(msg)
-        if msg.role == "assistant":
+        if msg.role == "assistant" and any(
+            tool_use.is_runnable for tool_use in ToolUse.iter_from_content(msg.content)
+        ):
             self._set_state("executing tools")
+            self._show_tool_placeholder()
+        elif msg.role == "system" and self.state == "executing tools":
+            self._show_tool_placeholder()
         self._update_status()
 
-    def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
+    async def on_worker_state_changed(self, event: Worker.StateChanged) -> None:
         if event.worker.group != "generation":
             return
         if event.state in (
@@ -900,12 +1624,13 @@ class GptmeApp(App):
             WorkerState.ERROR,
             WorkerState.CANCELLED,
         ):
-            self._generation_done()
+            await self._generation_done()
 
-    def _generation_done(self) -> None:
+    async def _generation_done(self) -> None:
         self.generating = False
         # stream may have ended without a final message (interrupt mid-stream)
         self._clear_stream_view()
+        self._clear_tool_placeholder()
         if self._interrupt_event.is_set() and self.prompt_queue:
             # user interrupted: hand queued text back instead of auto-submitting
             text = "\n".join(self.prompt_queue)
@@ -919,7 +1644,7 @@ class GptmeApp(App):
             if self._queued_widgets:
                 self._queued_widgets.pop(0).remove()
             self._set_state("idle")
-            self._submit(text)
+            await self._submit(text)
             return
         self._set_state("idle")
 

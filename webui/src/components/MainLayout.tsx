@@ -4,6 +4,7 @@ import { ResizablePanelGroup, ResizablePanel, ResizableHandle } from '@/componen
 import { Sheet, SheetContent, SheetHeader, SheetTitle } from '@/components/ui/sheet';
 import { WelcomeView } from '@/components/WelcomeView';
 import { ConversationContent } from '@/components/ConversationContent';
+import { ExternalSessionDetail } from '@/components/ExternalSessionDetail';
 import { SplitConversationView } from '@/components/SplitConversationView';
 import { TaskDetails } from '@/components/TaskDetails';
 import { RightSidebar } from '@/components/RightSidebar';
@@ -54,6 +55,7 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
   const stepParam = searchParams.get('step');
   const serverParam = searchParams.get('server');
   const splitParam = searchParams.get('split');
+  const externalParam = searchParams.get('external');
   const splitIds = useMemo((): [string, string] | null => {
     if (!splitParam) return null;
     const ids = splitParam.split(',').filter(Boolean).slice(0, 2);
@@ -132,7 +134,12 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
   const leftVisible = use$(leftSidebarVisible$);
   const rightVisible = use$(rightSidebarVisible$);
   const rightActiveTab = use$(rightSidebarActiveTab$);
-  const currentConversation = conversation$.get();
+  // Reactive read: the chat section is rendered by renderMainContent(), a plain
+  // function rather than a <Memo> block, so a bare conversation$.get() there
+  // never subscribes.  Without this, a freshly created conversation renders as
+  // `null` until some *unrelated* state change re-renders MainLayout (in
+  // practice the next conversation-list refetch, seconds later).
+  const currentConversation = use$(conversation$);
 
   // Handle step parameter for auto-generation
   useEffect(() => {
@@ -284,6 +291,7 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
 
       const newParams = new URLSearchParams(searchParams);
       newParams.delete('split');
+      newParams.delete('external');
       if (serverId) {
         newParams.set('server', serverId);
       } else {
@@ -545,8 +553,10 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
       );
     }
 
-    // Chat section — single conversation
-    const conversation = conversation$.get();
+    // Chat section — single conversation.
+    // Use the reactively-tracked value from the component body — see the note
+    // at its declaration for why a bare conversation$.get() is not enough here.
+    const conversation = currentConversation;
     if (conversation) {
       return (
         <div className="flex h-full flex-col overflow-hidden">
@@ -583,6 +593,15 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
       return null;
     }
 
+    // External session selected from sidebar — show transcript inline in the native chat layout
+    if (externalParam) {
+      return (
+        <div className="h-full overflow-hidden">
+          <ExternalSessionDetail key={externalParam} sessionId={externalParam} />
+        </div>
+      );
+    }
+
     return (
       <div className="flex h-full flex-1 items-center justify-center">
         <WelcomeView />
@@ -608,6 +627,7 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
               <UnifiedSidebar
                 conversations={allConversations}
                 selectedConversationId$={selectedConversation$}
+                selectedExternalId={externalParam ?? undefined}
                 onSelectConversation={(id, serverId) => {
                   handleSelectConversation(id, serverId);
                   leftSidebarVisible$.set(false);
@@ -728,6 +748,7 @@ const MainLayout: FC<Props> = ({ conversationId, taskId }) => {
             <UnifiedSidebar
               conversations={allConversations}
               selectedConversationId$={selectedConversation$}
+              selectedExternalId={externalParam ?? undefined}
               onSelectConversation={handleSelectConversation}
               conversationsLoading={isLoading}
               conversationsFetching={isFetching}

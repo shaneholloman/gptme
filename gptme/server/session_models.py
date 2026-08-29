@@ -43,6 +43,12 @@ class ToolExecution:
     status: ToolStatus = ToolStatus.PENDING
     auto_confirm: bool = False
     started_at: float | None = None
+    branch: str = "main"
+    # Timestamp of the assistant message that requested this tool. Used to
+    # target the correct message when persisting timing data, since by the
+    # time execution completes a later assistant message may already exist
+    # (see _attach_tool_timings in session_step.py).
+    assistant_msg_timestamp: datetime | None = None
 
 
 @dataclass
@@ -73,16 +79,28 @@ class ConversationSession(BaseSession):
     generating_since: datetime | None = (
         None  # When generation started (for stuck detection)
     )
+    # Set by an interrupt that actually revokes active work; cleared when a new
+    # user-authorized generation chain is successfully dispatched. Tells tool
+    # workers not to continue the agent loop after their current tool completes.
+    interrupted: bool = False
     last_error: str | None = None
     events: list[EventType] = field(default_factory=list)
     _events_offset: int = 0  # number of events trimmed from front of list
     pending_tools: dict[str, ToolExecution] = field(default_factory=dict)
+    # Tools that have been popped from pending_tools but not yet written their
+    # results. Used to prevent the continuation step from starting before all
+    # concurrent tool threads have finished writing.
+    _executing_tools: set[str] = field(default_factory=set)
     auto_confirm_count: int = 0
     clients: set[str] = field(default_factory=set)
     event_flag: threading.Event = field(default_factory=threading.Event)
     # Lock for atomic check-and-set of the generating flag in /step.
     # Prevents concurrent requests from both reading False before either writes True.
     step_lock: threading.Lock = field(default_factory=threading.Lock, repr=False)
+    # Monotonically increasing generation epoch. Interrupts revoke the current
+    # epoch; successful user dispatches and tool continuations claim a new one.
+    # Tool workers compare their captured epoch before releasing or continuing.
+    step_seq: int = 0
 
     # ACP-backed subprocess session (opt-in via use_acp=True in step request)
     use_acp: bool = False
@@ -131,7 +149,42 @@ class SessionManager:
 
     _sessions: dict[str, ConversationSession] = {}
     _conversation_sessions: dict[str, set[str]] = defaultdict(set)
+    # Kept for the process lifetime. Conversation IDs are durable and their
+    # per-ID locks are tiny; retaining them avoids replacing a lock while a
+    # request still holds it after the final session is removed.
+    _conversation_locks: dict[str, threading.RLock] = {}
+    # Slash commands may perform slow LLM/tool work outside the conversation lock.
+    # This reservation keeps generation and mutations from racing that work.
+    _active_commands: set[str] = set()
     _lock = threading.Lock()
+
+    @classmethod
+    def conversation_lock(cls, conversation_id: str) -> threading.RLock:
+        """Return the lock serializing generation-sensitive conversation work."""
+        with cls._lock:
+            lock = cls._conversation_locks.get(conversation_id)
+            if lock is None:
+                lock = threading.RLock()
+                cls._conversation_locks[conversation_id] = lock
+            return lock
+
+    @classmethod
+    def command_is_active(cls, conversation_id: str) -> bool:
+        """Return whether a synchronous command owns the conversation."""
+        with cls._lock:
+            return conversation_id in cls._active_commands
+
+    @classmethod
+    def start_command(cls, conversation_id: str) -> None:
+        """Reserve a conversation for synchronous command execution."""
+        with cls._lock:
+            cls._active_commands.add(conversation_id)
+
+    @classmethod
+    def finish_command(cls, conversation_id: str) -> None:
+        """Release a synchronous command reservation."""
+        with cls._lock:
+            cls._active_commands.discard(conversation_id)
 
     @classmethod
     def create_session(cls, conversation_id: str) -> ConversationSession:
@@ -166,6 +219,19 @@ class SessionManager:
                 for sid in list(cls._conversation_sessions.get(conversation_id, set()))
                 if sid in cls._sessions
             ]
+
+    @classmethod
+    def conversation_generating(cls, conversation_id: str) -> bool:
+        """Return whether any session for the conversation is generating.
+
+        The ``generating`` flag is session-scoped, but generation writes to the
+        conversation's shared log — so reservation checks must consider all
+        sessions for the conversation, not just the requesting one.
+        """
+        return any(
+            session.generating
+            for session in cls.get_sessions_for_conversation(conversation_id)
+        )
 
     @classmethod
     def add_event(cls, conversation_id: str, event: EventType) -> None:

@@ -1,0 +1,80 @@
+name: Security Advisories
+
+on:
+  push:
+    branches: [master]
+  pull_request:
+    branches: [master]
+  schedule:
+    - cron: '0 8 * * 1'  # Weekly, Monday 8am UTC
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  security-events: write  # Required for SARIF upload to GitHub Security tab
+
+jobs:
+  dependency-audit:
+    name: Dependency Advisory Scan
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    # Phase 1: continue-on-error so this never blocks CI
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: astral-sh/setup-uv@v7
+
+      # gptme has no committed uv.lock (gitignored; project uses poetry), so
+      # --frozen would fail. `uv sync` resolves and generates the lockfile that
+      # `uv audit` reads. Note: this audits the uv-resolved graph rather than
+      # the Poetry-committed snapshot; Phase 2 can add `poetry export | pip-audit`
+      # for exact parity with what Poetry installs.
+      - name: Install dependencies and resolve lockfile
+        run: uv sync --all-extras || echo "::warning::Failed to resolve dependencies; audit will run against any existing lockfile or report a tooling error."
+
+      - name: Run audit and generate SARIF
+        id: audit
+        if: always()
+        continue-on-error: true
+        run: |
+          # Single uv audit run: SARIF output + exit-code-aware warnings.
+          # exit 0 = no advisories; exit 1 = advisories found — both produce valid SARIF.
+          # exit ≥2 = tooling failure (bad pyproject, network, missing lockfile) — not a finding.
+          # Phase 1: report-only. In Phase 2 remove continue-on-error to block on advisories.
+          audit_exit=0
+          uv audit --preview-features audit-command \
+              --output-format sarif \
+              --ignore CVE-2025-69872 \
+              --ignore PYSEC-2026-2447 \
+              > /tmp/audit_tmp.sarif || audit_exit=$?
+          # Accepted ignores (diskcache advisories, no fix available):
+          #   CVE-2025-69872, PYSEC-2026-2447 — diskcache; no upstream fix yet.
+          # NOT ignored (flask/setuptools advisories currently inactive in dep tree):
+          #   PYSEC-2026-2151, PYSEC-2026-3447 — unconditionally ignoring them
+          #   would mask real advisories if these packages re-enter the dep tree.
+          if [ "$audit_exit" -eq 0 ]; then
+            echo "No known advisories found."
+          elif [ "$audit_exit" -eq 1 ]; then
+            echo "::warning::Dependency advisories detected — see job log for details. Phase 1: non-blocking."
+          else
+            echo "::warning::Dependency audit tooling error (exit $audit_exit) — not an advisory finding. Phase 1: non-blocking."
+          fi
+          if [ "$audit_exit" -eq 0 ] || [ "$audit_exit" -eq 1 ]; then
+            if [ -s /tmp/audit_tmp.sarif ]; then
+              mv /tmp/audit_tmp.sarif audit.sarif
+              echo "SARIF report generated ($(wc -c < audit.sarif) bytes)."
+            else
+              echo "::warning::SARIF generation produced empty output (non-blocking)."
+            fi
+          fi
+
+      - name: Upload SARIF to GitHub Security tab
+        uses: github/codeql-action/upload-sarif@v3
+        # Fork PRs have a read-only GITHUB_TOKEN (no security-events: write),
+        # so skip SARIF upload for fork PRs to avoid a silent failure.
+        if: always() && hashFiles('audit.sarif') != '' && (github.event_name != 'pull_request' || github.event.pull_request.head.repo.fork == false)
+        continue-on-error: true
+        with:
+          sarif_file: audit.sarif
+          category: dependency-audit

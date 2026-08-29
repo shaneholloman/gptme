@@ -13,6 +13,7 @@ Overview
 - `Save`_ - Create and overwrite files
 - `Patch`_ - Apply precise changes to existing files
 - `Morph`_ - Apply fast targeted edits using Morph Fast Apply
+- `Hashline Edit`_ - Snapshot-anchored line-range edits with stale-file detection
 
 💻 Code & Development
 ^^^^^^^^^^^^^^^^^^^^^
@@ -63,6 +64,35 @@ Overview
 ^^^^^^^^^^^^^
 
 - `MCP`_ - Discover and connect Model Context Protocol servers
+
+Tool Interface Architecture
+^^^^^^^^^^^^^^^^^^^^^^^^^^^
+
+gptme's default tool interface is **Programmatic Tool Calling (PTC)**: the model
+writes executable code in fenced code blocks, and gptme runs it directly. For the
+default ``markdown`` and ``xml`` formats, no JSON schemas are sent to the model
+and no JSON-structured responses are parsed.
+
+The primary dispatch path is ``"markdown"`` format: a fenced code block whose
+language tag identifies any registered tool name (``python``, ``shell``, ``save``,
+``patch``, and others), and whose content gptme routes to
+``ToolSpec.execute(code, args, kwargs)``. For Python, this means IPython's
+``run_cell()``; for Shell, ``subprocess.Popen`` with a stateful bash shell.
+
+gptme also supports a **provider-native tool mode** (``"tool"`` format) for
+OpenAI and Anthropic APIs, where ``ToolSpec`` parameters are converted to
+JSON-schema definitions and sent to the provider — trading context-rot resilience
+for provider-side tool routing compatibility.
+
+**Why default to PTC?** A 2026 benchmark study (arXiv:2608.06370, *"The Bitter Lesson of
+Tool Calling"*) found that PTC matches or exceeds JSON-schema tool calling on
+11/14 models and — critically — **maintains accuracy under context rot** (long
+sessions with accumulated tool history) while JSON-schema accuracy degrades ~2.3%.
+Autonomous gptme sessions routinely accumulate 50–200 tool calls; this is exactly
+the regime where JSON-schema approaches falter.
+
+See :doc:`design/ptc-tool-interface` for the full architecture documentation and
+2026-08-13 audit of dispatch paths in ``gptme/tools/``.
 
 Combinations
 ^^^^^^^^^^^^
@@ -450,6 +480,15 @@ Morph
     :members:
     :noindex:
 
+.. _hashline edit:
+
+Hashline Edit
+-------------
+
+.. automodule:: gptme.tools.hashline_edit
+    :members:
+    :noindex:
+
 .. _gh:
 
 GH
@@ -498,6 +537,21 @@ Vent
 ----
 
 .. automodule:: gptme.tools.vent
+    :members:
+    :noindex:
+
+Request tool change
+-------------------
+
+``request_tool_change`` is an opt-in, audit-only relief valve for assistants
+that need a different session tool configuration. It records a structured
+request in ordinary tool-call history; it does not enable, disable, or configure
+any tool. Enable it explicitly with ``-t +request_tool_change``.
+
+This is separate from ``vent``: ``vent`` records operational friction, while
+``request_tool_change`` names a concrete tool-configuration request.
+
+.. automodule:: gptme.tools.request_tool_change
     :members:
     :noindex:
 
@@ -568,8 +622,18 @@ Pass a comma-separated list of tool names to ``--tools`` (CLI) or set the
     # Disable all tools (pure conversation)
     gptme --tools "" "just talk to me"
 
+    # Strict audit mode: only the built-in read tool, no writes or execution
+    gptme --tools read-only "summarise this repo"
+
 Glob patterns (``*``, ``?``, ``[...]``) are also supported, matched against tool
 names with :func:`fnmatch.fnmatchcase`.
+
+``read-only`` is a named preset, not a hint pattern. It expands to the built-in
+``read`` tool only, and cannot be combined with other tool names. This makes it
+safe for auditing untrusted workspaces where ``shell``, ``ipython``, ``save``,
+``append`` and ``patch`` must stay unavailable. Use ``hint:read-only`` only when
+you explicitly want to trust third-party tool annotations, such as MCP server
+metadata.
 
 .. _hint-allowlist:
 
@@ -582,7 +646,7 @@ once using the ``hint:`` prefix:
 
 .. code-block:: bash
 
-    # Allow only tools annotated as read-only (safe for untrusted workspaces)
+    # Allow only tools annotated as read-only
     gptme --tools "hint:read-only" "summarise this repo"
 
     # Mix exact names with hint patterns
@@ -608,9 +672,9 @@ The following hints are defined:
 
 .. note::
 
-    Built-in gptme tools do not carry hints in the current release. Hints are
-    currently populated automatically from **MCP tool annotations** (see below).
-    You can also set hints explicitly when :doc:`writing custom tools <custom_tool>`.
+    The built-in ``read`` tool carries the ``read-only`` hint. MCP tools can also
+    carry the hint through server-supplied annotations (see below), so
+    ``hint:read-only`` is broader than the strict ``read-only`` preset.
 
 MCP tool annotations
 ^^^^^^^^^^^^^^^^^^^^^
@@ -690,3 +754,9 @@ spawning subagents programmatically:
     # gptme.toml
     [env]
     TOOL_ALLOWLIST = "shell,patch,save,read,hint:read-only"
+
+.. toctree::
+   :maxdepth: 1
+   :caption: Tool guides
+
+   browser

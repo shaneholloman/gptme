@@ -100,11 +100,13 @@ class LessonIndex:
         Searches for lessons/skills in:
 
         User-level (lessons):
-        - ~/.config/gptme/lessons
+        - $XDG_CONFIG_HOME/gptme/lessons (i.e. get_config_dir()/lessons)
+        - ~/.config/gptme/lessons (fallback for backward compatibility)
         - ~/.agents/lessons (cross-platform standard)
 
         User-level (skills, Anthropic SKILL.md format):
-        - ~/.config/gptme/skills
+        - $XDG_CONFIG_HOME/gptme/skills (i.e. get_config_dir()/skills)
+        - ~/.config/gptme/skills (fallback for backward compatibility)
         - ~/.claude/skills (Claude CLI compatibility)
         - ~/.agents/skills (cross-platform standard)
 
@@ -131,10 +133,18 @@ class LessonIndex:
 
         # === User-level lessons directories ===
 
-        # gptme native config
-        config_dir = Path.home() / ".config" / "gptme" / "lessons"
+        # gptme native config (use get_config_dir to honour XDG_CONFIG_HOME)
+        from ..dirs import get_config_dir
+
+        config_dir = get_config_dir() / "lessons"
         if config_dir.exists():
             dirs.append(config_dir)
+
+        # Fallback to old hardcoded path for backward compatibility
+        # (when XDG_CONFIG_HOME is set to something other than ~/.config)
+        legacy_config_dir = Path.home() / ".config" / "gptme" / "lessons"
+        if legacy_config_dir.exists() and legacy_config_dir != config_dir:
+            dirs.append(legacy_config_dir)
 
         # Cross-platform standard (~/.agents/lessons)
         agents_lessons_dir = Path.home() / ".agents" / "lessons"
@@ -143,10 +153,16 @@ class LessonIndex:
 
         # === User-level skills directories ===
 
-        # gptme native skills
-        gptme_skills_dir = Path.home() / ".config" / "gptme" / "skills"
+        # gptme native skills (use get_config_dir to honour XDG_CONFIG_HOME)
+        gptme_skills_dir = get_config_dir() / "skills"
         if gptme_skills_dir.exists():
             dirs.append(gptme_skills_dir)
+
+        # Fallback to old hardcoded path for backward compatibility
+        # (when XDG_CONFIG_HOME is set to something other than ~/.config)
+        legacy_skills_dir = Path.home() / ".config" / "gptme" / "skills"
+        if legacy_skills_dir.exists() and legacy_skills_dir != gptme_skills_dir:
+            dirs.append(legacy_skills_dir)
 
         # Claude CLI compatibility (~/.claude/skills)
         claude_skills_dir = Path.home() / ".claude" / "skills"
@@ -272,9 +288,10 @@ class LessonIndex:
         2. By relative filename — catches same-named lessons across directories
 
         Directory order determines precedence (first directory wins):
-        1. User config (~/.config/gptme/lessons)
-        2. Workspace (./lessons)
-        3. Configured dirs (from gptme.toml)
+        1. User config (get_config_dir()/lessons, honouring XDG_CONFIG_HOME)
+        2. Legacy user config (~/.config/gptme/lessons, fallback for XDG compat)
+        3. Workspace (./lessons)
+        4. Configured dirs (from gptme.toml)
         """
         self.lessons = []
         cache_hits = 0

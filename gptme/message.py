@@ -98,6 +98,46 @@ class ArtifactDescriptor(TypedDict, total=False):
     tool: str  # producing tool name (provenance)
 
 
+class MessageTimings(TypedDict, total=False):
+    """Per-step timing breakdown for an assistant message.
+
+    All fields are in milliseconds (wall-clock).  All are optional — only the
+    phases that were instrumented for a given step will be present.
+
+    Persisted under ``timings`` in :class:`MessageMetadata` so that session
+    records can be used for bottleneck analysis (model latency vs. tool
+    execution time) without any overhead on the hot path — values are summed
+    during streaming and written once at message completion.
+
+    Example session record entry::
+
+        {
+          "role": "assistant",
+          "content": "...",
+          "metadata": {
+            "model": "anthropic/claude-sonnet-4-6",
+            "cost": 0.0018,
+            "usage": {"input_tokens": 2100, "output_tokens": 340},
+            "timings": {
+              "ttft_ms": 820,
+              "gen_ms": 4200,
+              "tool_ms": 1850,
+              "tool_ms_by_name": {"shell": 1600, "read": 250}
+            }
+          }
+        }
+    """
+
+    ttft_ms: float
+    """Wall-clock from prompt send to first token (model dispatch latency)."""
+    gen_ms: float
+    """Time from first token to last token (generation time only, not TTFT)."""
+    tool_ms: float
+    """Total wall-clock time spent in tool execution for this turn."""
+    tool_ms_by_name: dict[str, float]
+    """Per-tool breakdown, e.g. ``{"shell": 1200, "browser": 450}``."""
+
+
 class MessageMetadata(TypedDict, total=False):
     """
     Metadata stored with each message.
@@ -121,10 +161,20 @@ class MessageMetadata(TypedDict, total=False):
     """
 
     model: str
+    # The subprovider that actually served the request, in @provider suffix form
+    # (e.g. "openrouter/deepseek/deepseek-v4-flash-0731@together"). Only set when
+    # it differs from `model`, i.e. when OpenRouter auto-routed to a provider
+    # different from what the model string alone implies.
+    resolved_model: str
     cost: float  # Cost in USD
     usage: UsageData
+    timings: MessageTimings  # Per-step timing breakdown (ttft_ms, gen_ms, tool_ms, …)
     voice_call: dict[str, Any]  # Voice call metadata (call_sid, source, etc.)
     artifacts: list[ArtifactDescriptor]  # tool/plugin-emitted artifact descriptors
+    tool: str  # tool that produced this result message
+    # Identifies one generated startup-prompt generation. A newer generation
+    # supersedes older ones in provider context while all remain on disk.
+    prompt_generation: str
 
 
 _TOKEN_KEYS = (
@@ -619,7 +669,10 @@ def print_msg(
             skipped_hidden += 1
             continue
         try:
-            console.print(s)
+            # Plain-text formatting intentionally preserves literal Rich syntax.
+            # Disable markup and emoji parsing at the rendering boundary so strings
+            # such as "[/home/runner/run.sh]" and ":warning:" stay unchanged.
+            console.print(s, markup=highlight, emoji=False)
         except Exception:
             # rich can throw errors, if so then print the raw message
             logger.exception("Error printing message")

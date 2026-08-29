@@ -11,10 +11,7 @@ import shutil
 import subprocess
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import TYPE_CHECKING
-
-if TYPE_CHECKING:
-    from pathlib import Path
+from pathlib import Path
 
 logger = logging.getLogger(__name__)
 
@@ -70,6 +67,32 @@ def _make_external_session_id(path: str) -> str:
     return digest[:16]
 
 
+def _path_is_under(path: str | None, parent: Path) -> bool:
+    """Whether ``path`` (resolved) is inside ``parent``. False on any error."""
+    if not path:
+        return False
+    try:
+        return Path(path).resolve().is_relative_to(parent)
+    except OSError:
+        return False
+
+
+def _own_logs_dir() -> Path | None:
+    """This server's own conversation logs dir (resolved), or None on error.
+
+    Used to exclude the server's native conversations from external-session
+    discovery — the gptme harness discovery scans the same logs directory the
+    server already serves, so without this filter every local conversation
+    shows up twice in the webui (once native, once "external").
+    """
+    try:
+        from ..dirs import get_logs_dir
+
+        return get_logs_dir().resolve()
+    except Exception:
+        return None
+
+
 class ExternalSessionProvider:
     """Optional provider backed by ``gptme-sessions`` discovery/transcript APIs."""
 
@@ -92,10 +115,35 @@ class ExternalSessionProvider:
 
     @property
     def capabilities(self) -> dict[str, bool]:
-        return {
+        caps: dict[str, bool] = {
             "external_session_catalog": True,
             "external_session_transcript": True,
         }
+        try:
+            from gptme_sessions.steer import (
+                inject_message,  # type: ignore[import-not-found]
+            )
+
+            _ = inject_message  # verify importable
+            caps["external_session_steer"] = True
+        except ImportError:
+            pass
+        return caps
+
+    def steer_session(self, trajectory_path: str, message: str) -> bool:
+        """Inject a user message into a running session via gptme_sessions.steer.
+
+        Returns True on success, False if the steer module is unavailable.
+        Raises on other errors (session not found, harness not supported, etc.).
+        """
+        try:
+            from gptme_sessions.steer import (
+                inject_message,  # type: ignore[import-not-found]
+            )
+        except ImportError:
+            return False
+        inject_message(trajectory_path, message)
+        return True
 
     def _discover_paths(self, days: int) -> list[Path]:
         end = datetime.now(timezone.utc).date()
@@ -104,14 +152,21 @@ class ExternalSessionProvider:
         paths: list[Path] = []
         # gptme discovery returns session *directories*; resolve to the
         # conversation.jsonl file inside so IDs are consistent everywhere.
+        # Sessions under this server's own logs dir are excluded: they are
+        # already served as native conversations, and listing them again as
+        # "external" duplicates every conversation in the webui.
+        own_logs_dir = _own_logs_dir()
         for p in self._discover_gptme_sessions(start, end):
             jsonl = p / "conversation.jsonl"
-            if jsonl.exists():
-                paths.append(jsonl.resolve())
-            else:
+            if not jsonl.exists():
                 logger.debug(
                     "gptme session dir has no conversation.jsonl, skipping: %s", p
                 )
+                continue
+            resolved = jsonl.resolve()
+            if own_logs_dir and resolved.is_relative_to(own_logs_dir):
+                continue
+            paths.append(resolved)
         paths.extend(p.resolve() for p in self._discover_cc_sessions(start, end))
         paths.extend(p.resolve() for p in self._discover_codex_sessions(start, end))
         paths.extend(p.resolve() for p in self._discover_copilot_sessions(start, end))
@@ -134,6 +189,12 @@ class ExternalSessionProvider:
         for path in paths[:max_paths]:
             try:
                 transcript = self._read_transcript(path).to_dict()
+                # Canonicalize to the discovered path: get_session() derives the
+                # ID from this exact string, while the transcript may report a
+                # differently-normalized trajectory_path (unresolved symlinks,
+                # session dir vs file). Any mismatch makes listed sessions 404
+                # on detail lookup.
+                transcript["trajectory_path"] = str(path)
                 items.append(
                     ExternalSessionCatalogItem.from_transcript_dict(transcript)
                 )
@@ -180,6 +241,9 @@ class ExternalSessionProvider:
                     exc_info=True,
                 )
                 continue
+            # Keep trajectory_path consistent with the catalog listing (the ID
+            # is derived from this string in both places).
+            transcript["trajectory_path"] = path_str
             return {
                 "id": _make_external_session_id(path_str),
                 "transcript": transcript,
@@ -199,10 +263,26 @@ class CLIExternalSessionProvider:
 
     @property
     def capabilities(self) -> dict[str, bool]:
-        return {
+        caps: dict[str, bool] = {
             "external_session_catalog": True,
             "external_session_transcript": True,
         }
+        if _cli_has_steer_command():
+            caps["external_session_steer"] = True
+        return caps
+
+    def steer_session(self, trajectory_path: str, message: str) -> bool:
+        """Inject a user message into a running session via the gptme-sessions CLI.
+
+        Returns True on success, False if the steer subcommand is unavailable.
+        Raises on other errors (non-zero exit after args are validated, timeout).
+        """
+        if not _cli_has_steer_command():
+            return False
+        output = self._run_cli(
+            ["steer", trajectory_path, "--message", message, "--json"], timeout=30
+        )
+        return output is not None
 
     def _run_cli(self, args: list[str], timeout: int = 60) -> str | None:
         """Run a gptme-sessions CLI command and return stdout, or None on failure."""
@@ -239,10 +319,36 @@ class CLIExternalSessionProvider:
             return []
         try:
             data = json.loads(output)
-            return data.get("sessions", [])
+            sessions = data.get("sessions", [])
         except (json.JSONDecodeError, KeyError):
             logger.warning("Failed to parse gptme-sessions discover JSON output")
             return []
+        # Exclude sessions under this server's own logs dir — they are already
+        # served as native conversations (see ExternalSessionProvider._discover_paths).
+        own_logs_dir = _own_logs_dir()
+        if own_logs_dir:
+            sessions = [
+                s for s in sessions if not _path_is_under(s.get("path"), own_logs_dir)
+            ]
+        # gptme discovery reports session *directories*, but the `transcript`
+        # subcommand only accepts files — resolve to the conversation.jsonl
+        # inside (mirrors ExternalSessionProvider._discover_paths). Without
+        # this every remaining gptme session logs a CLI usage error and is
+        # skipped.
+        normalized: list[dict] = []
+        for s in sessions:
+            path = s.get("path")
+            if path and Path(path).is_dir():
+                jsonl = Path(path) / "conversation.jsonl"
+                if not jsonl.exists():
+                    logger.debug(
+                        "gptme session dir has no conversation.jsonl, skipping: %s",
+                        path,
+                    )
+                    continue
+                s = {**s, "path": str(jsonl)}
+            normalized.append(s)
+        return normalized
 
     def _read_transcript_cli(self, path: str) -> dict | None:
         """Read a transcript via CLI, returning the full JSON dict."""
@@ -289,6 +395,12 @@ class CLIExternalSessionProvider:
                 transcript = self._read_transcript_cli(path)
                 if transcript is None:
                     continue
+                # Canonicalize to the discovered path: get_session() derives
+                # the ID from this exact string, while the transcript may
+                # report a differently-normalized trajectory_path (e.g.
+                # symlinks resolved: ~/.claude -> ~/dotfiles/home/.claude).
+                # Any mismatch makes every listed session 404 on detail lookup.
+                transcript["trajectory_path"] = str(path)
                 items.append(
                     ExternalSessionCatalogItem.from_transcript_dict(transcript)
                 )
@@ -332,6 +444,9 @@ class CLIExternalSessionProvider:
                     exc_info=True,
                 )
                 continue
+            # Keep trajectory_path consistent with the catalog listing (the ID
+            # is derived from this string in both places).
+            transcript["trajectory_path"] = str(path)
             return {
                 "id": _make_external_session_id(path),
                 "transcript": transcript,
@@ -344,6 +459,22 @@ def _cli_has_transcript_command() -> bool:
     try:
         result = subprocess.run(
             ["gptme-sessions", "transcript", "--help"],
+            capture_output=True,
+            text=True,
+            timeout=10,
+            check=False,
+        )
+        return result.returncode == 0
+    except (subprocess.TimeoutExpired, FileNotFoundError):
+        return False
+
+
+@functools.lru_cache(maxsize=1)
+def _cli_has_steer_command() -> bool:
+    """Check if the installed gptme-sessions CLI has the ``steer`` subcommand."""
+    try:
+        result = subprocess.run(
+            ["gptme-sessions", "steer", "--help"],
             capture_output=True,
             text=True,
             timeout=10,

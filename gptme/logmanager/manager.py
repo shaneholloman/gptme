@@ -29,7 +29,7 @@ from dataclasses import dataclass, field, fields, replace
 from datetime import datetime, timezone
 from itertools import islice, zip_longest
 from pathlib import Path
-from tempfile import TemporaryDirectory
+from tempfile import NamedTemporaryFile, TemporaryDirectory
 from typing import (
     Literal,
     TextIO,
@@ -45,7 +45,12 @@ from ..message import Message, _migrate_metadata, len_tokens, print_msg
 from ..tools import ToolUse
 from ..util.context import enrich_messages_with_context
 from ..util.conversation_ids import conversation_id_error, validate_conversation_id
-from ..util.reduce import limit_log, proactive_summarize_log, reduce_log
+from ..util.reduce import (
+    _drop_orphaned_tool_pairs,
+    limit_log,
+    proactive_summarize_log,
+    reduce_log,
+)
 from ..util.uri import URI
 from . import eventlog
 
@@ -101,7 +106,7 @@ class Log:
         return Log(list(gen))
 
     def write_jsonl(self, path: PathLike) -> None:
-        with open(path, "w") as file:
+        with open(path, "w", encoding="utf-8") as file:
             file.writelines(json.dumps(msg.to_dict()) + "\n" for msg in self.messages)
 
     def print(self, show_hidden: bool = False) -> int:
@@ -179,20 +184,28 @@ class LogManager:
 
             self._acquire_lock()
 
+        # Snapshot attached files before the first provider render. Startup
+        # prompt files must stay byte-identical even if their live source changes.
+        initial_messages = self.snapshot_message_files(log or [])
+
         # load branches from adjacent files
-        self._branches = {self.current_branch: Log(log or [])}
+        self._branches = {self.current_branch: Log(initial_messages)}
         if (self.logdir / "conversation.jsonl").exists():
             _branch = "main"
             if _branch not in self._branches:
-                self._branches[_branch] = Log.read_jsonl(
-                    self.logdir / "conversation.jsonl"
+                branch_log = Log.read_jsonl(self.logdir / "conversation.jsonl")
+                self._branches[_branch] = Log(
+                    self.snapshot_message_files(branch_log.messages)
                 )
         for file in self.logdir.glob("branches/*.jsonl"):
             if file.name == self.logdir.name:
                 continue
             _branch = file.stem
             if _branch not in self._branches:
-                self._branches[_branch] = Log.read_jsonl(file)
+                branch_log = Log.read_jsonl(file)
+                self._branches[_branch] = Log(
+                    self.snapshot_message_files(branch_log.messages)
+                )
 
         # Load view branches (compacted views stored in views/ directory)
         self._views: dict[str, Log] = {}
@@ -200,7 +213,10 @@ class LogManager:
         if views_dir.exists():
             for file in views_dir.glob("*.jsonl"):
                 view_name = file.stem
-                self._views[view_name] = Log.read_jsonl(file)
+                view_log = Log.read_jsonl(file)
+                self._views[view_name] = Log(
+                    self.snapshot_message_files(view_log.messages)
+                )
                 logger.debug(f"Loaded view branch: {view_name}")
 
         # If a view was requested, load it as the active log
@@ -330,7 +346,17 @@ class LogManager:
     @property
     def workspace(self) -> Path:
         """Path to workspace directory (resolves symlink if exists)."""
-        return (self.logdir / "workspace").resolve()
+        ws = self.logdir / "workspace"
+        if ws.is_symlink() or ws.exists():
+            return ws.resolve()
+        # Fallback: if symlink creation failed (e.g. Windows without symlink privileges),
+        # retrieve the canonical workspace from the saved chat config.
+        try:
+            from ..config.chat import ChatConfig
+
+            return ChatConfig.from_logdir(self.logdir).workspace
+        except Exception:
+            return ws.resolve()
 
     @property
     def log(self) -> Log:
@@ -364,11 +390,15 @@ class LogManager:
         """Write an event to the event log and optionally a checkpoint.
 
         Writes a ``message_append``, ``message_edit``, or ``undo`` event
-        followed by a checkpoint if one is due.  Writes alongside the main
-        conversation JSONL (``get_logs_dir() / chat_id / events.jsonl``).
+        followed by a checkpoint if one is due. Main events live beside
+        ``conversation.jsonl``; branch events live under
+        ``branches/<branch>/events.jsonl`` so branch histories stay isolated.
         Silent-noop when the log directory is not set up yet.
         """
-        event_dir = self.logfile.parent
+        if self.current_branch == "main":
+            event_dir = self.logdir
+        else:
+            event_dir = self.logdir / "branches" / self.current_branch
         event_dir.mkdir(parents=True, exist_ok=True)
         seq = eventlog.sequence_number(event_dir)
         if event_type == eventlog.EVENT_MESSAGE_APPEND:
@@ -422,27 +452,44 @@ class LogManager:
         if not msg.quiet:
             print_msg(msg, oneline=False)
 
-    def _store_message_files(self, msg: Message) -> Message:
+    def _store_message_files(
+        self, msg: Message, *, preserve_existing: bool = False
+    ) -> Message:
         """Store attached files by content hash and return updated message."""
         if not msg.files:
             return msg
 
-        from ..util.file_storage import store_file
+        from ..util.file_storage import get_stored_path, store_file
 
         file_hashes = dict(msg.file_hashes)  # Start with existing hashes
         for filepath in msg.files:
             # Skip URIs - they can't be stored locally
             if isinstance(filepath, URI):
                 continue
-            if not filepath.exists():
+            try:
+                existing_hash = file_hashes.get(str(filepath))
+                if (
+                    preserve_existing
+                    and existing_hash
+                    and get_stored_path(self.logdir, existing_hash, filepath.suffix)
+                ):
+                    continue
+                if not filepath.is_file():
+                    continue
+                # Store by hash and record the mapping
+                file_hash, _stored_name = store_file(self.logdir, filepath)
+            except OSError as exc:
+                logger.warning("Could not snapshot attached file %s: %s", filepath, exc)
                 continue
-            # Store by hash and record the mapping
-            file_hash, stored_name = store_file(self.logdir, filepath)
             # Use full path as key to avoid collisions with same-named files
             file_hashes[str(filepath)] = file_hash
 
         # Return message with updated hashes (Message is frozen, so replace)
         return replace(msg, file_hashes=file_hashes)
+
+    def snapshot_message_files(self, msgs: list[Message]) -> list[Message]:
+        """Snapshot message attachments while preserving valid existing hashes."""
+        return [self._store_message_files(msg, preserve_existing=True) for msg in msgs]
 
     def write(self, branches=True, sync=False) -> None:
         """
@@ -486,10 +533,83 @@ class LogManager:
                     view_path = views_dir / f"{view_name}.jsonl"
                     log.write_jsonl(view_path)
 
+        # Persist model selection trace alongside the conversation
+        trace_path = self.write_model_trace()
+
         # Force sync to disk if requested
         if sync:
-            with open(self.logfile, "rb") as f:
-                os.fsync(f.fileno())
+            paths = [Path(self.logfile)]
+            if trace_path is not None:
+                paths.append(trace_path)
+            for path in paths:
+                with path.open("rb") as f:
+                    os.fsync(f.fileno())
+            if trace_path is not None:
+                self._fsync_directory(trace_path.parent)
+
+    @staticmethod
+    def _fsync_directory(path: Path) -> None:
+        """Best-effort sync of directory-entry changes on POSIX filesystems."""
+        if os.name == "nt":
+            return
+        flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0)
+        try:
+            directory_fd = os.open(path, flags)
+            try:
+                os.fsync(directory_fd)
+            finally:
+                os.close(directory_fd)
+        except OSError as error:
+            logger.warning("Could not fsync log directory %s: %s", path, error)
+
+    _TRACE_FILENAME = "model_selection_trace.json"
+
+    def write_model_trace(self) -> Path | None:
+        """Persist the active ModelSelectionTrace and return its path.
+
+        Called automatically by write(). No-op when no trace is active in the
+        current context (e.g. tests or sessions that pre-date Phase 0).
+        """
+        from ..model_attestation import get_selection_trace
+
+        trace = get_selection_trace()
+        if trace is None:
+            return None
+        trace_path = self.logdir / self._TRACE_FILENAME
+        with NamedTemporaryFile(
+            mode="w",
+            dir=self.logdir,
+            prefix=f".{self._TRACE_FILENAME}.",
+            suffix=".tmp",
+            delete=False,
+        ) as temp_file:
+            temp_file.write(trace.to_json() + "\n")
+            temp_path = Path(temp_file.name)
+        try:
+            temp_path.replace(trace_path)
+        finally:
+            temp_path.unlink(missing_ok=True)
+        return trace_path
+
+    def read_model_trace(self):
+        """Read the persisted ModelSelectionTrace from logdir, or None if absent.
+
+        Returns:
+            ModelSelectionTrace if model_selection_trace.json exists, else None.
+        """
+        from ..model_attestation import ModelSelectionTrace
+
+        trace_path = self.logdir / self._TRACE_FILENAME
+        if not trace_path.exists():
+            return None
+        try:
+            data = json.loads(trace_path.read_text())
+            return ModelSelectionTrace.from_dict(data)
+        except (json.JSONDecodeError, ValueError):
+            logger.warning(
+                "Failed to parse model_selection_trace.json in %s", self.logdir
+            )
+            return None
 
     def _save_backup_branch(self, type="edit") -> None:
         """backup the current log to a new branch, usually before editing/undoing"""
@@ -729,6 +849,12 @@ def prune_ephemeral_messages(msgs: list[Message]) -> list[Message]:
             assistant_turns_after += 1
 
     pruned = list(reversed(kept_reversed))
+
+    # Enforce tool call / tool result atomicity: dropping an assistant message
+    # that contains tool calls must also drop its companion tool results, and
+    # vice versa — otherwise the Responses API returns 400.
+    pruned = _drop_orphaned_tool_pairs(msgs, pruned)
+
     return _merge_consecutive_messages(pruned)
 
 
@@ -739,11 +865,14 @@ def _merge_consecutive_messages(msgs: list[Message]) -> list[Message]:
     providers reject.  Merge the adjacent messages while preserving attachments
     and message flags via Message.concat().
 
-    Exception: system messages with a call_id are structured tool results.
-    Merging them would discard all but the first call_id, causing providers
-    that use the Responses API (Codex/OpenAI) to return 400 "No tool output
-    found for function call <id>" on the next multi-tool-call turn.
+    Exceptions: system messages with a call_id are structured tool results,
+    and the explicit prompt-cache boundary must remain a standalone message.
+    Merging tool results would discard all but the first call_id, causing
+    providers that use the Responses API (Codex/OpenAI) to return 400 "No tool
+    output found for function call <id>" on the next multi-tool-call turn.
     """
+    from ..prompts import SYSTEM_PROMPT_CACHE_BOUNDARY
+
     merged: list[Message] = []
     for msg in msgs:
         if (
@@ -751,6 +880,8 @@ def _merge_consecutive_messages(msgs: list[Message]) -> list[Message]:
             and merged[-1].role == msg.role
             and not msg.call_id
             and not merged[-1].call_id
+            and msg.content != SYSTEM_PROMPT_CACHE_BOUNDARY
+            and merged[-1].content != SYSTEM_PROMPT_CACHE_BOUNDARY
         ):
             merged[-1] = merged[-1].concat(msg)
         else:
@@ -777,6 +908,49 @@ def ephemeral_cache_boundary(
     return first_ephemeral_idx - 1
 
 
+def _active_prompt_generation(msgs: list[Message]) -> list[Message]:
+    """Move the newest generated prompt to the front of provider context.
+
+    Runtime configuration changes append a marked prompt generation. Older
+    generated prompts remain on disk for auditability, while the provider gets
+    only the newest generation followed by intact conversation history. The
+    unmarked contiguous pinned-system prefix is the legacy startup prompt.
+    """
+    latest = next(
+        (
+            msg.metadata["prompt_generation"]
+            for msg in reversed(msgs)
+            if msg.metadata and "prompt_generation" in msg.metadata
+        ),
+        None,
+    )
+    if latest is None:
+        return msgs
+
+    legacy_prompt_ids: set[int] = set()
+    for msg in msgs:
+        if (
+            msg.role != "system"
+            or not msg.pinned
+            or (msg.metadata and "prompt_generation" in msg.metadata)
+        ):
+            break
+        legacy_prompt_ids.add(id(msg))
+
+    active = [
+        msg
+        for msg in msgs
+        if msg.metadata and msg.metadata.get("prompt_generation") == latest
+    ]
+    history = [
+        msg
+        for msg in msgs
+        if id(msg) not in legacy_prompt_ids
+        and not (msg.metadata and "prompt_generation" in msg.metadata)
+    ]
+    return active + history
+
+
 def prepare_messages(
     msgs: list[Message],
     workspace: Path | None = None,
@@ -790,6 +964,10 @@ def prepare_messages(
     """
 
     from gptme.llm.models import get_default_model  # fmt: skip
+
+    # A runtime model/tool change appends a replacement generated prompt. Keep
+    # the historical prompts on disk, but only send the newest generation.
+    msgs = _active_prompt_generation(msgs)
 
     # Enrich with enabled context enhancements (RAG, fresh context)
     msgs = enrich_messages_with_context(msgs, workspace)
@@ -873,7 +1051,7 @@ def _gen_read_jsonl(path: PathLike) -> Generator[Message, None, None]:
     # Pre-compute file mtime as fallback for messages without timestamps
     _file_mtime = datetime.fromtimestamp(Path(path).stat().st_mtime, tz=timezone.utc)
 
-    with open(path) as file:
+    with open(path, encoding="utf-8") as file:
         for line in file:
             line = line.strip()
             if not line:

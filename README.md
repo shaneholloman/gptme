@@ -51,7 +51,7 @@
   </a>
   <br>
   <a href="https://gptme.org/docs/projects.html">
-    <img src="https://img.shields.io/badge/powered%20by-gptme%20%F0%9F%A4%96-5151f5?style=flat" alt="Powered by gptme" />
+    <img src="https://gptme.org/badge.svg" alt="Built with gptme" />
   </a>
 </p>
 
@@ -87,13 +87,14 @@ active development.
 - 🚀 [Getting Started](#-getting-started)
 - 🛠 [Usage](#-usage)
 - 🌍 [Ecosystem](#-ecosystem)
+- 🏷️ [Repository Badge](#%EF%B8%8F-repository-badge)
 - 💬 [Community](#-community)
 - 📊 [Stats](#-stats)
 - 🔗 [Links](#-links)
 
 ## 📢 News
 
-- **Coming soon** - [gptme.ai](https://gptme.ai) service for running agents in the cloud; [gptme desktop](https://github.com/gptme/gptme-tauri) app for easy local use.
+- **2026-07** - [v0.32.1](https://github.com/gptme/gptme/releases/tag/v0.32.1): Desktop app for Linux (AppImage), macOS, and Windows with auto-updates — [download here](https://github.com/gptme/gptme/releases/latest); [gptme.ai](https://gptme.ai) cloud service
 - **2026-01** - [gptme-agent-template](https://github.com/gptme/gptme-agent-template) v0.4: [Bob](https://github.com/TimeToBuildBob) has run extensively as an autonomous agent, autonomous run loops, enhanced context generation
 - **2025-12** - [v0.31.0](https://github.com/gptme/gptme/releases/tag/v0.31.0): Background jobs, form tool, cost tracking, content-addressable storage
 - **2025-11** - [v0.30.0](https://github.com/gptme/gptme/releases/tag/v0.30.0): Plugin system, context compression, subagent planner mode
@@ -254,10 +255,10 @@ You can find more [Demos][docs-demos] and [Examples][docs-examples] in the [docu
 - 🤖 **Support for many LLM [providers][docs-providers]**
   - Anthropic (Claude), OpenAI (GPT), Google (Gemini), xAI (Grok), DeepSeek, and more.
   - Use OpenRouter for access to 100+ models, or serve locally with `llama.cpp`.
+  - Bring your own subscription: use your existing ChatGPT Plus/Pro or SuperGrok plan instead of API keys (see [providers][docs-providers]).
   - [Pick the right model per task][docs-model-routing] — fast/cheap for triage, powerful for coding.
 - 🌐 **Web UI and REST API**
-  - Modern web interface at [chat.gptme.org](https://chat.gptme.org) ([gptme-webui])
-  - Simple built-in web UI included in the Python package.
+  - Modern [gptme-webui] bundled with `gptme-server` and hosted at [chat.gptme.org](https://chat.gptme.org).
   - [Server][docs-server] with REST API.
   - Standalone executable builds available with PyInstaller.
 - 💻 **[Computer use][docs-tools-computer]** (see [#216](https://github.com/gptme/gptme/issues/216))
@@ -322,13 +323,21 @@ enabled = ["my_plugin"]
 
 ### 🔗 Integrations: MCP & ACP
 
-**[MCP (Model Context Protocol)][docs-mcp]** — use any MCP server as a tool source:
+**[MCP (Model Context Protocol)][docs-mcp]** — gptme works in both directions:
+
+- **MCP client:** discover and load external MCP servers as gptme tools.
+- **MCP server:** expose gptme's persistent shell, Python REPL, and file tools to
+  Claude Desktop, Cursor, or any other MCP client.
 
 ```sh
 pipx install gptme  # MCP support included by default
+
+# Run gptme as an MCP server over stdio
+gptme-mcp-server --tools shell,ipython,save,read
 ```
 
-gptme can discover and dynamically load MCP servers, giving the agent access to databases, APIs, file systems, and any other MCP-compatible tool. See the [MCP docs][docs-mcp] for server configuration.
+The server keeps shell and Python state across tool calls. See the [MCP docs][docs-mcp]
+for a ready-to-paste Claude Desktop configuration and MCP client setup.
 
 **[ACP (Agent Client Protocol)][docs-acp]** — use gptme as a coding agent directly from your editor:
 
@@ -355,6 +364,33 @@ gptme-agent create ~/my-agent --name MyAgent
 gptme-agent install   # runs on a schedule
 gptme-agent status    # check on it
 ```
+
+#### Headless Agents with systemd
+
+For quick setup of a gptme agent as a persistent systemd service on any Linux machine, use `gptme service init`:
+
+```sh
+# Generate a complete headless agent setup
+gptme service init --name my-agent --model gpt-4o-mini --work-dir ~/my-agent
+
+# Install and start on a daily timer
+systemctl --user daemon-reload
+systemctl --user enable --now my-agent.timer
+
+# Update the schedule (--force overwrites all generated files, including gptme.toml and startup script)
+gptme service init --name my-agent --work-dir ~/my-agent --timer-schedule hourly --force
+```
+
+This command scaffolds:
+- **systemd service unit** — runs your agent in a user session
+- **Optional timer** — schedule autonomous runs (hourly, daily, weekly, or on-demand)
+- **Startup script** — runs one non-interactive gptme session per trigger and writes a durable journal entry
+- **Session prompt** — `prompt.md`, the instruction the agent executes on every run
+- **Skeleton config** — `gptme.toml` and `AGENTS.md` ready to customize
+
+The scaffolded workspace is self-contained and runs as generated — edit `prompt.md` to say what the agent should do each run; all you need is gptme installed. Perfect for automation, monitoring, CI/CD orchestration, or running background agents on headless servers.
+
+See the [Headless Agents guide](https://gptme.org/docs/agents/headless.html) for advanced configurations and troubleshooting.
 
 [**Bob**](https://github.com/TimeToBuildBob) is the reference implementation — a production autonomous agent that's been running continuously since late 2024. Bob opens PRs, reviews code, fixes CI, manages his own task queue, maintains a growing set of behavioral lessons, posts on [Twitter](https://twitter.com/TimeToBuildBob), responds on Discord, and writes [blog posts](https://timetobuildbob.github.io/).
 
@@ -398,8 +434,8 @@ This stack is simple and composable: selectors improve work choice, lessons stee
 
 ### 🚧 In Progress
 
-- 🖥 **[gptme-tauri](https://github.com/gptme/gptme-tauri)** — desktop app wrapping gptme for easy local use (WIP)
-- ☁️ **[gptme.ai](https://gptme.ai)** — managed cloud service for running gptme agents (WIP; still self-hostable by running `gptme-server` + `gptme-webui` yourself)
+- 🖥 **[gptme-tauri](https://github.com/gptme/gptme-tauri)** — desktop app for Linux, macOS, and Windows with auto-updates ([download](https://github.com/gptme/gptme/releases/latest))
+- ☁️ **[gptme.ai](https://gptme.ai)** — managed cloud service for running gptme agents (early access; still self-hostable by running `gptme-server` + `gptme-webui` yourself)
 - 🌳 Tree-based conversation structure (see [#17](https://github.com/gptme/gptme/issues/17))
 - 📜 RAG to automatically include context from local files (see [#59](https://github.com/gptme/gptme/issues/59))
 - 🏆 Advanced evals for testing frontier capabilities
@@ -412,6 +448,9 @@ This stack is simple and composable: selectors improve work choice, lessons stee
 - Credentials for at least one LLM provider:
   - OpenRouter can be configured interactively with `/account setup openrouter`
     inside gptme, using browser OAuth onboarding.
+  - Subscriptions work too: sign in with your ChatGPT Plus/Pro or SuperGrok plan
+    via `gptme-auth openai-subscription` or `gptme-auth grok-subscription`,
+    no API key needed (see [providers docs][docs-providers]).
   - You can also set API keys manually for [Anthropic](https://console.anthropic.com/)
     (`ANTHROPIC_API_KEY`), [OpenAI](https://platform.openai.com/)
     (`OPENAI_API_KEY`), [OpenRouter](https://openrouter.ai/)
@@ -587,14 +626,24 @@ gptme is more than a CLI — it's a platform with a growing ecosystem:
 | [gptme-contrib] | Community plugins, packages, scripts, and lessons |
 | [gptme-codegraph] | Structural code retrieval with tree-sitter (9 MCP tools for code graph analysis) |
 | [gptme-agent-template][agent-template] | Template for building persistent autonomous agents |
+| [gptme-provider-template][provider-template] | Template for building custom LLM provider plugins |
 | [gptme-rag] | RAG integration for semantic search over local files |
 | [gptme.vim] | Vim plugin for in-editor gptme integration |
-| [gptme-tauri] | Desktop app (WIP) |
-| [gptme.ai](https://gptme.ai) | Managed cloud service (WIP) |
+| [gptme-tauri] | Desktop app for Linux, macOS, and Windows ([download](https://github.com/gptme/gptme/releases/latest)) |
+| [gptme.ai](https://gptme.ai) | Managed cloud service (early access) |
 
 **Community agents powered by gptme:**
 - [Bob](https://github.com/TimeToBuildBob) — autonomous AI agent, running continuously since late 2024, contributes to open source and manages his own tasks
 - [Alice](https://github.com/TimeToLearnAlice) — personal assistant & agent orchestrator, forked from the same architecture
+
+## 🏷️ Repository Badge
+
+This repo is maintained with [gptme](https://gptme.org).
+To show your repo is AI-assisted with gptme, add the badge below.
+
+```markdown
+[![Built with gptme](https://gptme.org/badge.svg)](https://gptme.org)
+```
 
 ## 💬 Community
 
@@ -637,6 +686,7 @@ Contributions welcome! See the [contributing guide](https://gptme.org/docs/contr
 [gptme-codegraph]: https://github.com/gptme/gptme-contrib/tree/master/packages/gptme-codegraph
 [gptme-tauri]: https://github.com/gptme/gptme-tauri
 [agent-template]: https://github.com/gptme/gptme-agent-template
+[provider-template]: https://github.com/gptme/gptme-provider-template
 [bob]: https://github.com/TimeToBuildBob
 [docs]: https://gptme.org/docs/
 [docs-getting-started]: https://gptme.org/docs/getting-started.html
@@ -746,11 +796,15 @@ gptme ships with comprehensive tools:
 
 ### How does the MCP integration work?
 
-gptme has **built-in MCP support**:
+gptme has **built-in, bidirectional MCP support**:
 
-- **MCP Discovery**: Automatically discovers MCP servers
-- **Dynamic Loading**: Loads MCP tools on demand
-- **Tool Integration**: MCP tools work like native tools
+- **MCP client**: Automatically discover MCP servers and load their tools on demand
+- **MCP server**: Run `gptme-mcp-server` to expose gptme's session-backed tools to
+  Claude Desktop, Cursor, and other MCP clients
+- **Tool integration**: External MCP tools work like native tools; clients calling
+  gptme retain shell and Python state across requests
+
+See the [MCP guide][docs-mcp] for configuration in either direction.
 
 Example MCP servers supported:
 - [gptme-codegraph] — structural code graph analysis with tree-sitter (9 tools)

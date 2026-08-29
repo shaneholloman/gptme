@@ -585,3 +585,53 @@ class TestEdgeCases:
         with patch("gptme.dirs.Path.cwd", return_value=deepest):
             result = dirs.get_project_gptme_dir()
         assert result == inner  # nearest parent with gptme.toml
+
+
+# ── Regression: walks terminate at the filesystem root (Windows infinite loop) ──
+
+
+class _WindowsDriveRootPath:
+    """A minimal Windows-style path usable on any OS, for the termination guard.
+
+    Its parents shrink toward a drive root (``["C:"]``) that is its own parent and
+    never equals ``Path("/")`` — the semantics that made the old
+    ``while path != Path("/")`` walk loop forever on Windows. A call cap converts a
+    non-terminating walk into a fast assertion failure (rather than a CI hang), so
+    these tests fail on any platform if the fix is reverted.
+    """
+
+    def __init__(self, parts, calls=None):
+        self._parts = list(parts)
+        self._calls = calls if calls is not None else [0]
+
+    @property
+    def parent(self) -> _WindowsDriveRootPath:
+        self._calls[0] += 1
+        assert self._calls[0] < 10_000, "directory walk did not terminate (regression)"
+        parts = self._parts[:-1] or self._parts  # drive root is its own parent
+        return _WindowsDriveRootPath(parts, self._calls)
+
+    def __truediv__(self, other) -> _WindowsDriveRootPath:
+        return _WindowsDriveRootPath(self._parts + [str(other)], self._calls)
+
+    def exists(self) -> bool:
+        return False  # no .git / gptme.toml anywhere -> the walk must reach the root
+
+    def __eq__(self, other) -> bool:
+        return isinstance(other, _WindowsDriveRootPath) and self._parts == other._parts
+
+
+class TestProjectDirWalkTerminatesAtRoot:
+    """Both upward walks must stop at the filesystem root and return None instead of
+    spinning forever at a Windows drive root. Uses a simulated Windows path so the
+    guard also holds under Linux-only CI (POSIX tmp_path can't reproduce the hang)."""
+
+    def test_git_walk_terminates(self):
+        cwd = _WindowsDriveRootPath(["C:", "Users", "me", "proj"])
+        with patch("gptme.dirs.Path.cwd", return_value=cwd):
+            assert dirs._get_project_git_dir_walk() is None
+
+    def test_gptme_walk_terminates(self):
+        cwd = _WindowsDriveRootPath(["C:", "Users", "me", "proj"])
+        with patch("gptme.dirs.Path.cwd", return_value=cwd):
+            assert dirs.get_project_gptme_dir() is None

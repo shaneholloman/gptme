@@ -1,0 +1,252 @@
+"""
+Visual regression tests for the gptme TUI using SVG snapshots.
+
+Captures the TUI at a fixed terminal size and compares against stored baselines.
+A mismatch means the visual output changed — either a regression or an intentional
+change that needs a new baseline.
+
+To regenerate baselines after an intentional visual change:
+    pytest tests/test_tui_visual.py --snapshot-update
+
+On failure, the actual SVG is written next to the baseline for manual inspection.
+"""
+
+import re
+from pathlib import Path
+
+import pytest
+
+pytest.importorskip("textual")
+
+from gptme.logmanager import LogManager
+from gptme.message import Message
+from gptme.tui.app import GptmeApp
+
+SNAPSHOT_DIR = Path(__file__).parent / "snapshots"
+# Fixed terminal size for stable, reproducible renders
+TERM_SIZE = (80, 24)
+
+
+def make_manager(tmp_path):
+    return LogManager([], logdir=tmp_path / "conv", lock=False)
+
+
+def _normalize_svg(svg: str) -> str:
+    """Replace the run-specific hash and minify SVG for stable comparison."""
+    svg = re.sub(r"terminal-\d{6,}", "terminal-HASH", svg)
+    # Minify the SVG by removing non-essential whitespace to handle formatting
+    # differences between Textual versions or export variations.
+    # Remove whitespace between tags, but preserve content within text elements.
+    svg = re.sub(r">\s+<", "><", svg)  # Remove whitespace between tags
+    svg = re.sub(r">\s*\n\s*", ">", svg)  # Remove newlines/indentation between tags
+    # Normalize the status bar text wherever it appears.
+    # It shows "MODEL | Xk/Yk (Z%) | status" — the "Xk/Yk" token is distinctive.
+    # In full mode it sits at line-23; in inline mode it sits at line-7.
+    # Replace textLength + content so model-name-length differences don't cause
+    # mismatches across environments.
+    svg = re.sub(
+        r'textLength="[\d.]+" clip-path="url\(#terminal-HASH-line-\d+\)">[^<]*&#160;\|&#160;\d+k/\d+k[^<]*</text>',
+        'textLength="0" clip-path="url(#terminal-HASH-line-STATUS)">STATUS_BAR</text>',
+        svg,
+    )
+    # Normalize status bar background rects (widths are proportional to model name length).
+    # Full mode:   status bar at line-23, y≈562.7
+    # Inline mode: status bar at line-7,  y≈172.3
+    svg = re.sub(
+        r'<rect fill="#121212" x="[\d.]+" y="562\.7" width="[\d.]+"',
+        '<rect fill="#121212" x="0" y="562.7" width="0"',
+        svg,
+    )
+    svg = re.sub(
+        r'<rect fill="#121212" x="[\d.]+" y="172\.3" width="[\d.]+"',
+        '<rect fill="#121212" x="0" y="172.3" width="0"',
+        svg,
+    )
+    return svg
+
+
+def _rect_fills(svg: str) -> list[str]:
+    """Extract all explicit fill colors from rect elements."""
+    return re.findall(r'<rect[^>]*\bfill="(#[0-9a-fA-F]{3,8})"', svg)
+
+
+def _is_mid_gray(color: str) -> bool:
+    """True if the color is a mid-range neutral gray (the gray background bug range)."""
+    h = color.lstrip("#")
+    if len(h) != 6:
+        return False
+    r, g, b = int(h[0:2], 16), int(h[2:4], 16), int(h[4:6], 16)
+    max_channel_diff = max(abs(r - g), abs(g - b), abs(r - b))
+    # Must be nearly neutral (R≈G≈B) and in the mid range that textual-dark uses
+    # for $panel / $surface (roughly 0x20–0xB0).  Very dark blacks (#121212 etc.)
+    # and near-white colors are intentional and not the regression target.
+    return max_channel_diff <= 20 and 0x20 <= r <= 0xB0
+
+
+def _check_no_gray_rects(svg: str, label: str) -> None:
+    """Fail if any mid-gray fill appears in a content-area rect."""
+    fills = _rect_fills(svg)
+    gray_fills = [c for c in fills if _is_mid_gray(c)]
+    # #292929 is the terminal window frame border — intentional, not a content gray
+    gray_fills = [c for c in gray_fills if c.lower() != "#292929"]
+    assert not gray_fills, (
+        f"{label}: mid-gray background color(s) detected in rendered SVG: "
+        f"{gray_fills!r}. This is likely a regression of the gray active-output "
+        "strip bug (see gptme#3334). Check that native_ansi_color is True."
+    )
+
+
+def _italic_cell_classes(svg: str) -> list[str]:
+    """Return terminal cell CSS class names that apply italic font-style.
+
+    Textual encodes per-cell styling as ``.terminal-HASH-rN { fill: #color }``
+    rules in the SVG ``<style>`` block.  Italic text adds ``font-style: italic``
+    to those rules.  The ``@font-face`` declarations also contain ``font-style``
+    descriptors (``normal`` / ``bold``) but never ``italic``, so a match here
+    always indicates actual italic content styling.
+    """
+    style_match = re.search(r"<style>(.*?)</style>", svg, re.DOTALL)
+    if not style_match:
+        return []
+    return re.findall(
+        r"(\.terminal-[^{]+)\{[^}]*font-style:\s*italic[^}]*\}",
+        style_match.group(1),
+    )
+
+
+def _check_no_italic_text(svg: str, label: str) -> None:
+    """Fail if any terminal cell class applies italic font-style (regression #3340)."""
+    italic_classes = _italic_cell_classes(svg)
+    assert not italic_classes, (
+        f"{label}: italic font-style detected on terminal cell class(es) in SVG: "
+        f"{italic_classes!r}. This may be a regression of the italic "
+        "CollapsibleTitle bug (see gptme#3340). Check that 'text-style: italic' "
+        "is not applied to content-area elements in app.tcss / GptmeApp CSS."
+    )
+
+
+def _snapshot_check(name: str, svg: str, *, update: bool) -> None:
+    path = SNAPSHOT_DIR / f"{name}.svg"
+    normalized = _normalize_svg(svg)
+
+    if update:
+        SNAPSHOT_DIR.mkdir(parents=True, exist_ok=True)
+        path.write_text(normalized, encoding="utf-8")
+        return
+
+    if not path.exists():
+        pytest.fail(
+            f"Snapshot '{name}' not found at {path}. "
+            "Run `pytest tests/test_tui_visual.py --snapshot-update` to generate it."
+        )
+
+    baseline = path.read_text(encoding="utf-8")
+    if normalized.rstrip("\n") != baseline.rstrip("\n"):
+        actual_path = path.with_suffix(".actual.svg")
+        actual_path.write_text(normalized, encoding="utf-8")
+        pytest.fail(
+            f"Snapshot '{name}' differs from baseline.\n"
+            f"  baseline : {path}\n"
+            f"  actual   : {actual_path}\n"
+            "If this change is intentional, run `pytest tests/test_tui_visual.py "
+            "--snapshot-update` to accept the new baseline."
+        )
+
+
+# ── fixtures ──────────────────────────────────────────────────────────────────
+
+
+@pytest.fixture
+def snapshot_update(request):
+    return request.config.getoption("--snapshot-update", default=False)
+
+
+# ── tests ─────────────────────────────────────────────────────────────────────
+
+
+@pytest.mark.asyncio
+async def test_idle_state_no_gray_background(tmp_path):
+    """Idle TUI must not render any mid-gray content-area background (regression #3334)."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test(size=TERM_SIZE) as pilot:
+        await pilot.pause()
+        svg = app.export_screenshot()
+    _check_no_gray_rects(svg, "idle state")
+    _check_no_italic_text(svg, "idle state")
+
+
+@pytest.mark.asyncio
+async def test_stream_state_no_gray_background(tmp_path):
+    """Streaming state must not render a gray active-output strip (regression #3334)."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test(size=TERM_SIZE) as pilot:
+        await pilot.pause()
+        app._begin_stream()
+        await pilot.pause()
+        svg = app.export_screenshot()
+    _check_no_gray_rects(svg, "streaming state")
+    _check_no_italic_text(svg, "streaming state")
+
+
+@pytest.mark.asyncio
+async def test_inline_mode_no_gray_background(tmp_path):
+    """Inline mode must not render any mid-gray content-area background."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path, inline=True)
+    async with app.run_test(size=TERM_SIZE) as pilot:
+        await pilot.pause()
+        svg = app.export_screenshot()
+    _check_no_gray_rects(svg, "inline mode")
+    _check_no_italic_text(svg, "inline mode")
+
+
+@pytest.mark.asyncio
+async def test_thinking_title_no_italic_text(tmp_path):
+    """Thinking-block title must not render italic text (regression #3340)."""
+    manager = LogManager(
+        [
+            Message(
+                "assistant",
+                "<think>step-by-step reasoning</think>\n\nFinal answer.",
+            )
+        ],
+        logdir=tmp_path / "conv",
+        lock=False,
+    )
+    app = GptmeApp(manager, workspace=tmp_path)
+    async with app.run_test(size=TERM_SIZE) as pilot:
+        await pilot.pause()
+        svg = app.export_screenshot()
+    assert "Thinking" in svg
+    _check_no_italic_text(svg, "thinking-block title")
+
+
+@pytest.mark.asyncio
+async def test_idle_state_snapshot(tmp_path, snapshot_update):
+    """Full visual snapshot of the idle TUI — catches palette and layout regressions."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test(size=TERM_SIZE) as pilot:
+        await pilot.pause()
+        svg = app.export_screenshot()
+    _snapshot_check("tui_idle", svg, update=snapshot_update)
+
+
+@pytest.mark.asyncio
+async def test_stream_state_snapshot(tmp_path, snapshot_update):
+    """Full visual snapshot of the streaming TUI — catches active-output regressions."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path)
+    async with app.run_test(size=TERM_SIZE) as pilot:
+        await pilot.pause()
+        app._begin_stream()
+        await pilot.pause()
+        svg = app.export_screenshot()
+    _snapshot_check("tui_stream", svg, update=snapshot_update)
+
+
+@pytest.mark.asyncio
+async def test_inline_mode_snapshot(tmp_path, snapshot_update):
+    """Full visual snapshot of inline mode — catches per-mode rendering regressions."""
+    app = GptmeApp(make_manager(tmp_path), workspace=tmp_path, inline=True)
+    async with app.run_test(size=TERM_SIZE) as pilot:
+        await pilot.pause()
+        svg = app.export_screenshot()
+    _snapshot_check("tui_inline", svg, update=snapshot_update)

@@ -15,6 +15,7 @@ from ...hooks import HookType, StopPropagation, trigger_hook
 from ...llm.models import get_default_model
 from ...message import Message, len_tokens
 from ..base import ToolSpec
+from .config import _get_keep_head
 from .decision import should_auto_compact
 from .engine import auto_compact_log
 from .handlers import cmd_compact_handler
@@ -116,7 +117,13 @@ def autocompact_hook(
 
         # Apply auto-compacting to get compacted messages
         try:
-            compacted_msgs = list(auto_compact_log(messages, logdir=manager.logdir))
+            compacted_msgs = list(
+                auto_compact_log(
+                    messages,
+                    logdir=manager.logdir,
+                    keep_head=_get_keep_head(),
+                )
+            )
 
             # Calculate reduction stats
             m = get_default_model()

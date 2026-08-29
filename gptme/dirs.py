@@ -66,9 +66,11 @@ def get_project_gptme_dir() -> Path | None:
     Meant to be used in scripts/tools to detect a suitable location to store agent data/logs.
     """
     path = Path.cwd()
-    while path != Path("/"):
+    while True:
         if (path / "gptme.toml").exists():
             return path
+        if path == path.parent:  # reached the filesystem root (cross-platform)
+            break
         path = path.parent
 
     # if no gptme.toml file was found, look for a git repo
@@ -82,11 +84,12 @@ def get_project_git_dir() -> Path | None:
 def _get_project_git_dir_walk() -> Path | None:
     # if no gptme.toml file was found, look for a git repo
     path = Path.cwd()
-    while path != Path("/"):
+    while True:
         if (path / ".git").exists():
             return path
+        if path == path.parent:  # reached the filesystem root (cross-platform)
+            return None
         path = path.parent
-    return None
 
 
 def _get_project_git_dir_call() -> Path | None:
@@ -163,6 +166,51 @@ def get_profile_memory_dir(profile_name: str) -> Path:
     path = get_data_dir() / "memories" / "profiles" / profile_name
     path.mkdir(parents=True, exist_ok=True)
     return path
+
+
+def get_cc_memory_dir(workspace: Path) -> Path:
+    """Get the Claude Code memory directory for a given workspace.
+
+    Claude Code stores per-project memories at:
+        ~/.claude/projects/<workspace-hash>/memory/
+
+    where the hash is the absolute workspace path with slashes, backslashes, and
+    colons replaced by dashes, e.g. ``/home/user/myproject`` → ``-home-user-myproject``
+    and ``C:\\Users\\user\\project`` → ``C--Users-user-project``.
+
+    This allows gptme sessions to read memories written by CC sessions (and vice
+    versa when the memory tool writes to this location).
+
+    Args:
+        workspace: Absolute path to the workspace root
+
+    Returns:
+        Path to the CC memory directory (may not exist)
+
+    Note:
+        The slash-to-dash encoding is non-injective: paths that differ only by a
+        dash versus a path separator (e.g. ``/a/b`` and ``/a-b``) map to the
+        same identifier. This is CC's own encoding scheme; gptme replicates it
+        faithfully so it reads the correct memory directory. The collision risk is
+        inherited from CC's design and cannot be resolved without diverging from
+        CC's path formula.
+    """
+    workspace_hash = (
+        str(workspace.resolve()).replace("\\", "-").replace("/", "-").replace(":", "-")
+    )
+    return Path.home() / ".claude" / "projects" / workspace_hash / "memory"
+
+
+def get_cc_memory_file(workspace: Path) -> Path:
+    """Get the Claude Code MEMORY.md file path for a given workspace.
+
+    Args:
+        workspace: Absolute path to the workspace root
+
+    Returns:
+        Path to MEMORY.md inside the CC memory directory (may not exist)
+    """
+    return get_cc_memory_dir(workspace) / "MEMORY.md"
 
 
 def _migrate_readline_history():

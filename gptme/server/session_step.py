@@ -27,7 +27,7 @@ from ..hooks import HookType, trigger_hook
 from ..hooks.confirm import ConfirmationResult
 from ..llm import _chat_complete, _stream
 from ..logmanager import LogManager, prepare_messages
-from ..message import Message
+from ..message import Message, MessageMetadata, MessageTimings
 from ..telemetry import trace_function
 from ..tools import ToolUse, get_tools
 from ..tools.shell import set_workspace_cwd
@@ -227,6 +227,93 @@ def _append_and_notify(manager: LogManager, session: ConversationSession, msg: M
             "message": msg2dict(msg, manager.workspace, manager.logdir),
         },
     )
+
+
+def _attach_tool_timings(
+    conversation_id: str,
+    tool_ms_by_name: dict[str, float],
+    target_timestamp: datetime | None = None,
+    branch: str = "main",
+) -> None:
+    """Attach aggregated tool-execution timing to the originating assistant message.
+
+    Walks the log backwards looking for the assistant message whose timestamp
+    matches ``target_timestamp`` (the message that requested these tools),
+    merges the per-tool timing data into its ``metadata.timings`` dict, and
+    rewrites the JSONL file. This is a best-effort operation — failures are
+    logged but do not interrupt tool execution or step continuation.
+
+    ``target_timestamp`` matters because a continuation step can already have
+    appended a *newer* assistant message by the time a slower confirmation
+    thread finishes: two non-auto-confirm tools from the same message can be
+    confirmed on separate threads, and if the earlier one clears the last
+    pending tool it triggers auto-step (a new assistant message) before the
+    later thread gets here. Without a target, "most recent assistant message"
+    would then be the wrong one. Falls back to the most recent assistant
+    message if no ``target_timestamp`` is given (or no match is found), for
+    backward compatibility with callers that don't have it.
+
+    Multiple confirmation threads for the same assistant message can call this
+    concurrently, each with only its own local tool durations. Merging alone
+    isn't enough to avoid a lost update: two threads can each read the
+    caller's (possibly stale) in-memory log before either has written, merge
+    against that same stale state, and the later write silently discards the
+    earlier thread's contribution. Serialize the whole read-merge-write under
+    the conversation lock and reload fresh from disk inside it so each thread
+    merges against the latest state, not a snapshot taken before the lock.
+    """
+    from typing import cast
+
+    with SessionManager.conversation_lock(conversation_id):
+        manager = LogManager.load(conversation_id, branch=branch, lock=False)
+        messages = manager.log.messages
+
+        target_idx: int | None = None
+        fallback_idx: int | None = None
+        for i in range(len(messages) - 1, -1, -1):
+            if messages[i].role == "assistant":
+                if fallback_idx is None:
+                    fallback_idx = i
+                if (
+                    target_timestamp is not None
+                    and messages[i].timestamp == target_timestamp
+                ):
+                    target_idx = i
+                    break
+        if target_idx is None:
+            target_idx = fallback_idx
+
+        if target_idx is not None:
+            msg = messages[target_idx]
+            existing_meta = dict(msg.metadata) if msg.metadata else {}
+            _raw_timings = existing_meta.get("timings")
+            existing_timings = cast(
+                MessageTimings,
+                dict(_raw_timings) if isinstance(_raw_timings, dict) else {},
+            )
+            # Merge with any tool timings already recorded by prior
+            # confirmation threads — each thread only has its own local
+            # measurements, so we must accumulate rather than replace to
+            # avoid losing earlier tools.
+            prior = {
+                k: round(v, 1)
+                for k, v in (existing_timings.get("tool_ms_by_name") or {}).items()
+            }
+            for k, v in tool_ms_by_name.items():
+                prior[k] = round(prior.get(k, 0.0) + v, 1)
+            existing_timings["tool_ms"] = round(sum(prior.values()), 1)
+            existing_timings["tool_ms_by_name"] = prior
+            existing_meta["timings"] = existing_timings
+            updated_msg = msg.replace(metadata=cast(MessageMetadata, existing_meta))
+            manager.log.messages[target_idx] = updated_msg
+            manager.write()
+            logger.debug(
+                "Attached tool timings to assistant message: tool_ms=%.1f, by_name=%s",
+                existing_timings["tool_ms"],
+                existing_timings["tool_ms_by_name"],
+            )
+            return
+        logger.warning("_attach_tool_timings: no assistant message found in log")
 
 
 def _persist_generation_error(
@@ -508,11 +595,19 @@ def _start_acp_step_thread(
     conversation_id: str,
     session: "ConversationSession",
     workspace: Path,
-) -> None:
-    """Start an ACP-backed step in a background thread."""
+    *,
+    reserved: bool = False,
+) -> bool:
+    """Start an ACP-backed step unless another operation has reserved it."""
+    if not reserved:
+        with SessionManager.conversation_lock(conversation_id), session.step_lock:
+            if SessionManager.conversation_generating(
+                conversation_id
+            ) or SessionManager.command_is_active(conversation_id):
+                return False
+            session.generating = True
+            session.generating_since = datetime.now(tz=timezone.utc)
     session.last_error = None
-    session.generating = True
-    session.generating_since = datetime.now(tz=timezone.utc)
 
     def _run() -> None:
         from ..hooks import current_conversation_id, current_session_id
@@ -526,6 +621,7 @@ def _start_acp_step_thread(
     ctx = contextvars.copy_context()
     t = threading.Thread(target=ctx.run, args=(_run,), daemon=True)
     t.start()
+    return True
 
 
 # ---------------------------------------------------------------------------
@@ -542,6 +638,7 @@ def step(
     branch: str = "main",
     auto_confirm: bool = False,
     stream: bool = True,
+    step_seq: int | None = None,
 ) -> None:
     """
     Generate a response and detect tools.
@@ -561,6 +658,9 @@ def step(
         branch: Branch to use (default: "main")
         auto_confirm: Whether to auto-confirm tools (default: False)
         stream: Whether to stream the response (default: True)
+        step_seq: The epoch this step owns, captured under step_lock by the caller.
+            Used in finally to detect whether the continuation has taken ownership.
+            If None, falls back to sampling session.step_seq at entry (racy on delay).
     """
 
     # Load chat config and prepare execution environment
@@ -579,6 +679,17 @@ def step(
         lock=False,
     )
 
+    # Snapshot the step sequence at the earliest possible point — before any
+    # early-exit path that might clear `generating`. All generating=False clears
+    # below (workspace missing, no messages, and the main finally block) use
+    # compare-and-clear against this value so that a descheduled thread waking
+    # up in the setup phase cannot erase a newer step's reservation.
+    # Use the epoch passed by the caller (captured under step_lock before thread
+    # spawn) rather than sampling session.step_seq here. A thread delayed before
+    # this line could see the epoch of a replacement step if interrupt + /step
+    # ran while the thread was descheduled.
+    my_step_seq = step_seq if step_seq is not None else session.step_seq
+
     # Fail cleanly if the configured workspace is missing (e.g. an external
     # symlinked workspace that was moved/deleted). step() runs in a daemon
     # thread, so an uncaught error here would silently leave the session stuck
@@ -591,15 +702,19 @@ def step(
         _persist_generation_error(manager, session, str(e))
         SessionManager.add_event(conversation_id, ws_error_event)
         session.last_error = str(e)
-        session.generating = False
-        session.generating_since = None
+        with session.step_lock:
+            if session.step_seq == my_step_seq:
+                session.generating = False
+                session.generating_since = None
         return
 
     # Set the model as default before triggering hooks
     # This ensures hooks like token_awareness can access the model
     from ..llm.models import set_default_model
+    from ..model_attestation import record_runtime_selection
 
     set_default_model(model)
+    record_runtime_selection(model, "api_request")
 
     # Trigger SESSION_START hook for new conversations
     assistant_messages = [m for m in manager.log.messages if m.role == "assistant"]
@@ -673,8 +788,10 @@ def step(
             "error": "No messages to process",
         }
         SessionManager.add_event(conversation_id, error_event)
-        session.generating = False
-        session.generating_since = None
+        with session.step_lock:
+            if session.step_seq == my_step_seq:
+                session.generating = False
+                session.generating_since = None
         return
 
     # Notify clients about generation status
@@ -820,6 +937,8 @@ def step(
                 tool_id=tool_id,
                 tooluse=tooluse,
                 auto_confirm=session.auto_confirm_count > 0 or auto_confirm,
+                branch=branch,
+                assistant_msg_timestamp=msg.timestamp,
             )
             session.pending_tools[tool_id] = tool_exec
 
@@ -855,6 +974,7 @@ def step(
                 None,  # no edit for auto-confirm
                 model,
                 chat_config,
+                branch=branch,
             )
 
     except Exception as e:
@@ -869,8 +989,24 @@ def step(
             conversation_id, {"type": "error", "error": error_message}
         )
     finally:
-        session.generating = False
-        session.generating_since = None
+        # Only release generating if this step still owns the reservation.
+        # A fast tool may finish, increment step_seq, set generating=True for
+        # the continuation, and return BEFORE we reach here. If we clear
+        # unconditionally we erase the continuation's reservation (Race 5).
+        # The tool worker increments step_seq inside step_lock before handing
+        # off, so the compare-and-clear below is atomic with respect to that
+        # handoff.
+        with session.step_lock:
+            if session.step_seq == my_step_seq:
+                session.generating = False
+                session.generating_since = None
+            else:
+                logger.debug(
+                    "step() finally: skipping generating=False — "
+                    "reservation transferred to continuation (seq %d→%d)",
+                    my_step_seq,
+                    session.step_seq,
+                )
 
 
 def start_tool_execution(
@@ -880,8 +1016,28 @@ def start_tool_execution(
     edited_tooluse: ToolUse | None,
     model: str,
     chat_config: ChatConfig,
+    *,
+    reserved: bool = False,
+    branch: str = "main",
 ) -> threading.Thread:
-    """Execute a tool and handle its output."""
+    """Execute a tool and handle its output.
+
+    If ``reserved`` is True, the caller has already set ``session.generating``
+    inside the conversation lock.  The generation reservation is transferred to
+    ``_start_step_thread`` (via ``reserved=True``) when a continuation is
+    started; if the thread exits without starting a continuation, it clears the
+    reservation so subsequent requests are not permanently blocked.
+
+    ``branch`` must match the branch used by the originating ``step()`` call so
+    that tool execution reads from and writes to the correct branch, and so that
+    the continuation step (started after all tools finish) also runs on the same
+    branch.  Defaults to ``"main"`` to match the default in ``step()``.
+    """
+
+    # Capture the generation epoch at queue time, not thread-start time. If an
+    # interrupt and a new step happen before this worker is scheduled, it must
+    # still remain stale.
+    my_seq = session.step_seq
 
     # This function would ideally run asynchronously to not block the request
     # For simplicity, we'll run it in a thread
@@ -893,134 +1049,295 @@ def start_tool_execution(
         current_conversation_id.set(conversation_id)
         current_session_id.set(session.id)
 
-        # Prepare execution environment (config, tools, hooks, .env)
-        prepare_execution_environment(
-            workspace=chat_config.workspace,
-            tools=None,
-            chat_config=chat_config,
-        )
-
-        # Execute tools serially. When break_on_tooluse=False, a single
-        # assistant message may contain multiple tool uses. After completing
-        # each tool we chain to the next pending auto-confirm tool (if any)
-        # to guarantee serial execution order.
-        current_tool_id: str = tool_id
-        current_edited_tooluse: ToolUse | None = edited_tooluse
-
-        while True:
-            # Reload the conversation to pick up outputs from prior tools
-            manager = LogManager.load(conversation_id, lock=False)
-
-            # Use .get() to atomically retrieve and handle concurrent removal
-            tool_exec = session.pending_tools.get(current_tool_id)
-            if tool_exec is None:
-                logger.warning(
-                    f"Tool {current_tool_id} not found in pending tools "
-                    "(may have been handled by another thread)"
-                )
-                return  # another thread claimed this tool; don't trigger auto-step
-            tool_exec.status = ToolStatus.EXECUTING
-
-            # use explicit tooluse if set (may be modified), else from pending
-            tooluse: ToolUse = current_edited_tooluse or tool_exec.tooluse
-
-            # Remove the tool from pending
-            session.pending_tools.pop(current_tool_id, None)
-
-            # Record start time and notify about tool execution
-            tool_exec.started_at = time.monotonic()
-            SessionManager.add_event(
-                conversation_id,
-                {"type": "tool_executing", "tool_id": current_tool_id},
+        try:
+            # Prepare execution environment (config, tools, hooks, .env)
+            prepare_execution_environment(
+                workspace=chat_config.workspace,
+                tools=None,
+                chat_config=chat_config,
             )
-            logger.info(f"Tool {current_tool_id} executing")
 
-            # Execute the tool
-            try:
-                logger.info(f"Executing tool: {tooluse.tool}")
-                stream_tool_id = current_tool_id
+            # Execute tools serially. When break_on_tooluse=False, a single
+            # assistant message may contain multiple tool uses. After completing
+            # each tool we chain to the next pending auto-confirm tool (if any)
+            # to guarantee serial execution order.
+            current_tool_id: str = tool_id
+            current_edited_tooluse: ToolUse | None = edited_tooluse
+            # Accumulate per-tool durations across all chained executions so
+            # they can be persisted in the assistant message metadata at the end.
+            tool_ms_by_name: dict[str, float] = {}
+            # Timestamp of the assistant message that requested these tools —
+            # captured from the first tool claimed below, so timing is
+            # attached to that message even if a later one is appended before
+            # this thread finishes (see _attach_tool_timings).
+            assistant_msg_timestamp = None
 
-                def stream_tool_output(
-                    tool_output: Message, tool_id: str = stream_tool_id
-                ) -> None:
-                    if (
-                        tool_output.role == "system"
-                        and not tool_output.hide
-                        and not tool_output.quiet
-                    ):
+            while True:
+                # Reload the conversation to pick up outputs from prior tools.
+                # Use the same branch as the originating step() call so we read
+                # the correct message history, not always the "main" branch.
+                manager = LogManager.load(conversation_id, branch=branch, lock=False)
+
+                # Atomically claim the tool with pop() and register it as
+                # executing — both under conversation_lock so no sibling thread
+                # can see pending_tools empty while this thread hasn't yet
+                # added itself to _executing_tools.
+                with SessionManager.conversation_lock(conversation_id):
+                    tool_exec = session.pending_tools.pop(current_tool_id, None)
+                    if tool_exec is not None:
+                        session._executing_tools.add(current_tool_id)
+                if tool_exec is None:
+                    logger.warning(
+                        f"Tool {current_tool_id} not found in pending tools "
+                        "(may have been handled by another thread)"
+                    )
+                    # Release only a reservation this worker still owns. A newer
+                    # /step may have reused generating=True under a later epoch.
+                    if reserved:
+                        with session.step_lock:
+                            if session.step_seq == my_seq:
+                                session.generating = False
+                                session.generating_since = None
+                    return  # another thread claimed this tool; don't trigger auto-step
+                # The claim is registered above but the try/finally that releases
+                # it only starts below, so anything that raises in between (most
+                # plausibly add_event, which iterates sessions and trims their
+                # event buffers) would strand current_tool_id in
+                # _executing_tools for the lifetime of the session. Nothing else
+                # ever clears that set, and the continuation gate requires it to
+                # be empty — so a single failure here would silently stop every
+                # later tool in this session from producing an assistant reply.
+                try:
+                    if assistant_msg_timestamp is None:
+                        assistant_msg_timestamp = tool_exec.assistant_msg_timestamp
+                    tool_exec.status = ToolStatus.EXECUTING
+
+                    # use explicit tooluse if set (may be modified), else from pending
+                    tooluse: ToolUse = current_edited_tooluse or tool_exec.tooluse
+
+                    # Record start time and notify about tool execution
+                    tool_exec.started_at = time.monotonic()
+                    SessionManager.add_event(
+                        conversation_id,
+                        {"type": "tool_executing", "tool_id": current_tool_id},
+                    )
+                    logger.info(f"Tool {current_tool_id} executing")
+                except BaseException:
+                    session._executing_tools.discard(current_tool_id)
+                    raise
+
+                claimed_tool_id = current_tool_id
+                try:
+                    # Execute the tool
+                    try:
+                        logger.info(f"Executing tool: {tooluse.tool}")
+                        stream_tool_id = current_tool_id
+
+                        def stream_tool_output(
+                            tool_output: Message, tool_id: str = stream_tool_id
+                        ) -> None:
+                            if (
+                                tool_output.role == "system"
+                                and not tool_output.hide
+                                and not tool_output.quiet
+                            ):
+                                SessionManager.add_event(
+                                    conversation_id,
+                                    {
+                                        "type": "tool_output",
+                                        "tool_id": tool_id,
+                                        "output": tool_output.content,
+                                    },
+                                )
+
+                        tool_outputs = list(
+                            tooluse.execute(
+                                log=manager.log,
+                                workspace=manager.workspace,
+                                on_result_message=stream_tool_output,
+                            )
+                        )
+                        logger.info(
+                            f"Tool execution complete, outputs: {len(tool_outputs)}"
+                        )
+
+                        # Store the tool outputs. call_id is already assigned in
+                        # ToolUse.execute() for real results; hook messages intentionally
+                        # have no call_id — don't re-stamp here or hook messages become
+                        # duplicate function_call_output entries (Responses API 400).
+                        #
+                        # Reload under conversation_lock before appending: without this,
+                        # a stale in-memory manager (loaded at the top of the loop) would
+                        # rewrite the full JSONL, overwriting concurrent tool-result appends
+                        # or timing patches written by other confirmation threads.
+                        with SessionManager.conversation_lock(conversation_id):
+                            manager = LogManager.load(
+                                conversation_id, branch=branch, lock=False
+                            )
+                            for tool_output in tool_outputs:
+                                _append_and_notify(manager, session, tool_output)
+                    except Exception as e:
+                        logger.exception(f"Error executing tool {tooluse.tool}: {e}")
+                        tool_exec.status = ToolStatus.FAILED
+
+                        with SessionManager.conversation_lock(conversation_id):
+                            manager = LogManager.load(
+                                conversation_id, branch=branch, lock=False
+                            )
+                            msg = Message(
+                                "system", f"Error: {e!s}", call_id=tooluse.call_id
+                            )
+                            _append_and_notify(manager, session, msg)
+
+                    # Emit tool_complete with duration; also accumulate for metadata.
+                    if tool_exec.started_at is not None:
+                        duration_ms = (time.monotonic() - tool_exec.started_at) * 1000
+                        tool_ms_by_name[tooluse.tool] = (
+                            tool_ms_by_name.get(tooluse.tool, 0.0) + duration_ms
+                        )
                         SessionManager.add_event(
                             conversation_id,
                             {
-                                "type": "tool_output",
-                                "tool_id": tool_id,
-                                "output": tool_output.content,
+                                "type": "tool_complete",
+                                "tool_id": current_tool_id,
+                                "duration_ms": duration_ms,
+                                "success": tool_exec.status != ToolStatus.FAILED,
                             },
                         )
 
-                tool_outputs = list(
-                    tooluse.execute(
-                        log=manager.log,
-                        workspace=manager.workspace,
-                        on_result_message=stream_tool_output,
-                    )
-                )
-                logger.info(f"Tool execution complete, outputs: {len(tool_outputs)}")
+                    # Chain to next pending auto-confirm tool (serial execution)
+                    next_auto_id: str | None = None
+                    next_auto_ts: datetime | None = None
+                    for tid, texec in list(session.pending_tools.items()):
+                        if texec.auto_confirm:
+                            next_auto_id = tid
+                            next_auto_ts = texec.assistant_msg_timestamp
+                            break
 
-                # Store the tool outputs, propagating call_id to pair results
-                # with the assistant's tool-use block (matches CLI behavior)
-                for tool_output in tool_outputs:
-                    _append_and_notify(
-                        manager,
+                    if next_auto_id is not None:
+                        # If the next chained tool belongs to a different assistant
+                        # message (e.g. added by a rerun while this thread is
+                        # running), flush accumulated timings for the current target
+                        # before switching — otherwise those durations would be
+                        # attached to the wrong step.
+                        if next_auto_ts != assistant_msg_timestamp and tool_ms_by_name:
+                            _attach_tool_timings(
+                                conversation_id,
+                                dict(tool_ms_by_name),
+                                assistant_msg_timestamp,
+                                branch=branch,
+                            )
+                            tool_ms_by_name.clear()
+                            assistant_msg_timestamp = next_auto_ts
+                        current_tool_id = next_auto_id
+                        current_edited_tooluse = None
+                    else:
+                        # Persist aggregated timing before releasing the final claim,
+                        # so continuation cannot load the originating message while
+                        # its completion metadata is still being patched.
+                        if tool_ms_by_name:
+                            _attach_tool_timings(
+                                conversation_id,
+                                tool_ms_by_name,
+                                assistant_msg_timestamp,
+                                branch=branch,
+                            )
+                        break
+                finally:
+                    # Keep the claim through completion events and timing writes.
+                    # Releasing it under the same lock used by the continuation
+                    # election prevents a sibling from observing an incomplete
+                    # bookkeeping state as quiescent.
+                    with SessionManager.conversation_lock(conversation_id):
+                        session._executing_tools.discard(claimed_tool_id)
+
+            # Elect exactly one continuation while holding the same lock used to
+            # add and remove execution claims. This makes quiescence observation
+            # and generation reservation one atomic state transition.
+            start_continuation = False
+            continuation_seq: int | None = None
+            with SessionManager.conversation_lock(conversation_id), session.step_lock:
+                owns_reservation = not reserved or session.step_seq == my_seq
+                if session.interrupted or not owns_reservation:
+                    logger.debug(
+                        "Skipping tool continuation: interrupted=%s, seq %d→%d",
+                        session.interrupted,
+                        my_seq,
+                        session.step_seq,
+                    )
+                elif not session.pending_tools and not session._executing_tools:
+                    if reserved or (
+                        not SessionManager.conversation_generating(conversation_id)
+                        and not SessionManager.command_is_active(conversation_id)
+                    ):
+                        # Advance step_seq BEFORE setting generating=True (Race 5).
+                        # The originating step() finally block snapshots
+                        # my_step_seq at entry; incrementing here signals
+                        # ownership transferred to the continuation so that
+                        # finally skips the clear instead of erasing this
+                        # reservation.
+                        session.step_seq += 1
+                        continuation_seq = session.step_seq
+                        session.generating = True
+                        session.generating_since = datetime.now(tz=timezone.utc)
+                        start_continuation = True
+                elif reserved:
+                    session.generating = False
+                    session.generating_since = None
+
+            if start_continuation:
+                try:
+                    _start_step_thread(
+                        conversation_id,
                         session,
-                        tool_output.replace(call_id=tooluse.call_id),
+                        model,
+                        chat_config.workspace,
+                        branch=branch,
+                        reserved=True,
+                        step_seq=continuation_seq,
                     )
-            except Exception as e:
-                logger.exception(f"Error executing tool {tooluse.tool}: {e}")
-                tool_exec.status = ToolStatus.FAILED
-
-                msg = Message("system", f"Error: {e!s}", call_id=tooluse.call_id)
-                _append_and_notify(manager, session, msg)
-
-            # Emit tool_complete with duration
-            if tool_exec.started_at is not None:
-                duration_ms = (time.monotonic() - tool_exec.started_at) * 1000
-                SessionManager.add_event(
-                    conversation_id,
-                    {
-                        "type": "tool_complete",
-                        "tool_id": current_tool_id,
-                        "duration_ms": duration_ms,
-                        "success": tool_exec.status != ToolStatus.FAILED,
-                    },
-                )
-
-            # Persist tool outputs to disk
-            manager.write()
-
-            # Chain to next pending auto-confirm tool (serial execution)
-            next_auto_id: str | None = None
-            for tid, texec in list(session.pending_tools.items()):
-                if texec.auto_confirm:
-                    next_auto_id = tid
-                    break
-
-            if next_auto_id is not None:
-                current_tool_id = next_auto_id
-                current_edited_tooluse = None
-            else:
-                break
-
-        # Only auto-step when all pending tools have been executed.
-        # With multiple tools per message, we must wait until every tool
-        # has run before asking the model for a continuation.
-        if not session.pending_tools:
-            _start_step_thread(conversation_id, session, model, chat_config.workspace)
+                except Exception:
+                    # Dispatch failed after ownership transfer. Release that new
+                    # epoch unless another operation has already superseded it.
+                    with session.step_lock:
+                        if session.step_seq == continuation_seq:
+                            session.generating = False
+                            session.generating_since = None
+                    raise
+        except Exception:
+            logger.exception(
+                f"Unhandled error in tool execution thread for {conversation_id}"
+            )
+            if reserved:
+                with session.step_lock:
+                    # If the election block advanced step_seq (setting
+                    # continuation_seq) but an exception prevented
+                    # start_continuation from being set to True, the
+                    # reservation is at continuation_seq, not my_seq.
+                    # Release whichever epoch we actually own.
+                    release_seq = (
+                        continuation_seq
+                        if continuation_seq is not None and not start_continuation
+                        else my_seq
+                    )
+                    if session.step_seq == release_seq:
+                        session.generating = False
+                        session.generating_since = None
+            raise
 
     # Propagate ContextVars from the request context into the execution thread.
     ctx = contextvars.copy_context()
-    thread = threading.Thread(target=ctx.run, args=(execute_tool_thread,))
-    thread.daemon = True
-    thread.start()
+    try:
+        thread = threading.Thread(target=ctx.run, args=(execute_tool_thread,))
+        thread.daemon = True
+        thread.start()
+    except Exception:
+        if reserved:
+            with session.step_lock:
+                if session.step_seq == my_seq:
+                    session.generating = False
+                    session.generating_since = None
+        raise
     return thread
 
 
@@ -1032,24 +1349,36 @@ def _start_step_thread(
     branch: str = "main",
     auto_confirm: bool = False,
     stream: bool = True,
-) -> None:
-    """Start a step execution in a background thread.
+    *,
+    reserved: bool = False,
+    step_seq: int | None = None,
+) -> bool:
+    """Start a step unless another operation has already reserved it.
 
-    Clears any previous error state before starting.
+    ``step_seq`` should be the epoch captured under ``step_lock`` by the caller
+    (e.g. the value stored after incrementing ``session.step_seq`` in the /step
+    route). It is passed into ``step()`` so the finally block's compare-and-clear
+    uses the epoch sampled under the lock rather than inside the spawned thread
+    (where a delay could cause it to see a later epoch).
     """
 
-    # Clear previous error and mark as generating before starting thread
-    # to avoid race condition where interrupt is called before the thread
-    # sets generating=True.
-    #
-    # NOTE: the /step route handler also sets session.generating = True early
-    # (under step_lock, with try/finally guard).  This assignment is still
-    # needed because _start_step_thread is called directly from the
-    # tool-confirm endpoint (api_conversation_tool_response), which bypasses
-    # the /step route's guard.
+    # Direct callers (tool continuations and A2A) share /step's atomic
+    # check-and-reserve protocol. The /step route reserves before setup and
+    # identifies that reservation explicitly to avoid rejecting itself.
+    if not reserved:
+        with SessionManager.conversation_lock(conversation_id), session.step_lock:
+            if SessionManager.conversation_generating(
+                conversation_id
+            ) or SessionManager.command_is_active(conversation_id):
+                return False
+            session.generating = True
+            session.generating_since = datetime.now(tz=timezone.utc)
+            # Capture the epoch under the lock so step() doesn't need to sample
+            # session.step_seq inside the thread (where a delay could give it
+            # a stale or replacement epoch).
+            if step_seq is None:
+                step_seq = session.step_seq
     session.last_error = None
-    session.generating = True
-    session.generating_since = datetime.now(tz=timezone.utc)
 
     def step_thread() -> None:
         # Set conversation/session context vars so hooks triggered during
@@ -1067,14 +1396,29 @@ def _start_step_thread(
             branch=branch,
             auto_confirm=auto_confirm,
             stream=stream,
+            step_seq=step_seq,
         )
 
     # Propagate ContextVars (model, config) from the caller into the step thread.
     # Each thread gets its own copy so mutations stay isolated between sessions.
     ctx = contextvars.copy_context()
-    thread = threading.Thread(target=ctx.run, args=(step_thread,))
-    thread.daemon = True
-    thread.start()
+    try:
+        thread = threading.Thread(target=ctx.run, args=(step_thread,))
+        thread.daemon = True
+        thread.start()
+    except Exception:
+        # A reserved caller owns this slot; release it if dispatch itself fails.
+        # Non-reserved callers reserved above and need the same rollback.
+        # Compare-and-clear: only release if no newer step has taken ownership.
+        # An interrupt + replacement /step increments step_seq under step_lock
+        # before setting generating=True; if our epoch is stale we must not
+        # clear the replacement's reservation.
+        with session.step_lock:
+            if step_seq is None or session.step_seq == step_seq:
+                session.generating = False
+                session.generating_since = None
+        raise
+    return True
 
 
 # ---------------------------------------------------------------------------

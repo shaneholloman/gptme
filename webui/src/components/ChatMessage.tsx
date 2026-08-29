@@ -90,11 +90,15 @@ function MessageMetaLabel({
     : null;
 
   const model = metadata?.model;
+  const resolvedModel = metadata?.resolved_model;
   const cost = metadata?.cost;
   const usage = metadata?.usage;
 
+  // Display the resolved model (actual subprovider) when it differs from the requested model
+  const displayModel = resolvedModel ?? model;
+
   const parts: string[] = [];
-  if (model) parts.push(model);
+  if (displayModel) parts.push(displayModel);
   if (relTime) parts.push(relTime);
   const shortLabel = parts.join(' · ');
   if (!shortLabel) return null;
@@ -102,6 +106,7 @@ function MessageMetaLabel({
   const tooltipLines: string[] = [];
   if (fullTime) tooltipLines.push(fullTime);
   if (model) tooltipLines.push(`Model: ${model}`);
+  if (resolvedModel) tooltipLines.push(`Resolved via: ${resolvedModel}`);
   if (cost != null) tooltipLines.push(`Cost: $${cost.toFixed(4)}`);
   if (usage) {
     if (usage.input_tokens)
@@ -560,9 +565,6 @@ const ChatMessageComponent: FC<Props> = ({
         ${visualChain === 'standalone' ? 'mb-4' : 'mb-0'}
       `;
   });
-  const contentOffsetClasses$ = useObservable(() => {
-    return isUser$.get() ? 'pr-10 md:px-12' : 'pl-10 md:px-12';
-  });
 
   return (
     <Memo>
@@ -572,22 +574,26 @@ const ChatMessageComponent: FC<Props> = ({
             <div className="mx-auto max-w-3xl px-4">
               <div className="relative">
                 {!hideAvatar && (
-                  <MessageAvatar
-                    role$={message$.role}
-                    isError$={isError$}
-                    isSuccess$={isSuccess$}
-                    chainType$={chainType$}
-                    agentAvatarUrl={agentAvatarUrl}
-                    agentName={agentName}
-                    userAvatarUrl={
-                      api.userInfo$.avatar?.get()
-                        ? `${connectionConfig.baseUrl.replace(/\/+$/, '')}/api/v2/user/avatar`
-                        : undefined
-                    }
-                    userName={api.userInfo$.name?.get()}
-                  />
+                  // Render the avatar only on medium+ screens. On small screens, the avatar is hidden to save space.
+                  <div className={`hidden md:flex`}>
+                    <MessageAvatar
+                      role$={message$.role}
+                      isError$={isError$}
+                      isSuccess$={isSuccess$}
+                      chainType$={chainType$}
+                      agentAvatarUrl={agentAvatarUrl}
+                      agentName={agentName}
+                      userAvatarUrl={
+                        api.userInfo$.avatar?.get()
+                          ? `${connectionConfig.baseUrl.replace(/\/+$/, '')}/api/v2/user/avatar`
+                          : undefined
+                      }
+                      userName={api.userInfo$.name?.get()}
+                    />
+                  </div>
                 )}
-                <div className={contentOffsetClasses$.get()}>
+
+                <div className={`md:px-12`}>
                   <div className={`group/message relative flex flex-col ${messageClasses$.get()}`}>
                     {/* Per-message actions — rendered under the message (order-last),
                         aligned left for assistant/system and right for user. */}

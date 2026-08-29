@@ -367,9 +367,54 @@ def test_no_context_or_suggestion(mock_pr_basic_response):
     assert "**@reviewer** on test.py:5 (ID: 1005):" in content
     assert "Looks good!" in content
 
+    # Should have "Review Comments (Unresolved)" section header since thread is open
+    assert "Review Comments (Unresolved)" in content
+
     # Should NOT have context or suggestion sections
     assert "Referenced code" not in content
     assert "Suggested change:" not in content
+
+
+def test_review_thread_resolution_controls_unresolved_section(mock_pr_basic_response):
+    """Only comments from unresolved review threads are rendered."""
+    mock_pr_basic_response["review_comments"] = [
+        {
+            "id": 2001,
+            "user": {"login": "reviewer"},
+            "body": "This needs documentation.",
+            "path": "gptme/util/review.py",
+            "line": 42,
+            "diff_hunk": "",
+        }
+    ]
+
+    for is_resolved, section_present in ((False, True), (True, False)):
+        mock_pr_basic_response["graphql_threads"] = {
+            "data": {
+                "repository": {
+                    "pullRequest": {
+                        "reviewThreads": {
+                            "nodes": [
+                                {
+                                    "isResolved": is_resolved,
+                                    "comments": {"nodes": [{"databaseId": 2001}]},
+                                }
+                            ]
+                        }
+                    }
+                }
+            }
+        }
+
+        with patch(
+            "subprocess.run",
+            side_effect=mock_subprocess_run(mock_pr_basic_response),
+        ):
+            content = get_github_pr_content("https://github.com/owner/repo/pull/200")
+
+        assert content is not None
+        assert ("Review Comments (Unresolved)" in content) is section_present
+        assert ("This needs documentation." in content) is section_present
 
 
 def test_empty_diff_hunk():

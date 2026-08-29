@@ -316,6 +316,19 @@ export function ApiProvider({
         }
         return;
       }
+      // A 401 means the server is up and asking for a token. Retrying the same
+      // unauthenticated probe will never recover; the user has to paste it.
+      if (lastResult && !lastResult.ok && lastResult.status === 401) {
+        console.log('[ApiContext] 401 — stopping auto-connect (token required)');
+        stopAutoConnect();
+        if (!isInitialAttempt) {
+          toast.error(
+            lastResult.message ||
+              'Server is running but requires a bearer token. Paste it in settings.'
+          );
+        }
+        return;
+      }
 
       const delay = INITIAL_RETRY_DELAY * Math.pow(2, autoConnectAttempts - 1);
       const maxDelay = 30000;
@@ -389,9 +402,35 @@ export function ApiProvider({
   );
 
   useEffect(() => {
-    if (!needsTauriServerUrlSync || !activeServer || !tauriServerBaseUrl) return;
-    updateServer(activeServer.id, { baseUrl: tauriServerBaseUrl });
-  }, [activeServer, needsTauriServerUrlSync, tauriServerBaseUrl]);
+    if (!activeServer || !tauriServerBaseUrl) return;
+    if (!isDefaultLoopbackTarget(connectionConfig.baseUrl)) return;
+    if (!needsTauriServerUrlSync && !tauriServerStatus?.auth_token) return;
+
+    const updates: Partial<ServerConfig> = {};
+    if (needsTauriServerUrlSync) {
+      updates.baseUrl = tauriServerBaseUrl;
+    }
+    if (tauriServerStatus?.auth_token) {
+      // Only inject the sidecar token when Tauri manages the server.  If an
+      // independently-running server was detected on the same port, its own
+      // credential is already configured and must not be overwritten.
+      const tokenAlreadySet =
+        activeServer.authToken === tauriServerStatus.auth_token && activeServer.useAuthToken;
+      if (!tokenAlreadySet && !tauriServerStatus.existing_server_detected) {
+        updates.authToken = tauriServerStatus.auth_token;
+        updates.useAuthToken = true;
+      }
+    }
+    if (Object.keys(updates).length === 0) return;
+    updateServer(activeServer.id, updates);
+  }, [
+    activeServer,
+    connectionConfig.baseUrl,
+    needsTauriServerUrlSync,
+    tauriServerBaseUrl,
+    tauriServerStatus?.auth_token,
+    tauriServerStatus?.existing_server_detected,
+  ]);
 
   const shouldSkipInitialMobileAutoConnect =
     isTauri && managesLocalServer === false && isDefaultLoopbackTarget(connectionConfig.baseUrl);

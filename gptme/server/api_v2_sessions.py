@@ -329,7 +329,6 @@ def api_conversation_step(conversation_id: str):
         ), 403
 
     logdir = get_logs_dir() / conversation_id
-    chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
 
     model = req_json.get("model")
     if model is not None and not isinstance(model, str):
@@ -348,7 +347,7 @@ def api_conversation_step(conversation_id: str):
                 400,
             )
     else:
-        stream = chat_config.stream
+        stream = None
 
     # ACP opt-in: sticky once enabled for a session.
     # Default can be set server-wide via GPTME_USE_ACP_DEFAULT=true env var.
@@ -366,15 +365,6 @@ def api_conversation_step(conversation_id: str):
             400,
         )
 
-    if use_acp and not session.use_acp:
-        from .acp_session_runtime import AcpSessionRuntime
-
-        session.use_acp = True
-        session.acp_runtime = AcpSessionRuntime(workspace=chat_config.workspace)
-        # Lazy-start the health monitor on first ACP session — avoids unconditional
-        # background thread and global session-eviction side-effects at app startup.
-        start_acp_health_monitor()
-
     # Validate auto_confirm type explicitly (bool OR int).
     # Reject strings/floats/etc. to avoid accidental truthy coercion.
     auto_confirm = req_json.get("auto_confirm", False)
@@ -389,31 +379,38 @@ def api_conversation_step(conversation_id: str):
             400,
         )
 
-    # If auto_confirm set, set auto_confirm_count.
-    # Check bool first: bool is a subclass of int in Python, so isinstance(True, int) is True.
-    # Use type() to distinguish them correctly.
-    if type(auto_confirm) is bool:
-        session.auto_confirm_count = 1 if auto_confirm else -1
-    else:  # int
-        session.auto_confirm_count = auto_confirm
-
-    auto_confirm_enabled = bool(session.auto_confirm_count > 0)
-
-    # Atomically check-and-set generating under a per-session lock.
-    # Without the lock, two concurrent requests on a threaded WSGI server can
-    # both read False before either writes True (classic TOCTOU).  The lock is
-    # held only for the check+set — the expensive model/branch resolution that
-    # follows runs outside it.
-    with session.step_lock:
-        if session.generating:
+    # Reserve generation and capture config in the same critical section as
+    # config PATCH. A PATCH completed before this acquisition must affect the
+    # worker; one arriving afterward sees generating=True and returns 409.
+    with SessionManager.conversation_lock(conversation_id), session.step_lock:
+        if SessionManager.conversation_generating(
+            conversation_id
+        ) or SessionManager.command_is_active(conversation_id):
             return flask.jsonify({"error": "Generation already in progress"}), 409
-        # Mark generating early to prevent concurrent /step requests from racing
-        # through the setup code below.  _start_step_thread/_start_acp_step_thread
-        # also set this, but ~60 lines of model/branch resolution sit between the
-        # check above and those calls — enough for a second request to slip through
-        # on threaded WSGI servers.
+        chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
+        if stream is None:
+            stream = chat_config.stream
+        # Check bool first: bool is a subclass of int.
+        if type(auto_confirm) is bool:
+            session.auto_confirm_count = 1 if auto_confirm else -1
+        else:
+            session.auto_confirm_count = auto_confirm
+        auto_confirm_enabled = session.auto_confirm_count > 0
+        if use_acp and not session.use_acp:
+            from .acp_session_runtime import AcpSessionRuntime
+
+            session.use_acp = True
+            session.acp_runtime = AcpSessionRuntime(workspace=chat_config.workspace)
+            # Lazy-start the health monitor on first ACP session.
+            start_acp_health_monitor()
         session.generating = True
         session.generating_since = datetime.now(tz=timezone.utc)
+        # Claim a new generation epoch before dispatch. If later setup fails,
+        # finally rolls it back so an existing worker retains its ownership.
+        previous_interrupted = session.interrupted
+        session.interrupted = False
+        session.step_seq += 1
+        step_seq = session.step_seq
 
     # Wrap setup in try/finally so any unexpected exception (get_default_model,
     # config I/O, etc.) resets the flag rather than leaving the session
@@ -488,6 +485,7 @@ def api_conversation_step(conversation_id: str):
                 conversation_id=conversation_id,
                 session=session,
                 workspace=chat_config.workspace,
+                reserved=True,
             )
         else:
             # model should be non-None here: the `if not model and not session.use_acp`
@@ -507,12 +505,18 @@ def api_conversation_step(conversation_id: str):
                 branch=branch,
                 auto_confirm=auto_confirm_enabled,
                 stream=stream,
+                reserved=True,
+                step_seq=step_seq,
             )
         _step_dispatched = True
     finally:
         if not _step_dispatched:
-            session.generating = False
-            session.generating_since = None
+            with SessionManager.conversation_lock(conversation_id), session.step_lock:
+                if session.step_seq == step_seq:
+                    session.step_seq -= 1
+                    session.interrupted = previous_interrupted
+                    session.generating = False
+                    session.generating_since = None
 
     # Wait briefly for early errors (bad model, auth failure, empty messages, etc.)
     # so we can return them in the HTTP response instead of swallowing silently.
@@ -561,7 +565,12 @@ def api_conversation_step(conversation_id: str):
     description="Confirm, edit, skip, or auto-confirm a pending tool execution. "
     "session_id is optional - if not provided, the tool will be found across all sessions for the conversation.",
     request_body=ToolConfirmRequest,
-    responses={200: StatusResponse, 400: ErrorResponse, 404: ErrorResponse},
+    responses={
+        200: StatusResponse,
+        400: ErrorResponse,
+        404: ErrorResponse,
+        409: ErrorResponse,
+    },
     parameters=[CONVERSATION_ID_PARAM],
     tags=["sessions"],
 )
@@ -643,15 +652,18 @@ def api_conversation_tool_confirm(conversation_id: str):
         )
 
     logdir = get_logs_dir() / conversation_id
-    chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
 
-    # Get model from session config, default model, or fallback to "anthropic"
-    default_model = get_default_model()
-    model = chat_config.model or (default_model.full if default_model else "anthropic")
+    # Skip reserves its continuation before resolving hook state or consuming the
+    # pending tool below. Other actions retain the existing hook resolution flow.
+    if action != "skip":
+        resolve_hook_confirmation(tool_id, action, req_json.get("content"))
 
-    # Try to resolve via hook system (for hook-based confirmation flow)
-    # This enables future integration where tools use hooks for confirmation
-    resolve_hook_confirmation(tool_id, action, req_json.get("content"))
+    if action in {"confirm", "edit"}:
+        chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
+        default_model = get_default_model()
+        model = chat_config.model or (
+            default_model.full if default_model else "anthropic"
+        )
 
     if action == "confirm":
         # Execute the tool
@@ -659,7 +671,13 @@ def api_conversation_tool_confirm(conversation_id: str):
 
         logger.info(f"Executing runnable tooluse: {tooluse}")
         start_tool_execution(
-            conversation_id, session, tool_id, tooluse, model, chat_config
+            conversation_id,
+            session,
+            tool_id,
+            tooluse,
+            model,
+            chat_config,
+            branch=tool_exec.branch,
         )
         return flask.jsonify({"status": "ok", "message": "Tool confirmed"})
 
@@ -679,28 +697,80 @@ def api_conversation_tool_confirm(conversation_id: str):
             dataclasses.replace(tool_exec.tooluse, content=edited_content),
             model,
             chat_config,
+            branch=tool_exec.branch,
         )
 
     elif action == "skip":
-        # Skip the tool execution
-        tool_exec.status = ToolStatus.SKIPPED
-        session.pending_tools.pop(
-            tool_id, None
-        )  # use pop to avoid KeyError if concurrently removed
+        continuation_dispatched = False
+        # Reserve the continuation before consuming any tool or hook state. A
+        # concurrent /step may already own the reservation; then the pending tool
+        # stays untouched so the client can retry.
+        with SessionManager.conversation_lock(conversation_id), session.step_lock:
+            current_tool = session.pending_tools.get(tool_id)
+            if current_tool is None:
+                return flask.jsonify({"error": f"Tool not found: {tool_id}"}), 404
+            # Check all sessions for the conversation (not just this one) —
+            # another client's session may be generating into the same log.
+            if SessionManager.conversation_generating(conversation_id):
+                return (
+                    flask.jsonify({"error": "Generation already in progress"}),
+                    409,
+                )
 
-        # Provide meaningful message to prevent LLM from re-suggesting the same tool
-        tool_name = tool_exec.tooluse.tool
-        msg = Message(
-            "system",
-            f"User chose not to execute this {tool_name} tool. "
-            "Do not re-suggest the same action unless explicitly requested.",
-        )
-        _append_and_notify(LogManager.load(conversation_id, lock=False), session, msg)
+            # Capture the continuation config only after the shared lock is held,
+            # so a config PATCH that completed first cannot be silently ignored.
+            chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
+            default_model = get_default_model()
+            model = chat_config.model or (
+                default_model.full if default_model else "anthropic"
+            )
 
-        # Resume generation
-        _start_step_thread(conversation_id, session, model, chat_config.workspace)
+            session.generating = True
+            session.generating_since = datetime.now(tz=timezone.utc)
+            # Advance step_seq before capturing the epoch so that any
+            # concurrent tool worker whose my_seq equals the pre-skip value
+            # sees a mismatch and stands down (same protocol as /step and
+            # /interrupt + rerun).
+            session.step_seq += 1
+            skip_step_seq = session.step_seq
+            try:
+                current_tool.status = ToolStatus.SKIPPED
+                session.pending_tools.pop(tool_id)
+
+                # Persist the skip before the continuation can load the log.
+                tool_name = current_tool.tooluse.tool
+                msg = Message(
+                    "system",
+                    f"User chose not to execute this {tool_name} tool. "
+                    "Do not re-suggest the same action unless explicitly requested.",
+                )
+                manager = LogManager.load(
+                    conversation_id, branch=current_tool.branch, lock=False
+                )
+                _append_and_notify(manager, session, msg)
+                manager.write()
+
+                resolve_hook_confirmation(tool_id, action, req_json.get("content"))
+                continuation_dispatched = _start_step_thread(
+                    conversation_id,
+                    session,
+                    model,
+                    chat_config.workspace,
+                    branch=current_tool.branch,
+                    reserved=True,
+                    step_seq=skip_step_seq,
+                )
+            finally:
+                if not continuation_dispatched:
+                    session.generating = False
+                    session.generating_since = None
 
     elif action == "auto":
+        chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
+        default_model = get_default_model()
+        model = chat_config.model or (
+            default_model.full if default_model else "anthropic"
+        )
         # Enable auto-confirmation for future tools
         count = req_json.get("count", 1)
         if not isinstance(count, int) or isinstance(count, bool) or count <= 0:
@@ -710,7 +780,13 @@ def api_conversation_tool_confirm(conversation_id: str):
 
         # Also confirm this tool
         start_tool_execution(
-            conversation_id, session, tool_id, tool_exec.tooluse, model, chat_config
+            conversation_id,
+            session,
+            tool_id,
+            tool_exec.tooluse,
+            model,
+            chat_config,
+            branch=tool_exec.branch,
         )
 
     return flask.jsonify({"status": "ok", "message": f"Tool {action}ed"})
@@ -763,91 +839,116 @@ def api_conversation_rerun(conversation_id: str):
             }
         ), 403
 
-    if session.generating:
-        return flask.jsonify(
-            {"error": "Cannot rerun while generation is in progress"}
-        ), 409
+    # Hold the conversation lock from the guard through pending-tool
+    # registration and execution scheduling, so a concurrent /step (or another
+    # reservation site) cannot reserve generation between the check and the
+    # rerun's shared-state work. The check is conversation-wide — another
+    # client's session generating into the same log must also block a rerun
+    # (same class of bug as the /step guard). All work inside the lock is fast
+    # and local (log read, parsing, thread spawn) — no LLM or tool execution.
+    with SessionManager.conversation_lock(conversation_id), session.step_lock:
+        if SessionManager.conversation_generating(
+            conversation_id
+        ) or SessionManager.command_is_active(conversation_id):
+            return flask.jsonify(
+                {"error": "Cannot rerun while generation is in progress"}
+            ), 409
 
-    # Load conversation and find the last assistant message
-    try:
-        manager = LogManager.load(conversation_id, lock=False)
-    except FileNotFoundError:
-        return flask.jsonify(
-            {"error": f"Conversation not found: {conversation_id}"}
-        ), 404
+        # Load conversation and find the last assistant message
+        try:
+            manager = LogManager.load(conversation_id, lock=False)
+        except FileNotFoundError:
+            return flask.jsonify(
+                {"error": f"Conversation not found: {conversation_id}"}
+            ), 404
 
-    # Find the last assistant message
-    last_assistant = None
-    for msg in reversed(list(manager.log.messages)):
-        if msg.role == "assistant":
-            last_assistant = msg
-            break
+        # Find the last assistant message
+        last_assistant = None
+        for msg in reversed(list(manager.log.messages)):
+            if msg.role == "assistant":
+                last_assistant = msg
+                break
 
-    if not last_assistant:
-        return flask.jsonify({"error": "No assistant message found"}), 400
+        if not last_assistant:
+            return flask.jsonify({"error": "No assistant message found"}), 400
 
-    # Parse tool uses from the message content
-    tooluses = list(ToolUse.iter_from_content(last_assistant.content))
-    if not tooluses:
-        return flask.jsonify(
-            {"error": "No tool uses found in the last assistant message"}
-        ), 400
+        # Parse tool uses from the message content
+        tooluses = list(ToolUse.iter_from_content(last_assistant.content))
+        if not tooluses:
+            return flask.jsonify(
+                {"error": "No tool uses found in the last assistant message"}
+            ), 400
 
-    # Set them as pending (same flow as step() tool detection)
-    first_auto_id: str | None = None
-    logdir = get_logs_dir() / conversation_id
-    chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
-    default_model = get_default_model()
-    model = chat_config.model or (default_model.full if default_model else "anthropic")
-
-    for tooluse in tooluses:
-        tool_id = str(uuid.uuid4())
-        tool_exec = ToolExecution(
-            tool_id=tool_id,
-            tooluse=tooluse,
-            auto_confirm=session.auto_confirm_count > 0,
+        # Set them as pending (same flow as step() tool detection)
+        first_auto_id: str | None = None
+        logdir = get_logs_dir() / conversation_id
+        chat_config = ChatConfig.load_or_create(logdir, ChatConfig())
+        default_model = get_default_model()
+        model = chat_config.model or (
+            default_model.full if default_model else "anthropic"
         )
-        session.pending_tools[tool_id] = tool_exec
 
-        SessionManager.add_event(
-            conversation_id,
-            {
-                "type": "tool_pending",
-                "tool_id": tool_id,
-                "tooluse": {
-                    "tool": tooluse.tool,
-                    "args": tooluse.args,
-                    "content": tooluse.content,
+        for tooluse in tooluses:
+            tool_id = str(uuid.uuid4())
+            tool_exec = ToolExecution(
+                tool_id=tool_id,
+                tooluse=tooluse,
+                auto_confirm=session.auto_confirm_count > 0,
+                assistant_msg_timestamp=last_assistant.timestamp,
+            )
+            session.pending_tools[tool_id] = tool_exec
+
+            SessionManager.add_event(
+                conversation_id,
+                {
+                    "type": "tool_pending",
+                    "tool_id": tool_id,
+                    "tooluse": {
+                        "tool": tooluse.tool,
+                        "args": tooluse.args,
+                        "content": tooluse.content,
+                    },
+                    "auto_confirm": tool_exec.auto_confirm,
                 },
-                "auto_confirm": tool_exec.auto_confirm,
-            },
+            )
+
+            if tool_exec.auto_confirm:
+                if session.auto_confirm_count > 0:
+                    session.auto_confirm_count -= 1
+                if first_auto_id is None:
+                    first_auto_id = tool_id
+
+        # Start execution for only the first auto-confirm tool.
+        # execute_tool_thread will chain the remaining tools serially (same as step()).
+        # Pre-reserve generation inside the lock so no concurrent /step can slip
+        # in between the guard check above and the tool worker's own call to
+        # _start_step_thread.  The worker transfers the reservation to
+        # _start_step_thread (reserved=True) when it starts the continuation, or
+        # releases it itself if the continuation is not needed.
+        if first_auto_id is not None:
+            # Rerun starts a new user-authorized generation chain. Clear the old
+            # interrupt marker and advance the generation epoch before queueing it.
+            session.interrupted = False
+            session.step_seq += 1
+            session.generating = True
+            session.generating_since = datetime.now(tz=timezone.utc)
+            start_tool_execution(
+                conversation_id,
+                session,
+                first_auto_id,
+                session.pending_tools[first_auto_id].tooluse,
+                model,
+                chat_config,
+                reserved=True,
+            )
+
+        return flask.jsonify(
+            {
+                "status": "ok",
+                "message": f"Re-running {len(tooluses)} tool(s)",
+                "tool_ids": list(session.pending_tools),
+            }
         )
-
-        if tool_exec.auto_confirm:
-            if session.auto_confirm_count > 0:
-                session.auto_confirm_count -= 1
-            if first_auto_id is None:
-                first_auto_id = tool_id
-
-    # Start execution for only the first auto-confirm tool.
-    # execute_tool_thread will chain the remaining tools serially (same as step()).
-    if first_auto_id is not None:
-        start_tool_execution(
-            conversation_id,
-            session,
-            first_auto_id,
-            session.pending_tools[first_auto_id].tooluse,
-            model,
-            chat_config,
-        )
-
-    return flask.jsonify(
-        {
-            "status": "ok",
-            "message": f"Re-running {len(tooluses)} tool(s)",
-            "tool_ids": list(session.pending_tools),
-        }
-    )
 
 
 @sessions_api.route(
@@ -1052,18 +1153,37 @@ def api_conversation_interrupt(conversation_id: str):
             }
         ), 403
 
-    if not session.generating and not session.pending_tools:
+    # Interrupt conversation-wide: generation may have been started by a
+    # *different* session for the same conversation (e.g. another connected
+    # client). Only clearing the requesting session's flag would leave that
+    # sibling generation running and report "Already interrupted".
+    # Hold the conversation lock so a concurrent reservation can't slip in
+    # between clearing one session and the next.
+    interrupted = False
+    with SessionManager.conversation_lock(conversation_id):
+        for sess in SessionManager.get_sessions_for_conversation(conversation_id):
+            with sess.step_lock:
+                active = bool(
+                    sess.generating or sess.pending_tools or sess._executing_tools
+                )
+                if active:
+                    interrupted = True
+                    # Mark session as not generating and clear pending tools.
+                    # Also set interrupted so execute_tool_thread won't start a
+                    # continuation step after the currently-running tool finishes.
+                    sess.generating = False
+                    sess.generating_since = None
+                    sess.interrupted = True
+                    # Revoke every worker queued under the previous epoch, even
+                    # when a later explicit /step clears the boolean marker.
+                    sess.step_seq += 1
+                    sess.pending_tools.clear()
+
+    if not interrupted:
         # Idempotent: if nothing is generating, treat as already interrupted
         return flask.jsonify(
             {"status": "ok", "message": "Already interrupted or not generating"}
         )
-
-    # Mark session as not generating
-    session.generating = False
-    session.generating_since = None
-
-    # Clear pending tools
-    session.pending_tools.clear()
 
     # Notify about interruption
     SessionManager.add_event(conversation_id, {"type": "interrupted"})

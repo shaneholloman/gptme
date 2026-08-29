@@ -37,6 +37,7 @@ _last_logs: dict = {"logs": [], "errors": [], "url": None}
 _current_page: Page | None = None
 _current_context: BrowserContext | None = None
 logger = logging.getLogger(__name__)
+_inline_data_image = re.compile(r"!\[[^\]]*\]\(data:image[^)]*\)")
 
 
 def _is_cdp_connection() -> bool:
@@ -157,8 +158,8 @@ def _execute_with_retry(
     raise last_error
 
 
-def _load_page(browser: Browser, url: str) -> str:
-    """Load a page and return its body HTML, always capturing logs"""
+def _load_page(browser: Browser, url: str) -> tuple[str, bool]:
+    """Load a page and return its content plus whether it is Markdown."""
     global _last_logs
 
     managed = _create_page(
@@ -196,21 +197,27 @@ def _load_page(browser: Browser, url: str) -> str:
     page.on("pageerror", on_page_error)
 
     # Navigate to the page
+    nav_response = None
     try:
-        page.goto(url)
+        nav_response = page.goto(url)
         # Wait for page to be fully loaded (includes network idle)
         page.wait_for_load_state("networkidle")
     except Exception as e:
         page_errors.append(f"Navigation error: {e}")
         # Don't re-raise, just capture the error
 
+    content_type = nav_response.headers.get("content-type", "") if nav_response else ""
+    is_markdown = content_type.partition(";")[0].strip().lower() == "text/markdown"
+
     # Store logs globally
     _last_logs = {"logs": logs, "errors": page_errors, "url": url}
 
     try:
-        # Try to extract main content area first, falling back to body
-        html = _extract_main_content(page)
-        return html
+        # Server returned markdown directly — preserve source whitespace and skip HTML extraction
+        if is_markdown:
+            return page.text_content("body") or "", True
+        # Otherwise extract main content HTML for html_to_markdown conversion
+        return _extract_main_content(page), False
     finally:
         managed.close()
 
@@ -330,8 +337,10 @@ def _extract_main_content(page: Page) -> str:
 
 def read_url(url: str) -> str:
     """Read the text of a webpage and return the text in Markdown format."""
-    body_html = _execute_with_retry(_load_page, url)
-    return html_to_markdown(body_html)
+    body_content, is_markdown = _execute_with_retry(_load_page, url)
+    if is_markdown:
+        return _inline_data_image.sub("", body_content)
+    return html_to_markdown(body_content)
 
 
 def read_logs() -> str:
@@ -1161,12 +1170,6 @@ def html_to_markdown(html):
     markdown = re.sub(r"\{(#|style|target|\.)[^}]*\}", "", markdown)
 
     # strip inline images, like: data:image/png;base64,...
-    re_strip_data = re.compile(r"!\[[^\]]*\]\(data:image[^)]*\)")
-
-    # test cases
-    assert re_strip_data.sub("", "![test](data:image/png;base64,123)") == ""
-    assert re_strip_data.sub("", "![test](data:image/png;base64,123) test") == " test"
-
-    markdown = re_strip_data.sub("", markdown)
+    markdown = _inline_data_image.sub("", markdown)
 
     return markdown

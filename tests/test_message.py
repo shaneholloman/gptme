@@ -80,16 +80,32 @@ def test_format_msgs_escapes_rich_markup():
     # Test with content containing Rich-like markup that should be escaped
     msg = Message("user", "Testing [project] with [bold]content[/bold]")
 
-    # Without highlight - should not escape
+    # Without highlight, preserve the literal content for plaintext consumers
     outputs_no_highlight = format_msgs([msg], highlight=False)
-    assert len(outputs_no_highlight) == 1
+    assert outputs_no_highlight[0].endswith(
+        "Testing [project] with [bold]content[/bold]"
+    )
 
-    # With highlight - should escape markup
+    # With highlight, escape message content while preserving generated role markup.
     outputs_highlight = format_msgs([msg], highlight=True)
-    assert len(outputs_highlight) == 1
-    # The escaped version should be different (escaped brackets)
-    # Note: We can't directly check the escape as it's in the Rich formatted string
-    # but we verify no exception is raised from Rich interpreting brackets as tags
+    assert outputs_highlight[0].endswith(
+        r"Testing \[project] with \[bold]content\[/bold]"
+    )
+
+
+def test_format_msgs_no_highlight_preserves_path_like_bracket():
+    """Plaintext formatting must preserve path-like bracket content verbatim."""
+    from gptme.message import Message, format_msgs
+
+    # Content that matches a Rich closing-tag pattern (slash prefix)
+    msg = Message(
+        "user", "Run the script at [/home/runner/run.sh] to reproduce the issue."
+    )
+
+    outputs = format_msgs([msg], highlight=False)
+    assert outputs[0].endswith(
+        "Run the script at [/home/runner/run.sh] to reproduce the issue."
+    )
 
 
 def test_format_msgs_oneline_escapes_rich_markup():
@@ -98,10 +114,62 @@ def test_format_msgs_oneline_escapes_rich_markup():
 
     msg = Message("user", "Testing [project]\nwith newlines")
 
+    # Without highlight, preserve literal brackets for plaintext consumers
+    outputs_no_highlight = format_msgs([msg], oneline=True, highlight=False)
+    assert outputs_no_highlight[0].endswith("Testing [project]\\nwith newlines")
+
     # With highlight and oneline
-    outputs = format_msgs([msg], oneline=True, highlight=True)
-    assert len(outputs) == 1
+    outputs_highlight = format_msgs([msg], oneline=True, highlight=True)
+    assert len(outputs_highlight) == 1
     # Verify no Rich markup interpretation error
+
+
+def test_format_msgs_oneline_no_highlight_preserves_path_like_bracket():
+    """Oneline plaintext formatting must preserve path-like brackets verbatim."""
+    from gptme.message import Message, format_msgs
+
+    msg = Message(
+        "user", "Run the script at [/home/runner/run.sh] to reproduce the issue."
+    )
+
+    outputs = format_msgs([msg], oneline=True, highlight=False)
+    assert outputs[0].endswith(
+        "Run the script at [/home/runner/run.sh] to reproduce the issue."
+    )
+
+
+def test_print_msg_no_highlight_preserves_rich_syntax(monkeypatch):
+    """Non-TTY output must disable Rich parsing at the console boundary."""
+    from unittest.mock import patch
+
+    from gptme.message import Message, print_msg
+
+    msg = Message("user", "Run [/home/runner/run.sh] :warning:")
+    monkeypatch.setattr("sys.stdout.isatty", lambda: False)
+
+    with patch("gptme.message.console") as mock_console:
+        assert print_msg(msg) == 1
+
+    (rendered,) = mock_console.print.call_args.args
+    assert rendered.endswith("Run [/home/runner/run.sh] :warning:")
+    assert mock_console.print.call_args.kwargs == {"markup": False, "emoji": False}
+
+
+def test_print_msg_highlight_path_like_bracket_is_escaped(monkeypatch):
+    """TTY output must escape message content before enabling Rich markup."""
+    from unittest.mock import patch
+
+    from gptme.message import Message, print_msg
+
+    msg = Message("user", "Run [/home/runner/run.sh]")
+    monkeypatch.setattr("sys.stdout.isatty", lambda: True)
+
+    with patch("gptme.message.console") as mock_console:
+        assert print_msg(msg, highlight=True) == 1
+
+    (rendered,) = mock_console.print.call_args.args
+    assert rendered.endswith(r"Run \[/home/runner/run.sh]")
+    assert mock_console.print.call_args.kwargs == {"markup": True, "emoji": False}
 
 
 def test_format_msgs_preserves_codeblocks():
@@ -267,6 +335,7 @@ def test_message_metadata():
     meta: MessageMetadata = {
         "model": "claude-sonnet",
         "cost": 0.005,
+        "tool": "shell",
         "usage": {
             "input_tokens": 100,
             "output_tokens": 50,
@@ -280,6 +349,7 @@ def test_message_metadata():
     assert msg.metadata is not None
     assert msg.metadata["model"] == "claude-sonnet"
     assert msg.metadata["cost"] == 0.005
+    assert msg.metadata["tool"] == "shell"
     usage = msg.metadata["usage"]
     assert usage["input_tokens"] == 100
     assert usage["output_tokens"] == 50

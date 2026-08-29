@@ -39,22 +39,72 @@ logger = logging.getLogger(__name__)
 computer_api = flask.Blueprint("computer_api", __name__)
 
 
+_DISPLAY_UNAVAILABLE_MARKERS = (
+    "can't open x display",
+    "cannot open display",
+    "unable to open display",
+    "failed to open display",
+    "could not open display",
+    "no display",
+)
+
+
+def _is_display_unavailable_error(exc: BaseException) -> bool:
+    """Return True when a screenshot failure is 'no usable display', not a 500."""
+    import subprocess
+
+    texts = [str(exc).lower()]
+    if isinstance(exc, subprocess.CalledProcessError) and exc.stderr:
+        stderr = exc.stderr
+        if isinstance(stderr, bytes):
+            stderr = stderr.decode(errors="replace")
+        texts.append(stderr.lower())
+    return any(
+        marker in text for text in texts for marker in _DISPLAY_UNAVAILABLE_MARKERS
+    )
+
+
 def _native_screenshot_available() -> bool:
     """Return True when the native screenshot backend is available.
 
     Mirrors the logic in ``gptme.tools.screenshot._is_available`` to ensure
     the API endpoint's availability check matches the actual screenshot tool
-    backends.
+    backends. scrot is X11-only and needs ``$DISPLAY``; a binary on PATH is
+    not enough on a headless host.
     """
     system = platform.system()
     if system == "Linux":
-        has_gnome = bool(shutil.which("gnome-screenshot"))
         is_wayland = os.environ.get("XDG_SESSION_TYPE") == "wayland"
-        has_scrot = bool(shutil.which("scrot")) and not is_wayland
+        has_display = bool(os.environ.get("DISPLAY"))
+        has_wayland_display = bool(os.environ.get("WAYLAND_DISPLAY"))
+        has_gnome = bool(shutil.which("gnome-screenshot")) and (
+            (is_wayland and has_wayland_display) or has_display
+        )
+        has_scrot = bool(shutil.which("scrot")) and not is_wayland and has_display
         return has_gnome or has_scrot
     if system == "Darwin":
         return bool(shutil.which("screencapture"))
     return False
+
+
+def _linux_unavailable_hint() -> str:
+    """Actionable 503 body when Linux cannot actually take a screenshot."""
+    has_scrot = bool(shutil.which("scrot"))
+    has_gnome = bool(shutil.which("gnome-screenshot"))
+    is_wayland = os.environ.get("XDG_SESSION_TYPE") == "wayland"
+    has_display = bool(os.environ.get("DISPLAY"))
+    if not is_wayland and not has_display:
+        if has_gnome or has_scrot:
+            installed = "gnome-screenshot" if has_gnome else "scrot"
+            return (
+                f"{installed} is installed but $DISPLAY is unset, so screenshots "
+                "cannot be taken. Set DISPLAY to a running X11 server (or start "
+                "Xvfb), or use a Wayland session with gnome-screenshot."
+            )
+    return (
+        "No supported Linux screenshot backend available. "
+        "Install gnome-screenshot, or install scrot and run under X11/Xvfb."
+    )
 
 
 def _screenshot_available() -> bool:
@@ -109,10 +159,7 @@ def screenshot():
         if not _screenshot_available():
             system = platform.system()
             if system == "Linux":
-                hint = (
-                    "No supported Linux screenshot backend available. "
-                    "Install gnome-screenshot, or install scrot and run under X11/Xvfb."
-                )
+                hint = _linux_unavailable_hint()
             elif system == "Darwin":
                 hint = "screencapture not found (unexpected on macOS)"
             else:
@@ -181,9 +228,11 @@ def screenshot():
         )
     except Exception as exc:
         logger.exception("Screenshot failed")
+        # A missing/dead X display is unavailability (503), not an internal error.
+        status = 503 if _is_display_unavailable_error(exc) else 500
         return flask.Response(
             response=flask.json.dumps({"error": str(exc)}),
-            status=500,
+            status=status,
             content_type="application/json",
         )
 

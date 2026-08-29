@@ -17,6 +17,8 @@ from click.testing import CliRunner
 import gptme.cli.main as cli
 import gptme.constants
 import gptme.tools.browser
+from gptme.__version__ import __version__
+from gptme.message import Message
 from gptme.tools import ToolUse
 
 project_root = Path(__file__).parent.parent
@@ -157,7 +159,16 @@ def test_help_no_external_subcommands_section_when_none_installed(
 def test_version(runner: CliRunner):
     result = runner.invoke(cli.main, ["--version"])
     assert result.exit_code == 0
+    # --version outputs just the bare version string, usable in scripts
+    assert result.output == f"{__version__}\n"
+
+
+def test_version_verbose(runner: CliRunner):
+    result = runner.invoke(cli.main, ["--version", "--verbose"])
+    assert result.exit_code == 0
+    # --version --verbose shows the full human-readable info block
     assert "gptme" in result.output
+    assert __version__ in result.output
 
 
 def test_show_prompt_stats_exits_before_chat(monkeypatch, tmp_path: Path, runner):
@@ -471,7 +482,7 @@ def test_model_allows_provider_owned_nested_model_path(runner: CliRunner):
     )
 
     assert result.exit_code == 0, result.output
-    assert "gptme v" in result.output
+    assert __version__ in result.output
 
 
 def test_model_allows_nested_path_through_validation_block(
@@ -537,6 +548,210 @@ def test_model_rejects_unknown_provider_before_context_cmd(
 
     assert result.exit_code == 2, result.output
     assert "Unknown provider: badprovider" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_model_rejects_unknown_bare_name_before_context_cmd(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+):
+    """--model with an unresolvable bare name should fail fast before get_prompt().
+
+    Regression: the early check only ran for slash-prefixed provider/model
+    strings, so `gptme --model nosuch` paid the full workspace context_cmd
+    cost (often looking like a hang) before init_model() rejected it.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setattr("gptme.llm.is_custom_provider", lambda name: False)
+    monkeypatch.setattr(
+        "gptme.prompts.get_prompt",
+        lambda **kwargs: pytest.fail("get_prompt was called before model validation"),
+    )
+    monkeypatch.setattr(
+        importlib.import_module("gptme.chat"),
+        "chat",
+        lambda *args, **kwargs: pytest.fail("chat ran"),
+    )
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(
+        cli.main,
+        ["--model", "definitely-not-a-model-7f83", "--non-interactive", "hello"],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Unknown model 'definitely-not-a-model-7f83'" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_model_allows_bare_alias_through_validation_block(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+):
+    """A resolvable bare alias should still reach get_prompt()."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setattr("gptme.llm.is_custom_provider", lambda name: False)
+    monkeypatch.setattr(
+        "gptme.llm.models.get_model",
+        lambda model: SimpleNamespace(provider="openai", model=model),
+    )
+
+    called: dict[str, bool] = {"get_prompt": False}
+
+    def _fake_get_prompt(**kwargs):
+        called["get_prompt"] = True
+        return []
+
+    monkeypatch.setattr("gptme.prompts.get_prompt", _fake_get_prompt)
+    monkeypatch.setattr(
+        importlib.import_module("gptme.chat"), "chat", lambda *args, **kwargs: None
+    )
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(
+        cli.main,
+        ["--model", "known-alias", "--non-interactive", "hello"],
+    )
+
+    assert result.exit_code == 0, result.output
+    assert called["get_prompt"], "resolvable aliases must still reach get_prompt"
+
+
+def test_model_validation_preserves_existing_conversation_alias(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+):
+    """A saved alias may outlive the registry and must not block resuming."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+    logdir = tmp_path / "existing-conversation"
+    logdir.mkdir()
+    (logdir / "conversation.jsonl").write_text('{"role":"user","content":"hello"}\n')
+    (logdir / "config.toml").write_text(
+        f'[chat]\nmodel = "retired-alias"\ntool_format = "markdown"\n'
+        f'workspace = "{tmp_path}"\n'
+    )
+
+    monkeypatch.setattr(cli, "get_logdir", lambda name: logdir)
+    monkeypatch.setattr("gptme.llm.is_custom_provider", lambda name: False)
+    monkeypatch.setattr(
+        "gptme.llm.models.get_model",
+        lambda model: pytest.fail("saved aliases must not be prevalidated on resume"),
+    )
+    monkeypatch.setattr(
+        "gptme.prompts.get_prompt",
+        lambda **kwargs: pytest.fail("get_prompt ran for an existing conversation"),
+    )
+
+    seen_models: list[str | None] = []
+
+    def _fake_chat(*args, **kwargs):
+        seen_models.append(args[4])
+
+    monkeypatch.setattr(importlib.import_module("gptme.chat"), "chat", _fake_chat)
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(
+        cli.main,
+        ["--name", "existing-conversation", "--non-interactive", "hello"],
+        env={"GPTME_MODEL": ""},
+    )
+
+    assert result.exit_code == 0, result.output
+    assert seen_models == ["retired-alias"]
+
+
+def test_model_rejects_explicit_unknown_provider_on_existing_conversation(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+):
+    """Resuming with an explicit slash-prefixed --model must still fail fast.
+
+    The existing-conversation skip only protects saved aliases; passing
+    `--model badprovider/x` on the command line used to (and must still)
+    raise UsageError before chat()/init_model().
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+    logdir = tmp_path / "existing-conversation"
+    logdir.mkdir()
+    (logdir / "conversation.jsonl").write_text('{"role":"user","content":"hello"}\n')
+    (logdir / "config.toml").write_text(
+        f'[chat]\nmodel = "retired-alias"\ntool_format = "markdown"\n'
+        f'workspace = "{tmp_path}"\n'
+    )
+
+    monkeypatch.setattr(cli, "get_logdir", lambda name: logdir)
+    monkeypatch.setattr(
+        "gptme.prompts.get_prompt",
+        lambda **kwargs: pytest.fail("get_prompt was called before model validation"),
+    )
+    monkeypatch.setattr(
+        importlib.import_module("gptme.chat"),
+        "chat",
+        lambda *args, **kwargs: pytest.fail("chat ran"),
+    )
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(
+        cli.main,
+        [
+            "--name",
+            "existing-conversation",
+            "--model",
+            "badprovider/some-model",
+            "--non-interactive",
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Unknown provider: badprovider" in result.output
+    assert "Traceback" not in result.output
+
+
+def test_model_rejects_explicit_unknown_bare_name_on_existing_conversation(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+):
+    """Resuming with an explicit unknown bare --model must still fail fast."""
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+
+    logdir = tmp_path / "existing-conversation"
+    logdir.mkdir()
+    (logdir / "conversation.jsonl").write_text('{"role":"user","content":"hello"}\n')
+    (logdir / "config.toml").write_text(
+        f'[chat]\nmodel = "retired-alias"\ntool_format = "markdown"\n'
+        f'workspace = "{tmp_path}"\n'
+    )
+
+    monkeypatch.setattr(cli, "get_logdir", lambda name: logdir)
+    monkeypatch.setattr("gptme.llm.is_custom_provider", lambda name: False)
+    monkeypatch.setattr(
+        "gptme.prompts.get_prompt",
+        lambda **kwargs: pytest.fail("get_prompt was called before model validation"),
+    )
+    monkeypatch.setattr(
+        importlib.import_module("gptme.chat"),
+        "chat",
+        lambda *args, **kwargs: pytest.fail("chat ran"),
+    )
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(
+        cli.main,
+        [
+            "--name",
+            "existing-conversation",
+            "--model",
+            "definitely-not-a-model-7f83",
+            "--non-interactive",
+            "hello",
+        ],
+    )
+
+    assert result.exit_code == 2, result.output
+    assert "Unknown model 'definitely-not-a-model-7f83'" in result.output
     assert "Traceback" not in result.output
 
 
@@ -1321,6 +1536,79 @@ def test_stdin(args: list[str], runner: CliRunner):
     assert result.exit_code == 0
 
 
+def test_group_prompt_args_preserves_markdown_list() -> None:
+    prompt = "Investigate this item:\n\n- **Repo**: gptme/gptme\n- **PR**: #123"
+
+    assert cli._group_prompt_args((prompt,)) == [prompt]
+
+
+def test_group_prompt_args_splits_standalone_separator() -> None:
+    assert cli._group_prompt_args(("first", "-", "second")) == ["first", "second"]
+
+
+def test_group_prompt_args_preserves_lone_separator() -> None:
+    assert cli._group_prompt_args(("-",)) == ["-"]
+
+
+def test_cli_preserves_lone_separator_prompt(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+) -> None:
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    received_prompts: list[Message] = []
+
+    def fake_chat(prompt_msgs, *args, **kwargs):
+        received_prompts.extend(prompt_msgs)
+
+    monkeypatch.setattr("gptme.prompts.get_prompt", lambda **kwargs: [])
+    monkeypatch.setattr(importlib.import_module("gptme.chat"), "chat", fake_chat)
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(cli.main, ["--non-interactive", "-"])
+
+    assert result.exit_code == 0, result.output
+    assert received_prompts == [Message("user", "-")]
+
+
+def test_cli_lone_separator_prepends_to_piped_stdin(
+    monkeypatch, tmp_path: Path, runner: CliRunner
+) -> None:
+    """A lone `-` stays the first prompt when stdin is also piped.
+
+    This is the pre-#3502 behaviour, restored deliberately: `-` is documented
+    only as the chained-prompt separator, never as a read-stdin marker, so a
+    sole `-` has always been passed through as a literal prompt and stdin
+    appended to it. Pinned here because the piped path is where the difference
+    is observable at all.
+    """
+    monkeypatch.setenv("HOME", str(tmp_path))
+    monkeypatch.setenv("XDG_DATA_HOME", str(tmp_path / "data"))
+    monkeypatch.setenv("XDG_STATE_HOME", str(tmp_path / "state"))
+
+    received_prompts: list[Message] = []
+
+    def fake_chat(prompt_msgs, *args, **kwargs):
+        received_prompts.extend(prompt_msgs)
+
+    monkeypatch.setattr("gptme.prompts.get_prompt", lambda **kwargs: [])
+    monkeypatch.setattr(importlib.import_module("gptme.chat"), "chat", fake_chat)
+    monkeypatch.setattr("gptme.telemetry.init_telemetry", lambda **kwargs: None)
+
+    result = runner.invoke(cli.main, ["--non-interactive", "-"], input="hello\n")
+
+    assert result.exit_code == 0, result.output
+    assert len(received_prompts) == 1
+    content = received_prompts[0].content
+    assert content.startswith("-\n\n")
+    assert "hello" in content
+
+
+def test_group_prompt_args_joins_non_separator_arguments() -> None:
+    assert cli._group_prompt_args(("first", "second")) == ["first\n\nsecond"]
+
+
 # Flaky, seems to not always get "User:" outputted?
 @pytest.mark.xfail(strict=False)
 @pytest.mark.slow
@@ -1563,7 +1851,36 @@ def test_tools_short_option_equals_syntax_works(runner: CliRunner):
     """The documented `-t=-browser` short form should parse successfully."""
     result = runner.invoke(cli.main, ["-t=-browser", "--version"])
     assert result.exit_code == 0, result.output
-    assert "gptme v" in result.output
+    assert __version__ in result.output
+
+
+def test_tools_read_only_preset_is_valid_cli_choice(runner: CliRunner):
+    result = runner.invoke(cli.main, ["-t", "read-only", "--version"])
+
+    assert result.exit_code == 0, result.output
+    assert __version__ in result.output
+
+
+def test_tools_hint_prefix_is_valid_cli_choice(runner: CliRunner):
+    result = runner.invoke(cli.main, ["-t", "hint:read-only", "--version"])
+
+    assert result.exit_code == 0, result.output
+    assert __version__ in result.output
+
+
+def test_tools_hint_destructive_is_valid_cli_choice(runner: CliRunner):
+    """hint:destructive must be accepted — it is a real hint used by shell, patch, save, etc."""
+    result = runner.invoke(cli.main, ["-t", "hint:destructive", "--version"])
+
+    assert result.exit_code == 0, result.output
+    assert __version__ in result.output
+
+
+def test_tools_unknown_hint_fails_cli_validation(runner: CliRunner):
+    result = runner.invoke(cli.main, ["-t", "hint:red-only", "--version"])
+
+    assert result.exit_code != 0
+    assert "invalid choice: hint:red-only" in result.output
 
 
 @pytest.mark.parametrize(

@@ -1,6 +1,10 @@
 """Tests for lynx browser backend."""
 
+import os
 import shutil
+import stat
+import sys
+import tempfile
 from unittest.mock import patch
 
 import pytest
@@ -26,6 +30,115 @@ def test_url_scheme_validation():
 
     with pytest.raises(ValueError, match="not allowed"):
         _validate_url_scheme("javascript:alert(1)")
+
+
+def test_url_validation_rejects_missing_host_and_credentials():
+    with pytest.raises(ValueError, match="hostname"):
+        _validate_url_scheme("https://")
+
+    with pytest.raises(ValueError, match="hostname"):
+        _validate_url_scheme("https:///etc/passwd")
+
+    with pytest.raises(ValueError, match="credentials"):
+        _validate_url_scheme("https://user:password@example.com")
+
+
+def test_url_validation_enforces_input_length():
+    prefix = "https://example.com/"
+    _validate_url_scheme(prefix + "a" * (2048 - len(prefix)))
+
+    with pytest.raises(ValueError, match="2048"):
+        _validate_url_scheme(prefix + "a" * (2049 - len(prefix)))
+
+
+@pytest.mark.parametrize("cookies", [{"bad\nname": "value"}, {"name": "bad\tvalue"}])
+def test_read_url_rejects_cookie_line_injection(cookies):
+    with pytest.raises(ValueError, match="tabs/newlines"):
+        read_url("https://example.com", cookies=cookies)
+
+
+def test_read_url_cookie_file_is_private():
+    observed_mode = None
+    cookie_path = None
+
+    def mock_run(cmd, **kwargs):
+        nonlocal cookie_path, observed_mode
+        cookie_path = next(
+            arg.split("=", 1)[1] for arg in cmd if arg.startswith("-cookie_file=")
+        )
+        observed_mode = stat.S_IMODE(os.stat(cookie_path).st_mode)
+
+        from unittest.mock import MagicMock
+
+        result = MagicMock()
+        result.stdout = "mock page content"
+        return result
+
+    with patch("gptme.tools._browser_lynx.subprocess.run", side_effect=mock_run):
+        read_url("https://example.com", cookies={"CONSENT": "YES"})
+
+    assert cookie_path is not None
+    assert not os.path.exists(cookie_path)
+    if sys.platform != "win32":
+        assert observed_mode == 0o600
+
+
+def test_read_url_closes_cookie_descriptor_when_chmod_fails():
+    fd, cookie_path = tempfile.mkstemp()
+    try:
+        with (
+            patch(
+                "gptme.tools._browser_lynx.tempfile.mkstemp",
+                return_value=(fd, cookie_path),
+            ),
+            patch("gptme.tools._browser_lynx.Path.chmod", side_effect=PermissionError),
+            pytest.raises(PermissionError),
+        ):
+            read_url("https://example.com", cookies={"CONSENT": "YES"})
+
+        with pytest.raises(OSError, match="WinError 6|Bad file descriptor"):
+            os.fstat(fd)
+        assert not os.path.exists(cookie_path)
+    finally:
+        if os.path.exists(cookie_path):
+            os.close(fd)
+            os.unlink(cookie_path)
+
+
+def test_search_rejects_invalid_input():
+    with pytest.raises(ValueError, match="non-empty"):
+        search("   ")
+
+    with pytest.raises(ValueError, match="2048"):
+        search("a" * 2049)
+
+    with pytest.raises(ValueError, match="Unknown search engine"):
+        search("query", "bing")
+
+
+@pytest.mark.parametrize(
+    ("engine", "url_template"),
+    [
+        ("google", "https://www.google.com/search?q={query}&hl=en&gl=us"),
+        ("duckduckgo", "https://lite.duckduckgo.com/lite/?q={query}"),
+    ],
+)
+def test_search_accepts_query_that_fits_final_url_limit(
+    monkeypatch, engine, url_template
+):
+    captured_url = None
+
+    def mock_read_url(url, cookies=None):
+        nonlocal captured_url
+        captured_url = url
+        return "search results"
+
+    monkeypatch.setattr("gptme.tools._browser_lynx.read_url", mock_read_url)
+    query = "a" * (2048 - len(url_template.format(query="")))
+
+    assert search(query, engine) == "search results"
+    assert captured_url is not None
+    assert len(captured_url) <= 2048
 
 
 @pytest.mark.slow

@@ -17,7 +17,7 @@ from ..config import config_path, get_config, save_provider_config, set_config_v
 from ..config.models import ProviderConfig
 from ..config.user import get_user_config_paths
 from ..llm import get_model_from_api_key, list_available_providers
-from ..llm.models import PROVIDERS, get_default_model
+from ..llm.models import PROVIDERS, get_default_model, get_recommended_model
 from ..util import console, path_with_tilde
 
 
@@ -786,8 +786,110 @@ def _setup_custom_provider() -> tuple[str, str]:  # pragma: no cover
     return name, api_key
 
 
+def _choose_first_run_auth() -> str:
+    """Ask which authentication path a first-run user wants."""
+    console.print(
+        "[bold]How would you like to connect?[/bold]\n"
+        "  1. ChatGPT Plus/Pro subscription [dim](browser sign-in, no API key)[/dim]\n"
+        "  2. Grok SuperGrok subscription [dim](browser sign-in, no API key)[/dim]\n"
+        "  3. OpenRouter [dim](browser sign-in, access 300+ models, no API key required)[/dim]\n"
+        "  4. gptme.ai [dim](device sign-in, hosted service)[/dim]\n"
+        "  5. Provider API key [dim](OpenAI, Anthropic, OpenRouter, Gemini)[/dim]\n"
+        "  6. Custom OpenAI-compatible provider"
+    )
+    return Prompt.ask("Connection", choices=["1", "2", "3", "4", "5", "6"], default="1")
+
+
+def _show_api_key_sources() -> None:  # pragma: no cover
+    """Show links for supported API-key providers."""
+    providers_table = Table(title="🔑 Get API Keys", show_header=True, box=None)
+    providers_table.add_column("Provider", style="cyan")
+    providers_table.add_column("URL", style="blue")
+    providers_table.add_row("OpenAI", "https://platform.openai.com/account/api-keys")
+    providers_table.add_row("Anthropic", "https://console.anthropic.com/settings/keys")
+    providers_table.add_row("OpenRouter", "https://openrouter.ai/settings/keys")
+    providers_table.add_row("Gemini", "https://aistudio.google.com/app/apikey")
+    console.print()
+    console.print(providers_table)
+    console.print()
+
+
+def _setup_openai_subscription() -> tuple[str, str]:
+    """Authenticate a ChatGPT subscription and persist it as the default."""
+    from ..llm.llm_openai_subscription import oauth_authenticate
+
+    console.print(
+        "\n[bold]Opening your browser for ChatGPT sign-in...[/bold]\n"
+        "[dim]This uses your existing Plus/Pro subscription; no API key is needed.[/dim]"
+    )
+    oauth_authenticate()
+    provider = "openai-subscription"
+    model = f"{provider}/{get_recommended_model('openai-subscription')}"
+    set_config_value("models.default", model)
+    console.print(f"[green]✅ ChatGPT subscription connected ({model})[/green]")
+    return provider, "oauth"
+
+
+def _setup_grok_subscription() -> tuple[str, str]:
+    """Authenticate a Grok SuperGrok subscription and persist it as the default."""
+    from ..llm.llm_grok_subscription import oauth_authenticate
+
+    console.print(
+        "\n[bold]Opening your browser for Grok sign-in...[/bold]\n"
+        "[dim]This uses your existing SuperGrok subscription; no API key is needed.[/dim]\n"
+        "[dim]If you already have the grok CLI installed and ran 'grok login', "
+        "tokens are reused automatically.[/dim]"
+    )
+    oauth_authenticate()
+    provider = "grok-subscription"
+    model = f"{provider}/{get_recommended_model('grok-subscription')}"
+    set_config_value("models.default", model)
+    console.print(f"[green]✅ Grok subscription connected ({model})[/green]")
+    return provider, "oauth"
+
+
+def _setup_openrouter_oauth() -> tuple[str, str]:  # pragma: no cover
+    """Authenticate via OpenRouter OAuth and persist the API key as the default."""
+    from ..llm.llm_openrouter_subscription import oauth_get_api_key
+
+    console.print(
+        "\n[bold]Opening your browser for OpenRouter sign-in...[/bold]\n"
+        "[dim]OpenRouter gives access to 300+ models (GPT, Claude, Gemini, …).[/dim]\n"
+        "[dim]The sign-in returns a permanent API key — no subscription required.[/dim]"
+    )
+    try:
+        api_key = oauth_get_api_key()
+    except RuntimeError as exc:
+        console.print(f"[red]❌ OpenRouter OAuth failed: {exc}[/red]")
+        raise
+
+    set_config_value("env.OPENROUTER_API_KEY", api_key, local=True)
+    provider = "openrouter"
+    model = f"{provider}/{get_recommended_model('openrouter')}"
+    set_config_value("models.default", model)
+    console.print(f"[green]✅ OpenRouter connected ({model})[/green]")
+    return provider, api_key
+
+
+def _setup_gptme_ai() -> tuple[str, str]:  # pragma: no cover
+    """Authenticate via gptme.ai device flow and persist the token as default."""
+    from ..llm.llm_gptme import DEFAULT_SERVICE_URL, device_flow_authenticate
+
+    console.print(
+        "\n[bold]Starting gptme.ai device sign-in...[/bold]\n"
+        "[dim]You'll be given a short code to enter on gptme.ai in your browser.[/dim]\n"
+        "[dim]Works in SSH/headless environments — no browser redirect needed.[/dim]"
+    )
+    device_flow_authenticate(server_url=DEFAULT_SERVICE_URL)
+    provider = "gptme"
+    model = f"{provider}/{get_recommended_model('gptme')}"
+    set_config_value("models.default", model)
+    console.print(f"[green]✅ gptme.ai connected ({model})[/green]")
+    return provider, "device-flow"
+
+
 def ask_for_api_key():  # pragma: no cover
-    """Interactively ask user for an API key or configure a custom provider."""
+    """Interactively configure subscription, API-key, or custom provider auth."""
     console.print(
         Panel.fit(
             Text("🔑 Provider Setup", style="bold green"),
@@ -796,25 +898,19 @@ def ask_for_api_key():  # pragma: no cover
         )
     )
 
-    # Create a nice table with provider links
-    providers_table = Table(title="🔑 Get API Keys", show_header=True, box=None)
-    providers_table.add_column("Provider", style="cyan")
-    providers_table.add_column("URL", style="blue")
-
-    providers_table.add_row("OpenAI", "https://platform.openai.com/account/api-keys")
-    providers_table.add_row("Anthropic", "https://console.anthropic.com/settings/keys")
-    providers_table.add_row("OpenRouter", "https://openrouter.ai/settings/keys")
-    providers_table.add_row("Gemini", "https://aistudio.google.com/app/apikey")
-
-    console.print()
-    console.print(providers_table)
-    console.print()
-
-    if Confirm.ask(
-        "Set up a custom OpenAI-compatible provider instead?", default=False
-    ):
+    choice = _choose_first_run_auth()
+    if choice == "1":
+        return _setup_openai_subscription()
+    if choice == "2":
+        return _setup_grok_subscription()
+    if choice == "3":
+        return _setup_openrouter_oauth()
+    if choice == "4":
+        return _setup_gptme_ai()
+    if choice == "6":
         return _setup_custom_provider()
 
+    _show_api_key_sources()
     # Save to config
     api_key, provider, env_var = _prompt_api_key()
     set_config_value(f"env.{env_var}", api_key)

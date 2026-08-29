@@ -258,6 +258,39 @@ class TestPromptGptme:
         assert "gptme v" in content
         assert "general-purpose AI assistant" in content
 
+    def test_next_step_guidance_present(self):
+        """The concrete-next-step instruction is in the full prompt."""
+        from gptme.prompts import prompt_gptme
+
+        msgs = list(prompt_gptme(interactive=True))
+        content = msgs[0].content
+        assert "End your response with a concrete next step" in content
+        assert "offer to elaborate" in content
+
+    def test_next_step_guidance_present_when_compact(self):
+        """The instruction applies uniformly — compact prompts get it too."""
+        from gptme.prompts import prompt_gptme
+
+        msgs = list(prompt_gptme(interactive=True, compact=True))
+        content = msgs[0].content
+        assert "End with a concrete next step" in content
+
+    @pytest.mark.parametrize("compact", [False, True])
+    def test_clarifying_question_guidance_only_in_interactive_mode(self, compact):
+        """Non-interactive agents must proceed instead of asking questions."""
+        from gptme.prompts import prompt_gptme
+
+        interactive_content = list(prompt_gptme(interactive=True, compact=compact))[
+            0
+        ].content
+        non_interactive_content = list(
+            prompt_gptme(interactive=False, compact=compact)
+        )[0].content
+
+        assert "Ask a clarifying question only when" in interactive_content
+        assert "Ask a clarifying question only when" not in non_interactive_content
+        assert "concrete next step" in non_interactive_content
+
     def test_thinking_tags_without_reasoning_model(self):
         """Models without native reasoning get <thinking> tag instructions."""
         from gptme.prompts import prompt_gptme
@@ -315,6 +348,9 @@ class TestPromptGptme:
             msgs = list(prompt_gptme(interactive=True))
         content = msgs[0].content
         assert "Custom base prompt for my project." in content
+        # The concrete-next-step instruction must still apply, not silently drop
+        # when a project overrides the base prompt.
+        assert "End your response with a concrete next step" in content
 
     def test_xml_format_wraps_in_role(self):
         """XML format wraps the entire prompt in <role> tags."""
@@ -1034,3 +1070,193 @@ class TestConstants:
         from gptme.prompts import AGENT_FILES, ALWAYS_LOAD_FILES
 
         assert ALWAYS_LOAD_FILES is AGENT_FILES
+
+
+# ---------------------------------------------------------------------------
+# prompt_gptme — editing guidance conditioned on tool availability
+# ---------------------------------------------------------------------------
+
+
+class TestPromptGptmeEditingGuidance:
+    """
+    Tests for the tool-conditional editing guidance in prompt_gptme.
+
+    The new logic selects `editing_inline` and `code_editing_strategy` based
+    on which of the `patch` / `save` tools are actually present in the session.
+    All four combinations must produce correct, non-misleading instructions.
+    """
+
+    @pytest.fixture(autouse=True)
+    def _isolate(self):
+        """Mock project config lookups so tests don't depend on the live repo."""
+        with (
+            patch("gptme.prompts.templates.get_project_git_dir", return_value=None),
+            patch(
+                "gptme.prompts.templates.get_project_config",
+                return_value=MagicMock(base_prompt=None),
+            ),
+        ):
+            yield
+
+    # ------------------------------------------------------------------
+    # helpers
+    # ------------------------------------------------------------------
+
+    def _make_tool(self, name: str):
+        """Create a minimal ToolSpec with the given name."""
+        from gptme.tools import ToolSpec
+
+        return ToolSpec(name=name, desc=f"{name} tool", instructions="")
+
+    def _prompt_content(self, tools, compact: bool = False) -> str:
+        """Return the first message content from prompt_gptme."""
+        from gptme.prompts import prompt_gptme
+
+        msgs = list(prompt_gptme(interactive=True, tools=tools, compact=compact))
+        return msgs[0].content
+
+    # ------------------------------------------------------------------
+    # parametrize across the four tool combinations
+    # ------------------------------------------------------------------
+
+    @pytest.mark.parametrize(
+        ("tool_names", "expected_in", "expected_not_in"),
+        [
+            # Both tools available
+            (
+                ["patch", "save"],
+                [
+                    "patch tool",
+                    "save tool",
+                    "two edit tools",
+                    "DO NOT try to edit cells with patch",
+                ],
+                ["show the changes clearly"],
+            ),
+            # Patch only
+            (
+                ["patch"],
+                [
+                    "patch tool",
+                    "one file-editing tool",
+                    "DO NOT try to edit cells with patch",
+                ],
+                ["save tool", "show the changes clearly"],
+            ),
+            # Save only
+            (
+                ["save"],
+                ["save tool", "one file-editing tool"],
+                [
+                    "patch tool",
+                    "show the changes clearly",
+                    "DO NOT try to edit cells with patch",
+                ],
+            ),
+            # No editing tools
+            (
+                [],
+                ["show the changes clearly"],
+                [
+                    "patch tool",
+                    "save tool",
+                    "Code Editing Strategy",
+                    "Spreadsheet and Data Editing",
+                    "Editing Multiple Files",
+                ],
+            ),
+        ],
+        ids=["both", "patch-only", "save-only", "no-tools"],
+    )
+    def test_editing_guidance_combinations(
+        self, tool_names, expected_in, expected_not_in
+    ):
+        """Editing guidance is scoped to tools that are actually available."""
+        tools = [self._make_tool(n) for n in tool_names]
+        content = self._prompt_content(tools)
+        for phrase in expected_in:
+            assert phrase in content, (
+                f"Expected {phrase!r} in prompt for tools={tool_names}"
+            )
+        for phrase in expected_not_in:
+            assert phrase not in content, (
+                f"Unexpected {phrase!r} in prompt for tools={tool_names}"
+            )
+
+    def test_code_editing_strategy_section_present_with_editing_tools(self):
+        """The 'Code Editing Strategy' section only appears when editing tools exist."""
+        tools = [self._make_tool("patch"), self._make_tool("save")]
+        content = self._prompt_content(tools)
+        assert "Code Editing Strategy" in content
+
+    def test_code_editing_strategy_section_absent_without_editing_tools(self):
+        """No editing strategy sections emitted when no editing tools are loaded."""
+        content = self._prompt_content(tools=[])
+        assert "Code Editing Strategy" not in content
+        assert "Spreadsheet and Data Editing" not in content
+        assert "Editing Multiple Files" not in content
+
+    def test_data_and_multifile_sections_present_with_editing_tools(self):
+        """'Spreadsheet and Data Editing' and 'Editing Multiple Files' appear when editing tools are loaded."""
+        tools = [self._make_tool("patch"), self._make_tool("save")]
+        content = self._prompt_content(tools)
+        assert "Spreadsheet and Data Editing" in content
+        assert "Editing Multiple Files" in content
+
+    def test_preserve_comments_in_all_branches(self):
+        """'Preserve comments' instruction must appear for every tool combination."""
+        for tool_names in [["patch", "save"], ["patch"], ["save"], []]:
+            tools = [self._make_tool(n) for n in tool_names]
+            content = self._prompt_content(tools)
+            assert "Preserve comments" in content, (
+                f"'Preserve comments' missing for tools={tool_names}"
+            )
+
+    # ------------------------------------------------------------------
+    # compact mode
+    # ------------------------------------------------------------------
+
+    def test_compact_mode_with_both_tools(self):
+        """Compact prompt includes tool-aware editing hint when both tools present."""
+        tools = [self._make_tool("patch"), self._make_tool("save")]
+        content = self._prompt_content(tools, compact=True)
+        assert "patch tool" in content
+        assert "save tool" in content
+
+    def test_compact_mode_without_editing_tools(self):
+        """Compact prompt shows generic editing hint when no editing tools are loaded."""
+        content = self._prompt_content(tools=[], compact=True)
+        assert "show the changes clearly" in content
+        assert "patch tool" not in content
+        assert "save tool" not in content
+
+    def test_compact_mode_patch_only(self):
+        """Compact prompt with patch only mentions patch, not save."""
+        tools = [self._make_tool("patch")]
+        content = self._prompt_content(tools, compact=True)
+        assert "patch tool" in content
+        assert "save tool" not in content
+
+    # ------------------------------------------------------------------
+    # default parameter (tools=None)
+    # ------------------------------------------------------------------
+
+    def test_tools_default_none_gives_generic_hint(self):
+        """Calling prompt_gptme without tools argument (default None) gives the generic hint."""
+        from gptme.prompts import prompt_gptme
+
+        with (
+            patch("gptme.prompts.templates.get_project_git_dir", return_value=None),
+            patch(
+                "gptme.prompts.templates.get_project_config",
+                return_value=MagicMock(base_prompt=None),
+            ),
+        ):
+            # tools defaults to None — must behave identically to tools=[]
+            msgs = list(prompt_gptme(interactive=True))
+        content = msgs[0].content
+        assert "show the changes clearly" in content
+        assert "Preserve comments" in content
+        assert "patch tool" not in content
+        assert "save tool" not in content
+        assert "Code Editing Strategy" not in content

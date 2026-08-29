@@ -101,7 +101,8 @@ def _minimal_png_bytes() -> bytes:
 
 
 @pytest.fixture()
-def client():
+def client(monkeypatch):
+    monkeypatch.setenv("GPTME_DISABLE_AUTH", "true")
     app = create_app(cors_origin=None)
     app.config["TESTING"] = True
     with app.test_client() as c:
@@ -324,6 +325,25 @@ class TestComputerScreenshot500:
         data = resp.get_json()
         assert data["error"] == "cliclick not found"
 
+    def test_missing_x_display_is_503_not_500(self, client):
+        """scrot 'Can't open X display' is unavailability, not an internal error."""
+        with (
+            patch("gptme.server.computer_api._screenshot_available", return_value=True),
+            patch(
+                "gptme.server.computer_api._take_screenshot",
+                side_effect=RuntimeError(
+                    "Screenshot command failed (exit code 1): "
+                    "scrot: Can't open X display. It *is* running, yeah? [NULL]"
+                ),
+            ),
+        ):
+            resp = client.get("/api/v2/computer/screenshot")
+
+        assert resp.status_code == 503
+        assert resp.content_type == "application/json"
+        data = resp.get_json()
+        assert "Can't open X display" in data["error"]
+
 
 # ---------------------------------------------------------------------------
 # _screenshot_available helper
@@ -342,13 +362,68 @@ class TestScreenshotAvailable:
 
             assert _screenshot_available() is False
 
-    def test_linux_wayland_gnome_screenshot_without_display_returns_true(
-        self, monkeypatch
+    def test_linux_scrot_without_display_returns_false(self, monkeypatch):
+        """scrot on PATH is not enough on a headless host (no $DISPLAY)."""
+        if platform.system() != "Linux":
+            pytest.skip("Linux-only test")
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+        with patch(
+            "shutil.which",
+            side_effect=lambda cmd: "/usr/bin/scrot" if cmd == "scrot" else None,
+        ):
+            from gptme.server.computer_api import _screenshot_available
+
+            assert _screenshot_available() is False
+
+    def test_status_scrot_without_display_reports_unavailable(
+        self, client, monkeypatch
     ):
         if platform.system() != "Linux":
             pytest.skip("Linux-only test")
         monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+        with patch(
+            "shutil.which",
+            side_effect=lambda cmd: "/usr/bin/scrot" if cmd == "scrot" else None,
+        ):
+            resp = client.get("/api/v2/computer/status")
+
+        assert resp.status_code == 200
+        data = resp.get_json()
+        assert data["display"] is None
+        assert data["screenshot_available"] is False
+        assert data["backends"]["scrot"] is True
+
+    def test_screenshot_scrot_without_display_returns_503(self, client, monkeypatch):
+        if platform.system() != "Linux":
+            pytest.skip("Linux-only test")
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+        with patch(
+            "shutil.which",
+            side_effect=lambda cmd: "/usr/bin/scrot" if cmd == "scrot" else None,
+        ):
+            resp = client.get("/api/v2/computer/screenshot")
+
+        assert resp.status_code == 503
+        data = resp.get_json()
+        error = data["error"].lower()
+        assert "display" in error
+        assert "scrot" in error
+
+    def test_linux_wayland_gnome_screenshot_without_display_returns_true(
+        self, monkeypatch
+    ):
+        """gnome-screenshot on a live Wayland session (WAYLAND_DISPLAY set) is available."""
+        if platform.system() != "Linux":
+            pytest.skip("Linux-only test")
+        monkeypatch.delenv("DISPLAY", raising=False)
         monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
 
         with patch(
             "shutil.which",
@@ -356,9 +431,68 @@ class TestScreenshotAvailable:
                 "/usr/bin/gnome-screenshot" if cmd == "gnome-screenshot" else None
             ),
         ):
-            from gptme.server.computer_api import _screenshot_available
+            from gptme.server.computer_api import _native_screenshot_available
 
-            assert _screenshot_available() is True
+            assert _native_screenshot_available() is True
+
+    def test_linux_headless_wayland_gnome_screenshot_returns_false(self, monkeypatch):
+        """gnome-screenshot on headless Wayland (no WAYLAND_DISPLAY) reports unavailable."""
+        if platform.system() != "Linux":
+            pytest.skip("Linux-only test")
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.setenv("XDG_SESSION_TYPE", "wayland")
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+
+        with patch(
+            "shutil.which",
+            side_effect=lambda cmd: (
+                "/usr/bin/gnome-screenshot" if cmd == "gnome-screenshot" else None
+            ),
+        ):
+            from gptme.server.computer_api import _native_screenshot_available
+
+            assert _native_screenshot_available() is False
+
+    def test_linux_x11_gnome_screenshot_without_display_returns_false(
+        self, monkeypatch
+    ):
+        if platform.system() != "Linux":
+            pytest.skip("Linux-only test")
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+        with patch(
+            "shutil.which",
+            side_effect=lambda cmd: (
+                "/usr/bin/gnome-screenshot" if cmd == "gnome-screenshot" else None
+            ),
+        ):
+            from gptme.server.computer_api import _native_screenshot_available
+
+            assert _native_screenshot_available() is False
+
+    def test_linux_x11_gnome_screenshot_without_display_hint_mentions_gnome(
+        self, client, monkeypatch
+    ):
+        """Hint body should call out gnome-screenshot, not say 'install gnome-screenshot'."""
+        if platform.system() != "Linux":
+            pytest.skip("Linux-only test")
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("XDG_SESSION_TYPE", raising=False)
+
+        with patch(
+            "shutil.which",
+            side_effect=lambda cmd: (
+                "/usr/bin/gnome-screenshot" if cmd == "gnome-screenshot" else None
+            ),
+        ):
+            resp = client.get("/api/v2/computer/screenshot")
+
+        assert resp.status_code == 503
+        data = resp.get_json()
+        error = data["error"].lower()
+        assert "display" in error
+        assert "gnome-screenshot" in error
 
     def test_linux_with_display_and_scrot_returns_true(self, monkeypatch):
         if platform.system() != "Linux":

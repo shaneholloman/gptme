@@ -18,6 +18,7 @@ import {
   API_KEY_PROVIDER_OPTIONS,
   type ApiKeyProvider,
 } from '@/utils/apiKeyProviders';
+import { formatUnknownError, messageFromApiErrorBody } from '@/utils/errors';
 import { fetchProviderConfigured } from '@/utils/providerStatus';
 import { isTauriEnvironment, invokeTauri } from '@/utils/tauri';
 import { isDemoMode, processConnectionFromHash } from '@/utils/connectionConfig';
@@ -63,6 +64,13 @@ function getCloudAuthUrl(): string {
   return `${cloudBaseUrl || 'https://gptme.ai'}/authorize`;
 }
 
+function isHostedPageOrigin(): boolean {
+  if (typeof window === 'undefined' || !window.location) {
+    return false;
+  }
+  return window.location.hostname === 'chat.gptme.org';
+}
+
 const CLOUD_AUTH_URL = getCloudAuthUrl();
 const CLOUD_AUTH_ORIGIN = new URL(CLOUD_AUTH_URL).origin;
 const CLOUD_AUTH_MESSAGE_TYPE = 'gptme-cloud-auth-code';
@@ -97,7 +105,9 @@ export function SetupWizard() {
   // Also avoids React batching issues: completeSetup() + setStep('complete') update two separate
   // state atoms in the same event handler; a derived signal would close the dialog before the
   // 'complete' step could render.
-  const [isOpen, setIsOpen] = useState(!demoMode && !settings.hasCompletedSetup);
+  const [isOpen, setIsOpen] = useState(
+    !demoMode && !settings.hasCompletedSetup && !isHostedPageOrigin()
+  );
   const [isConnecting, setIsConnecting] = useState(false);
   const [connectError, setConnectError] = useState<string | null>(null);
   const [cloudLoginStarted, setCloudLoginStarted] = useState(false);
@@ -108,7 +118,6 @@ export function SetupWizard() {
   const externalStep = use$(setupWizard$.step);
   const isRemoteOnlyTauri = isTauri && managesLocalServer === false;
   const isDeterminingTauriMode = isTauri && isLoadingTauriStatus;
-  const cloudSetupSupported = !isRemoteOnlyTauri;
   const canManageApiKeyInApp = isTauri && managesLocalServer === true;
   const [remoteBaseUrl, setRemoteBaseUrl] = useState(
     connectionConfig.baseUrl === 'http://127.0.0.1:5700' ? '' : connectionConfig.baseUrl
@@ -136,7 +145,11 @@ export function SetupWizard() {
   );
 
   const saveApiKeyToServer = useCallback(
-    async (provider: ApiKeyProvider, apiKeyValue: string, model?: string) => {
+    async (
+      provider: ApiKeyProvider,
+      apiKeyValue: string,
+      model?: string
+    ): Promise<{ warning?: string }> => {
       const resp = await fetch(`${connectionConfig.baseUrl}/api/v2/user/api-key`, {
         method: 'POST',
         headers: withAuthHeaders(api.authHeader, {
@@ -150,15 +163,21 @@ export function SetupWizard() {
       });
 
       if (resp.ok) {
-        return;
+        // A successful save may still carry a non-blocking warning (e.g. the
+        // provider could not be reached for key validation). Surface it so the
+        // user knows the key was saved but not confirmed.
+        try {
+          const data = (await resp.json()) as { warning?: string };
+          return { warning: data.warning };
+        } catch {
+          return {};
+        }
       }
 
       let message = `Failed to save API key (${resp.status})`;
       try {
-        const data = (await resp.json()) as { error?: string };
-        if (data.error) {
-          message = data.error;
-        }
+        const data: unknown = await resp.json();
+        message = messageFromApiErrorBody(data, message);
       } catch {
         // Fall back to the generic status-based message.
       }
@@ -184,7 +203,7 @@ export function SetupWizard() {
     } catch (error) {
       setAvailableModels([]);
       setRecommendedModels([]);
-      setModelsError(error instanceof Error ? error.message : 'Failed to load available models.');
+      setModelsError(formatUnknownError(error, 'Failed to load available models.'));
     } finally {
       setModelsLoading(false);
     }
@@ -246,7 +265,7 @@ export function SetupWizard() {
         return;
       } catch (error) {
         lastError = error;
-        const message = error instanceof Error ? error.message : String(error);
+        const message = formatUnknownError(error, 'Failed to start gptme-server');
         const shouldRetry =
           /port\s+\d+\s+is already in use/i.test(message) || /already in use/i.test(message);
 
@@ -258,7 +277,7 @@ export function SetupWizard() {
       }
     }
 
-    throw lastError instanceof Error ? lastError : new Error('Failed to start gptme-server');
+    throw new Error(formatUnknownError(lastError, 'Failed to start gptme-server'));
   }, []);
 
   const waitForRestartedServer = useCallback(async () => {
@@ -396,7 +415,11 @@ export function SetupWizard() {
     setIsConnecting(true);
     setConnectError(null);
     try {
-      await connect();
+      const trimmedAuthToken = remoteAuthToken.trim();
+      await connect({
+        authToken: trimmedAuthToken || null,
+        useAuthToken: Boolean(trimmedAuthToken),
+      });
       // The isConnected useEffect will fire and call checkProviderAndAdvance.
     } catch (err) {
       setConnectError(
@@ -422,7 +445,16 @@ export function SetupWizard() {
     setApiKeySaving(true);
     setApiKeyError(null);
     try {
-      await saveApiKeyToServer(apiKeyProvider, trimmed, apiKeyModel || undefined);
+      const { warning } = await saveApiKeyToServer(
+        apiKeyProvider,
+        trimmed,
+        apiKeyModel || undefined
+      );
+      if (warning) {
+        // The save succeeds, so we proceed to the completion step — surface the
+        // unverified-key notice as a toast so it is not hidden by that transition.
+        toast.warning(warning);
+      }
       try {
         await invokeTauri('stop_server');
       } catch {
@@ -433,7 +465,7 @@ export function SetupWizard() {
       lastAutoAdvanceBaseUrlRef.current = null;
       await waitForRestartedServer();
     } catch (err) {
-      setApiKeyError(err instanceof Error ? err.message : String(err));
+      setApiKeyError(formatUnknownError(err, 'Failed to save API key'));
     } finally {
       setApiKeySaving(false);
     }
@@ -445,19 +477,45 @@ export function SetupWizard() {
       await checkProviderAndAdvance({ assumeConfiguredOnError: false });
     } catch (err) {
       setApiKeyError(
-        err instanceof Error
-          ? err.message
-          : 'Could not verify provider configuration. Try again in a few seconds.'
+        formatUnknownError(
+          err,
+          'Could not verify provider configuration. Try again in a few seconds.'
+        )
       );
     }
   };
 
-  const handleCloudLogin = () => {
+  const handleCloudLogin = async () => {
     // Open the cloud auth URL — the deep-link flow (gptme://) or URL fragment
     // will handle the callback and connect automatically.
-    window.open(CLOUD_AUTH_URL, '_blank');
     setConnectError(null);
     setCloudLoginStarted(true);
+
+    // In Tauri, hand the URL to the OS browser via the opener plugin instead of
+    // window.open(). On Android, wry's WebView has no multiple-window support,
+    // so `window.open(url, '_blank')` navigates the *app's own* WebView to the
+    // auth page: the SPA that has to receive the callback is unloaded, and the
+    // final gptme:// redirect lands in a WebView that cannot dispatch it (the
+    // deep-link plugin only listens for Intents). Opening externally keeps the
+    // app alive and brings the callback back as a gptme:// Intent.
+    if (isTauri) {
+      try {
+        await invokeTauri('plugin:opener|open_url', { url: CLOUD_AUTH_URL });
+      } catch (error) {
+        // Do NOT fall back to window.open() here: that is the exact in-WebView
+        // navigation this branch exists to avoid, and on Android it unloads the
+        // SPA that has to receive the callback. Surface a recoverable error
+        // with the URL so the user can open it manually and retry instead.
+        console.warn('Failed to open cloud auth URL externally', error);
+        setCloudLoginStarted(false);
+        setConnectError(
+          `Could not open the browser automatically. Open ${CLOUD_AUTH_URL} manually to sign in, then return to the app.`
+        );
+      }
+      return;
+    }
+
+    window.open(CLOUD_AUTH_URL, '_blank');
   };
 
   const handleRemoteSetup = async () => {
@@ -578,18 +636,13 @@ export function SetupWizard() {
               </button>
               <button
                 onClick={() => setStep('cloud')}
-                disabled={!cloudSetupSupported}
-                className="flex items-start gap-4 rounded-lg border p-4 text-left transition-colors hover:bg-accent disabled:cursor-not-allowed disabled:opacity-60 disabled:hover:bg-transparent"
+                className="flex items-start gap-4 rounded-lg border p-4 text-left transition-colors hover:bg-accent"
               >
                 <Cloud className="mt-0.5 h-6 w-6 shrink-0" />
                 <div>
-                  <div className="font-medium">
-                    {cloudSetupSupported ? 'Cloud' : 'Cloud (coming soon on mobile)'}
-                  </div>
+                  <div className="font-medium">Cloud</div>
                   <div className="text-sm text-muted-foreground">
-                    {cloudSetupSupported
-                      ? 'Connect to gptme.ai for a managed experience. No setup required.'
-                      : 'Not ready on this mobile build yet. Use a server URL for now.'}
+                    Connect to gptme.ai for a managed experience. No setup required.
                   </div>
                 </div>
               </button>
@@ -624,8 +677,8 @@ export function SetupWizard() {
               ) : isRemoteOnlyTauri ? (
                 <div className="flex flex-col gap-3">
                   <p className="text-sm text-muted-foreground">
-                    Enter the URL for a remote gptme server. Cloud sign-in is not ready on this
-                    mobile build yet, so use Bob or another hosted gptme server for now.
+                    Enter the URL for a remote gptme server. Use Cloud instead if you want the
+                    managed <code>gptme.ai</code> sign-in flow.
                   </p>
                   <Input
                     autoComplete="url"
@@ -658,7 +711,7 @@ export function SetupWizard() {
                 </div>
               ) : managesLocalServer ? (
                 <div className="flex items-start gap-3 rounded-lg bg-muted p-4">
-                  <Check className="mt-0.5 h-5 w-5 shrink-0 text-green-500" />
+                  <Check className="mt-0.5 h-5 w-5 shrink-0 text-green-700 dark:text-green-400" />
                   <div className="text-sm">
                     <p className="font-medium">Server starts automatically</p>
                     <p className="mt-1 text-muted-foreground">
@@ -701,10 +754,27 @@ export function SetupWizard() {
                     The <code className="rounded bg-muted px-1">--cors-origin</code> flag lets this
                     page connect to your local server.
                   </p>
+                  <Input
+                    autoComplete="off"
+                    placeholder="Server token from gptme-server logs"
+                    type="password"
+                    value={remoteAuthToken}
+                    onChange={(event) => setRemoteAuthToken(event.target.value)}
+                    onKeyDown={(event) => {
+                      if (event.key === 'Enter' && !isConnecting) {
+                        event.preventDefault();
+                        void handleLocalSetup();
+                      }
+                    }}
+                  />
+                  <p className="text-xs text-muted-foreground">
+                    After gptme#3430 the local server requires the bearer token it prints on
+                    startup. Paste it here if the UI cannot connect.
+                  </p>
                 </div>
               )}
               {isConnected && (
-                <div className="flex items-center gap-2 text-sm text-green-500">
+                <div className="flex items-center gap-2 text-sm text-green-700 dark:text-green-400">
                   <Check className="h-4 w-4" />
                   Connected to server
                 </div>
@@ -747,19 +817,16 @@ export function SetupWizard() {
             <DialogHeader>
               <DialogTitle>Cloud setup</DialogTitle>
               <DialogDescription>
-                {cloudSetupSupported
-                  ? 'Sign in to gptme.ai for a fully managed experience.'
-                  : 'Cloud sign-in is not available on this mobile build yet.'}
+                Sign in to gptme.ai for a fully managed experience.
               </DialogDescription>
             </DialogHeader>
             <div className="flex flex-col gap-4 py-4">
               <div className="flex flex-col gap-3">
                 <p className="text-sm text-muted-foreground">
-                  {cloudSetupSupported
-                    ? "You'll be redirected to gptme.ai to sign in. After authentication, you'll be connected automatically."
-                    : 'Use the Remote server path for now and connect to Bob or another hosted gptme server by URL.'}
+                  You&apos;ll be redirected to gptme.ai to sign in. After authentication,
+                  you&apos;ll be connected automatically.
                 </p>
-                {cloudSetupSupported && cloudLoginStarted && !isConnected && (
+                {cloudLoginStarted && !isConnected && (
                   <div className="rounded-lg border border-border/70 bg-muted px-3 py-2 text-sm text-muted-foreground">
                     Waiting for sign-in to complete… This window will update automatically once the
                     app connects.
@@ -770,7 +837,7 @@ export function SetupWizard() {
                     {connectError}
                   </div>
                 )}
-                {cloudSetupSupported && isTauri && (
+                {isTauri && (
                   <p className="text-xs text-muted-foreground">
                     The app will handle the login callback via the <code>gptme://</code> deep link.
                   </p>
@@ -781,19 +848,17 @@ export function SetupWizard() {
               <Button
                 variant="outline"
                 onClick={() => {
-                  setStep(cloudSetupSupported ? 'mode' : 'local');
+                  setStep('mode');
                   setCloudLoginStarted(false);
                   setConnectError(null);
                 }}
               >
-                {cloudSetupSupported ? 'Back' : 'Use Remote server'}
+                Back
               </Button>
-              {cloudSetupSupported && (
-                <Button onClick={handleCloudLogin} className="gap-2">
-                  Sign in to gptme.ai
-                  <ExternalLink className="h-4 w-4" />
-                </Button>
-              )}
+              <Button onClick={handleCloudLogin} className="gap-2">
+                Sign in to gptme.ai
+                <ExternalLink className="h-4 w-4" />
+              </Button>
             </DialogFooter>
           </>
         )}

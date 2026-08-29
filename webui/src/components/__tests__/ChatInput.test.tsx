@@ -4,7 +4,17 @@ import { observable } from '@legendapp/state';
 import { ChatInput } from '../ChatInput';
 
 const mockUploadFiles = jest.fn();
-const mockConversation$ = observable({
+
+// Three-value sentinel for chatConfig:
+//   undefined = fetch not yet attempted (show loading skeleton)
+//   null      = fetch completed but failed (show fallback model, no skeleton)
+//   ChatConfig = successfully fetched
+type MockChatConfig = { chat: { model?: string } } | null | undefined;
+const mockConversation$ = observable<{
+  isGenerating: boolean;
+  executingTool: null;
+  chatConfig: MockChatConfig;
+}>({
   isGenerating: false,
   executingTool: null,
   chatConfig: { chat: {} },
@@ -262,5 +272,192 @@ describe('ChatInput', () => {
       expect(screen.queryByText('existing.txt')).not.toBeInTheDocument();
       expect(screen.getByText('new.txt')).toBeInTheDocument();
     });
+  });
+});
+
+// Regression suite for gptme/gptme#3440 — model selector stability.
+//
+// Root cause: chatConfig (and thus the conversation model) loads asynchronously.
+// Before the fix, the model badge showed the hardcoded client-side fallback
+// ('anthropic/claude-sonnet-4-x') on every conversation open, then flickered to
+// the real model once the API response arrived.  Users saw the wrong model in the
+// badge for 1-3 seconds on every page load.
+//
+// Fix surface: ChatInput.tsx — effectiveModel derivation + ModelBadge data-testid.
+
+describe('Model selector (gptme#3440)', () => {
+  beforeEach(() => {
+    // Reset to a clean state before each test
+    mockConversation$.set({
+      isGenerating: false,
+      executingTool: null,
+      chatConfig: { chat: {} },
+    });
+  });
+
+  it('displays the conversation model when chatConfig is populated', () => {
+    // Simulate a conversation that has been opened and its config loaded.
+    // The model badge must show the conversation model, not the hardcoded fallback.
+    mockConversation$.set({
+      isGenerating: false,
+      executingTool: null,
+      chatConfig: { chat: { model: 'openai/gpt-4o' } },
+    });
+
+    const autoFocus$ = observable(false);
+    render(<ChatInput conversationId="conv-a" onSend={jest.fn()} autoFocus$={autoFocus$} />);
+
+    // displayName = modelInfo?.model || model.split('/').pop()
+    // With an empty models list in the mock, split('/').pop() gives 'gpt-4o'.
+    const badge = screen.getByTestId('model-selector');
+    expect(badge).toHaveTextContent('gpt-4o');
+    // Must NOT show any variant of the legacy hardcoded fallback
+    expect(badge).not.toHaveTextContent('claude-sonnet');
+  });
+
+  it('shows a loading skeleton before chatConfig loads (not the wrong fallback model)', () => {
+    // Root cause of bug #3440-item-1: before chatConfig arrives the badge was
+    // showing the client-side fallback model (claude-sonnet-4-6) as if it were
+    // the conversation's model, confusing users who started a conversation with
+    // a different model.  Fix: render a skeleton pill until chatConfig is known.
+    // undefined = fetch not yet attempted (the true loading state).
+    mockConversation$.set({
+      isGenerating: false,
+      executingTool: null,
+      chatConfig: undefined,
+    });
+
+    const autoFocus$ = observable(false);
+    render(<ChatInput conversationId="conv-a" onSend={jest.fn()} autoFocus$={autoFocus$} />);
+
+    const badge = screen.getByTestId('model-selector');
+    // Loading skeleton must be present and must NOT expose the wrong model name.
+    expect(badge).toBeInTheDocument();
+    expect(badge).toHaveAttribute('aria-label', 'Loading model...');
+    expect(badge.textContent ?? '').toBe('');
+  });
+
+  it('transitions from loading skeleton to real model when chatConfig arrives', async () => {
+    // Phase 1: chatConfig not yet loaded (undefined = fetch not yet attempted) —
+    // badge shows the skeleton, never the wrong fallback model name.
+    mockConversation$.set({
+      isGenerating: false,
+      executingTool: null,
+      chatConfig: undefined,
+    });
+
+    const autoFocus$ = observable(false);
+    render(<ChatInput conversationId="conv-a" onSend={jest.fn()} autoFocus$={autoFocus$} />);
+
+    // Loading skeleton is visible.
+    expect(screen.getByTestId('model-selector')).toHaveAttribute('aria-label', 'Loading model...');
+    // No model name text should be visible while loading.
+    expect((screen.getByTestId('model-selector').textContent ?? '').trim()).toBe('');
+
+    // Phase 2: simulate the API response landing — chatConfig updates with real model.
+    act(() => {
+      mockConversation$.chatConfig.set({ chat: { model: 'anthropic/claude-haiku-4-5' } });
+    });
+
+    // Badge must switch from skeleton to the actual conversation model.
+    await waitFor(() => {
+      expect(screen.getByTestId('model-selector')).toHaveTextContent('claude-haiku-4-5');
+    });
+    // Aria-label should now show the model, not the loading label.
+    expect(screen.getByTestId('model-selector')).not.toHaveAttribute(
+      'aria-label',
+      'Loading model...'
+    );
+  });
+
+  it('clears the loading skeleton when chatConfig fetch fails (no permanent skeleton)', () => {
+    // Regression guard for the P1 scenario: if the server is unreachable both
+    // getChatConfig requests fail and chatConfig stays null in the store.
+    // null = "fetch attempted, no config" — must NOT show the skeleton.
+    mockConversation$.set({
+      isGenerating: false,
+      executingTool: null,
+      chatConfig: null,
+    });
+
+    const autoFocus$ = observable(false);
+    render(<ChatInput conversationId="conv-a" onSend={jest.fn()} autoFocus$={autoFocus$} />);
+
+    const badge = screen.getByTestId('model-selector');
+    // Skeleton must NOT be shown when fetch failed — badge falls back to default model.
+    expect(badge).not.toHaveAttribute('aria-label', 'Loading model...');
+    // Badge must display some model text, not be empty.
+    expect((badge.textContent ?? '').trim()).not.toBe('');
+  });
+
+  it('resets the model badge to the new conversation model when switching conversations', async () => {
+    // First conversation uses gpt-4o
+    mockConversation$.set({
+      isGenerating: false,
+      executingTool: null,
+      chatConfig: { chat: { model: 'openai/gpt-4o' } },
+    });
+
+    const autoFocus$ = observable(false);
+    const { rerender } = render(
+      <ChatInput conversationId="conv-a" onSend={jest.fn()} autoFocus$={autoFocus$} />
+    );
+
+    expect(screen.getByTestId('model-selector')).toHaveTextContent('gpt-4o');
+
+    // Second conversation uses a different model
+    mockConversation$.set({
+      isGenerating: false,
+      executingTool: null,
+      chatConfig: { chat: { model: 'anthropic/claude-haiku-4-5' } },
+    });
+
+    rerender(<ChatInput conversationId="conv-b" onSend={jest.fn()} autoFocus$={autoFocus$} />);
+
+    await waitFor(() => {
+      expect(screen.getByTestId('model-selector')).toHaveTextContent('claude-haiku-4-5');
+    });
+    // Must NOT linger on the previous conversation's model
+    expect(screen.getByTestId('model-selector')).not.toHaveTextContent('gpt-4o');
+  });
+
+  it('keeps the model badge enabled while not generating so the user can change it', () => {
+    mockConversation$.set({
+      isGenerating: false,
+      executingTool: null,
+      chatConfig: { chat: { model: 'openai/gpt-4o' } },
+    });
+
+    const autoFocus$ = observable(false);
+    render(<ChatInput conversationId="conv-a" onSend={jest.fn()} autoFocus$={autoFocus$} />);
+
+    expect(screen.getByTestId('model-selector')).not.toBeDisabled();
+  });
+
+  it('keeps the model badge enabled during generation so the user can pre-select the next model', () => {
+    // Design intent: the model selector stays interactive even while the assistant
+    // is generating. The selection takes effect on the next send, so disabling it
+    // would prevent users from changing the model for a follow-up message. This
+    // test documents that intentional behaviour and guards against regressions that
+    // might incorrectly disable the badge during a streaming response.
+    mockConversation$.set({
+      isGenerating: true,
+      executingTool: null,
+      chatConfig: { chat: { model: 'openai/gpt-4o' } },
+    });
+
+    const autoFocus$ = observable(false);
+    render(
+      <ChatInput
+        conversationId="conv-a"
+        onSend={jest.fn()}
+        onInterrupt={jest.fn().mockResolvedValue(undefined)}
+        autoFocus$={autoFocus$}
+      />
+    );
+
+    // Badge must remain enabled — user should be able to change model mid-stream
+    // for the next turn (isDisabled is tied to isReadOnly/!isConnected, not isGenerating)
+    expect(screen.getByTestId('model-selector')).not.toBeDisabled();
   });
 });

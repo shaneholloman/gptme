@@ -72,38 +72,73 @@ jobs:
         context: .
         push: false
 
+    # Derive OCI labels for the base image (same pattern as server)
+    - name: Docker meta (base)
+      id: meta-base
+      uses: docker/metadata-action@v6
+      with:
+        images: ghcr.io/${{ env.OWNER_LC }}/gptme
+        context: git
+        tags: |
+          type=raw,value=${{ env.DOCKER_EXTRA_TAG }}
+          type=raw,value=${{ env.SANITIZED_REF_NAME }}
+
     # Push base image to registry if on master/tag
     - name: Push Docker image (base)
       uses: docker/build-push-action@v7
       if: env.SHOULD_PUSH == 'true'
       with:
-        tags: |
-          ghcr.io/${{ env.OWNER_LC }}/gptme:${{ env.DOCKER_EXTRA_TAG }}
-          ghcr.io/${{ env.OWNER_LC }}/gptme:${{ env.SANITIZED_REF_NAME }}
+        tags: ${{ steps.meta-base.outputs.tags }}
+        labels: ${{ steps.meta-base.outputs.labels }}
         file: ./scripts/Dockerfile
         context: .
         push: true
+
+    # Derive OCI labels (created/version/revision/source) for the server image so
+    # downstream consumers (e.g. gptme-cloud's image-bump automation) can read
+    # build metadata directly off the image instead of guessing "unknown".
+    - name: Docker meta (server)
+      id: meta-server
+      uses: docker/metadata-action@v6
+      with:
+        images: ghcr.io/${{ env.OWNER_LC }}/gptme-server
+        # Use git CLI context so org.opencontainers.image.revision reflects
+        # the checked-out commit SHA, not github.sha (which is the dispatch
+        # event's SHA and diverges when a tag is checked out explicitly).
+        context: git
+        tags: |
+          type=raw,value=${{ env.DOCKER_EXTRA_TAG }}
+          type=raw,value=${{ env.SANITIZED_REF_NAME }}
 
     # Build and push server image
     - name: Build and push Docker image (server)
       uses: docker/build-push-action@v7
       with:
-        tags: |
-          ghcr.io/${{ env.OWNER_LC }}/gptme-server:${{ env.DOCKER_EXTRA_TAG }}
-          ghcr.io/${{ env.OWNER_LC }}/gptme-server:${{ env.SANITIZED_REF_NAME }}
+        tags: ${{ steps.meta-server.outputs.tags }}
+        labels: ${{ steps.meta-server.outputs.labels }}
         file: ./scripts/Dockerfile.server
         context: .
         build-args: |
           BASE=gptme:latest
         push: ${{ env.SHOULD_PUSH }}
 
+    # Derive OCI labels for the eval image (same pattern as server)
+    - name: Docker meta (eval)
+      id: meta-eval
+      uses: docker/metadata-action@v6
+      with:
+        images: ghcr.io/${{ env.OWNER_LC }}/gptme-eval
+        context: git
+        tags: |
+          type=raw,value=${{ env.DOCKER_EXTRA_TAG }}
+          type=raw,value=${{ env.SANITIZED_REF_NAME }}
+
     # Build and push eval image
     - name: Build and push Docker image (eval)
       uses: docker/build-push-action@v7
       with:
-        tags: |
-          ghcr.io/${{ env.OWNER_LC }}/gptme-eval:${{ env.DOCKER_EXTRA_TAG }}
-          ghcr.io/${{ env.OWNER_LC }}/gptme-eval:${{ env.SANITIZED_REF_NAME }}
+        tags: ${{ steps.meta-eval.outputs.tags }}
+        labels: ${{ steps.meta-eval.outputs.labels }}
         file: ./scripts/Dockerfile.eval
         context: .
         push: ${{ env.SHOULD_PUSH }}
@@ -161,7 +196,7 @@ jobs:
       run: pipx install poetry
 
     - name: Set up Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: ${{ matrix.python_version }}
         cache: 'poetry'
@@ -181,6 +216,19 @@ jobs:
       run: |
         make build
         poetry install --extras server --extras pyinstaller --with dev
+
+    - name: Set up Node.js
+      uses: actions/setup-node@v7
+      with:
+        node-version: '20'
+        cache: 'npm'
+        cache-dependency-path: webui/package-lock.json
+
+    - name: Build and bundle webui
+      run: |
+        cd webui && npm ci && npm run build
+        cd ..
+        make bundle-webui
 
     - name: Build PyInstaller executable
       run: make build-server-exe

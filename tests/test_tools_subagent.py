@@ -7,12 +7,22 @@ import pytest
 from gptme.tools.subagent import SubtaskDef, _subagents, subagent
 
 
-def _wait_for_new_subagent_threads(initial_count: int, timeout: float = 1.0) -> None:
-    """Join spawned threads before a thread-mocking patch context can unwind."""
+def _wait_for_new_subagent_threads(initial_count: int, timeout: float = 30.0) -> None:
+    """Join spawned threads before a thread-mocking patch context can unwind.
+
+    The timeout is a liveness bound, not a latency assertion: a healthy thread
+    joins as soon as it exits, so a generous budget costs nothing. It must stay
+    generous because the thread has to be *scheduled* first, and run_subagent
+    then acquires the global slot semaphore before its (mocked) body runs. Under
+    a loaded parallel CI run that startup can take seconds, which made a 1s
+    budget fail as `assert not True` with no diagnostic.
+    """
     for sa in _subagents[initial_count:]:
         if sa.thread is not None:
             sa.thread.join(timeout=timeout)
-            assert not sa.thread.is_alive()
+            assert not sa.thread.is_alive(), (
+                f"subagent {sa.agent_id!r} thread still alive after {timeout}s join"
+            )
 
 
 def _new_subagents(initial_count: int):
@@ -2303,21 +2313,28 @@ def test_role_implement_resolves_developer_profile(mock_create_thread: MagicMock
     assert call_kwargs["profile_name"] == "developer"
 
 
-@patch("gptme.tools.subagent.execution._run_subagent_subprocess")
-def test_role_verify_defaults_subprocess_and_isolated(
-    mock_run_subprocess: MagicMock,
-):
+def test_role_verify_defaults_subprocess_and_isolated():
     """Test that role='verify' defaults to subprocess mode with isolation and verifier profile."""
     _subagents.clear()
 
-    subagent(
-        agent_id="checker",
-        prompt="Verify the auth module",
-        role="verify",
-    )
+    # Also mock _monitor_subprocess: it spawns a daemon progress-polling thread
+    # that sleeps 0.5s/cycle and can outlive the 1s join timeout in
+    # _wait_for_new_subagent_threads, causing a flaky is_alive() assertion.
+    # Same fix as applied in #3196 for similar subprocess tests.
+    with (
+        patch(
+            "gptme.tools.subagent.execution._run_subagent_subprocess",
+        ) as mock_run_subprocess,
+        patch("gptme.tools.subagent.execution._monitor_subprocess"),
+    ):
+        subagent(
+            agent_id="checker",
+            prompt="Verify the auth module",
+            role="verify",
+        )
 
-    # Wait for launcher thread to execute (subprocess mode is now async)
-    _wait_for_new_subagent_threads(0)
+        # Wait for launcher thread inside the with-block so both mocks are active.
+        _wait_for_new_subagent_threads(0)
 
     assert len(_subagents) == 1
     sa = _subagents[-1]

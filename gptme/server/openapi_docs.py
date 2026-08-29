@@ -25,7 +25,15 @@ from gptme.__version__ import __version__
 # Increment CONTRACT_REVISION for additive (backward-compatible) changes;
 # increment API_VERSION and update the URL prefix for breaking changes.
 API_VERSION = 2
-CONTRACT_REVISION = 1
+# Revision 2 — BYOK warn-not-block: the /user/api-key endpoint now returns 200
+# with an optional "warning" field for UNREACHABLE providers instead of 502.
+# This is CONTRACT_REVISION (not API_VERSION) because:
+#   - HTTP success/failure semantics are preserved: 200 = save accepted, 4xx = rejected.
+#   - The "warning" field is optional and additive; existing clients that do not read
+#     it continue to work (they just lose the UNREACHABLE notification).
+#   - The 502 path was itself new in revision 1 (PR #3555) and had no stable consumers
+#     outside the SetupWizard, which is updated in this PR to handle the new field.
+CONTRACT_REVISION = 2
 
 logger = logging.getLogger(__name__)
 
@@ -78,6 +86,9 @@ class Message(BaseModel):
     content: str = Field(..., description="Message content")
     timestamp: str = Field(..., description="Message timestamp")
     files: list[str] | None = Field(None, description="Associated files")
+    call_id: str | None = Field(
+        None, description="Tool call identifier for result messages"
+    )
 
 
 class Conversation(BaseModel):
@@ -228,6 +239,10 @@ class UserApiKeySaveRequest(BaseModel):
         None,
         description="Optional fully qualified default model to persist in [env.MODEL]",
     )
+    skip_validation: bool = Field(
+        False,
+        description="Skip live provider validation of the key (for testing or offline use)",
+    )
 
 
 class UserApiKeySaveResponse(BaseModel):
@@ -239,6 +254,10 @@ class UserApiKeySaveResponse(BaseModel):
     restart_required: bool = Field(
         True,
         description="Whether the running server must be restarted before the new key is guaranteed to take effect",
+    )
+    warning: str | None = Field(
+        None,
+        description="Non-blocking warning when the key was saved but could not be verified (e.g. provider unreachable)",
     )
 
 
@@ -415,6 +434,12 @@ class ExternalSessionResponse(BaseModel):
     transcript: dict = Field(
         ..., description="Normalized external session transcript payload"
     )
+
+
+class ExternalSessionSteerResponse(BaseModel):
+    """Response for a successful steer_inject operation."""
+
+    status: str = Field(..., description="Always 'ok' on success")
 
 
 class SessionResponse(BaseModel):

@@ -21,6 +21,7 @@ if TYPE_CHECKING:
 logger = logging.getLogger(__name__)
 
 VALID_PROJECT_SYSTEM_PROMPTS = {"full", "short"}
+MAX_SCRIPT_HOOK_TIMEOUT = 300
 
 
 def _pop_object_section(config_data: dict, key: str) -> dict:
@@ -50,6 +51,41 @@ class PluginsConfig:
 
     # Optional: plugin allowlist (empty = all discovered plugins enabled)
     enabled: list[str] = field(default_factory=list)
+
+
+@dataclass
+class ScriptHookConfig:
+    """Shell command registered for an allowlisted lifecycle hook event."""
+
+    event: str
+    command: str
+    timeout: int = 30
+    priority: int = 0
+
+    def __post_init__(self) -> None:
+        if self.event not in {"session.start", "session.end"}:
+            raise ValueError(
+                f"unsupported hooks.scripts event {self.event!r}; "
+                "expected session.start or session.end"
+            )
+        if not self.command.strip():
+            raise ValueError("hooks.scripts command must not be empty")
+        if not isinstance(self.timeout, int) or isinstance(self.timeout, bool):
+            raise ValueError("hooks.scripts timeout must be an integer")
+        if not 0 < self.timeout <= MAX_SCRIPT_HOOK_TIMEOUT:
+            raise ValueError(
+                "hooks.scripts timeout must be between 1 and "
+                f"{MAX_SCRIPT_HOOK_TIMEOUT} seconds"
+            )
+        if not isinstance(self.priority, int) or isinstance(self.priority, bool):
+            raise ValueError("hooks.scripts priority must be an integer")
+
+
+@dataclass
+class HooksConfig:
+    """Project-configured hooks."""
+
+    scripts: list[ScriptHookConfig] = field(default_factory=list)
 
 
 @dataclass
@@ -198,6 +234,9 @@ class UserConfig:
     # CLI/runtime defaults. Mirrors project-level [settings].
     settings: SettingsConfig = field(default_factory=SettingsConfig)
 
+    # Lifecycle hooks that apply across projects.
+    hooks: HooksConfig = field(default_factory=HooksConfig)
+
     # Plugin-specific configuration namespace (user-level)
     # Allows plugins to have their own config sections like [plugin.retrieval]
     plugin: dict[str, dict] = field(default_factory=dict)
@@ -298,6 +337,7 @@ class ProjectConfig:
     files: list[str] | None = None
     exclude: list[str] = field(default_factory=list)
     context_cmd: str | None = None
+    hooks: HooksConfig = field(default_factory=HooksConfig)
     rag: RagConfig = field(default_factory=RagConfig)
     agent: AgentConfig | None = None
     lessons: LessonsConfig = field(default_factory=LessonsConfig)
@@ -325,7 +365,6 @@ class ProjectConfig:
     def from_dict(cls, config_data: dict, workspace: Path | None = None) -> Self:
         """Create a ProjectConfig instance from a dictionary. Warns about unknown keys."""
         # Support new "prompt" section or old-style base_prompt + files + context_cmd
-        # Support new "prompt" section or old-style base_prompt + files + context_cmd
         prompt_data = config_data.pop("prompt", None)
         system: str | None = None
         if isinstance(prompt_data, dict):
@@ -349,6 +388,23 @@ class ProjectConfig:
             files = config_data.pop("files", None)
             exclude = []
             context_cmd = config_data.pop("context_cmd", None)
+
+        hooks_data = _pop_object_section(config_data, "hooks")
+        script_hooks_data = hooks_data.pop("scripts", [])
+        if not isinstance(script_hooks_data, list):
+            raise ValueError("hooks.scripts must be a list")
+        if hooks_data:
+            logger.warning(
+                f"Unknown keys in hooks config: {list(hooks_data)} (ignored)"
+            )
+        script_hooks = [
+            _build_section("hooks.scripts", ScriptHookConfig, hook_data)
+            for hook_data in script_hooks_data
+            if isinstance(hook_data, dict)
+        ]
+        if len(script_hooks) != len(script_hooks_data):
+            raise ValueError("each hooks.scripts entry must be an object")
+        hooks = HooksConfig(scripts=script_hooks)
 
         rag = _build_section("rag", RagConfig, _pop_object_section(config_data, "rag"))
 
@@ -446,6 +502,7 @@ class ProjectConfig:
             files=files,
             exclude=exclude,
             context_cmd=context_cmd,
+            hooks=hooks,
             rag=rag,
             agent=agent,
             lessons=lessons,

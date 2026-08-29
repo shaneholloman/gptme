@@ -1,4 +1,4 @@
-import { useEffect, useState, useCallback } from 'react';
+import { useEffect, useRef, useState, useCallback } from 'react';
 import { Download, Loader2 } from 'lucide-react';
 import { formatDistanceToNow } from 'date-fns';
 import { useWorkspaceApi } from '@/utils/workspaceApi';
@@ -7,6 +7,7 @@ import type { WorkspaceRoot } from '@/stores/workspaceExplorer';
 import { CodeDisplay } from '@/components/CodeDisplay';
 import { Button } from '@/components/ui/button';
 import { MarkdownPreviewTabs } from './MarkdownPreviewTabs';
+import '@google/model-viewer';
 
 // Helper function to check if a file is a markdown file
 function isMarkdownFileType(file: FileType): boolean {
@@ -63,20 +64,41 @@ export function FilePreview({ file, conversationId, root = 'workspace' }: FilePr
   const [error, setError] = useState<string | null>(null);
   const [downloadError, setDownloadError] = useState<string | null>(null);
   const [loading, setLoading] = useState(true);
+  const activeControllerRef = useRef<AbortController | null>(null);
 
   const { previewFile, downloadFile } = useWorkspaceApi();
 
   const loadPreview = useCallback(async () => {
+    // Abort any in-flight fetch to prevent stale blob URLs being created
+    // after the component unmounts or switches to a different file.
+    activeControllerRef.current?.abort();
+    const controller = new AbortController();
+    activeControllerRef.current = controller;
+
     try {
       setLoading(true);
       setError(null);
       setDownloadError(null);
-      const data = await previewFile(conversationId, file.path, root);
+      const data = await previewFile(conversationId, file.path, root, controller.signal);
+      if (controller.signal.aborted) {
+        // Revoke any blob URL that was created before the abort was detected.
+        if (
+          'content' in data &&
+          typeof data.content === 'string' &&
+          data.content.startsWith('blob:')
+        ) {
+          URL.revokeObjectURL(data.content);
+        }
+        return;
+      }
       setPreview(data);
     } catch (err) {
+      if (controller.signal.aborted) return;
       setError(err instanceof Error ? err.message : 'Failed to load preview');
     } finally {
-      setLoading(false);
+      if (!controller.signal.aborted) {
+        setLoading(false);
+      }
     }
   }, [file.path, conversationId, previewFile, root]);
 
@@ -92,6 +114,27 @@ export function FilePreview({ file, conversationId, root = 'workspace' }: FilePr
   useEffect(() => {
     loadPreview();
   }, [loadPreview]);
+
+  // Abort any in-flight preview fetch on unmount.
+  useEffect(() => {
+    return () => {
+      activeControllerRef.current?.abort();
+    };
+  }, []);
+
+  // Revoke blob URLs when the preview changes or on unmount.
+  // Covers images and self-contained model formats (GLB/USDZ) that use blob URLs.
+  // glTF previews use direct workspace URLs, so no revocation is needed there.
+  useEffect(() => {
+    return () => {
+      if (preview && preview.type !== 'binary') {
+        const { content } = preview;
+        if (content.startsWith('blob:')) {
+          URL.revokeObjectURL(content);
+        }
+      }
+    };
+  }, [preview]);
 
   if (loading) {
     return (
@@ -145,6 +188,30 @@ export function FilePreview({ file, conversationId, root = 'workspace' }: FilePr
           </div>
         </div>
       );
+    case 'model3d': {
+      // glTF/GLB/USDZ get an interactive 3D viewer; OBJ/STL get a download prompt.
+      const isGltfLike = /\.(gltf|glb|usdz)$/i.test(file.name);
+      return (
+        <div className="flex h-full flex-col">
+          <FileHeader file={file} onDownload={handleDownload} downloadError={downloadError} />
+          <div className="flex flex-1 items-center justify-center overflow-hidden">
+            {isGltfLike ? (
+              <model-viewer
+                src={preview.content}
+                camera-controls
+                auto-rotate
+                style={{ width: '100%', height: '100%' }}
+              />
+            ) : (
+              <div className="flex flex-col items-center gap-2 text-center text-muted-foreground">
+                <p>OBJ/STL preview not available inline.</p>
+                <p className="text-sm">Use the download button to open in a local viewer.</p>
+              </div>
+            )}
+          </div>
+        </div>
+      );
+    }
     case 'binary':
       return (
         <div className="flex h-full flex-col">

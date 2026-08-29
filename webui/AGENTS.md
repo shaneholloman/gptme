@@ -40,6 +40,27 @@ await page.screenshot({ path: 'screenshot.png', fullPage: true });
 
 You can navigate directly to a conversation URL to test specific scenarios. The server ID is shown in the browser's connection config.
 
+### Opt-in vision assertions
+
+`e2e/helpers/visionAssert.ts` screenshots a page (or locator) and asks a vision
+model whether a single visual claim holds. It is a **no-op** unless
+`GPTME_VISION_ASSERT=1` is set, so default CI stays free of paid vision calls.
+
+```bash
+GPTME_VISION_ASSERT=1 OPENROUTER_API_KEY=... npm run test:e2e -- e2e/vision-assert-gap.spec.ts
+```
+
+Artifacts land in `webui/test-results/vision-assert/` (`VISION_ASSERT_DIR` to override).
+Do not enable this on every CI run until cost/latency/false-positive rate are known;
+see the cost notes in `e2e/helpers/visionAssertCore.ts`.
+
+Screenshot artifact paths today (no vision model involved):
+
+- `e2e/visual-snapshots.spec.ts` writes PNGs to `$SCREENSHOTS_DIR` or `webui/visual-snapshots/`
+- CI uploads those as the `webui-visual-snapshots` artifact; `webui-visual-diff.yml` diffs them against master
+- Playwright HTML report: `webui/playwright-report/` (CI artifacts `playwright-report-stable` / `playwright-report-dev`)
+- Failed-test dumps: `webui/test-results/` (gitignored; config does not currently set `screenshot: 'only-on-failure'`)
+
 ## Rendering Paths
 
 The web UI has **two independent markdown rendering paths**:

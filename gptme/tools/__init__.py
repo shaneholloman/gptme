@@ -4,6 +4,7 @@ import importlib
 import logging
 import pkgutil
 import threading
+import time
 from contextvars import ContextVar
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -16,6 +17,7 @@ from ..util.interrupt import clear_interruptible
 from ..util.terminal import terminal_state_title
 from ._allowlist import (
     allowlist_contains_glob,
+    expand_tool_allowlist_presets,
     is_hint_pattern,
     matching_allowlist_tools,
     tool_matches_allowlist,
@@ -182,6 +184,8 @@ def init_tools(
             elif config.chat and config.chat.tools:
                 allowlist = config.chat.tools
 
+        allowlist = expand_tool_allowlist_presets(allowlist)
+
         # Partition allowlist into file paths and tool names
         file_paths: list[str] = []
         tool_names: list[str] = []
@@ -253,6 +257,8 @@ def _unavailable_message(tool_name: str, matched_tools: list[ToolSpec]) -> str:
 def get_toolchain(
     allowlist: list[str] | None, *, strict: bool = True
 ) -> list[ToolSpec]:
+    allowlist = expand_tool_allowlist_presets(allowlist)
+
     # Validate allowlist if provided
     # When strict=False, warn about missing/unavailable tools instead of raising.
     # Server contexts use strict=False since conversations may reference tools
@@ -319,8 +325,21 @@ def execute_msg(
     msg: Message,
     log: Log | None = None,
     workspace: Path | None = None,
+    tool_timings: dict[str, float] | None = None,
 ) -> Generator[Message, None, None]:
-    """Uses any tools called in a message and returns the response."""
+    """Uses any tools called in a message and returns the response.
+
+    Args:
+        msg: The assistant message whose tool uses should be executed.
+        log: Optional conversation log (passed through to tool execution).
+        workspace: Optional workspace path (passed through to tool execution).
+        tool_timings: Optional dict to accumulate per-tool wall-clock durations
+            in milliseconds.  If provided, each executed tool's name is used as
+            the key and its duration (ms) is *added* to any existing value so
+            repeated calls to the same tool accumulate correctly.  Pass an empty
+            dict ``{}`` from the caller and read it back after the generator is
+            exhausted to obtain ``tool_ms_by_name`` for timing metadata.
+    """
     assert msg.role == "assistant", "Only assistant messages can be executed"
 
     # Snapshot runnability once per tool_use. Evaluating `is_runnable` a second
@@ -337,9 +356,9 @@ def execute_msg(
     for tooluse, runnable in remaining:
         if runnable:
             with terminal_state_title(f"🛠️ running {tooluse.tool}"):
+                t0 = time.monotonic()
                 try:
-                    for tool_response in tooluse.execute(log=log, workspace=workspace):
-                        yield tool_response.replace(call_id=tooluse.call_id)
+                    yield from tooluse.execute(log=log, workspace=workspace)
                 except KeyboardInterrupt:
                     clear_interruptible()
                     yield Message(
@@ -358,6 +377,12 @@ def execute_msg(
                                 call_id=rem_tu.call_id,
                             )
                     return
+                finally:
+                    if tool_timings is not None:
+                        elapsed_ms = (time.monotonic() - t0) * 1000
+                        tool_timings[tooluse.tool] = (
+                            tool_timings.get(tooluse.tool, 0.0) + elapsed_ms
+                        )
         elif tooluse.call_id is not None:
             # A structured (tool-format) tool_use that isn't runnable still needs
             # a paired tool_result, or the next API request dangles it and 400s.
@@ -492,6 +517,22 @@ def get_tool(tool_name: str) -> ToolSpec | None:
 def has_tool(tool_name: str) -> bool:
     """Returns True if a tool is loaded."""
     return any(tool.name == tool_name for tool in _get_loaded_tools())
+
+
+def notify_file_read(path: str, content: str) -> str | None:
+    """Store a hashline snapshot unconditionally; return the tag only when hashline_edit is active.
+
+    Always stores a snapshot so hashline_edit can edit files that were read before
+    the tool was activated (e.g., via load_tool mid-session). Returns the tag only
+    when hashline_edit is loaded so read.py can gate the [path#tag] header.
+
+    This decouples read.py from the hashline_snapshot module: read.py calls this
+    function without importing _hashline_snapshot directly.
+    """
+    from ._hashline_snapshot import store_snapshot
+
+    tag = store_snapshot(path, content)
+    return tag if has_tool("hashline_edit") else None
 
 
 def load_tool(tool_name: str) -> ToolSpec:

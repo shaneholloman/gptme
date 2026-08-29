@@ -564,6 +564,70 @@ def test_chat_config_workspace_at_log_without_logdir():
         ChatConfig.from_dict(config_dict)
 
 
+def test_chat_config_no_workspace_field_uses_logdir(tmp_path):
+    """from_dict with _logdir but no workspace in config must not fall back to cwd.
+
+    This is the P1 regression: when config.toml exists but has no workspace field
+    and logdir/workspace doesn't exist (Windows without Developer Mode), the old
+    code would return Path.cwd() — causing tools to operate against an unrelated
+    directory silently.
+    """
+    logdir = tmp_path / "test-conversation"
+    logdir.mkdir()
+
+    # Config has no workspace field; logdir/workspace symlink does not exist.
+    config_dict = {"_logdir": logdir, "chat": {}}
+    config = ChatConfig.from_dict(config_dict)
+
+    # Must not be cwd — must be the logdir.
+    assert config.workspace != Path.cwd()
+    assert config.workspace == logdir.resolve()
+
+
+def test_from_logdir_config_without_workspace_field_not_cwd(tmp_path):
+    """from_logdir loading a config.toml without a workspace field must not return cwd.
+
+    Covers the rename-flow path where config.toml is written without a workspace
+    field and logdir/workspace has been removed (Windows without symlink privilege).
+    """
+    import tomlkit
+
+    logdir = tmp_path / "test-conversation"
+    logdir.mkdir()
+
+    # Write a config.toml with no workspace field and no logdir/workspace symlink.
+    config_path = logdir / "config.toml"
+    doc = tomlkit.document()
+    chat_section = tomlkit.table()
+    chat_section.add("model", "gpt-4o")
+    doc.add("chat", chat_section)
+    config_path.write_text(tomlkit.dumps(doc), encoding="utf-8")
+
+    config = ChatConfig.from_logdir(logdir)
+
+    assert config.workspace != Path.cwd(), (
+        "workspace must not fall back to process cwd when no workspace is configured"
+    )
+    assert config.workspace == logdir.resolve()
+
+
+def test_from_logdir_malformed_config_cannot_overwrite_source(tmp_path):
+    """Recovery from malformed TOML must not make the source saveable."""
+    logdir = tmp_path / "test-conversation"
+    logdir.mkdir()
+    config_path = logdir / "config.toml"
+    malformed = b"[chat\nmodel = 'broken'\n"
+    config_path.write_bytes(malformed)
+
+    config = ChatConfig.from_logdir(logdir)
+
+    assert config.workspace == logdir.resolve()
+    assert config._logdir is None
+    with pytest.raises(ValueError, match="no logdir"):
+        config.save()
+    assert config_path.read_bytes() == malformed
+
+
 def test_chat_config_to_dict():
     config = ChatConfig.from_dict(json.loads(config_json))
     config_dict = config.to_dict()
@@ -572,7 +636,7 @@ def test_chat_config_to_dict():
     assert config_dict["chat"]["tool_format"] == "markdown"
     assert config_dict["chat"]["stream"] is True
     assert config_dict["chat"]["interactive"] is True
-    assert config_dict["chat"]["workspace"] == "~/workspace"
+    assert Path(config_dict["chat"]["workspace"]).as_posix() == "~/workspace"
     assert config_dict["env"] == {"API_KEY": "your-key"}
     assert config_dict["mcp"] == {
         "enabled": True,
@@ -836,7 +900,7 @@ tool_format = "xml"
 tools = ["shell", "python"]
 stream = true
 interactive = true
-workspace = "{workspace!s}"
+workspace = "{workspace.as_posix()}"
 
 [env]
 """
@@ -960,18 +1024,17 @@ myproject = "A cool project."
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
         f.write(config_toml)
-        f.flush()
-        try:
-            config = load_user_config(f.name)
-            assert config.user.name == "Erik"
-            assert config.user.about == "I am a curious human programmer."
-            assert (
-                config.user.response_preference
-                == "Basic concepts don't need to be explained."
-            )
-            assert config.prompt.project == {"myproject": "A cool project."}
-        finally:
-            os.remove(f.name)
+    try:
+        config = load_user_config(f.name)
+        assert config.user.name == "Erik"
+        assert config.user.about == "I am a curious human programmer."
+        assert (
+            config.user.response_preference
+            == "Basic concepts don't need to be explained."
+        )
+        assert config.prompt.project == {"myproject": "A cool project."}
+    finally:
+        os.remove(f.name)
 
 
 def test_user_identity_config_backward_compat():
@@ -985,15 +1048,14 @@ response_preference = "Keep it short."
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
         f.write(config_toml)
-        f.flush()
-        try:
-            config = load_user_config(f.name)
-            # Should fall back to [prompt] values
-            assert config.user.name == "User"
-            assert config.user.about == "I am a legacy user."
-            assert config.user.response_preference == "Keep it short."
-        finally:
-            os.remove(f.name)
+    try:
+        config = load_user_config(f.name)
+        # Should fall back to [prompt] values
+        assert config.user.name == "User"
+        assert config.user.about == "I am a legacy user."
+        assert config.user.response_preference == "Keep it short."
+    finally:
+        os.remove(f.name)
 
 
 def test_user_identity_config_new_overrides_old():
@@ -1012,15 +1074,14 @@ response_preference = "Old preference."
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
         f.write(config_toml)
-        f.flush()
-        try:
-            config = load_user_config(f.name)
-            # [user] should take priority
-            assert config.user.name == "Erik"
-            assert config.user.about == "New about text."
-            assert config.user.response_preference == "New preference."
-        finally:
-            os.remove(f.name)
+    try:
+        config = load_user_config(f.name)
+        # [user] should take priority
+        assert config.user.name == "Erik"
+        assert config.user.about == "New about text."
+        assert config.user.response_preference == "New preference."
+    finally:
+        os.remove(f.name)
 
 
 def test_user_identity_config_defaults():
@@ -1051,13 +1112,12 @@ some_future_user_key = 42
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
         f.write(config_toml)
-        f.flush()
-        try:
-            config = load_user_config(f.name)
-            assert config.user.name == "Erik"
-            assert config.user.about == "Hi"
-        finally:
-            os.remove(f.name)
+    try:
+        config = load_user_config(f.name)
+        assert config.user.name == "Erik"
+        assert config.user.about == "Hi"
+    finally:
+        os.remove(f.name)
 
 
 def test_user_identity_config_partial_fallback():
@@ -1074,14 +1134,13 @@ response_preference = "Fallback preference."
 """
     with tempfile.NamedTemporaryFile(mode="w", suffix=".toml", delete=False) as f:
         f.write(config_toml)
-        f.flush()
-        try:
-            config = load_user_config(f.name)
-            assert config.user.name == "Erik"
-            assert config.user.about == "Custom about."
-            assert config.user.response_preference == "Fallback preference."
-        finally:
-            os.remove(f.name)
+    try:
+        config = load_user_config(f.name)
+        assert config.user.name == "Erik"
+        assert config.user.about == "Custom about."
+        assert config.user.response_preference == "Fallback preference."
+    finally:
+        os.remove(f.name)
 
 
 def test_user_config_local_toml(tmp_path):
@@ -1226,7 +1285,7 @@ def test_setup_config_from_cli_merges_prune_tool_output_override(tmp_path):
     logdir.mkdir()
     (logdir / "config.toml").write_text(
         f"""[chat]
-workspace = "{workspace!s}"
+workspace = "{workspace.as_posix()}"
 
 [env]
 EXISTING = "1"
@@ -1331,6 +1390,221 @@ def test_tool_exclusion_multiple(tmp_path):
         assert tool in config.chat.tools, (
             f"Default tool '{tool}' should still be in tools list after exclusion"
         )
+
+
+def test_setup_config_from_cli_read_only_preset(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist="read-only",
+        tool_format=None,
+        stream=True,
+        interactive=True,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    # Preset name is persisted verbatim so that resume detection is unambiguous.
+    assert config.chat.tools == ["read-only"]
+
+
+def test_setup_config_from_cli_read_only_preset_does_not_add_complete(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist="read-only",
+        tool_format=None,
+        stream=True,
+        interactive=False,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    # Preset name is persisted verbatim (not expanded) to preserve provenance.
+    assert config.chat.tools == ["read-only"]
+    assert "complete" not in (config.chat.tools or [])
+
+
+def test_setup_config_from_cli_explicit_read_tool_adds_complete_noninteractive(
+    tmp_path,
+):
+    """--tools read (explicit, not a preset) must still get 'complete' in non-interactive mode.
+
+    Greptile P1: expansion-based detection conflated an explicit ["read"] allowlist
+    with the read-only preset, incorrectly suppressing 'complete'.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist="read",
+        tool_format=None,
+        stream=True,
+        interactive=False,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert "complete" in (config.chat.tools or []), (
+        "Non-interactive session with explicit --tools read must include 'complete'; "
+        f"got tools={config.chat.tools}"
+    )
+
+
+def test_setup_config_from_cli_read_only_preset_survives_noninteractive_resume(
+    tmp_path,
+):
+    """Non-interactive resume of a read-only session must not append 'complete'.
+
+    The preset name is persisted verbatim so that resumed sessions can detect
+    it unambiguously without relying on expansion-equality heuristics.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    # Initial session: create the conversation with read-only preset
+    setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist="read-only",
+        tool_format=None,
+        stream=True,
+        interactive=False,
+        agent_path=None,
+    )
+
+    # Resume non-interactively without repeating --tools: preset must hold
+    resumed = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=None,
+        tool_format=None,
+        stream=True,
+        interactive=False,
+        agent_path=None,
+    )
+
+    assert resumed.chat is not None
+    assert resumed.chat.tools == ["read-only"], (
+        "Non-interactive resume of a read-only session silently changed tools: "
+        f"{resumed.chat.tools}"
+    )
+    assert "complete" not in (resumed.chat.tools or []), (
+        "Non-interactive resume of a read-only session silently added 'complete': "
+        f"{resumed.chat.tools}"
+    )
+
+
+def test_setup_config_from_cli_tool_allowlist_env_trailing_comma(tmp_path, monkeypatch):
+    """TOOL_ALLOWLIST env var with a trailing comma must not raise or add an empty tool.
+
+    Regression for P2 finding: 'read-only,' split into ['read-only', ''] which
+    then failed the len==1 preset check, causing 'complete' to be appended and
+    expand_tool_allowlist_presets to raise ValueError.
+    """
+    monkeypatch.setenv("TOOL_ALLOWLIST", "read-only,")
+
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=None,
+        tool_format=None,
+        stream=True,
+        interactive=False,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    # Trailing comma is stripped; preset name is preserved verbatim.
+    assert config.chat.tools == ["read-only"]
+    assert "complete" not in (config.chat.tools or [])
+    assert "" not in (config.chat.tools or [])
+
+
+def test_setup_config_from_cli_preset_exclusion_raises(tmp_path):
+    """Using '-read-only' exclusion syntax must raise, not silently use the full toolset.
+
+    Security regression: 'read-only' is now in _known_tool_names (as a preset)
+    so '-read-only' passes CLI validation. The exclusion branch must raise
+    ValueError (promoted from a warning) so the call fails closed instead of
+    proceeding with the full default toolset — a fail-open security boundary.
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    with pytest.raises(ValueError, match="Cannot exclude preset name 'read-only'"):
+        setup_config_from_cli(
+            workspace=workspace,
+            logdir=logdir,
+            model=None,
+            tool_allowlist="-read-only",
+            tool_format=None,
+            stream=True,
+            interactive=False,
+            agent_path=None,
+        )
+
+
+def test_setup_config_from_cli_tool_allowlist_direct_trailing_comma(tmp_path):
+    """Direct tool_allowlist parameter with trailing comma must not crash or add empty tool.
+
+    Regression for P2 finding: the env-var branch already filtered empty
+    elements ('if tool.strip()'), but the normal-mode branch (direct parameter
+    path) did not.  'read-only,' split to ['read-only', ''], which failed the
+    len==1 preset check, causing 'complete' to be appended and
+    expand_tool_allowlist_presets to raise ValueError (preset cannot combine
+    with other tools).
+    """
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist="read-only,",
+        tool_format=None,
+        stream=True,
+        interactive=False,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    # Trailing comma is stripped; preset name is preserved verbatim.
+    assert config.chat.tools == ["read-only"]
+    assert "complete" not in (config.chat.tools or [])
+    assert "" not in (config.chat.tools or [])
 
 
 def test_custom_tool_file_allowlist_preserved(tmp_path):
@@ -1449,7 +1723,7 @@ def test_save_provider_config_upserts_existing_provider(tmp_path, monkeypatch):
     }
 
 
-def test_chat_config_save_transition_empty_dir_to_symlink(tmp_path):
+def test_chat_config_save_transition_empty_dir_to_symlink(tmp_path, requires_symlinks):
     """Test that save() replaces an empty from_logdir workspace directory with a symlink."""
     logdir = tmp_path / "conversation-save-transition"
 
@@ -1467,6 +1741,32 @@ def test_chat_config_save_transition_empty_dir_to_symlink(tmp_path):
 
     assert (logdir / "workspace").is_symlink()
     assert (logdir / "workspace").resolve() == custom_workspace
+
+
+def test_logmanager_workspace_fallback_when_symlink_absent(tmp_path):
+    """Test that LogManager.workspace falls back to ChatConfig if symlink is missing."""
+    from gptme.logmanager import LogManager
+
+    logdir = tmp_path / "conversation-fallback"
+    logdir.mkdir()
+    custom_workspace = tmp_path / "custom-workspace"
+    custom_workspace.mkdir()
+
+    # Save config with custom workspace
+    config = ChatConfig(_logdir=logdir, workspace=custom_workspace)
+    config.save()
+
+    # If workspace symlink was created, remove it to simulate environments without symlinks
+    ws_symlink = logdir / "workspace"
+    if ws_symlink.is_symlink() or ws_symlink.is_file():
+        ws_symlink.unlink()
+    elif ws_symlink.is_dir():
+        ws_symlink.rmdir()
+
+    assert not ws_symlink.exists()
+
+    manager = LogManager.load(logdir, create=True)
+    assert manager.workspace == custom_workspace
 
 
 def test_get_env_required_checks_gptme_prefix(monkeypatch):
@@ -1575,11 +1875,13 @@ def test_get_plugin_config_layers_user_and_project(tmp_path):
     temp_user_config = str(tmp_path / "config.toml")
     with open(temp_user_config, "w") as f:
         f.write(default_user_config)
-        f.write(f'\n[plugins]\npaths = ["{user_plugins}"]\nenabled = ["user-plugin"]\n')
+        f.write(
+            f'\n[plugins]\npaths = ["{user_plugins.as_posix()}"]\nenabled = ["user-plugin"]\n'
+        )
 
     with open(tmp_path / "gptme.toml", "w") as f:
         f.write(
-            f'[plugins]\npaths = ["{project_plugins}"]\nenabled = ["project-plugin"]\n'
+            f'[plugins]\npaths = ["{project_plugins.as_posix()}"]\nenabled = ["project-plugin"]\n'
         )
 
     config = Config.from_workspace(tmp_path)
@@ -1847,3 +2149,25 @@ def test_setup_config_from_cli_explicit_tools_override_gear(tmp_path):
     assert config.chat is not None
     assert config.chat.gear == 3
     assert config.chat.tools == ["read"]
+
+
+def test_setup_config_from_cli_noninteractive_gear_profile_adds_complete(tmp_path):
+    workspace = tmp_path / "workspace"
+    workspace.mkdir()
+    logdir = tmp_path / "logs"
+    logdir.mkdir()
+
+    config = setup_config_from_cli(
+        workspace=workspace,
+        logdir=logdir,
+        model=None,
+        tool_allowlist=None,
+        tool_format=None,
+        gear=0,
+        stream=True,
+        interactive=False,
+        agent_path=None,
+    )
+
+    assert config.chat is not None
+    assert config.chat.tools == ["read", "chats", "complete"]

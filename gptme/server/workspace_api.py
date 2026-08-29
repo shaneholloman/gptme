@@ -24,6 +24,15 @@ logger = logging.getLogger(__name__)
 # Maximum bytes returned for text-file preview to avoid OOM on huge files.
 MAX_PREVIEW_BYTES = 10 * 1024 * 1024  # 10 MB
 
+# MIME types for 3D model extensions — Python's mimetypes doesn't know these.
+_MODEL3D_MIME: dict[str, str] = {
+    ".gltf": "model/gltf+json",
+    ".glb": "model/gltf-binary",
+    ".obj": "model/obj",
+    ".stl": "model/stl",
+    ".usdz": "model/vnd.usdz+zip",
+}
+
 workspace_api = flask.Blueprint("workspace_api", __name__)
 
 
@@ -305,7 +314,29 @@ def browse_workspace(conversation_id: str, subpath: str | None = None):
         show_hidden = request.args.get("show_hidden", "").lower() == "true"
 
         if path.is_file():
-            # Return single file metadata
+            # Serve 3D model files as raw bytes so that model-viewer can use
+            # the file's natural URL as the base for relative URI resolution
+            # (e.g. sibling buffers and textures referenced by .gltf files).
+            # TODO: sibling requests from model-viewer (buffers, textures) are
+            # plain relative-path fetches and do not carry ?root=attachments.
+            # A .gltf stored under the attachments root therefore has working
+            # intra-root relative URIs only when the sibling assets reside at
+            # the same path under the workspace root. Fix: detect/infer the root
+            # from the request path prefix or a signed URL token so sibling
+            # fetches inherit the correct root automatically.
+            ext = path.suffix.lower()
+            if ext in _MODEL3D_MIME:
+                return flask.send_file(path, mimetype=_MODEL3D_MIME[ext])
+            # Also serve images and binary buffers (.bin) as raw bytes.
+            # model-viewer resolves glTF sibling assets (textures, geometry
+            # buffers) via relative URIs against the model's workspace URL,
+            # so they must return bytes here, not JSON metadata.
+            mime = mimetypes.guess_type(path.name)[0]
+            if mime and mime.startswith("image/"):
+                return flask.send_file(path, mimetype=mime)
+            if ext == ".bin":
+                return flask.send_file(path, mimetype="application/octet-stream")
+            # Return single file metadata for other files
             return flask.jsonify(WorkspaceFile(path, workspace).to_dict())
         if not path.exists():
             return flask.jsonify({"error": "File or directory not found"}), 404
@@ -577,6 +608,10 @@ def preview_file(conversation_id: str, filepath: str):
         if mime_type and mime_type.startswith("image/"):
             # Images
             return flask.send_file(path, mimetype=mime_type)
+        # 3D model files — served as raw bytes; frontend creates a blob URL for model-viewer.
+        ext = path.suffix.lower()
+        if ext in _MODEL3D_MIME:
+            return flask.send_file(path, mimetype=_MODEL3D_MIME[ext])
         # Binary files - return only metadata
         return flask.jsonify({"type": "binary", "metadata": wfile.to_dict()})
 

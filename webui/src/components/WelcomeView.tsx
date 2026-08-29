@@ -25,6 +25,9 @@ import { withLocalAddressSpace } from '@/utils/addressSpace';
 import { isLikelyChromeCorsPna } from '@/utils/api';
 import { isDemoMode } from '@/utils/connectionConfig';
 import { appRoute, chatRoute } from '@/utils/routes';
+import { isTauriEnvironment, invokeTauri } from '@/utils/tauri';
+import { formatUnknownError } from '@/utils/errors';
+import { useTauriServerStatus } from '@/hooks/useTauriServerStatus';
 
 const DEFAULT_LOCAL_SERVER_URLS = new Set(['http://127.0.0.1:5700', 'http://localhost:5700']);
 
@@ -45,10 +48,13 @@ export const WelcomeView = () => {
 
   const [isSubmitting, setIsSubmitting] = useState(false);
   const [isRetryingConnection, setIsRetryingConnection] = useState(false);
+  const [isRestartingServer, setIsRestartingServer] = useState(false);
   const [providerConfigured, setProviderConfigured] = useState<boolean | null>(null);
   const navigate = useNavigate();
   const { api, isConnected$, connectionConfig, switchServer, connect } = useApi();
   const demoMode = isDemoMode();
+  const isTauri = isTauriEnvironment();
+  const { managesLocalServer } = useTauriServerStatus();
   const queryClient = useQueryClient();
   const isConnected = use$(isConnected$);
   const lastConnectionResult = use$(api.lastConnectionResult$);
@@ -146,6 +152,28 @@ export const WelcomeView = () => {
     }
   };
 
+  const handleTauriRestartServer = async () => {
+    setIsRestartingServer(true);
+    try {
+      await invokeTauri('start_server');
+    } catch (error) {
+      const msg = formatUnknownError(error, 'Failed to start the server');
+      if (!msg.includes('already running')) {
+        toast.error('Failed to start the server. Please restart the app.');
+        setIsRestartingServer(false);
+        return;
+      }
+      // Server is already running — just retry the connection below
+    }
+    try {
+      await connect();
+    } catch {
+      // connect() already shows a toast on failure
+    } finally {
+      setIsRestartingServer(false);
+    }
+  };
+
   useEffect(() => {
     if (!isConnected) {
       setProviderConfigured(null);
@@ -179,6 +207,12 @@ export const WelcomeView = () => {
   // their disconnected banner is left unchanged.
   const isFirstVisit = !settings.hasCompletedSetup;
   const showGuidedSetup = isDefaultLocalServer && isFirstVisit && !demoMode;
+  // Wizard CTA stays available after setup was skipped/completed so onboarding
+  // remains reachable, and on remote-only Tauri (mobile) where the wizard is the
+  // primary way to configure a server URL. Desktop Tauri manages its own server
+  // and keeps the CTA hidden (#3407).
+  const isRemoteOnlyTauri = isTauri && managesLocalServer === false;
+  const showWizardCta = isDefaultLocalServer && !demoMode && (!isTauri || isRemoteOnlyTauri);
 
   // Classify the last connection failure into actionable buckets for targeted guidance.
   const errorBucket = (() => {
@@ -256,6 +290,12 @@ export const WelcomeView = () => {
   ]);
 
   const disconnectedDesc = (() => {
+    if (isTauri && managesLocalServer) {
+      // Desktop app: the bundled server is managed by the app — no CLI commands needed.
+      if (errorBucket === 'network' || errorBucket === 'timeout' || errorBucket === 'unknown') {
+        return 'The built-in server failed to start. Click "Restart server" to try again.';
+      }
+    }
     if (errorBucket === 'network') {
       return isDefaultLocalServer
         ? 'The gptme server is not running. Start one with the command below.'
@@ -290,9 +330,9 @@ export const WelcomeView = () => {
 
   return (
     <div className="mx-auto flex h-full w-full flex-col" style={bgStyle}>
-      <div className="mx-auto flex h-full w-full max-w-5xl flex-col items-center justify-center px-4 pt-12 sm:px-6">
+      <div className="mx-auto flex h-full w-full max-w-5xl flex-col items-center justify-center pt-12 sm:px-6">
         <div
-          className={`w-full max-w-4xl rounded-[28px] border p-6 shadow-[0_30px_120px_-48px_rgba(15,23,42,0.45)] sm:p-8 ${
+          className={`w-full max-w-4xl border p-6 shadow-[0_30px_120px_-48px_rgba(15,23,42,0.45)] sm:rounded-[3em] sm:p-8 ${
             hasCustomBg
               ? 'border-white/20 bg-background/60 backdrop-blur-xl'
               : 'border-border/70 bg-background/90 backdrop-blur'
@@ -374,7 +414,8 @@ export const WelcomeView = () => {
                       using the managed gptme.ai option — no copy-pasting required.
                     </p>
                   )}
-                  {isDefaultLocalServer &&
+                  {!isTauri &&
+                    isDefaultLocalServer &&
                     !isFirstVisit &&
                     errorBucket !== 'cors' &&
                     !showHostedLoopbackCorsHint && (
@@ -401,7 +442,7 @@ export const WelcomeView = () => {
                       </div>
                     )}
                   <div className="flex flex-wrap gap-2">
-                    {showGuidedSetup && (
+                    {showWizardCta && (
                       <Button
                         type="button"
                         size="sm"
@@ -410,7 +451,18 @@ export const WelcomeView = () => {
                           setupWizard$.open.set(true);
                         }}
                       >
-                        Get started
+                        {isFirstVisit ? 'Get started' : 'Run setup'}
+                      </Button>
+                    )}
+                    {isTauri && managesLocalServer && (
+                      <Button
+                        type="button"
+                        size="sm"
+                        onClick={() => void handleTauriRestartServer()}
+                        disabled={isRestartingServer}
+                      >
+                        <RotateCcw className="mr-2 h-4 w-4" />
+                        {isRestartingServer ? 'Starting...' : 'Restart server'}
                       </Button>
                     )}
                     <Button
@@ -423,7 +475,7 @@ export const WelcomeView = () => {
                       <RotateCcw className="mr-2 h-4 w-4" />
                       {isRetryingConnection ? 'Retrying...' : 'Retry connection'}
                     </Button>
-                    {isDefaultLocalServer && !isFirstVisit && (
+                    {!isTauri && isDefaultLocalServer && !isFirstVisit && (
                       <Button
                         type="button"
                         size="sm"
@@ -445,7 +497,7 @@ export const WelcomeView = () => {
                       </Button>
                     )}
                   </div>
-                  {isDefaultLocalServer && !isFirstVisit && (
+                  {!isTauri && isDefaultLocalServer && !isFirstVisit && (
                     <p className="text-sm text-muted-foreground">
                       Prefer not to run a local server?{' '}
                       <Button

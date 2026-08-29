@@ -1478,3 +1478,61 @@ def test_xml_roundtrip_special_chars():
     xml = original.to_xml()
     restored = Codeblock.from_xml(xml)
     assert restored.content == original.content
+
+
+def test_from_markdown_normalizes_crlf():
+    """CRLF input must produce the same content as LF input (no carriage returns)."""
+    crlf = Codeblock.from_markdown("```python\r\nprint(1)\r\n```")
+    lf = Codeblock.from_markdown("```python\nprint(1)\n```")
+    assert crlf.content == lf.content
+    assert "\r" not in crlf.content
+
+
+def test_iter_from_markdown_normalizes_crlf():
+    """CRLF input to iter_from_markdown must not leave \\r in content."""
+    blocks = Codeblock.iter_from_markdown("```python\r\nprint(1)\r\n```")
+    assert blocks == [Codeblock("python", "print(1)")]
+
+
+def test_from_markdown_normalizes_standalone_cr():
+    """Standalone \\r (old-Mac) line endings must also be normalized."""
+    cr = Codeblock.from_markdown("```python\rprint(1)\r```")
+    lf = Codeblock.from_markdown("```python\nprint(1)\n```")
+    assert cr.content == lf.content
+    assert "\r" not in cr.content
+
+
+def test_iter_from_markdown_normalizes_standalone_cr():
+    """Standalone \\r (old-Mac) line endings must also be normalized."""
+    blocks = Codeblock.iter_from_markdown("```python\rprint(1)\r```")
+    assert blocks == [Codeblock("python", "print(1)")]
+
+
+def test_from_markdown_leading_whitespace_after_fence():
+    """Leading whitespace between the opening fence and the lang must not leak
+    lang characters into the content.
+
+    Regression test: the body was sliced on ``len(lang)`` (the *stripped* lang),
+    which ignored any whitespace between the fence and the lang. For an opening
+    like ```` ``` python ```` the slice was one short, so the tail of the lang
+    word leaked into the content — e.g. content became ``"n\\nprint(1)"``.
+    """
+    # single space between fence and lang
+    cb = Codeblock.from_markdown("``` python\nprint(1)\n```")
+    assert cb.lang == "python"
+    assert cb.content == "print(1)\n"
+
+    # multiple spaces between fence and lang
+    cb = Codeblock.from_markdown("```  python\nprint(1)\n```")
+    assert cb.lang == "python"
+    assert cb.content == "print(1)\n"
+
+    # trailing space on the lang line is consumed, not leaked into content
+    cb = Codeblock.from_markdown("``` python \nprint(1)\n```")
+    assert cb.lang == "python"
+    assert cb.content == "print(1)\n"
+
+    # path-like lang with leading whitespace (common in save blocks)
+    cb = Codeblock.from_markdown("``` save path/to/file.py\nprint(1)\n```")
+    assert cb.lang == "save path/to/file.py"
+    assert cb.content == "print(1)\n"

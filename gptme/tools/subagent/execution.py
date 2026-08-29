@@ -22,6 +22,7 @@ from typing import TYPE_CHECKING, Literal
 
 from ...llm.retry_abort import bind_thread_generation, release_thread
 from ...message import Message
+from ...prompt_queue import drain_steer_prompts
 from .. import clear_tools, get_tools, load_tool, set_tools
 from .._allowlist import (
     is_hint_pattern,
@@ -165,6 +166,7 @@ def _create_subagent_thread(
     redact_secrets: bool = True,
     context_window: int | None = None,
     parent_messages: list[Message] | None = None,
+    prompt_queue_closed: threading.Event | None = None,
 ) -> None:
     """Shared function for running subagent threads.
 
@@ -184,6 +186,9 @@ def _create_subagent_thread(
         parent_messages: Recent messages from the parent's conversation to inject as context.
             Formatted as a system message so the subagent understands what the parent has
             been doing without confusing the subagent's own conversation flow.
+        prompt_queue_closed: Optional event to set immediately when chat() returns.
+            Passed by run_subagent() so the event fires before the caller acquires
+            _subagents_lock to find sa — closing the lock+lookup window.
     """
     # Store agent_id in thread-local so the progress tool can identify this subagent
     if agent_id is not None:
@@ -316,8 +321,13 @@ def _create_subagent_thread(
                 "only agent identity and tools will be included",
                 context_include,
             )
-        initial_msgs = list(prompt_gptme(False, None, agent_name=None)) + list(
-            prompt_tools(tools=available_tools, tool_format="markdown")
+        include_examples = not bool(os.environ.get("GPTME_NO_EXAMPLES"))
+        initial_msgs = list(
+            prompt_gptme(False, None, agent_name=None, tools=available_tools)
+        ) + list(
+            prompt_tools(
+                tools=available_tools, tool_format="markdown", examples=include_examples
+            )
         )
     elif context_mode == "selective":
         # Selective context — build from specified components.
@@ -325,6 +335,7 @@ def _create_subagent_thread(
         # controls the context set explicitly via context_include instead.
         from ...prompts import prompt_gptme, prompt_tools
 
+        include_examples = not bool(os.environ.get("GPTME_NO_EXAMPLES"))
         initial_msgs = []
 
         # Type narrowing: context_include validated as not None by caller
@@ -332,15 +343,27 @@ def _create_subagent_thread(
 
         # Add components based on context_include
         if "agent" in context_include:
-            initial_msgs.extend(list(prompt_gptme(False, None, agent_name=None)))
+            initial_msgs.extend(
+                list(prompt_gptme(False, None, agent_name=None, tools=available_tools))
+            )
         if "tools" in context_include:
             initial_msgs.extend(
-                list(prompt_tools(tools=available_tools, tool_format="markdown"))
+                list(
+                    prompt_tools(
+                        tools=available_tools,
+                        tool_format="markdown",
+                        examples=include_examples,
+                    )
+                )
             )
     else:  # "full" mode (default)
         # Full context (using profile-filtered tools)
+        include_examples = not bool(os.environ.get("GPTME_NO_EXAMPLES"))
         initial_msgs = get_prompt(
-            available_tools, interactive=False, workspace=workspace
+            available_tools,
+            interactive=False,
+            workspace=workspace,
+            include_examples=include_examples,
         )
         # Truncate workspace context if a positive window is specified.
         # Base messages (agent identity + tools) do NOT count against the
@@ -412,19 +435,42 @@ def _create_subagent_thread(
     # calling set_output_format() before the call) is required — chat() itself
     # calls set_output_format(output_format) at its start, which would otherwise
     # immediately override quiet mode back to the default "text".
-    chat(
-        prompt_msgs,
-        initial_msgs,
-        logdir=logdir,
-        workspace=workspace,
-        model=model,
-        stream=False,
-        no_confirm=True,
-        interactive=False,
-        show_hidden=False,
-        tool_format="markdown",
-        output_format="quiet",
-    )
+    try:
+        chat(
+            prompt_msgs,
+            initial_msgs,
+            logdir=logdir,
+            workspace=workspace,
+            model=model,
+            stream=False,
+            no_confirm=True,
+            interactive=False,
+            show_hidden=False,
+            tool_format="markdown",
+            output_format="quiet",
+        )
+    finally:
+        # Signal immediately when chat() returns — before any caller cleanup.
+        # This closes the window between "chat() last drain" and the caller
+        # acquiring _subagents_lock to find `sa`. Any concurrent subagent_steer()
+        # that slips between this set and chat()'s actual last drain is a
+        # sub-microsecond race that requires modifying chat() itself to close.
+        if prompt_queue_closed is not None:
+            prompt_queue_closed.set()
+        # Drain any steer messages that arrived after the last STEP_PRE fired but
+        # before chat() returned. These were not deliverable mid-turn; warn so
+        # the orchestrator knows the guidance was not seen.
+        try:
+            stranded = drain_steer_prompts(logdir)
+            if stranded:
+                logger.warning(
+                    "Subagent exited with %d stranded steer message(s) never "
+                    "delivered (arrived after final STEP_PRE checkpoint): %s",
+                    len(stranded),
+                    [m.content[:60] for m in stranded],
+                )
+        except Exception:
+            pass
 
 
 def _run_subagent_subprocess(

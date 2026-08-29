@@ -1,4 +1,8 @@
+import builtins
+import json
+from contextlib import contextmanager
 from pathlib import Path
+from unittest.mock import patch
 
 import pytest
 
@@ -9,7 +13,10 @@ from gptme.logmanager import (
     check_for_modifications,
     conversation_name_error,
 )
-from gptme.logmanager.manager import _merge_consecutive_messages
+from gptme.logmanager.manager import (
+    _active_prompt_generation,
+    _merge_consecutive_messages,
+)
 from gptme.message import Message
 from gptme.tools import init_tools
 
@@ -18,6 +25,127 @@ from gptme.tools import init_tools
 def _init_tools():
     """Ensure tools are loaded for check_for_modifications tests."""
     init_tools(allowlist=["save", "patch", "append"])
+
+
+def test_active_prompt_generation_preserves_conversation_history():
+    """A replacement retires generated prompts, never user/assistant history."""
+    old_prompt = Message("system", "old prompt", pinned=True, hide=True)
+    user = Message("user", "question")
+    assistant = Message("assistant", "answer")
+    runtime = Message("system", "tool output")
+    replacement = Message(
+        "system",
+        "new prompt",
+        pinned=True,
+        hide=True,
+        metadata={"prompt_generation": "one"},
+    )
+    user_after = Message("user", "next question")
+
+    result = _active_prompt_generation(
+        [old_prompt, user, assistant, runtime, replacement, user_after]
+    )
+
+    assert result == [replacement, user, assistant, runtime, user_after]
+
+
+def test_active_prompt_generation_preserves_later_pinned_system_messages():
+    runtime_prompt = Message(
+        "system",
+        "runtime instruction",
+        pinned=True,
+        hide=True,
+    )
+    replacement = Message(
+        "system",
+        "complete replacement",
+        pinned=True,
+        hide=True,
+        metadata={"prompt_generation": "replacement"},
+    )
+    user = Message("user", "history")
+
+    result = _active_prompt_generation(
+        [
+            Message("system", "old core", pinned=True),
+            user,
+            runtime_prompt,
+            replacement,
+        ]
+    )
+
+    assert result == [replacement, user, runtime_prompt]
+
+
+def test_active_prompt_generation_keeps_only_newest_replacement():
+    generation_one = Message(
+        "system",
+        "generation one",
+        pinned=True,
+        metadata={"prompt_generation": "z-first"},
+    )
+    generation_two = Message(
+        "system",
+        "generation two",
+        pinned=True,
+        metadata={"prompt_generation": "a-second"},
+    )
+    user = Message("user", "history")
+
+    result = _active_prompt_generation([generation_one, user, generation_two])
+
+    assert result == [generation_two, user]
+
+
+def test_load_snapshots_initial_message_files(tmp_path: Path):
+    """Startup attachments must not be re-rendered from mutable live files."""
+    from gptme.util.context import enrich_messages_with_context
+
+    bootstrap_file = tmp_path / "bootstrap.md"
+    bootstrap_file.write_text("original bootstrap")
+    manager = LogManager.load(
+        tmp_path / "conversation",
+        initial_msgs=[Message("system", "bootstrap", files=[bootstrap_file])],
+        create=True,
+        lock=False,
+    )
+
+    first = enrich_messages_with_context(manager.log.messages, tmp_path)
+    bootstrap_file.write_text("mutated bootstrap")
+    second = enrich_messages_with_context(manager.log.messages, tmp_path)
+
+    assert manager.log.messages[0].file_hashes[str(bootstrap_file)]
+    assert first[0].content == second[0].content
+    assert "original bootstrap" in second[0].content
+    assert "mutated bootstrap" not in second[0].content
+
+
+def test_constructor_snapshots_initial_message_files(tmp_path: Path):
+    """Direct constructors used by server tasks must snapshot startup files."""
+    bootstrap_file = tmp_path / "bootstrap.md"
+    bootstrap_file.write_text("original bootstrap")
+
+    manager = LogManager(
+        [Message("system", "bootstrap", files=[bootstrap_file])],
+        logdir=tmp_path / "conversation",
+        lock=False,
+    )
+
+    assert manager.log.messages[0].file_hashes[str(bootstrap_file)]
+
+
+def test_initial_message_directories_are_not_snapshotted(tmp_path: Path):
+    """Directory prompt matches are context references, not file snapshots."""
+    context_dir = tmp_path / "docs"
+    context_dir.mkdir()
+
+    manager = LogManager(
+        [Message("system", "context", files=[context_dir])],
+        logdir=tmp_path / "conversation",
+        lock=False,
+    )
+
+    assert manager.log.messages[0].file_hashes == {}
 
 
 def test_log_repr():
@@ -412,6 +540,19 @@ def test_merge_consecutive_still_merges_plain_same_role_messages():
     assert "part two" in result[0].content
 
 
+def test_merge_consecutive_preserves_prompt_cache_boundary():
+    """Provider preprocessing must not merge volatile context into the prefix."""
+    from gptme.prompts import SYSTEM_PROMPT_CACHE_BOUNDARY
+
+    msgs = [
+        Message(role="system", content="static"),
+        Message(role="system", content=SYSTEM_PROMPT_CACHE_BOUNDARY),
+        Message(role="system", content="dynamic"),
+    ]
+
+    assert _merge_consecutive_messages(msgs) == msgs
+
+
 def test_read_jsonl_unknown_field(tmp_path):
     """Unknown message fields (e.g. from a newer gptme version) should be
     dropped rather than crashing the whole read with a TypeError."""
@@ -426,3 +567,141 @@ def test_read_jsonl_unknown_field(tmp_path):
     assert len(log.messages) == 2
     assert log.messages[0].content == "hello"
     assert log.messages[1].content == "world"
+
+
+# ── JSONL conversation I/O must be explicit UTF-8 ─────────────────────
+#
+# conversation.jsonl is the durability substrate: read on every startup,
+# written on every turn, across machines and locales. gptme's own writers emit
+# pure ASCII today (json.dumps defaults to ensure_ascii=True), but a log edited
+# by hand, produced by an older/newer build, or written under any future
+# ensure_ascii=False change puts real non-ASCII UTF-8 bytes on disk. Reading or
+# writing those bytes without naming an encoding falls back to the platform's
+# *preferred* encoding -- a legacy codepage on a stock Windows install -- so a
+# conversation written on one machine can break on another. These tests pin the
+# explicit UTF-8 discipline established for config (#3399) and tools (#2051) to
+# the conversation-persistence layer, and mirror tests/test_config_encoding.py.
+
+
+@contextmanager
+def _legacy_default_encoding(codec: str):
+    """Make encoding-less ``open()`` calls behave as under a legacy locale.
+
+    Monkeypatching ``locale.getpreferredencoding`` does not work: CPython reads
+    the locale encoding at the C level, so ``open()`` ignores the patched
+    function. This shim instead supplies ``codec`` in exactly the position
+    CPython would supply the locale's -- only when the caller passed no
+    ``encoding`` -- so these tests fail on a machine of any locale when
+    ``encoding=`` is missing, and pass on a machine of any locale when present.
+    Mirrors the helper of the same name in tests/test_config_encoding.py.
+    """
+    real_open = builtins.open
+
+    def shim(file, mode="r", *args, **kwargs):
+        if "b" not in mode and kwargs.get("encoding") is None and len(args) < 2:
+            kwargs["encoding"] = codec
+        return real_open(file, mode, *args, **kwargs)
+
+    with patch.object(builtins, "open", shim):
+        yield
+
+
+@contextmanager
+def _record_open_calls():
+    """Record every ``builtins.open`` call's file/mode/encoding for spy tests."""
+    real_open = builtins.open
+    calls: list[dict] = []
+
+    def shim(file, mode="r", *args, **kwargs):
+        calls.append(
+            {"file": str(file), "mode": mode, "encoding": kwargs.get("encoding")}
+        )
+        return real_open(file, mode, *args, **kwargs)
+
+    with patch.object(builtins, "open", shim):
+        yield calls
+
+
+def test_read_jsonl_round_trips_non_ascii_with_explicit_encoding(tmp_path: Path):
+    """A conversation.jsonl line holding raw non-ASCII UTF-8 must round-trip.
+
+    Today ``Log.write_jsonl`` emits pure ASCII (``json.dumps`` defaults to
+    ``ensure_ascii=True``), but a log edited by hand, written by an older or
+    newer build, or produced by any future ``ensure_ascii=False`` change puts
+    real UTF-8 bytes on disk. Reading those bytes must not depend on the
+    platform's preferred encoding.
+
+    The fixture writes non-ASCII bytes with ``ensure_ascii=False`` (test-only,
+    to put real bytes on disk) and reads them back under a legacy single-byte
+    codec shimmed into the position CPython would otherwise fill with the locale
+    encoding -- so this fails on a machine of any locale if the ``encoding=`` is
+    removed from ``_gen_read_jsonl``.
+    """
+    non_ascii = "café — 中文 — 🎉"
+    jsonl_file = tmp_path / "conversation.jsonl"
+    line = json.dumps(
+        {
+            "role": "user",
+            "content": non_ascii,
+            "timestamp": "2025-01-01T00:00:00+00:00",
+        },
+        ensure_ascii=False,
+    )
+    jsonl_file.write_text(line + "\n", encoding="utf-8")
+    # Real multi-byte UTF-8 on disk, not "\uXXXX" ASCII escapes.
+    assert b"\xc3\xa9" in jsonl_file.read_bytes()
+
+    with _legacy_default_encoding("latin-1"):
+        log = Log.read_jsonl(jsonl_file)
+
+    assert log.messages[0].content == non_ascii
+
+
+def test_write_jsonl_uses_explicit_utf8_encoding(tmp_path: Path):
+    """``write_jsonl`` must open conversation.jsonl with ``encoding="utf-8"``.
+
+    A direct spy on ``builtins.open`` proves the encoding kwarg is passed
+    regardless of the machine's locale -- the locale-independent complement to
+    the round-trip test. ``write_jsonl`` makes exactly one ``open()`` call, so
+    that call is the one under test.
+    """
+    log = Log([Message("user", "hello")])
+    jsonl_file = tmp_path / "conversation.jsonl"
+
+    with _record_open_calls() as calls:
+        log.write_jsonl(jsonl_file)
+
+    assert len(calls) == 1, f"expected one open() call, got {calls}"
+    assert "w" in calls[0]["mode"]
+    assert calls[0]["encoding"] == "utf-8", (
+        f"write_jsonl must pass encoding='utf-8', got encoding={calls[0]['encoding']!r}"
+    )
+
+
+def test_read_jsonl_uses_explicit_utf8_encoding(tmp_path: Path):
+    """``read_jsonl`` must open conversation.jsonl with ``encoding="utf-8"``.
+
+    Symmetric to the write-side spy. ``_gen_read_jsonl`` makes exactly one
+    ``open()`` call (the ``Path.stat`` for the mtime fallback is not an open), so
+    that call is the one under test.
+    """
+    jsonl_file = tmp_path / "conversation.jsonl"
+    jsonl_file.write_text(
+        json.dumps(
+            {
+                "role": "user",
+                "content": "hello",
+                "timestamp": "2025-01-01T00:00:00+00:00",
+            }
+        )
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with _record_open_calls() as calls:
+        Log.read_jsonl(jsonl_file)
+
+    assert len(calls) == 1, f"expected one open() call, got {calls}"
+    assert calls[0]["encoding"] == "utf-8", (
+        f"read_jsonl must pass encoding='utf-8', got encoding={calls[0]['encoding']!r}"
+    )

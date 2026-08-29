@@ -6,6 +6,7 @@ These are unit-level tests using the Flask test client — they don't
 require API keys or LLM calls.
 """
 
+import threading
 import uuid
 from unittest.mock import MagicMock, patch
 
@@ -394,6 +395,59 @@ class TestStepEndpoint:
         finally:
             session.generating = False
 
+    def test_step_loads_config_and_reserves_under_conversation_lock(
+        self, conv, client: FlaskClient
+    ):
+        """Config snapshot and generation reservation share the mutation lock."""
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        lock = MagicMock()
+        lock.__enter__.side_effect = lambda: setattr(lock, "held", True)
+        lock.__exit__.side_effect = lambda *_: setattr(lock, "held", False)
+
+        with (
+            patch.object(SessionManager, "conversation_lock", return_value=lock),
+            patch.object(
+                session,
+                "step_lock",
+                MagicMock(
+                    __enter__=MagicMock(
+                        side_effect=lambda: setattr(
+                            lock, "step_entered_while_held", lock.held
+                        )
+                    )
+                ),
+            ),
+            patch("gptme.server.api_v2_sessions.get_default_model", return_value=None),
+            patch(
+                "gptme.server.api_v2_sessions.ChatConfig.load_or_create"
+            ) as mock_config,
+            patch(
+                "gptme.server.api_v2_sessions.Config.from_workspace"
+            ) as mock_ws_config,
+        ):
+            from gptme.config import ChatConfig
+
+            cfg = ChatConfig()
+            cfg.model = None
+
+            def load_config(*_args, **_kwargs):
+                lock.config_loaded_while_held = lock.held
+                return cfg
+
+            mock_config.side_effect = load_config
+            mock_ws_config.return_value = MagicMock(
+                get_env=MagicMock(return_value=None)
+            )
+            response = client.post(
+                f"/api/v2/conversations/{conv['conversation_id']}/step",
+                json={"session_id": conv["session_id"]},
+            )
+
+        assert response.status_code == 400
+        assert lock.config_loaded_while_held is True
+        assert lock.step_entered_while_held is True
+
 
 # --- Interrupt endpoint tests ---
 
@@ -519,6 +573,261 @@ class TestInterruptEndpoint:
         assert response.status_code == 200
         assert session.generating is False
         assert len(session.pending_tools) == 0
+
+    def test_interrupt_marks_epoch_revoked(self, conv, client: FlaskClient):
+        """Interrupt revokes workers queued under the current generation epoch."""
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        session.generating = True
+        initial_seq = session.step_seq
+
+        response = client.post(
+            f"/api/v2/conversations/{conv['conversation_id']}/interrupt",
+            json={"session_id": conv["session_id"]},
+        )
+
+        assert response.status_code == 200
+        assert session.interrupted is True
+        assert session.step_seq == initial_seq + 1
+
+    def test_failed_step_preserves_generation_epoch(
+        self, conv, client: FlaskClient, monkeypatch
+    ):
+        """A setup error does not revoke an existing tool worker's epoch."""
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        session.step_seq = 7
+        session.interrupted = True
+        monkeypatch.setattr(
+            "gptme.server.api_v2_sessions.get_default_model", lambda: None
+        )
+        monkeypatch.setattr(
+            "gptme.server.api_v2_sessions.Config.from_workspace",
+            lambda **_kwargs: MagicMock(get_env=MagicMock(return_value=None)),
+        )
+
+        response = client.post(
+            f"/api/v2/conversations/{conv['conversation_id']}/step",
+            json={"session_id": conv["session_id"]},
+        )
+
+        assert response.status_code == 400
+        assert session.step_seq == 7
+        assert session.interrupted is True
+        assert session.generating is False
+
+    def test_interrupt_idle_session_does_not_poison_next_chain(
+        self, conv, client: FlaskClient
+    ):
+        """An idempotent interrupt must not leave stale interrupt state."""
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        initial_seq = session.step_seq
+
+        response = client.post(
+            f"/api/v2/conversations/{conv['conversation_id']}/interrupt",
+            json={"session_id": conv["session_id"]},
+        )
+
+        assert response.status_code == 200
+        assert "already interrupted" in response.get_json()["message"].lower()
+        assert session.interrupted is False
+        assert session.step_seq == initial_seq
+
+    def test_continuation_reservation_not_cleared_by_originating_step(
+        self, conv, tmp_path, monkeypatch
+    ):
+        """Race 5: step() finally must not clear generating when a continuation reserved it.
+
+        The tool worker increments step_seq (inside step_lock) before setting
+        generating=True for the continuation. The originating step()'s finally
+        captures step_seq at entry; a mismatch means the continuation took over
+        and we must not clear its reservation.
+        """
+        # step() calls os.chdir(workspace) when user_messages <= 1; use monkeypatch so
+        # the cwd change is scoped to this test and doesn't bleed into siblings.
+        monkeypatch.chdir(tmp_path)
+
+        from gptme.message import Message
+        from gptme.server.session_step import step
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+
+        # step_seq=1 is the value set by the /step API handler before step() runs.
+        # step() will snapshot my_step_seq=1 at entry.
+        session.step_seq = 1
+        session.generating = True
+
+        def advance_seq_then_return(*args, **kwargs):
+            """Simulate: tool continuation advanced step_seq to 2 inside step_lock."""
+            with session.step_lock:
+                session.step_seq += 1  # 1 → 2
+            return iter([])  # no tokens; step() finds no tools, exits normally
+
+        with (
+            patch(
+                "gptme.server.session_step._stream", side_effect=advance_seq_then_return
+            ),
+            patch("gptme.server.session_step.require_workspace_exists"),
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch("gptme.server.session_step.trigger_hook", return_value=[]),
+            patch(
+                "gptme.server.session_step.prepare_messages",
+                return_value=[Message("user", "test")],
+            ),
+            patch("gptme.server.session_step._try_auto_name_and_notify"),
+            patch("gptme.server.session_step.set_workspace_cwd"),
+            patch(
+                "gptme.server.session_step.ChatConfig.load_or_create",
+                return_value=MagicMock(
+                    tool_format="markdown",
+                    tools=None,
+                    workspace=tmp_path,
+                    max_tokens=None,
+                    temperature=None,
+                    top_p=None,
+                ),
+            ),
+            patch("gptme.llm.models.set_default_model"),
+            patch("gptme.model_attestation.record_runtime_selection"),
+        ):
+            step(
+                conversation_id=conv["conversation_id"],
+                session=session,
+                model="mock/model",
+                workspace=tmp_path,
+            )
+
+        # step() captured my_step_seq=1 at entry; advance_seq_then_return bumped to 2.
+        # The finally block must have seen 2 != 1 and skipped clearing generating.
+        assert session.generating is True, (
+            "Race 5: originating step() finally must not clear the "
+            "continuation's generating reservation when step_seq advanced"
+        )
+        assert session.step_seq == 2
+
+    def test_step_seq_passed_by_caller_not_sampled_in_thread(
+        self, conv, tmp_path, monkeypatch
+    ):
+        """step() must use the caller-supplied step_seq, not sample session.step_seq.
+
+        Race: a thread delayed between spawn and step_seq snapshot can see the epoch
+        of a replacement step (if interrupt + /step ran while it was descheduled).
+        The fix passes the epoch from the caller (captured under step_lock before
+        dispatch) so the finally compare-and-clear uses the original epoch, not
+        the replacement's.
+
+        Scenario:
+        - Route handler increments step_seq to 1 and spawns step() with step_seq=1.
+        - Thread is delayed; interrupt fires (step_seq → 2), new /step starts (→ 3).
+        - Thread finally runs step() with the passed step_seq=1.
+        - session.step_seq is now 3; step() must NOT clear generating (3 != 1).
+        """
+        monkeypatch.chdir(tmp_path)
+
+        from gptme.message import Message
+        from gptme.server.session_step import step
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+
+        # Simulate the state AFTER interrupt+replacement: step_seq advanced to 3,
+        # generating=True is held by the replacement step.
+        session.step_seq = 3
+        session.generating = True
+
+        with (
+            patch("gptme.server.session_step._stream", return_value=iter([])),
+            patch("gptme.server.session_step.require_workspace_exists"),
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch("gptme.server.session_step.trigger_hook", return_value=[]),
+            patch(
+                "gptme.server.session_step.prepare_messages",
+                return_value=[Message("user", "test")],
+            ),
+            patch("gptme.server.session_step._try_auto_name_and_notify"),
+            patch("gptme.server.session_step.set_workspace_cwd"),
+            patch(
+                "gptme.server.session_step.ChatConfig.load_or_create",
+                return_value=MagicMock(
+                    tool_format="markdown",
+                    tools=None,
+                    workspace=tmp_path,
+                    max_tokens=None,
+                    temperature=None,
+                    top_p=None,
+                ),
+            ),
+            patch("gptme.llm.models.set_default_model"),
+            patch("gptme.model_attestation.record_runtime_selection"),
+        ):
+            # Pass step_seq=1: the original epoch captured under step_lock by the
+            # route handler. The thread sees session.step_seq=3 (replacement), but
+            # must use 1 as my_step_seq for the finally compare-and-clear.
+            step(
+                conversation_id=conv["conversation_id"],
+                session=session,
+                model="mock/model",
+                workspace=tmp_path,
+                step_seq=1,
+            )
+
+        # finally: session.step_seq (3) != my_step_seq (1) → must NOT clear generating.
+        # Without the fix (step() sampled session.step_seq=3 inside the thread),
+        # my_step_seq would have been 3 and generating would be False here.
+        assert session.generating is True, (
+            "Delayed-thread race: step() finally must not clear the replacement "
+            "step's generating reservation when step_seq passed from caller != current"
+        )
+        assert session.step_seq == 3
+
+    def test_setup_exit_does_not_clear_newer_reservation(
+        self, conv, tmp_path, monkeypatch
+    ):
+        """Early-exit paths (workspace missing, no messages) must not clear a newer step's reservation.
+
+        Race: step A is spawned (step_seq=1), descheduled during setup,
+        step B interrupts + starts (step_seq=3, generating=True). When step A's
+        thread wakes up and hits an early exit (e.g. workspace missing), it must
+        compare step_seq before clearing generating, so it does not erase B's
+        reservation.
+        """
+        monkeypatch.chdir(tmp_path)
+
+        from gptme.server.session_step import step
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+
+        # Simulate: replacement step B has taken over (step_seq=3, generating=True).
+        session.step_seq = 3
+        session.generating = True
+
+        with (
+            patch(
+                "gptme.server.session_step.require_workspace_exists",
+                side_effect=FileNotFoundError("workspace missing"),
+            ),
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch("gptme.server.session_step._persist_generation_error"),
+            patch("gptme.server.session_step.SessionManager.add_event"),
+        ):
+            # Old step A calls step() with its original epoch (1).
+            step(
+                conversation_id=conv["conversation_id"],
+                session=session,
+                model="mock/model",
+                workspace=tmp_path,
+                step_seq=1,
+            )
+
+        # step_seq (3) != my_step_seq (1) → early exit must NOT have cleared generating.
+        assert session.generating is True, (
+            "Setup exit: step() workspace-missing early exit must not clear "
+            "a newer step's generating reservation when step_seq advanced"
+        )
+        assert session.step_seq == 3
 
 
 # --- Tool confirm endpoint tests ---
@@ -697,8 +1006,10 @@ class TestToolConfirmEndpoint:
         finally:
             session.pending_tools.pop(tool_id, None)
 
-    def test_skip_action(self, conv, client: FlaskClient):
-        """Skip action removes pending tool and appends system message."""
+    def test_skip_loads_config_after_reserving_continuation(
+        self, conv, client: FlaskClient
+    ):
+        """Skip captures model/workspace while holding the mutation lock."""
         session = SessionManager.get_session(conv["session_id"])
         assert session is not None
         tool_id = str(uuid.uuid4())
@@ -706,10 +1017,58 @@ class TestToolConfirmEndpoint:
             tool_id=tool_id,
             tooluse=ToolUse("bash", [], "rm -rf /"),
         )
+        lock = MagicMock()
+        lock.__enter__.side_effect = lambda: setattr(lock, "held", True)
+        lock.__exit__.side_effect = lambda *_: setattr(lock, "held", False)
+        from gptme.config import ChatConfig
+
+        cfg = ChatConfig(model="fresh/model")
+
+        def load_config(*_args, **_kwargs):
+            lock.config_loaded_while_held = lock.held
+            return cfg
+
+        with (
+            patch.object(SessionManager, "conversation_lock", return_value=lock),
+            patch(
+                "gptme.server.api_v2_sessions.ChatConfig.load_or_create",
+                side_effect=load_config,
+            ),
+            patch(
+                "gptme.server.api_v2_sessions._start_step_thread", return_value=True
+            ) as start_step,
+            patch("gptme.server.api_v2_sessions._append_and_notify"),
+        ):
+            response = client.post(
+                f"/api/v2/conversations/{conv['conversation_id']}/tool/confirm",
+                json={
+                    "session_id": conv["session_id"],
+                    "tool_id": tool_id,
+                    "action": "skip",
+                },
+            )
+        assert response.status_code == 200
+        assert lock.config_loaded_while_held is True
+        assert start_step.call_args.args[2] == "fresh/model"
+        assert start_step.call_args.args[3] == cfg.workspace
+
+    def test_skip_action(self, conv, client: FlaskClient):
+        """Skip consumes the tool only after reserving its continuation."""
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        tool_id = str(uuid.uuid4())
+        tool_exec = ToolExecution(
+            tool_id=tool_id,
+            tooluse=ToolUse("bash", [], "rm -rf /"),
+        )
+        session.pending_tools[tool_id] = tool_exec
 
         with (
             patch("gptme.server.api_v2_sessions._append_and_notify"),
-            patch("gptme.server.api_v2_sessions._start_step_thread"),
+            patch(
+                "gptme.server.api_v2_sessions._start_step_thread", return_value=True
+            ) as start_step,
+            patch("gptme.server.api_v2_sessions.resolve_hook_confirmation") as resolve,
         ):
             response = client.post(
                 f"/api/v2/conversations/{conv['conversation_id']}/tool/confirm",
@@ -722,6 +1081,125 @@ class TestToolConfirmEndpoint:
 
         assert response.status_code == 200
         assert tool_id not in session.pending_tools
+        assert tool_exec.status.value == "skipped"
+        resolve.assert_called_once_with(tool_id, "skip", None)
+        assert start_step.call_count == 1
+        assert start_step.call_args.args[:2] == (conv["conversation_id"], session)
+        assert start_step.call_args.kwargs == {
+            "branch": "main",
+            "reserved": True,
+            "step_seq": session.step_seq,
+        }
+
+    def test_skip_increments_step_seq_to_invalidate_stale_workers(
+        self, conv, client: FlaskClient
+    ):
+        """Skip must advance step_seq so concurrent tool workers stand down.
+
+        A concurrent auto-confirm tool worker captures my_seq at start_tool_execution
+        time. If skip does NOT increment step_seq, the worker's owns_reservation check
+        (session.step_seq == my_seq) still holds after skip fires, and the worker elects
+        its own continuation — producing duplicate LLM turns alongside the skip
+        continuation.
+        """
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        initial_step_seq = session.step_seq
+        tool_id = str(uuid.uuid4())
+        tool_exec = ToolExecution(
+            tool_id=tool_id,
+            tooluse=ToolUse("bash", [], "echo hi"),
+        )
+        session.pending_tools[tool_id] = tool_exec
+
+        with (
+            patch("gptme.server.api_v2_sessions._append_and_notify"),
+            patch("gptme.server.api_v2_sessions._start_step_thread", return_value=True),
+            patch("gptme.server.api_v2_sessions.resolve_hook_confirmation"),
+        ):
+            response = client.post(
+                f"/api/v2/conversations/{conv['conversation_id']}/tool/confirm",
+                json={
+                    "session_id": conv["session_id"],
+                    "tool_id": tool_id,
+                    "action": "skip",
+                },
+            )
+
+        assert response.status_code == 200
+        # step_seq must have advanced so any stale tool worker with the old
+        # my_seq sees a mismatch and releases its reservation instead of
+        # electing a duplicate continuation.
+        assert session.step_seq == initial_step_seq + 1, (
+            "skip must increment step_seq to invalidate stale concurrent workers"
+        )
+
+    def test_skip_preserves_tool_when_step_reserved_generation(
+        self, conv, client: FlaskClient
+    ):
+        """A rejected skip remains retryable while another generation runs."""
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        tool_id = str(uuid.uuid4())
+        tool_exec = ToolExecution(
+            tool_id=tool_id,
+            tooluse=ToolUse("bash", [], "rm -rf /"),
+        )
+        session.pending_tools[tool_id] = tool_exec
+        session.generating = True
+
+        with (
+            patch("gptme.server.api_v2_sessions._append_and_notify") as append,
+            patch("gptme.server.api_v2_sessions._start_step_thread") as start_step,
+            patch("gptme.server.api_v2_sessions.resolve_hook_confirmation") as resolve,
+        ):
+            response = client.post(
+                f"/api/v2/conversations/{conv['conversation_id']}/tool/confirm",
+                json={
+                    "session_id": conv["session_id"],
+                    "tool_id": tool_id,
+                    "action": "skip",
+                },
+            )
+
+        assert response.status_code == 409
+        assert session.pending_tools[tool_id] is tool_exec
+        assert tool_exec.status.value == "pending"
+        append.assert_not_called()
+        start_step.assert_not_called()
+        resolve.assert_not_called()
+
+    def test_skip_releases_reservation_when_dispatch_fails(
+        self, conv, client: FlaskClient
+    ):
+        """A failed continuation dispatch must not strand generating=True."""
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        tool_id = str(uuid.uuid4())
+        session.pending_tools[tool_id] = ToolExecution(
+            tool_id=tool_id,
+            tooluse=ToolUse("bash", [], "rm -rf /"),
+        )
+
+        with (
+            patch("gptme.server.api_v2_sessions._append_and_notify"),
+            patch(
+                "gptme.server.api_v2_sessions._start_step_thread",
+                side_effect=RuntimeError("thread start failed"),
+            ),
+        ):
+            response = client.post(
+                f"/api/v2/conversations/{conv['conversation_id']}/tool/confirm",
+                json={
+                    "session_id": conv["session_id"],
+                    "tool_id": tool_id,
+                    "action": "skip",
+                },
+            )
+
+        assert response.status_code == 500
+        assert session.generating is False
+        assert session.generating_since is None
 
     def test_edit_requires_content(self, conv, client: FlaskClient):
         """Edit action without content returns 400."""
@@ -816,6 +1294,428 @@ class TestToolConfirmEndpoint:
             assert response.status_code == 200
         finally:
             session.pending_tools.pop(tool_id, None)
+
+
+# --- Concurrent tool confirmation tests (issue #3479) ---
+
+
+class TestConcurrentToolConfirmation:
+    """Regression tests for #3479: concurrent non-auto-confirm tool confirmation
+    must not trigger the continuation step before all tool threads finish writing."""
+
+    def test_executing_tools_field_exists(self, conv, client: FlaskClient):
+        """ConversationSession has _executing_tools set, initially empty."""
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        assert hasattr(session, "_executing_tools")
+        assert len(session._executing_tools) == 0
+
+    def test_no_premature_step_with_concurrent_confirmations(
+        self, conv, client: FlaskClient
+    ):
+        """Fast tool must not trigger continuation while slow tool is still writing.
+
+        Simulates issue #3479: two non-auto-confirm tools confirmed simultaneously.
+        The fast tool finishes first; without the _executing_tools guard it would
+        see pending_tools empty and fire _start_step_thread prematurely, before the
+        slow tool has written its output.
+        """
+        from gptme.config import ChatConfig
+        from gptme.server.session_step import start_tool_execution
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+
+        tool1_id = str(uuid.uuid4())
+        tool2_id = str(uuid.uuid4())
+
+        # slow_can_proceed gates tool2's write — held until we release it
+        slow_can_proceed = threading.Event()
+
+        step_calls: list[dict] = []
+
+        def mock_start_step(conv_id, sess, *args, **kwargs):
+            # Record whether slow tool is still in _executing_tools
+            step_calls.append(
+                {
+                    "tool2_still_executing": tool2_id in sess._executing_tools,
+                }
+            )
+            return True
+
+        def make_execute(delay_event: threading.Event | None):
+            """Return a tooluse.execute side-effect that optionally waits."""
+
+            def execute(log, workspace, on_result_message=None):
+                if delay_event is not None:
+                    delay_event.wait(timeout=5)
+                return []
+
+            return execute
+
+        # Register two tools: tool1 (fast), tool2 (slow — waits for slow_can_proceed)
+        tool1_exec = ToolExecution(
+            tool_id=tool1_id,
+            tooluse=ToolUse("bash", [], "echo fast"),
+            auto_confirm=False,
+        )
+        tool2_exec = ToolExecution(
+            tool_id=tool2_id,
+            tooluse=ToolUse("bash", [], "echo slow"),
+            auto_confirm=False,
+        )
+        session.pending_tools[tool1_id] = tool1_exec
+        session.pending_tools[tool2_id] = tool2_exec
+
+        tool1_exec.tooluse = MagicMock(
+            tool="bash",
+            args=[],
+            content="echo fast",
+            call_id=tool1_id,
+        )
+        tool1_exec.tooluse.execute = make_execute(None)
+
+        tool2_exec.tooluse = MagicMock(
+            tool="bash",
+            args=[],
+            content="echo slow",
+            call_id=tool2_id,
+        )
+        tool2_exec.tooluse.execute = make_execute(slow_can_proceed)
+
+        chat_config = ChatConfig(model="mock/model")
+
+        with (
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch(
+                "gptme.server.session_step.LogManager.load",
+                return_value=MagicMock(
+                    log=MagicMock(messages=[]),
+                    workspace=MagicMock(),
+                ),
+            ),
+            patch("gptme.server.session_step._append_and_notify"),
+            patch("gptme.server.session_step._attach_tool_timings"),
+            patch(
+                "gptme.server.session_step._start_step_thread",
+                side_effect=mock_start_step,
+            ),
+        ):
+            # Confirm both tools concurrently (same as the UI "confirm all" action)
+            t1 = start_tool_execution(
+                conv["conversation_id"],
+                session,
+                tool1_id,
+                None,
+                "mock/model",
+                chat_config,
+                branch="main",
+            )
+            t2 = start_tool_execution(
+                conv["conversation_id"],
+                session,
+                tool2_id,
+                None,
+                "mock/model",
+                chat_config,
+                branch="main",
+            )
+
+            # Let tool1 finish immediately (it doesn't wait)
+            # Give it time to run and see if it tries to start the step
+            t1.join(timeout=2)
+
+            # Verify tool1 did NOT trigger the step (tool2 is still "executing")
+            assert step_calls == [], (
+                "Fast tool triggered step continuation before slow tool finished writing"
+            )
+
+            # Now let tool2 proceed to write its result
+            slow_can_proceed.set()
+            t2.join(timeout=5)
+
+        # After both threads finish, exactly one step trigger should have fired
+        assert len(step_calls) == 1, (
+            f"Expected exactly 1 step trigger, got {len(step_calls)}"
+        )
+        # And at that point, tool2 must have already been removed from _executing_tools
+        assert not step_calls[0]["tool2_still_executing"], (
+            "Step was triggered while tool2 was still in _executing_tools"
+        )
+        # Both sets are clean
+        assert len(session._executing_tools) == 0
+        assert len(session.pending_tools) == 0
+
+    def test_interrupt_suppresses_tool_continuation(self, conv, client: FlaskClient):
+        """A tool already executing when interrupted must not continue the loop."""
+        from gptme.config import ChatConfig
+        from gptme.server.session_step import start_tool_execution
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        tool_id = str(uuid.uuid4())
+        started = threading.Event()
+        finish = threading.Event()
+
+        def execute(*args, **kwargs):
+            started.set()
+            finish.wait(timeout=5)
+            return []
+
+        tooluse = MagicMock(tool="bash", args=[], content="echo slow", call_id=tool_id)
+        tooluse.execute = execute
+        tool_exec = ToolExecution(
+            tool_id=tool_id,
+            tooluse=tooluse,
+            auto_confirm=True,
+        )
+        session.pending_tools[tool_id] = tool_exec
+        session.generating = True
+        session.step_seq = 1
+
+        with (
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch(
+                "gptme.server.session_step.LogManager.load",
+                return_value=MagicMock(
+                    log=MagicMock(messages=[]), workspace=MagicMock()
+                ),
+            ),
+            patch("gptme.server.session_step._append_and_notify"),
+            patch("gptme.server.session_step._attach_tool_timings"),
+            patch("gptme.server.session_step._start_step_thread") as start_step,
+        ):
+            thread = start_tool_execution(
+                conv["conversation_id"],
+                session,
+                tool_id,
+                None,
+                "mock/model",
+                ChatConfig(model="mock/model"),
+                reserved=True,
+            )
+            assert started.wait(timeout=2)
+
+            response = client.post(
+                f"/api/v2/conversations/{conv['conversation_id']}/interrupt",
+                json={"session_id": conv["session_id"]},
+            )
+            assert response.status_code == 200
+            finish.set()
+            thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        start_step.assert_not_called()
+        assert session.generating is False
+
+    def test_stale_worker_does_not_clear_new_step_reservation(
+        self, conv, client: FlaskClient
+    ):
+        """A stale worker cannot release generating owned by a newer epoch."""
+        from gptme.config import ChatConfig
+        from gptme.server.session_step import start_tool_execution
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        session.generating = True
+        session.step_seq = 4
+
+        with (
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch("gptme.server.session_step._start_step_thread"),
+        ):
+            # No pending tool forces the worker's reservation-release path.
+            thread = start_tool_execution(
+                conv["conversation_id"],
+                session,
+                "already-removed",
+                None,
+                "mock/model",
+                ChatConfig(model="mock/model"),
+                reserved=True,
+            )
+            # Simulate a newer /step taking ownership before this worker runs.
+            with session.step_lock:
+                session.step_seq += 1
+                session.generating = True
+            thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert session.generating is True
+
+    def test_reserved_tool_dispatch_failure_releases_generation(
+        self, conv, client: FlaskClient
+    ):
+        """A thread-start failure cannot strand a reserved rerun slot."""
+        from gptme.config import ChatConfig
+        from gptme.server.session_step import start_tool_execution
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+        session.generating = True
+        session.step_seq = 3
+
+        with (
+            patch(
+                "gptme.server.session_step.threading.Thread",
+                side_effect=RuntimeError("thread start failed"),
+            ),
+            pytest.raises(RuntimeError, match="thread start failed"),
+        ):
+            start_tool_execution(
+                conv["conversation_id"],
+                session,
+                "tool",
+                None,
+                "mock/model",
+                ChatConfig(model="mock/model"),
+                reserved=True,
+            )
+
+        assert session.generating is False
+        assert session.generating_since is None
+
+    def test_completion_bookkeeping_finishes_before_continuation(
+        self, conv, client: FlaskClient
+    ):
+        """The final execution claim covers completion events and timing writes."""
+        from gptme.config import ChatConfig
+        from gptme.server.session_step import start_tool_execution
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+
+        tool_id = str(uuid.uuid4())
+        tool_exec = ToolExecution(
+            tool_id=tool_id,
+            tooluse=ToolUse("bash", [], "echo done"),
+            auto_confirm=False,
+        )
+        tool_exec.tooluse = MagicMock(
+            tool="bash", args=[], content="echo done", call_id=tool_id
+        )
+        tool_exec.tooluse.execute = lambda *args, **kwargs: []
+        session.pending_tools[tool_id] = tool_exec
+
+        timing_entered = threading.Event()
+        allow_timing = threading.Event()
+        step_calls: list[bool] = []
+
+        def blocking_attach_timings(*args, **kwargs):
+            timing_entered.set()
+            assert tool_id in session._executing_tools
+            allow_timing.wait(timeout=5)
+
+        chat_config = ChatConfig(model="mock/model")
+        with (
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch(
+                "gptme.server.session_step.LogManager.load",
+                return_value=MagicMock(
+                    log=MagicMock(messages=[]), workspace=MagicMock()
+                ),
+            ),
+            patch("gptme.server.session_step._append_and_notify"),
+            patch(
+                "gptme.server.session_step._attach_tool_timings",
+                side_effect=blocking_attach_timings,
+            ),
+            patch(
+                "gptme.server.session_step._start_step_thread",
+                side_effect=lambda *args, **kwargs: step_calls.append(True),
+            ),
+        ):
+            thread = start_tool_execution(
+                conv["conversation_id"],
+                session,
+                tool_id,
+                None,
+                "mock/model",
+                chat_config,
+                branch="main",
+            )
+            assert timing_entered.wait(timeout=5)
+            assert step_calls == []
+            assert tool_id in session._executing_tools
+            allow_timing.set()
+            thread.join(timeout=5)
+
+        assert not thread.is_alive()
+        assert step_calls == [True]
+        assert session._executing_tools == set()
+
+    def test_claim_released_when_setup_raises_before_execution(
+        self, conv, client: FlaskClient
+    ):
+        """A failure between claiming the tool and entering the execute block
+        must still release the claim.
+
+        The claim is added under conversation_lock, but the try/finally that
+        releases it starts further down. If anything in between raises — most
+        plausibly add_event, which iterates sessions and trims their event
+        buffers — the tool id would be stranded in _executing_tools forever.
+        Nothing else ever clears that set and the continuation gate requires it
+        to be empty, so every later tool in this session would silently stop
+        producing an assistant reply.
+        """
+        from gptme.config import ChatConfig
+        from gptme.server.session_step import start_tool_execution
+
+        session = SessionManager.get_session(conv["session_id"])
+        assert session is not None
+
+        tool_id = str(uuid.uuid4())
+        tool_exec = ToolExecution(
+            tool_id=tool_id,
+            tooluse=ToolUse("bash", [], "echo hi"),
+            auto_confirm=False,
+        )
+        session.pending_tools[tool_id] = tool_exec
+        tool_exec.tooluse = MagicMock(
+            tool="bash", args=[], content="echo hi", call_id=tool_id
+        )
+        tool_exec.tooluse.execute = lambda *a, **kw: []
+
+        real_add_event = SessionManager.add_event
+
+        def failing_add_event(conversation_id, event):
+            # Fail exactly on the setup-phase event, after the claim is taken
+            # but before the execute try/finally is entered.
+            if event.get("type") == "tool_executing":
+                raise RuntimeError("event bus exploded")
+            return real_add_event(conversation_id, event)
+
+        chat_config = ChatConfig(model="mock/model")
+
+        with (
+            patch("gptme.server.session_step.prepare_execution_environment"),
+            patch(
+                "gptme.server.session_step.LogManager.load",
+                return_value=MagicMock(
+                    log=MagicMock(messages=[]), workspace=MagicMock()
+                ),
+            ),
+            patch("gptme.server.session_step._append_and_notify"),
+            patch("gptme.server.session_step._attach_tool_timings"),
+            patch("gptme.server.session_step._start_step_thread"),
+            patch.object(SessionManager, "add_event", staticmethod(failing_add_event)),
+        ):
+            thread = start_tool_execution(
+                conv["conversation_id"],
+                session,
+                tool_id,
+                None,
+                "mock/model",
+                chat_config,
+                branch="main",
+            )
+            thread.join(timeout=5)
+
+        assert tool_id not in session._executing_tools, (
+            "Tool claim was stranded in _executing_tools after a setup failure — "
+            "the session can never start another continuation step"
+        )
+        assert len(session._executing_tools) == 0
 
 
 # --- Rerun endpoint tests ---
@@ -960,6 +1860,14 @@ class TestRerunEndpoint:
             assert "re-running" in data["message"].lower()
             assert "tool_ids" in data
             assert len(data["tool_ids"]) > initial_pending
+
+            # Regression: rerun-created ToolExecutions must carry the
+            # originating assistant message's timestamp so timing gets
+            # attached to the correct step, not misattributed to whatever
+            # assistant message happens to be last when the tool finishes.
+            for tool_id in data["tool_ids"]:
+                tool_exec = session.pending_tools[tool_id]
+                assert tool_exec.assistant_msg_timestamp is not None
         finally:
             session.pending_tools.clear()
 

@@ -16,6 +16,107 @@ from .git_cmd import GIT_CMD
 
 logger = logging.getLogger(__name__)
 
+# ---------------------------------------------------------------------------
+# Low-level shared helpers (used by review-watch and other gh-backed tools)
+# ---------------------------------------------------------------------------
+
+#: author_association values that indicate the commenter has write access.
+#: Used to gate autonomous sessions against prompt injection from untrusted users.
+TRUSTED_ASSOCIATIONS: frozenset[str] = frozenset({"OWNER", "MEMBER", "COLLABORATOR"})
+
+
+def run_gh_json(
+    args: list[str],
+    *,
+    timeout: float = 30,
+) -> dict | list | None:
+    """Run a ``gh`` command and parse its JSON output.
+
+    Returns ``None`` on error so callers can handle gracefully.
+    This is a shared primitive used by review-watch and other GitHub-backed
+    tools to avoid duplicating subprocess/JSON boilerplate.
+    """
+    try:
+        result = subprocess.run(
+            args,
+            capture_output=True,
+            text=True,
+            check=False,
+            timeout=timeout,
+        )
+    except (subprocess.TimeoutExpired, OSError) as exc:
+        logger.debug("gh command failed: %s", exc)
+        return None
+
+    if result.returncode != 0:
+        logger.debug("gh exited %d: %s", result.returncode, result.stderr.strip())
+        return None
+
+    try:
+        return json.loads(result.stdout)
+    except json.JSONDecodeError:
+        logger.debug("gh returned non-JSON output")
+        return None
+
+
+def infer_owner_repo() -> str | None:
+    """Infer ``owner/repo`` for the current directory using the ``gh`` CLI.
+
+    Runs ``gh repo view --json nameWithOwner`` which honours the user's active
+    ``gh auth`` context and handles SSH remotes, HTTPS remotes, and repo
+    forks correctly.  Falls back to ``None`` when the ``gh`` CLI is unavailable,
+    the current directory is not inside a GitHub repository, or the command
+    fails for any reason.
+
+    Returns:
+        A ``"owner/repo"`` string or ``None``.
+
+    Example::
+
+        repo = infer_owner_repo()
+        if repo is None:
+            raise click.UsageError("--repo is required (could not infer from git remote).")
+        owner, repo_name = repo.split("/", 1)
+    """
+    data = run_gh_json(["gh", "repo", "view", "--json", "nameWithOwner"], timeout=10)
+    if isinstance(data, dict):
+        value = data.get("nameWithOwner")
+        if isinstance(value, str) and "/" in value:
+            return value
+    return None
+
+
+def is_bot_user(user: dict) -> bool:
+    """Return ``True`` when a GitHub user dict describes a bot account.
+
+    GitHub bots can be detected by either ``type == "Bot"`` or a login
+    that ends with ``[bot]`` (e.g. ``dependabot[bot]``, ``greptile-ai[bot]``).
+    This check is used by review-watch (and any future autonomous session that
+    consumes PR comments) to exclude bot-generated noise from trusted-reviewer
+    filtering.
+    """
+    utype = user.get("type", "")
+    login = user.get("login", "")
+    return utype == "Bot" or login.endswith("[bot]")
+
+
+def is_trusted_reviewer(comment: dict) -> bool:
+    """Return ``True`` when a PR comment comes from a trusted human contributor.
+
+    A comment is trusted when:
+    - The author is NOT a bot account (``is_bot_user``).
+    - The ``author_association`` is one of OWNER / MEMBER / COLLABORATOR.
+
+    Used by review-watch to gate autonomous fix sessions against prompt
+    injection from untrusted users who can comment on a public PR.
+    """
+    user = comment.get("user", {})
+    if is_bot_user(user):
+        return False
+    assoc = comment.get("author_association", "")
+    return assoc in TRUSTED_ASSOCIATIONS
+
+
 # Default threshold for truncating long comment bodies
 # Based on empirical sampling: human comments typically <500 tokens,
 # verbose bot comments (Greptile, Ellipsis) can reach 900+ tokens
@@ -292,12 +393,34 @@ def transform_github_url(url: str) -> str:
     Transform GitHub blob URLs to raw URLs to get file content without UI.
 
     Transforms:
-    https://github.com/{owner}/{repo}/blob/{branch}/{path}
+    https://github.com/{owner}/{repo}/blob/{ref}/{path}
     to:
-    https://github.com/{owner}/{repo}/raw/refs/heads/{branch}/{path}
+    https://github.com/{owner}/{repo}/raw/{ref}/{path}
+
+    ``ref`` may be a branch, a tag, or a commit SHA. The raw endpoint resolves
+    all three, so the ref is kept as-is; forcing ``refs/heads/`` in front of it
+    only works for branches and 404s on tags and SHAs (GitHub permalinks are
+    SHA-based, so those are common).
+
+    Only the ``blob`` view segment is rewritten — the one at path position
+    ``/{owner}/{repo}/blob/``. A substring replace cannot express that: it also
+    rewrites ``blob`` directories inside the file path, and it is not
+    idempotent, which matters because the transform really is applied twice on
+    the normal read path (``util.context`` transforms the URL and then hands it
+    to ``tools.browser.read_url``, which transforms it again). Under a
+    substring replace the second pass would rewrite the surviving path segment
+    and fetch the wrong file.
     """
-    if "/blob/" in url and "github.com" in url:
-        return url.replace("/blob/", "/raw/refs/heads/")
+    parsed = urllib.parse.urlparse(url)
+    if parsed.hostname not in ("github.com", "www.github.com"):
+        return url
+
+    # Leading "" from the root slash, so the view segment sits at index 3:
+    # ["", owner, repo, view, ref, *path]
+    parts = parsed.path.split("/")
+    if len(parts) > 3 and parts[3] == "blob":
+        parts[3] = "raw"
+        return urllib.parse.urlunparse(parsed._replace(path="/".join(parts)))
     return url
 
 
@@ -1005,8 +1128,7 @@ def get_github_run_logs(
                 "view",
                 run_id,
                 "--json",
-                "databaseId,displayTitle,event,headBranch,conclusion,status,"
-                "workflowName,createdAt,updatedAt,url,jobs",
+                "databaseId,displayTitle,event,headBranch,conclusion,status,workflowName,createdAt,updatedAt,url,jobs",
             ],
             capture_output=True,
             text=True,
@@ -1126,12 +1248,22 @@ def get_github_run_logs(
 
                 output += f"\n```\n{extracted}\n```\n"
             else:
-                # Fallback: try per-job log via API
+                # Fallback: try per-job log via API.
+                # Derive owner/repo from the run URL (e.g.
+                # https://github.com/owner/repo/actions/runs/12345) so the
+                # jobs-logs endpoint is reachable; the URL needs the real
+                # values, not {owner}/{repo} placeholders.
+                owner, repo = "", ""
+                if url:
+                    parts = urllib.parse.urlparse(url).path.strip("/").split("/")
+                    if len(parts) >= 2:
+                        owner, repo = parts[0], parts[1]
+
                 api_result = subprocess.run(
                     [
                         "gh",
                         "api",
-                        f"/repos/{{owner}}/{{repo}}/actions/jobs/{job_id}/logs",
+                        f"/repos/{owner}/{repo}/actions/jobs/{job_id}/logs",
                     ],
                     capture_output=True,
                     text=True,

@@ -622,13 +622,20 @@ class TestCLI:
         """Test scan command help."""
         result = runner.invoke(main, ["scan", "--help"])
         assert result.exit_code == 0
-        assert "List live agent processes" in result.output
+        assert "live agent processes" in result.output
+        # Must clarify scan is about live processes, NOT persistent identities/workspaces
+        assert "NOT about persistent agents" in result.output
 
     def test_create_help(self, runner):
         """Test create command help."""
         result = runner.invoke(main, ["create", "--help"])
         assert result.exit_code == 0
-        assert "Create a new agent workspace" in result.output
+        assert "Create a new persistent agent workspace" in result.output
+        # Must reference gptme-agent-template with URL
+        assert "gptme-agent-template" in result.output
+        assert "github.com/gptme/gptme-agent-template" in result.output
+        # Must cross-reference the lightweight alternative
+        assert "gptme service init" in result.output
 
     def test_install_help(self, runner):
         """Test install command help."""
@@ -740,10 +747,12 @@ class TestCLI:
             assert result.exit_code == 0
             assert "No agents installed" in result.output
 
-    def test_scan_shows_active_agents(self, runner, mocker):
+    def test_scan_shows_active_agents(self, runner, monkeypatch):
         """Test scan command exposes the shared live-agent scanner."""
         agent = _make_scanned_agent()
-        mocker.patch("gptme.hooks.workspace_agents.scan_agents", return_value=[agent])
+        monkeypatch.setattr(
+            "gptme.hooks.workspace_agents.scan_agents", lambda **_: [agent]
+        )
 
         result = runner.invoke(main, ["scan"])
 

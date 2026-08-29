@@ -9,8 +9,13 @@ export interface MessageUsage {
 
 export interface MessageMetadata {
   model?: string;
+  /** The subprovider that actually served the request (set when OpenRouter auto-routed
+   *  to a different provider than what the model string alone implies). Format:
+   *  "openrouter/vendor/model@provider-slug", e.g. "openrouter/deepseek/deepseek-v4-flash-0731@together" */
+  resolved_model?: string;
   cost?: number;
   usage?: MessageUsage;
+  tool?: string;
 }
 
 export interface Message {
@@ -19,6 +24,7 @@ export interface Message {
   timestamp?: string;
   files?: string[];
   hide?: boolean;
+  call_id?: string;
   metadata?: MessageMetadata;
   /** Client-only: tracks send status for optimistic messages */
   _status?: 'pending' | 'sent' | 'failed';
@@ -66,6 +72,12 @@ export interface ConversationSummary {
   description?: string | null;
   tags?: string[];
   pinned_order?: number | null;
+  // Client-only: set when this entry is an external session merged into the list
+  _externalSession?: {
+    id: string; // original external session id (for API calls and selection)
+    harness: string;
+    label: string;
+  };
 }
 
 export interface GenerateCallbacks {

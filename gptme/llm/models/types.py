@@ -59,6 +59,7 @@ BuiltinProvider = Literal[
     "gemini",
     "groq",
     "xai",
+    "grok-subscription",
     "deepseek",
     "moonshot",
     "nvidia",
@@ -107,6 +108,7 @@ PROVIDERS_OPENAI = [
     "gptme",
     "gemini",
     "xai",
+    "grok-subscription",
     "groq",
     "deepseek",
     "moonshot",
@@ -150,6 +152,11 @@ class ModelMeta:
     # See gptme/gptme#2362.
     preferred_edit_format: Literal["diff", "whole"] | None = None
 
+    # How this model is priced: "per_token" for standard API billing,
+    # "subscription" for flat-rate plans (e.g. openai-subscription, grok-subscription).
+    # Subscription models preserve token counts but have zero marginal USD cost.
+    pricing_type: Literal["per_token", "subscription"] = "per_token"
+
     @property
     def full(self) -> str:
         # For unknown providers (including custom providers), the model field
@@ -192,7 +199,23 @@ class ProviderPlugin:
             api_key_env="MINIMAX_API_KEY",
             base_url="https://api.minimax.chat/v1",
             models=[
-                ModelMeta(provider="unknown", model="minimax/abab6.5s-chat", context=245_760),
+                ModelMeta(
+                    provider="unknown",
+                    model="minimax/MiniMax-M3",
+                    context=1_000_000,
+                    price_input=0.6,
+                    price_output=2.4,
+                    supports_vision=True,
+                    supports_reasoning=True,
+                ),
+                ModelMeta(
+                    provider="unknown",
+                    model="minimax/MiniMax-M2.7",
+                    context=204_800,
+                    price_input=0.3,
+                    price_output=1.2,
+                    supports_reasoning=True,
+                ),
             ],
         )
     """
@@ -248,3 +271,6 @@ class _ModelDictMeta(TypedDict):
 
     # preferred edit format for this model
     preferred_edit_format: NotRequired[Literal["diff", "whole"]]
+
+    # pricing model for this model
+    pricing_type: NotRequired[Literal["per_token", "subscription"]]

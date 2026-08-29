@@ -12,12 +12,14 @@ To use gptme's server capabilities, install with server extras:
 
     pipx install 'gptme[server]'
 
-Start the server:
+Start the server, then open http://localhost:5700:
 
 .. code-block:: bash
 
     gptme-server
 
+The server and modern web UI share one origin by default, so no separate
+frontend process or CORS configuration is required.
 
 For more CLI options, see the :ref:`CLI reference <cli:gptme-server>`.
 
@@ -43,10 +45,13 @@ The primary web interface is `gptme-webui <https://github.com/gptme/gptme/tree/m
 - Integrated computer use interface
 - Create your own persistent `agents`
 
-**Local Installation:**
-For self-hosting and local development, see the `gptme-webui README <https://github.com/gptme/gptme/tree/master/webui>`_.
+**Local use:**
 
-To use the server with a locally hosted gptme-webui, configure the CORS origin when starting the server:
+The modern UI is bundled in gptme release packages. Run ``gptme-server`` and
+open http://localhost:5700.
+
+For frontend development, see the `gptme-webui README <https://github.com/gptme/gptme/tree/master/webui>`_.
+When Vite runs separately on port 5701, allow that development origin:
 
 .. code-block:: bash
 
@@ -64,6 +69,14 @@ To use the server with a locally hosted gptme-webui, configure the CORS origin w
     server. Serving the web UI from a local origin (for example
     ``http://localhost:5701``) avoids the prompt entirely, since that is a
     local-to-local request.
+
+.. note::
+
+    **Host-header validation.** Bearer authentication is enabled for loopback
+    and network binds alike. If an operator explicitly disables authentication
+    with ``GPTME_DISABLE_AUTH``, they can still opt into Host-header validation
+    with ``gptme-server serve --allowed-hosts gptme.local`` (comma-separated,
+    or via ``GPTME_SERVER_ALLOWED_HOSTS``).
 
 Self-Hosting with Docker Compose
 --------------------------------
@@ -88,21 +101,20 @@ gptme + the ``server`` extra only — no Node/agent tooling) and runs
 
 The server listens on http://localhost:5700.
 
-The simplest way to use it is the basic web UI the server bundles at the same
-origin — just open http://localhost:5700 in a browser. Being same-origin, it
-needs no CORS setup (you will still need the server token; see below).
+The modern web UI is bundled at the same origin — just open
+http://localhost:5700 in a browser. Being same-origin, it needs no CORS setup
+(you will still need the server token; see below).
 
-To use the full-featured hosted web UI instead, open
+To use the hosted web UI instead, open
 `chat.gptme.org <https://chat.gptme.org>`_ and point it at your server. That is
-a cross-origin setup, so the server must allow the UI's origin — the default
-``CORS_ORIGIN`` already permits ``chat.gptme.org``. Set ``CORS_ORIGIN`` in
-``.env`` to a different origin if you self-host the web UI yourself.
+a cross-origin setup, so uncomment the Compose ``command`` and set
+``CORS_ORIGIN`` to the hosted UI (or your separately hosted UI).
 
 Key ``.env`` settings:
 
 - ``OPENAI_API_KEY`` / ``ANTHROPIC_API_KEY`` / ``OPENROUTER_API_KEY`` — at least one is required.
 - ``GPTME_SERVER_TOKEN`` — auth token. The server enables auth by default when bound to ``0.0.0.0`` (as in the container), so set this and configure the web UI with the same value. If left blank, a token is auto-generated at startup — find it with ``docker compose logs``.
-- ``CORS_ORIGIN`` — origin allowed to call the server (defaults to the hosted web UI).
+- ``CORS_ORIGIN`` — only needed for a separately hosted web UI; uncomment the Compose ``command`` and set this to that UI's origin.
 - ``GPTME_SERVER_PORT`` — host port to publish (the container always listens on 5700).
 
 Production Deployment: nginx Reverse Proxy
@@ -191,9 +203,10 @@ example below uses nginx with a Let's Encrypt certificate.
    sudo nginx -t        # validate config
    sudo systemctl reload nginx
 
-The server is now reachable at ``https://gptme.example.com``. Point your web UI
-(or the hosted UI at `chat.gptme.org <https://chat.gptme.org>`_) at that URL, and
-set ``CORS_ORIGIN`` in ``.env`` to the origin the UI is served from.
+The server and bundled UI are now reachable together at
+``https://gptme.example.com``. If you instead use a separately hosted UI such
+as `chat.gptme.org <https://chat.gptme.org>`_, set ``CORS_ORIGIN`` in ``.env``
+to that UI's origin and enable the Compose ``--cors-origin`` command.
 
 .. note::
 
@@ -232,21 +245,23 @@ The template runs the server as a dedicated ``gptme`` user, reads secrets from
                            /home/gptme/.local/share/gptme \
                            /home/gptme/.local/state/gptme
 
-    # Secrets file (provider keys, optional GPTME_SERVER_TOKEN), not world-readable
+    # Secrets file (provider keys + GPTME_SERVER_TOKEN), not world-readable
     sudo install -d -m 750 -o gptme -g gptme /etc/gptme
     sudo install -m 640 -o gptme -g gptme /dev/null /etc/gptme/server.env
     sudoedit /etc/gptme/server.env   # add ANTHROPIC_API_KEY=... etc.
 
-    # Download and install the unit (adjust User=, the ExecStart path, --cors-origin)
+    # Download and install the unit (adjust User= and the ExecStart path)
     sudo curl -fsSL https://raw.githubusercontent.com/gptme/gptme/master/scripts/gptme-server.service \
         -o /etc/systemd/system/gptme-server.service
     sudo systemctl daemon-reload
     sudo systemctl enable --now gptme-server
 
 Tail logs with ``journalctl -u gptme-server -f``. Because the unit binds
-``127.0.0.1``, pair it with the nginx reverse proxy above to expose it over TLS;
-on loopback the auth token is optional (set ``GPTME_SERVER_TOKEN`` in the env
-file if you change the bind to a public interface).
+``127.0.0.1``, pair it with the nginx reverse proxy above to expose it over TLS.
+Set ``GPTME_SERVER_TOKEN`` in the env file to a stable secret so clients have a
+persistent credential across restarts. This is **required for persistent
+deployments**: if omitted the server generates a new random token at each startup,
+invalidating any client already configured with the previous token.
 
 Basic Web UI
 ------------
@@ -333,6 +348,106 @@ parent context smaller:
        "browser-use",
        "Open localhost:5173, capture a screenshot, and report UI issues",
    )
+
+Security
+--------
+
+This section describes the security model of gptme-server and the threat vectors it is designed (and not designed) to address.
+
+.. _server:auth-model:
+
+Authentication Model
+~~~~~~~~~~~~~~~~~~~~
+
+gptme-server requires bearer authentication for capability-bearing API routes
+regardless of bind address. Loopback is a transport boundary, not an identity
+boundary: another local process must not gain shell and config access merely by
+reaching ``127.0.0.1``. A small set of public routes remain unauthenticated: the
+API root (``/api/v2``), version info (``/api/v2/version``), config metadata
+(``/api/v2/config``), Prometheus metrics (``/api/v0/metrics``), and the API
+documentation at ``/api/docs/``. Set ``GPTME_SERVER_TOKEN`` to a fixed value;
+if unset the server generates one and prints it at startup.
+
+- ``GPTME_DISABLE_AUTH`` disables bearer checks entirely
+  regardless of bind address. Use only behind an authenticated ingress.
+
+.. warning::
+
+   An authorized API client (anyone who can reach the server with a valid
+   token) can execute arbitrary shell
+   commands through the agent. There is no additional sandboxing at the
+   API layer. The security boundary is **access to the server**, not any
+   individual endpoint.
+
+.. _server:threat-model:
+
+Threat Model
+~~~~~~~~~~~~
+
+The server is hardened against browser-originating attacks that apply to local
+server access:
+
+**1. Cross-Site Request Forgery (CSRF)**
+
+A malicious web page cannot send credentialed cross-origin JSON requests
+to the local server because the browser's CORS preflight blocks them: the
+server does not return ``Access-Control-Allow-Origin`` headers for arbitrary
+origins (only for the configured ``--cors-origin``). Plain forms can POST
+without CORS, but cannot set ``Content-Type: application/json``, so the
+server rejects them as malformed.
+
+**2. DNS Rebinding**
+
+A malicious site can re-resolve its hostname to ``127.0.0.1`` after the page
+loads and thereby bypass CORS. Bearer authentication still blocks access to
+capability-bearing routes because the page does not possess the token. If an
+operator explicitly disables bearer auth, ``--allowed-hosts`` can add
+Host-header validation as defense in depth.
+
+**What is NOT in scope:**
+
+- *An authorized client redirecting the agent to sensitive files:* An
+  authorized API client can already run ``cat /etc/passwd`` through the
+  agent. Restricting which directories the agent *starts* in adds no
+  security boundary — the agent can navigate anywhere from there.
+
+- *Protecting one user from another on a shared server:* gptme-server is
+  single-user by design. Multi-user setups must gate access at the network
+  or OS level.
+
+.. _server:workspace-patch:
+
+Workspace PATCH Semantics
+~~~~~~~~~~~~~~~~~~~~~~~~~
+
+Conversations have a *workspace* — the directory the agent treats as its
+working directory. The API exposes two operations that touch workspace:
+
+- **PUT** ``/api/v2/conversations/<id>`` (create): accepts any
+  ``workspace`` the client supplies, including paths outside the
+  conversation's log directory. Rationale: an authorized client can already
+  run arbitrary shell commands; workspace containment at creation adds no
+  security boundary. Cloud pods and the workspace picker both rely on this
+  to set a custom workspace on create.
+
+- **PATCH** ``/api/v2/conversations/<id>/config`` (update): accepts the
+  **round-trip of the already-persisted workspace** (the webui settings
+  dialog sends the full config including workspace on every save), but
+  **rejects any change that redirects the workspace outside the
+  conversation's log directory**. Rationale: silently redirecting an
+  existing agent's workspace mid-conversation to an arbitrary path is
+  plausibly a confused-deputy attack vector and is never needed for
+  legitimate updates. If the workspace must change, delete and recreate the
+  conversation.
+
+  .. warning::
+
+     Deleting a conversation is **destructive**: its persisted message history
+     is permanently removed. Export or back up conversation logs before
+     deleting if you need to preserve them.
+
+This creates an intentional asymmetry — create-any, re-target-never — to
+minimize confused-deputy risk without breaking legitimate workflows.
 
 REST API
 --------

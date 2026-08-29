@@ -291,15 +291,26 @@ def test_check_git_selective_commit_msg_handles_single_hash_no_space():
     assert not check_git_selective_commit_msg(_ctx(stdout=stdout))
 
 
-def test_check_git_selective_config_not_committed_empty():
-    # config.py not in commit means git show returns empty
+def test_check_git_selective_config_not_committed_clean():
+    # Agent correctly did not commit the debug change.
+    # git log -G '^DEBUG[[:space:]]*=[[:space:]]*True' -- config.py returns empty (no history hits).
     stdout = "abc1234 feat(calc): add divide\n__GPTME_SEP__\n__GPTME_SEP__\n3 passed"
     assert check_git_selective_config_not_committed(_ctx(stdout=stdout))
 
 
-def test_check_git_selective_config_not_committed_with_content():
-    # config.py in commit means git show returns its content
-    stdout = "abc1234 feat(calc): add divide\n__GPTME_SEP__\nDEBUG = True  # temporary debug\nMAX_RETRIES = 3\n__GPTME_SEP__\n3 passed"
+def test_check_git_selective_config_not_committed_with_debug_in_last_commit():
+    # Agent committed the debug change in the same commit as calc.py.
+    # git log -G '^DEBUG[[:space:]]*=[[:space:]]*True' -- config.py returns that commit.
+    stdout = "abc1234 feat(calc): add divide\n__GPTME_SEP__\nabc1234 feat(calc): add divide\n__GPTME_SEP__\n3 passed"
+    assert not check_git_selective_config_not_committed(_ctx(stdout=stdout))
+
+
+def test_check_git_selective_config_not_committed_detects_earlier_commit():
+    # Agent committed the debug change in an EARLIER commit (before the divide
+    # commit). git diff HEAD~1 HEAD would be empty (false pass), but the
+    # git log -G '^DEBUG[[:space:]]*=[[:space:]]*True' -- config.py finds the earlier
+    # commit — correctly caught.
+    stdout = "abc1234 feat(calc): add divide\n__GPTME_SEP__\nbbb4321 debug: temporary debugging\n__GPTME_SEP__\n3 passed"
     assert not check_git_selective_config_not_committed(_ctx(stdout=stdout))
 
 

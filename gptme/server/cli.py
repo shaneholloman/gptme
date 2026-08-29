@@ -5,6 +5,46 @@ import signal
 import threading
 import time
 from pathlib import Path
+from urllib.parse import quote as urlquote
+
+# Re-entrance guard: SIGTERM can fire while a previous invocation is still
+# running (e.g. during a buffered write).  A module-level flag lets the
+# second invocation exit immediately rather than crashing with
+# "RuntimeError: reentrant call inside <_io.BufferedWriter name='<stderr>'>".
+_sigterm_received = False
+
+
+# Install a minimal SIGTERM handler at module level — before the slow
+# gptme/Flask imports that follow — so SIGTERM during startup produces
+# diagnostic output rather than silently terminating the process
+# (gptme/gptme#3589).  This handler is scoped to the CLI module: it only
+# activates when gptme.server.cli is imported (i.e. the server entrypoint
+# is being used), never when a caller only imports gptme.server.app.
+# _install_sigterm_handler() upgrades it to a logger-aware version once
+# init_logging() has run inside serve().
+def _startup_sigterm_handler(signum: int, frame: object) -> None:
+    global _sigterm_received
+    if _sigterm_received:
+        return
+    _sigterm_received = True
+    # os.write() goes directly to the fd without Python's BufferedWriter, so
+    # it is safe to call from a signal handler (POSIX async-signal-safe).
+    os.write(2, b"Received SIGTERM during startup, shutting down gracefully\n")
+    raise KeyboardInterrupt
+
+
+# Guard against non-main-thread imports (signal.signal raises ValueError
+# from a worker thread) and against overriding a *callable* handler the host
+# process may have installed (e.g. an embedder that sets its own graceful
+# shutdown handler before importing gptme.server.cli).  We install over
+# SIG_DFL (the OS default) and SIG_IGN — the latter may be inherited from a
+# parent process (e.g. a test runner or daemon supervisor) and does not
+# indicate a deliberate embedder choice.  Only an explicit callable handler
+# from the current process is left intact (gptme/gptme#3597).
+if threading.current_thread() is threading.main_thread() and not callable(
+    signal.getsignal(signal.SIGTERM)
+):
+    signal.signal(signal.SIGTERM, _startup_sigterm_handler)
 
 import click
 from click_default_group import DefaultGroup
@@ -102,27 +142,44 @@ def _start_parent_death_watcher(
 
 
 def _install_sigterm_handler() -> None:
-    """Make SIGTERM trigger the same graceful shutdown path as Ctrl+C (SIGINT).
+    """Upgrade the startup SIGTERM handler to use the logger.
 
-    Werkzeug's dev server (`app.run()`) catches `KeyboardInterrupt` in its
-    serve loop and exits cleanly, which lets the `finally: shutdown_telemetry()`
-    block run. Python only raises `KeyboardInterrupt` for SIGINT, though — the
-    default SIGTERM handler terminates the process immediately without unwinding
-    the stack, so on `systemctl stop`, container scale-down, or a rolling
-    restart the cleanup block never runs and any in-flight SSE stream is cut
-    mid-token.
+    Called from ``serve()`` right after ``init_logging()`` so the handler can
+    emit a structured log line rather than writing directly to stderr.  The
+    module-level ``_startup_sigterm_handler`` already handles any SIGTERM that
+    arrives during the import phase (before this upgrade runs).
 
-    Re-raising SIGTERM as `KeyboardInterrupt` routes it through the existing
-    clean-shutdown path. This also makes the parent-death watcher's self-SIGTERM
-    (see `_start_parent_death_watcher`) actually shut the server down gracefully,
-    as its comment already assumes.
+    Both handlers re-raise SIGTERM as ``KeyboardInterrupt``, routing it through
+    Werkzeug's clean-shutdown path so the ``finally: shutdown_telemetry()``
+    block runs on ``systemctl stop``, container scale-down, or rolling restarts
+    (gptme/gptme#3589).
 
     Signal handlers can only be installed from the main thread; this is called
-    from the `serve` command before `app.run()`, which runs there.
+    from the ``serve`` command, which runs there.
+
+    Only upgrades our own startup handler, the OS default (SIG_DFL), or an
+    inherited SIG_IGN.  A *callable* handler installed by an embedder before
+    calling ``serve()`` is left intact (gptme/gptme#3597).  SIG_IGN is treated
+    like SIG_DFL because it can be inherited from a parent process (daemon
+    supervisor, test runner) and does not indicate a deliberate embedder choice
+    — refusing to upgrade it would silently disable graceful shutdown for servers
+    started under such supervisors.
     """
+    current = signal.getsignal(signal.SIGTERM)
+    if callable(current) and current is not _startup_sigterm_handler:
+        # An embedder installed a custom callable handler; don't override it.
+        return
 
     def _handle_sigterm(signum, frame):
-        logger.info("Received SIGTERM, shutting down gracefully")
+        global _sigterm_received
+        if _sigterm_received:
+            return
+        _sigterm_received = True
+        # os.write() is POSIX async-signal-safe: it bypasses Python's
+        # BufferedWriter, which raises RuntimeError on reentrant calls
+        # (gptme/gptme#3589).  logger.info() is NOT safe in signal handlers
+        # (acquires locks, uses buffered I/O) so we omit it here.
+        os.write(2, b"Received SIGTERM, shutting down gracefully\n")
         raise KeyboardInterrupt
 
     signal.signal(signal.SIGTERM, _handle_sigterm)
@@ -180,14 +237,24 @@ def main():
     ),
 )
 @click.option(
+    "--allowed-hosts",
+    default=None,
+    envvar="GPTME_SERVER_ALLOWED_HOSTS",
+    help=(
+        "Comma-separated hostnames to accept in the Host header, in addition "
+        "to the built-in localhost/127.0.0.1/[::1] allow-list. Relevant when "
+        "bearer auth is explicitly disabled with GPTME_DISABLE_AUTH. Can also "
+        "be set via the GPTME_SERVER_ALLOWED_HOSTS environment variable."
+    ),
+)
+@click.option(
     "--webui-dir",
     type=click.Path(exists=True, file_okay=False, dir_okay=True, path_type=Path),
     default=None,
     envvar="GPTME_WEBUI_DIR",
     help=(
-        "Directory containing a web UI build (e.g. the modern React webui's "
-        "dist/) to serve instead of the bundled legacy UI. Can also be set "
-        "via the GPTME_WEBUI_DIR environment variable."
+        "Directory containing a web UI build to serve instead of the bundled "
+        "modern UI. Can also be set via the GPTME_WEBUI_DIR environment variable."
     ),
 )
 @click.option(
@@ -231,6 +298,7 @@ def serve(
     port: int,
     tools: str | None,
     cors_origin: str | None,
+    allowed_hosts: str | None,
     webui_dir: Path | None,
     exit_on_parent_death: bool,
     watch_pid: int | None,
@@ -238,6 +306,9 @@ def serve(
 ):  # pragma: no cover
     """Starts a server and web UI for gptme."""
     init_logging(verbose, compact=False)
+    # Upgrade the module-level startup SIGTERM handler (stderr-only) to the
+    # logger-aware version now that init_logging() has run.
+    _install_sigterm_handler()
     set_config_from_workspace(Path.cwd())
 
     if exit_on_parent_death or watch_pid is not None:
@@ -294,18 +365,28 @@ def serve(
     click.echo("Initialization complete, starting server")
 
     # Initialize authentication and display token
-    init_auth(host=host, display=True)
+    token = init_auth(host=host, display=True)
+    if token:
+        # Fragment (not query) so the token is not sent to the server or logged
+        # as a request URL. The bundled UI reads #userToken= and then strips it.
+        # Echo (not logger) so the URL is copyable on one line.
+        display_host = "127.0.0.1" if host in ("0.0.0.0", "::") else host
+        # IPv6 literals need square brackets in URLs (e.g. ::1 → [::1])
+        if ":" in display_host:
+            display_host = f"[{display_host}]"
+        click.echo(
+            f"Open the UI: http://{display_host}:{port}/#userToken={urlquote(token, safe='')}"
+        )
 
     app = create_app(
         cors_origin=cors_origin,
         host=host,
         webui_dir=webui_dir,
         default_profile=default_profile,
+        allowed_hosts=[h.strip() for h in allowed_hosts.split(",") if h.strip()]
+        if allowed_hosts
+        else None,
     )
-
-    # Route SIGTERM through the same clean-shutdown path as Ctrl+C so the
-    # `finally` block below runs on `systemctl stop` / container scale-down.
-    _install_sigterm_handler()
 
     try:
         app.run(debug=debug, host=host, port=port)

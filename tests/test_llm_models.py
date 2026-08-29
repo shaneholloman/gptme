@@ -15,6 +15,7 @@ from gptme.llm.models import (
     get_recommended_model,
     list_models,
 )
+from gptme.llm.models.data import _mark_parallel
 
 
 def test_get_static_model():
@@ -340,19 +341,41 @@ def test_list_models_json_available_keeps_plugin_models(
     mock_get_model_list.return_value = [
         ModelMeta(
             provider="unknown",
-            model="minimax/abab6.5s-chat",
-            context=245_760,
-        )
+            model="minimax/MiniMax-M3",
+            context=1_000_000,
+        ),
+        ModelMeta(
+            provider="unknown",
+            model="minimax/MiniMax-M2.7",
+            context=204_800,
+        ),
     ]
 
     list_models(json_output=True, available_only=True)
     output = capsys.readouterr().out
     data = json.loads(output)
 
-    assert [model["model"] for model in data] == ["minimax/abab6.5s-chat"]
+    assert [model["model"] for model in data] == [
+        "minimax/MiniMax-M3",
+        "minimax/MiniMax-M2.7",
+    ]
 
 
 # --- Tests for closest-match heuristic ---
+
+
+def test_kimi_k3_metadata():
+    """Kimi K3 must not silently inherit the smaller K2 metadata."""
+    model = get_model("moonshot/kimi-k3")
+
+    assert model.context == 1_048_576
+    assert model.max_output == 1_048_576
+    assert model.supports_reasoning is True
+    assert model.supports_vision is True
+    assert model.supports_parallel_tool_calls is True
+    assert model.supports_strict_tools is True
+    assert model.price_input == 3.0
+    assert model.price_output == 15.0
 
 
 class TestClosestModelMatch:
@@ -467,10 +490,57 @@ class TestSupportsParallelToolCalls:
         model = get_model("openrouter/anthropic/claude-sonnet-4.6")
         assert model.supports_parallel_tool_calls is True
 
+    def test_gemini_supports_parallel(self):
+        """Gemini docs document parallel function calling for current models."""
+        model = get_model("gemini/gemini-2.5-flash")
+        assert model.supports_parallel_tool_calls is True
+
+    def test_xai_grok_supports_parallel(self):
+        """xAI docs: parallel function calling is enabled by default."""
+        model = get_model("xai/grok-4")
+        assert model.supports_parallel_tool_calls is True
+
+    def test_grok_subscription_supports_parallel(self):
+        model = get_model("grok-subscription/grok-4.6")
+        assert model.supports_parallel_tool_calls is True
+
+    def test_groq_llama_33_supports_parallel(self):
+        """Groq's supported-models table lists llama-3.3-70b-versatile as Yes."""
+        model = get_model("groq/llama-3.3-70b-versatile")
+        assert model.supports_parallel_tool_calls is True
+
+    def test_deepseek_supports_parallel(self):
+        model = get_model("deepseek/deepseek-chat")
+        assert model.supports_parallel_tool_calls is True
+
+    def test_openrouter_gemini_alias_supports_parallel(self):
+        model = get_model("openrouter/google/gemini-3.5-flash")
+        assert model.supports_parallel_tool_calls is True
+
+    def test_moonshot_kimi_k2_parallel_not_recorded(self):
+        """Kimi K2/K2.6 stay unset: official tool-call docs do not document parallel."""
+        model = get_model("moonshot/kimi-k2")
+        assert model.supports_parallel_tool_calls is False
+
+    def test_deepseek_strict_not_recorded(self):
+        """DeepSeek strict mode needs the /beta base URL, which gptme does not use."""
+        model = get_model("deepseek/deepseek-chat")
+        assert model.supports_strict_tools is False
+
     def test_unknown_model_defaults_to_false(self):
         """Unknown models fall back to False (safe default — don't break things)."""
         model = get_model("unknown-provider/unknown-model")
         assert model.supports_parallel_tool_calls is False
+
+    def test_mark_parallel_does_not_overwrite_explicit_false(self):
+        stamped = _mark_parallel(
+            {
+                "a": {"context": 1, "supports_parallel_tool_calls": False},
+                "b": {"context": 1},
+            }
+        )
+        assert stamped["a"]["supports_parallel_tool_calls"] is False
+        assert stamped["b"]["supports_parallel_tool_calls"] is True
 
 
 class TestSupportsResponsesAPI:

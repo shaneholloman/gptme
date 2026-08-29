@@ -437,3 +437,80 @@ def test_scroll_invalid_amount():
         scroll_page("down", -100)
     with pytest.raises(ValueError, match="amount must be positive"):
         scroll_page("down", 0)
+
+
+# ---------------------------------------------------------------------------
+# Engine / executable-path parsing (no browser launch required)
+# ---------------------------------------------------------------------------
+
+
+def test_parse_engine_named_chromium():
+    """Named engine 'chromium' → (chromium, None)."""
+    from gptme.tools._browser_thread import _parse_engine_env
+
+    engine, path = _parse_engine_env("chromium")
+    assert engine == "chromium"
+    assert path is None
+
+
+def test_parse_engine_named_firefox():
+    """Named engine 'firefox' → (firefox, None)."""
+    from gptme.tools._browser_thread import _parse_engine_env
+
+    engine, path = _parse_engine_env("firefox")
+    assert engine == "firefox"
+    assert path is None
+
+
+def test_parse_engine_named_case_insensitive():
+    """Named engines match case-insensitively."""
+    from gptme.tools._browser_thread import _parse_engine_env
+
+    engine, path = _parse_engine_env("Firefox")
+    assert engine == "firefox"
+    assert path is None
+
+    engine, path = _parse_engine_env("CHROMIUM")
+    assert engine == "chromium"
+    assert path is None
+
+
+def test_parse_engine_absolute_path():
+    """Absolute path → firefox engine with that executable_path."""
+    from gptme.tools._browser_thread import _parse_engine_env
+
+    engine, path = _parse_engine_env("/usr/local/bin/camoufox")
+    assert engine == "firefox"
+    assert path == "/usr/local/bin/camoufox"
+
+
+def test_parse_engine_relative_path():
+    """Path containing '/' but not absolute → firefox engine with that path."""
+    from gptme.tools._browser_thread import _parse_engine_env
+
+    engine, path = _parse_engine_env("./custom-firefox")
+    assert engine == "firefox"
+    assert path == "./custom-firefox"
+
+
+def test_parse_engine_executable_on_path():
+    """Executable name on $PATH is resolved and used as custom executable."""
+    import shutil
+
+    from gptme.tools._browser_thread import _parse_engine_env
+
+    # git is required to check out the repo, so it's guaranteed to be on
+    # PATH wherever this test runs (unlike e.g. "python3", which is not the
+    # interpreter name on Windows)
+    engine, path = _parse_engine_env("git")
+    assert engine == "firefox"
+    assert path == shutil.which("git")
+
+
+def test_parse_engine_invalid_falls_back_to_chromium():
+    """Unrecognised value that isn't a path → (chromium, None) with a warning."""
+    from gptme.tools._browser_thread import _parse_engine_env
+
+    engine, path = _parse_engine_env("nonexistent-browser-xyz")
+    assert engine == "chromium"
+    assert path is None

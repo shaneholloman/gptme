@@ -23,6 +23,7 @@ from gptme.util.gh import (
     parse_github_url,
     search_github_issues,
     search_github_prs,
+    transform_github_url,
 )
 
 
@@ -54,6 +55,131 @@ def test_parse_github_url_invalid():
     """Test parsing non-GitHub URLs."""
     assert parse_github_url("https://example.com") is None
     assert parse_github_url("https://github.com/owner") is None
+
+
+# --- Tests for transform_github_url ---
+
+
+def test_transform_github_url_branch():
+    assert (
+        transform_github_url("https://github.com/o/r/blob/main/src/app.py")
+        == "https://github.com/o/r/raw/main/src/app.py"
+    )
+
+
+def test_transform_github_url_blob_in_path():
+    """Only the first ``/blob/`` (the owner/repo separator) is replaced.
+
+    A file path may itself contain a ``blob`` segment, e.g.
+    ``.../blob/main/blob/handler.py``. The old ``url.replace("/blob/", "/raw/")``
+    replaced *every* occurrence, flipping path segments too and pointing the
+    fetch at the wrong resource (404 / wrong content). Only the separator
+    should become ``raw``; the rest of the path is kept verbatim.
+    """
+    # Regression: a path that itself contains a /blob/ segment.
+    assert (
+        transform_github_url("https://github.com/o/r/blob/main/blob/handler.py")
+        == "https://github.com/o/r/raw/main/blob/handler.py"
+    )
+    # Nested case: a blob deeper in the path stays intact.
+    assert (
+        transform_github_url("https://github.com/o/r/blob/main/pkg/blob/util.py")
+        == "https://github.com/o/r/raw/main/pkg/blob/util.py"
+    )
+    # Regression guard: a plain single-/blob/ URL still transforms correctly.
+    assert (
+        transform_github_url("https://github.com/o/r/blob/main/README.md")
+        == "https://github.com/o/r/raw/main/README.md"
+    )
+    # Regression guard: a URL without /blob/ in the path is unchanged.
+    assert (
+        transform_github_url("https://github.com/o/r/tree/main/src")
+        == "https://github.com/o/r/tree/main/src"
+    )
+
+
+def test_transform_github_url_is_idempotent():
+    """Applying the transform twice must equal applying it once.
+
+    The normal read path really does apply it twice: ``util.context`` transforms
+    the URL and hands the result to ``tools.browser.read_url``, which transforms
+    it again. With a substring replace the second pass rewrote the surviving
+    ``blob`` *path* segment — ``.../raw/main/pkg/blob/util.py`` became
+    ``.../raw/main/pkg/raw/util.py`` — so the very URLs this function exists to
+    fix were still fetched from the wrong location.
+    """
+    for url in (
+        "https://github.com/o/r/blob/main/pkg/blob/util.py",
+        "https://github.com/o/r/blob/main/blob/handler.py",
+        "https://github.com/o/r/blob/main/README.md",
+    ):
+        once = transform_github_url(url)
+        assert transform_github_url(once) == once, f"not idempotent for {url}"
+
+
+def test_transform_github_url_only_rewrites_the_view_segment():
+    """``blob`` is only special at ``/{owner}/{repo}/blob/``."""
+    # A non-blob view whose file path contains a blob directory: unchanged.
+    assert (
+        transform_github_url("https://github.com/o/r/blame/main/blob/handler.py")
+        == "https://github.com/o/r/blame/main/blob/handler.py"
+    )
+    # An owner literally named "blob": the view segment is still the one rewritten.
+    assert (
+        transform_github_url("https://github.com/blob/r/blob/main/x.py")
+        == "https://github.com/blob/r/raw/main/x.py"
+    )
+    # A lookalike host must not be rewritten.
+    assert (
+        transform_github_url("https://github.com.evil.test/o/r/blob/main/x.py")
+        == "https://github.com.evil.test/o/r/blob/main/x.py"
+    )
+    # An explicit default port is still GitHub and must be rewritten.
+    assert (
+        transform_github_url("https://github.com:443/o/r/blob/main/x.py")
+        == "https://github.com:443/o/r/raw/main/x.py"
+    )
+
+
+def test_transform_github_url_preserves_query_and_fragment():
+    """Permalinks routinely carry ``?plain=1`` and ``#L10``."""
+    assert (
+        transform_github_url("https://github.com/o/r/blob/main/a.py?plain=1#L10")
+        == "https://github.com/o/r/raw/main/a.py?plain=1#L10"
+    )
+
+
+def test_transform_github_url_keeps_tags_and_shas_intact():
+    """A tag or commit SHA must be left as the ref.
+
+    Prefixing ``refs/heads/`` only resolves for branches; on a tag or a SHA
+    the raw endpoint 404s. GitHub permalinks are SHA-based, so this is the
+    common case.
+    """
+    assert (
+        transform_github_url("https://github.com/o/r/blob/v2.31.0/README.md")
+        == "https://github.com/o/r/raw/v2.31.0/README.md"
+    )
+    sha = "a" * 40
+    assert (
+        transform_github_url(f"https://github.com/o/r/blob/{sha}/f.txt")
+        == f"https://github.com/o/r/raw/{sha}/f.txt"
+    )
+
+
+def test_transform_github_url_leaves_other_urls_unchanged():
+    assert (
+        transform_github_url("https://github.com/o/r/pull/42")
+        == "https://github.com/o/r/pull/42"
+    )
+    assert transform_github_url("https://example.com/x/blob/y") == (
+        "https://example.com/x/blob/y"
+    )
+    # An already-raw URL has no /blob/ to rewrite and is returned verbatim.
+    assert (
+        transform_github_url("https://github.com/o/r/raw/main/foo")
+        == "https://github.com/o/r/raw/main/foo"
+    )
 
 
 # --- Tests for parse_github_ref ---
@@ -301,11 +427,14 @@ def test_gh_tool_read_pr():
 
 
 @pytest.mark.slow
-def test_get_github_pr_content_with_unresolved():
-    """Test that unresolved review comments are included.
+def test_get_github_pr_content_with_review_comments():
+    """Test that review comment metadata is included for a merged PR.
 
-    Uses PR #271 from gptme/gptme which has 4 unresolved review threads
-    from ErikBjare (open since Nov 2024, stable test target).
+    Uses PR #271 from gptme/gptme (merged).  The unresolved-thread assertion
+    was removed — PR threads can be resolved at any time, making that check
+    fragile for a live test.  Mocked coverage for the ``Review Comments
+    (Unresolved)`` section lives in ``test_util_gh_mocked.py`` where it is
+    stable regardless of GitHub state.
     """
     content = get_github_pr_content("https://github.com/gptme/gptme/pull/271")
 
@@ -313,12 +442,10 @@ def test_get_github_pr_content_with_unresolved():
         pytest.skip("gh CLI not available or request failed")
     assert content is not None  # help mypy narrow type after skip
 
-    # Should have basic PR info
+    # Should have basic PR info — title contains "prompts"
     assert "gptme-util" in content or "prompts" in content
 
-    # PR #271 has unresolved review threads — verify they show up
-    assert "Review Comments (Unresolved)" in content
-    # Should contain ErikBjare's review comments with file references
+    # PR was authored by ErikBjare
     assert "ErikBjare" in content
 
 
@@ -699,6 +826,66 @@ class TestGetGithubRunLogs:
             MagicMock(stdout=run_json, returncode=0),  # gh run view --json
             MagicMock(stdout="", returncode=1),  # gh run view --log-failed
             MagicMock(stdout="", returncode=1),  # gh api fallback
+        ]
+
+        result = get_github_run_logs("12345")
+        assert result is not None
+        assert "Could not fetch logs" in result
+
+    @patch("gptme.util.gh.shutil.which", return_value="/usr/bin/gh")
+    @patch("gptme.util.gh.subprocess.run")
+    def test_per_job_api_fallback_substitutes_owner_repo(self, mock_run, _mock_which):
+        """Per-job API fallback substitutes real owner/repo into the path.
+
+        Regression: the fallback built the gh api path with an f-string that
+        had literal ``{owner}``/``{repo}`` braces (``{{owner}}``), so the call
+        always 404'd and the user saw "Could not fetch logs" instead of the
+        real per-job logs. owner/repo must be derived from the run URL.
+        """
+        jobs = [self._make_job("test", "failure", 200)]
+        run_json = self._make_run_json("failure", jobs)
+
+        def fake_run(cmd, **kwargs):
+            if cmd[:2] == ["gh", "run"] and "--json" in cmd:
+                return MagicMock(stdout=run_json, returncode=0)
+            if cmd[:2] == ["gh", "run"] and "--log-failed" in cmd:
+                # Empty -> triggers the per-job API fallback.
+                return MagicMock(stdout="", returncode=1)
+            if cmd[:2] == ["gh", "api"]:
+                path = cmd[2]
+                # The fix must substitute real owner/repo — no literal braces.
+                assert "{owner}" not in path, f"literal {{owner}} in path: {path}"
+                assert "{repo}" not in path, f"literal {{repo}} in path: {path}"
+                if path == "/repos/owner/repo/actions/jobs/200/logs":
+                    return MagicMock(stdout="ERROR: real per-job log\n", returncode=0)
+                return MagicMock(stdout="", returncode=1)
+            return MagicMock(stdout="", returncode=1)
+
+        mock_run.side_effect = fake_run
+
+        result = get_github_run_logs("12345")
+        assert result is not None
+        assert "real per-job log" in result
+        assert "Could not fetch logs" not in result
+
+    @patch("gptme.util.gh.shutil.which", return_value="/usr/bin/gh")
+    @patch("gptme.util.gh.subprocess.run")
+    def test_per_job_api_fallback_missing_url_degrades(self, mock_run, _mock_which):
+        """Fallback degrades to 'Could not fetch logs' when the run URL is empty.
+
+        Guards the owner/repo extraction: a missing ``url`` leaves owner/repo
+        blank, the gh api call 404s, and the existing failure message is shown
+        (no crash — same outcome as the pre-fix always-404 behaviour).
+        """
+        jobs = [self._make_job("test", "failure", 200)]
+        run_data = json.loads(self._make_run_json("failure", jobs))
+        run_data["url"] = ""
+        run_json = json.dumps(run_data)
+
+        mock_run.side_effect = [
+            MagicMock(stdout=run_json, returncode=0),  # gh run view --json
+            MagicMock(stdout="", returncode=1),  # gh run view --log-failed (empty)
+            MagicMock(stdout="", returncode=1),  # gh api fallback 404s
         ]
 
         result = get_github_run_logs("12345")

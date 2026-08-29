@@ -34,6 +34,7 @@ class Codeblock:
     @classmethod
     @trace_function(name="codeblock.from_markdown", attributes={"component": "parser"})
     def from_markdown(cls, content: str) -> "Codeblock":
+        content = content.replace("\r\n", "\n").replace("\r", "\n")
         stripped = content.strip()
         fence_len = 0
 
@@ -51,11 +52,16 @@ class Codeblock:
             if fence_len == end_fence_len:
                 stripped = stripped.strip()[:-end_fence_len]
 
-        lang = stripped.splitlines()[0].strip() if stripped.strip() else ""
+        # Slice the body on the raw first line length (including any leading
+        # whitespace), not on the stripped lang: a fence like "``` python" leaves
+        # a space before the lang, and slicing on len(lang) would leave the tail
+        # of the lang word (e.g. the "n" of "python") leaking into the content.
+        first_line = stripped.splitlines()[0] if stripped.strip() else ""
+        lang = first_line.strip()
         fence = "`" * fence_len if fence_len else "```"
         return cls(
             lang,
-            stripped[len(lang) :].lstrip("\n") if lang else stripped,
+            stripped[len(first_line) :].lstrip("\n") if lang else stripped,
             fence=fence,
         )
 
@@ -176,6 +182,9 @@ def _extract_codeblocks(
     fence_pattern = re.compile(r"`{3,}")
     if len(fence_pattern.findall(markdown)) < 2:
         return
+
+    # Normalize line endings so CRLF input does not leak carriage returns into content.
+    markdown = markdown.replace("\r\n", "\n").replace("\r", "\n")
 
     lines = markdown.split("\n")
     i = 0

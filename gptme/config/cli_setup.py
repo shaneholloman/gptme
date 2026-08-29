@@ -11,6 +11,10 @@ from typing import TYPE_CHECKING, cast
 from ..gears import parse_gear, resolve_gear
 from ..profiles import get_profile
 from ..tools import get_toolchain
+from ..tools._allowlist import (
+    TOOL_PRESETS,
+    expand_tool_allowlist_presets,
+)
 from .chat import ChatConfig
 from .core import Config, get_config, set_config, set_config_from_workspace
 
@@ -46,7 +50,12 @@ def _is_tool_file_path(value: str) -> bool:
 
 
 def _normalize_tool_allowlist(allowlist: list[str] | None) -> list[str] | None:
-    """Normalize an allowlist while preserving custom tool file paths.
+    """Normalize an allowlist while preserving custom tool file paths and preset names.
+
+    Preset names (e.g. ``"read-only"``) are kept verbatim so that provenance is
+    preserved when the config is saved and later resumed.  Expansion into concrete
+    tool names happens at toolchain initialisation time (``tools/__init__.py``),
+    not here.
 
     ``get_toolchain()`` validates and expands named tools, but custom tool files
     are loaded later by ``init_tools()`` and must remain as file paths.
@@ -54,6 +63,14 @@ def _normalize_tool_allowlist(allowlist: list[str] | None) -> list[str] | None:
     if allowlist is None:
         return None
 
+    # If the allowlist is a single named preset, preserve it as-is so that
+    # resumed sessions can still detect it as a preset (not just a tool list
+    # that happens to match the preset's expansion).
+    if len(allowlist) == 1 and allowlist[0] in TOOL_PRESETS:
+        return list(allowlist)
+
+    allowlist = expand_tool_allowlist_presets(allowlist)
+    assert allowlist is not None
     normalized: list[str] = []
     seen: set[str] = set()
 
@@ -169,8 +186,21 @@ def setup_config_from_cli(
             excluded_tools = [
                 tool.strip() for tool in tool_list_str.split(",") if tool.strip()
             ]
+            # Detect attempts to exclude preset names (they're not tools in the
+            # default set; '-read-only' selects nothing and is almost certainly wrong).
+            preset_exclusions = [t for t in excluded_tools if t in TOOL_PRESETS]
+            if preset_exclusions:
+                raise ValueError(
+                    f"Cannot exclude preset name '{preset_exclusions[0]}' with '-' syntax. "
+                    f"Presets select an exclusive tool boundary — use "
+                    f"'--tools {preset_exclusions[0]}' to select one."
+                )
             default_tools = [tool.name for tool in get_toolchain(None)]
-            non_default = [t for t in excluded_tools if t not in default_tools]
+            non_default = [
+                t
+                for t in excluded_tools
+                if t not in default_tools and t not in TOOL_PRESETS
+            ]
             if non_default:
                 logger.warning(
                     "Tool(s) %s are not in the default toolset and cannot be excluded",
@@ -185,7 +215,7 @@ def setup_config_from_cli(
         else:
             # Normal mode - CLI override replaces defaults
             resolved_tool_allowlist = [
-                tool.strip() for tool in tool_allowlist.split(",")
+                tool.strip() for tool in tool_allowlist.split(",") if tool.strip()
             ]
     elif gear_tool_allowlist is not None:
         if gear_tool_allowlist and gear_tool_allowlist[0].startswith("+"):
@@ -201,10 +231,29 @@ def setup_config_from_cli(
         resolved_tool_allowlist = existing_chat_config.tools
     elif tools_env := config.get_env("TOOL_ALLOWLIST"):
         # Fall back to env/config for new conversations or when no saved tools
-        resolved_tool_allowlist = [tool.strip() for tool in tools_env.split(",")]
+        resolved_tool_allowlist = [
+            tool.strip() for tool in tools_env.split(",") if tool.strip()
+        ]
 
-    # Automatically add 'complete' tool in non-interactive mode
-    if not interactive:
+    # Profiles may override a gear's tool list. Apply that final override before
+    # deciding whether non-interactive mode should add the completion signal.
+    if gear_profile_name and not agent_path:
+        gear_profile = get_profile(gear_profile_name)
+        if gear_profile and gear_profile.tools is not None and tool_allowlist is None:
+            resolved_tool_allowlist = list(gear_profile.tools)
+
+    # A preset is "selected" if the allowlist is a literal preset name.
+    # Preset names are now persisted verbatim (not expanded) so that resumed
+    # sessions continue to be recognised here without ambiguity.
+    tool_preset_selected = (
+        resolved_tool_allowlist is not None
+        and len(resolved_tool_allowlist) == 1
+        and resolved_tool_allowlist[0] in TOOL_PRESETS
+    )
+
+    # Automatically add 'complete' tool in non-interactive mode, except for
+    # exclusive named presets such as read-only audit mode.
+    if not interactive and not tool_preset_selected:
         if resolved_tool_allowlist is None:
             # Get default tools and add complete to them
             default_tools = [tool.name for tool in get_toolchain(None)]
@@ -241,11 +290,6 @@ def setup_config_from_cli(
     resolved_no_confirm = gear_no_confirm if no_confirm is None else no_confirm
 
     # Handle agent_path with similar precedence
-    if gear_profile_name and not agent_path:
-        gear_profile = get_profile(gear_profile_name)
-        if gear_profile and gear_profile.tools is not None and tool_allowlist is None:
-            resolved_tool_allowlist = list(gear_profile.tools)
-
     resolved_agent_path: Path | None = agent_path
     if agent_path is None and existing_chat_config and existing_chat_config.agent:
         # When resuming, use saved conversation agent unless CLI override provided

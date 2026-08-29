@@ -51,8 +51,11 @@ export interface ConversationState {
   lastMessage?: Message;
   // Whether to show the initial system message
   showInitialSystem: boolean;
-  // The chat config
-  chatConfig: ChatConfig | null;
+  // The chat config.
+  // undefined = not yet fetched (show loading skeleton).
+  // null = fetch was attempted but failed (show fallback, no skeleton).
+  // ChatConfig = successfully fetched.
+  chatConfig: ChatConfig | null | undefined;
   // Whether this conversation needs initial step after connecting
   // Used to fix race condition where step() was called before event subscription
   needsInitialStep: boolean;
@@ -61,6 +64,9 @@ export interface ConversationState {
   initialStepStream?: boolean;
   // Currently displayed branch name
   currentBranch: string;
+  // Incremented whenever the displayed log is replaced wholesale without a
+  // necessarily observable count/offset change (edit, branch switch, reload).
+  logRevision: number;
   // Max tokens setting for model responses, persisted across operations.
   // Set by ChatInput when sending a message; read by all step() call sites.
   maxTokens?: number;
@@ -105,10 +111,11 @@ export function updateConversation(id: string, update: Partial<ConversationState
       executingTool: null,
       lastCompletedTool: null,
       showInitialSystem: false,
-      chatConfig: null,
+      chatConfig: undefined,
       needsInitialStep: false,
       initialStepStream: undefined,
       currentBranch: 'main',
+      logRevision: 0,
       logOffset: 0,
       hasMoreBefore: false,
       isWindowHydrated: false,
@@ -278,10 +285,11 @@ export function initConversation(
     executingTool: null,
     lastCompletedTool: null,
     showInitialSystem: false,
-    chatConfig: null,
+    chatConfig: undefined,
     needsInitialStep: options?.needsInitialStep ?? false,
     initialStepStream: options?.initialStepStream,
     currentBranch: 'main',
+    logRevision: 0,
     logOffset: 0,
     hasMoreBefore: false,
     // Treat pre-supplied data (e.g. demo conversations) as hydrated;
@@ -334,6 +342,7 @@ export function updateConversationData(id: string, data: ConversationResponse) {
   const logOffset = data.has_more ? (data.before ?? 0) : 0;
   batch(() => {
     conv.data.set(data);
+    conv.logRevision.set((revision) => revision + 1);
     conv.logOffset.set(logOffset);
     conv.hasMoreBefore.set(data.has_more ?? false);
     conv.isWindowHydrated.set(true);
@@ -350,6 +359,7 @@ export function setCurrentBranch(id: string, branch: string) {
   batch(() => {
     conv.currentBranch.set(branch);
     conv.data.log.set(branches[branch]);
+    conv.logRevision.set((revision) => revision + 1);
     conv.logOffset.set(0);
     conv.hasMoreBefore.set(false);
     conv.isWindowHydrated.set(true);
@@ -364,6 +374,7 @@ export function replaceLog(id: string, log: Message[]) {
   if (!conv) return;
   batch(() => {
     conv.data.log.set(log);
+    conv.logRevision.set((revision) => revision + 1);
     conv.logOffset.set(0);
     conv.hasMoreBefore.set(false);
     conv.isWindowHydrated.set(true);

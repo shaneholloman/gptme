@@ -6,14 +6,27 @@ import logging
 import os
 import queue
 import socket
+import sys
 import tempfile
 import threading
 import time
 import uuid
 from contextlib import contextmanager
+from pathlib import Path
 
 import pytest
 import requests
+
+# Hook implementation lives in its own module so the regression test can load
+# the exact shipped code via `-p retry_compat` instead of a copy.
+from retry_compat import pytest_runtest_teardown  # noqa: F401
+from thread_leak import (
+    diff_threads,
+    format_leaks,
+    format_thread_stacks,
+    is_dict_iteration_race,
+    snapshot_threads,
+)
 
 import gptme.init as _gptme_init
 from gptme.config import get_config, set_config
@@ -51,6 +64,29 @@ _QUOTA_ERROR_PATTERNS = [
     "authentication_error",
     "invalid x-api-key",
 ]
+
+
+def _check_supports_symlinks() -> bool:
+    """Check if the filesystem and environment support creating symlinks."""
+    with tempfile.TemporaryDirectory() as td:
+        target = Path(td) / "target"
+        target.touch()
+        link = Path(td) / "link"
+        try:
+            link.symlink_to(target)
+            return True
+        except (OSError, NotImplementedError):
+            return False
+
+
+SUPPORTS_SYMLINKS = _check_supports_symlinks()
+
+
+@pytest.fixture
+def requires_symlinks():
+    """Fixture that skips a test if symlinks are not supported or permitted in this environment."""
+    if not SUPPORTS_SYMLINKS:
+        pytest.skip("Symlinks not supported or permitted in this environment")
 
 
 def has_api_key() -> bool:
@@ -106,6 +142,15 @@ def _check_anthropic_quota_exhausted() -> bool:
         return False
 
 
+def pytest_addoption(parser):
+    parser.addoption(
+        "--snapshot-update",
+        action="store_true",
+        default=False,
+        help="Regenerate visual snapshot baselines instead of comparing against them.",
+    )
+
+
 def pytest_configure(config):
     """Register custom markers."""
     config.addinivalue_line(
@@ -116,6 +161,28 @@ def pytest_configure(config):
     os.environ["GPTME_CHECK"] = "false"
     # Disable chat history context during tests for predictable prompts
     os.environ["GPTME_CHAT_HISTORY"] = "false"
+
+
+def pytest_exception_interact(node, call, report):
+    """Dump every live thread's stack when the dict-iteration race fires.
+
+    CI only ever showed a single truncated frame for this failure
+    (``contextlib.py:135`` in ``_GeneratorContextManager.__enter__``), naming
+    neither the generator that was iterating nor the thread that mutated the
+    dict underneath it. Without the thread stacks the class is undiagnosable,
+    which is why five instance-level fixes chased the crash site instead of the
+    leaker. Print them at the moment of failure.
+    """
+    if not is_dict_iteration_race(
+        getattr(call, "excinfo", None) and call.excinfo.value
+    ):
+        return
+    print(
+        f"\n=== dict-iteration race in {node.nodeid} ({report.when}) ===\n"
+        f"{format_thread_stacks()}\n"
+        "=== end thread dump ===",
+        file=sys.stderr,
+    )
 
 
 @pytest.hookimpl(wrapper=True)
@@ -166,7 +233,6 @@ def pytest_runtest_makereport(item, call):
     #   (c) the error is specifically from _pytest.stash internals
     if (
         report.when == "teardown"
-        and report.failed
         and getattr(item, "_stash_guard_call_attempts", 0) > 1
         and getattr(item, "_stash_guard_call_passed", False)
     ):
@@ -202,12 +268,16 @@ def pytest_collection_modifyitems(config, items):
             if "requires_api" in item.keywords:
                 item.add_marker(skip_api)
 
-    # Wire up no_retry: override pytest-retry's global --retries for these tests.
-    # @pytest.mark.flaky(retries=0) takes precedence over the --retries CLI flag.
-    no_retry_mark = pytest.mark.flaky(retries=0)
+    # Wire up no_retry: prevent pytest-retry from retrying these tests.
+    # flaky(retries=0) is NOT sufficient — the retry loop always runs at least once.
+    # condition=False causes pytest-retry to return early before any retry attempt.
+    # append=False prepends our marker so get_closest_marker() finds it first,
+    # even if pytest-retry already added flaky(retries=N) during its own
+    # pytest_collection_modifyitems pass.
+    no_retry_mark = pytest.mark.flaky(condition=False)
     for item in items:
         if "no_retry" in item.keywords:
-            item.add_marker(no_retry_mark)
+            item.add_marker(no_retry_mark, append=False)
 
 
 def pytest_sessionstart(session):
@@ -242,6 +312,59 @@ def download_model():
 def auth_headers():
     """Provide authentication headers for HTTP requests to test server."""
     return {"Authorization": "Bearer test-token-for-server-thread"}
+
+
+#: nodeid -> leaked thread names, collected across the session for the summary.
+_thread_leaks: dict[str, list[str]] = {}
+
+
+@pytest.fixture(autouse=True)
+def detect_leaked_threads(request):
+    """Name any thread a test leaves running past teardown.
+
+    A leaked thread that later lazy-imports mutates ``sys.modules`` while an
+    unrelated test's main thread iterates it, producing ``RuntimeError:
+    dictionary changed size during iteration`` in a file that has no threads of
+    its own. #3257 fixed this for registered *subagent* threads; gptme starts
+    threads from ~27 other sites (server, ACP, computer transport, shell, hooks,
+    oauth, sound, tokens), so the class needs a generic detector.
+
+    Defined first among the autouse fixtures so its teardown runs *last* —
+    after ``cleanup_subagents_after`` has had its chance to join.
+
+    Reports only by default. Set ``GPTME_STRICT_THREAD_LEAKS=1`` to fail the
+    offending test instead, which is how a specific leaker gets pinned down
+    once the summary points at it.
+    """
+    before = snapshot_threads()
+    yield
+    leaks = diff_threads(before)
+    if not leaks:
+        return
+    nodeid = request.node.nodeid
+    _thread_leaks[nodeid] = [leak.name for leak in leaks]
+    report = format_leaks(nodeid, leaks)
+    logger.warning("%s", report)
+    if os.environ.get("GPTME_STRICT_THREAD_LEAKS") == "1":
+        hard_leaks = [lk for lk in leaks if not lk.soft]
+        if hard_leaks:
+            pytest.fail(format_leaks(nodeid, hard_leaks), pytrace=False)
+
+
+def pytest_terminal_summary(terminalreporter):
+    """List the tests that leaked threads, worst offenders first."""
+    if not _thread_leaks:
+        return
+    terminalreporter.section("thread leaks")
+    ranked = sorted(_thread_leaks.items(), key=lambda kv: -len(kv[1]))
+    for nodeid, names in ranked[:20]:
+        terminalreporter.write_line(f"{len(names):3d}  {nodeid}  {sorted(set(names))}")
+    if len(ranked) > 20:
+        terminalreporter.write_line(f"... and {len(ranked) - 20} more")
+    terminalreporter.write_line(
+        "Leaked threads can race main-thread dict iteration in unrelated files. "
+        "Re-run with GPTME_STRICT_THREAD_LEAKS=1 to fail on leak."
+    )
 
 
 @pytest.fixture(autouse=True)
@@ -320,6 +443,7 @@ def cleanup_acp_health_monitor():
             with SessionManager._lock:
                 SessionManager._sessions.clear()
                 SessionManager._conversation_sessions.clear()
+                SessionManager._conversation_locks.clear()
         except ImportError:
             pass
     except Exception as e:
@@ -361,9 +485,10 @@ def cleanup_subagents_after():
     # globals dirty for the next test.  Shorter timeouts give headroom.
     try:
         for subagent in subagents_copy:
-            # Clean up threads (2s cap — well under the 10s teardown limit)
+            # Clean up threads (5s cap — well under the 10s teardown limit)
+            # Increased from 2s to handle longer exponential backoff in retry decorators
             if subagent.thread is not None and subagent.thread.is_alive():
-                subagent.thread.join(timeout=2.0)
+                subagent.thread.join(timeout=5.0)
             # Clean up subprocesses (subprocess mode)
             if subagent.process is not None and subagent.process.poll() is None:
                 subagent.process.terminate()
@@ -415,6 +540,19 @@ def temp_file():
                 os.unlink(temporary_file.name)
 
     return _temp_file
+
+
+@pytest.fixture(autouse=True)
+def cleanup_logged_warnings():
+    """Clear the log_warn_once cache between tests to ensure test isolation."""
+    yield
+    # Reset the module-level warning cache after each test
+    try:
+        from gptme.llm.models.resolution import _logged_warnings
+
+        _logged_warnings.clear()
+    except (ImportError, AttributeError):
+        pass
 
 
 @pytest.fixture(autouse=True)
@@ -481,14 +619,22 @@ def cleanup_tmux_sessions():
 
 
 @pytest.fixture
-def server_thread():
+def server_thread(monkeypatch):
     """Start a server in a thread for testing."""
     # Skip if flask not installed
     pytest.importorskip(
         "flask", reason="flask not installed, install server extras (-E server)"
     )
 
+    from gptme.server import auth as _auth_mod  # fmt: skip
     from gptme.server.app import create_app  # fmt: skip
+
+    # Set a known token so setup_conversation/event_listener can authenticate.
+    monkeypatch.setenv("GPTME_SERVER_TOKEN", "test-token-for-server-thread")
+    # Reset the cached token so get_server_token() picks up the env var above
+    # (it's a module-level singleton that persists between tests).
+    monkeypatch.setattr(_auth_mod, "_server_token", None)
+    monkeypatch.setattr(_auth_mod, "_auth_enabled", True)
 
     app = create_app()
 
@@ -518,12 +664,15 @@ def server_thread():
 
 
 @pytest.fixture
-def client():
+def client(monkeypatch):
     from gptme.server.app import create_app  # fmt: skip
+
+    # Disable auth for the generic test client so existing tests don't need tokens.
+    # Auth-specific coverage lives in test_server_auth.py.
+    monkeypatch.setenv("GPTME_DISABLE_AUTH", "true")
 
     app = create_app()
 
-    # Create a test client without authentication by default
     with app.test_client() as test_client:
         yield test_client
 

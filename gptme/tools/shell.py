@@ -8,6 +8,12 @@ Configuration:
         - Invalid values default to 1200 seconds (20 minutes)
         - If not set, defaults to 1200 seconds (20 minutes)
 
+    GPTME_SHELL_MEMORY_LIMIT: Optional per-shell address-space ceiling (POSIX only,
+        off by default). Accepts a plain byte count or a binary suffix (e.g.
+        "512M", "1G"). Applies to the persistent shell and any command it runs
+        via `ulimit -v`, so a runaway build fails with an allocation error
+        instead of stalling the session.
+
     GPTME_SHELL_TRUNC_PRE_TOKENS / GPTME_SHELL_TRUNC_POST_TOKENS: Override the
     head/tail token budget for stdout truncation. Defaults: 2000 / 8000.
     GPTME_SHELL_TRUNC_STDERR_PRE_TOKENS / GPTME_SHELL_TRUNC_STDERR_POST_TOKENS:
@@ -34,6 +40,14 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..message import Message
+from ..sandbox import (
+    SandboxConfig,
+    _parse_size,
+    apply_memory_limit,
+    build_env,
+    verify_memory_limit,
+    wrap_shell_cmd,
+)
 from ..util import get_installed_programs
 from ..util.ask_execute import execute_with_confirmation
 from ..util.context import md_codeblock
@@ -252,6 +266,48 @@ def examples(tool_format):
 """.strip()
 
 
+def _get_memory_limit() -> int | None:
+    """Read the opt-in shell memory ceiling in bytes, or None if unset.
+
+    Knob is ``GPTME_SHELL_MEMORY_LIMIT`` (env) or ``[env] SHELL_MEMORY_LIMIT``
+    (config.toml). The value is a byte count or a binary-suffixed size (e.g.
+    ``"512M"``). Unparseable values and unenforceable limits (e.g. the value
+    exceeds the system hard ulimit) are both logged as warnings and treated as
+    unset so a misconfiguration never breaks the shell tool entirely.
+
+    POSIX-only: returns None on Windows because ``ulimit -v`` is not available.
+    """
+    if _is_windows:
+        return None  # ulimit -v is a POSIX-only bash builtin; skip silently
+    from ..config import get_config  # deferred: avoid import cycle
+
+    raw = get_config().get_env("SHELL_MEMORY_LIMIT")
+    if not raw:
+        return None
+    try:
+        limit = _parse_size(str(raw))
+    except (ValueError, AttributeError):
+        logger.warning(
+            "Ignoring invalid GPTME_SHELL_MEMORY_LIMIT=%r (expected e.g. '512M')",
+            raw,
+        )
+        return None
+    try:
+        verify_memory_limit(limit)
+    except ValueError as exc:
+        # Treat an unenforceable limit as unset rather than crashing the shell.
+        # A misconfigured ceiling (e.g. 4G on a system with a 2G hard ulimit)
+        # should not prevent every shell command from working.
+        logger.warning(
+            "GPTME_SHELL_MEMORY_LIMIT=%r cannot be enforced on this system "
+            "(running without memory ceiling). Details: %s",
+            raw,
+            exc,
+        )
+        return None
+    return limit
+
+
 class ShellSession:
     process: subprocess.Popen
     stdout_fd: int
@@ -259,9 +315,11 @@ class ShellSession:
     delimiter: str
     start_marker: str  # Fix for Issue #408: Add start marker to prevent output mixing
     _cwd: str | None  # Workspace directory for this session (thread-safe)
+    _memory_limit: int | None  # Address-space ceiling in bytes (None = off)
 
     def __init__(self, cwd: str | None = None) -> None:
         self._cwd = cwd
+        self._memory_limit = _get_memory_limit()
         self._init()
 
         # close on exit
@@ -277,6 +335,27 @@ class ShellSession:
             popen_kwargs = {
                 "start_new_session": True,  # Create new process group for proper signal handling
             }
+            if self._memory_limit is not None:
+                shell_cmd = apply_memory_limit(shell_cmd, self._memory_limit)
+
+        # Apply sandbox wrapper if GPTME_SANDBOX is set
+        sandbox = SandboxConfig.from_env(
+            workspace=Path(self._cwd) if self._cwd else None
+        )
+        if sandbox.enabled:
+            available, msg = sandbox.check_available()
+            if not available:
+                raise RuntimeError(
+                    f"GPTME_SANDBOX={sandbox.backend!r} was requested but the"
+                    f" backend is not available: {msg}. Either install the"
+                    f" sandbox tool or unset GPTME_SANDBOX."
+                )
+            shell_cmd = wrap_shell_cmd(sandbox, shell_cmd)
+            logger.info("Sandboxed shell: %s", " ".join(shell_cmd))
+        sandbox_env = build_env(
+            sandbox
+        )  # None if sandbox disabled → inherit os.environ
+
         self.process = subprocess.Popen(
             shell_cmd,
             stdin=subprocess.PIPE,
@@ -285,6 +364,7 @@ class ShellSession:
             bufsize=0,  # Unbuffered
             universal_newlines=True,
             cwd=self._cwd,  # Use explicit workspace dir (thread-safe)
+            env=sandbox_env,  # None → inherit; dict → sanitized env
             **popen_kwargs,
         )
         assert self.process.stdout is not None
@@ -326,6 +406,10 @@ class ShellSession:
         if _is_windows:
             return False  # No /dev/tty on Windows
         if not sys.stdin.isatty():
+            return False
+        if SandboxConfig.from_env().enabled:
+            # _run_with_tty launches a separate host process, outside the persistent
+            # sandbox. Keep sandboxed commands on the isolated shell instead.
             return False
         # Check for sudo without -S (stdin password) or -n (non-interactive)
         try:
@@ -383,8 +467,11 @@ class ShellSession:
                     "PYTHONUNBUFFERED": "1",
                 }
             )
+            shell_cmd = ["bash", "-c", command]
+            if self._memory_limit is not None:
+                shell_cmd = apply_memory_limit(shell_cmd, self._memory_limit)
             proc = subprocess.Popen(
-                ["bash", "-c", command],
+                shell_cmd,
                 stdin=tty_stdin,
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
@@ -1469,18 +1556,25 @@ def execute_shell_impl(
         timeout_value=timeout,
         logdir=logdir,
     )
-    yield Message("system", msg)
+    # Workspace-awareness: notify when cd enters a directory with gptme.toml.
+    # Append hint text directly to the command output (single yield) so no
+    # separate message is interleaved between the assistant tool_calls entry
+    # and the tool response.  The serializer converts system messages without
+    # a call_id to user-role messages; any message interleaved between
+    # tool_calls and the tool result causes strict providers (e.g. Moonshot AI
+    # / kimi-k2.6) to reject the conversation with a 400 error.
+    workspace_hint_content = ""
+    if returncode == 0 and not interrupted:
+        cmd_stripped = cmd.strip()
+        if cmd_stripped.startswith("cd ") or cmd_stripped == "cd":
+            hint = _check_workspace_config()
+            if hint:
+                workspace_hint_content = "\n\n" + hint.content
+
+    yield Message("system", msg + workspace_hint_content)
 
     if interrupted:
         raise KeyboardInterrupt from None
-
-    # Workspace-awareness: notify when cd enters a directory with gptme.toml
-    if returncode == 0:
-        cmd_stripped = cmd.strip()
-        if cmd_stripped.startswith("cd ") or cmd_stripped == "cd":
-            workspace_hint = _check_workspace_config()
-            if workspace_hint:
-                yield workspace_hint
 
 
 # Workspace paths already hinted this session, so we don't spam the
@@ -1640,38 +1734,134 @@ def execute_shell(
             break
 
     if bg_line_idx is not None:
-        # Found a bg command
+        # Found a bg command - extract bg_cmd and any surrounding commands
+        _bg_memory_limit = _get_memory_limit()
+        preceding_cmds = ""
+        remaining_cmds = ""
+
         if bg_line_idx == 0 and len(lines) == 1:
             # Simple case: bg is the only command
             bg_cmd = cmd_stripped[3:].strip()
-            yield from execute_bg_command(bg_cmd)
-            return
         elif bg_line_idx > 0:
-            # bg is on a later line - execute preceding commands first (Issue #992)
+            # bg is on a later line - preceding commands modify shell state (Issue #992)
             preceding_cmds = "\n".join(lines[:bg_line_idx])
-            if preceding_cmds.strip():
-                # Execute preceding commands (they modify shell state like cd)
-                yield from _execute_preceding_commands(preceding_cmds)
-            # Now execute the bg command
-            bg_line = lines[bg_line_idx].strip()
-            bg_cmd = bg_line[3:].strip()  # Remove "bg " prefix
-            yield from execute_bg_command(bg_cmd)
-            # Execute any remaining commands after bg (unlikely but handle it)
+            bg_cmd = lines[bg_line_idx].strip()[3:].strip()  # Remove "bg " prefix
             if bg_line_idx < len(lines) - 1:
                 remaining_cmds = "\n".join(lines[bg_line_idx + 1 :])
-                if remaining_cmds.strip():
-                    yield from execute_shell(remaining_cmds, None, None)
-            return
         else:
             # bg is first line but there are more lines after it
-            # Start bg job, then execute remaining commands
-            bg_line = lines[0].strip()
-            bg_cmd = bg_line[3:].strip()
-            yield from execute_bg_command(bg_cmd)
+            bg_cmd = lines[0].strip()[3:].strip()
             remaining_cmds = "\n".join(lines[1:])
-            if remaining_cmds.strip():
-                yield from execute_shell(remaining_cmds, None, None)
+
+        # Route bg payload through denylist + TOOL_CONFIRM hook chain before
+        # starting background execution so guardrails can intercept commands
+        # like `bg cat ~/.ssh/id_rsa` (Issue #3598).
+        is_bg_denied, bg_deny_reason, bg_matched_cmd = is_denylisted(bg_cmd)
+        if is_bg_denied:
+            yield Message(
+                "system", f"Command denied: `{bg_matched_cmd}`\n\n{bg_deny_reason}"
+            )
             return
+
+        # Denylist-check preceding commands too — they run inside execute_fn
+        # and would otherwise bypass this gate even though hooks only see bg_cmd.
+        if preceding_cmds.strip():
+            is_pre_denied, pre_deny_reason, pre_matched_cmd = is_denylisted(
+                preceding_cmds
+            )
+            if is_pre_denied:
+                yield Message(
+                    "system",
+                    f"Command denied (preceding): `{pre_matched_cmd}`\n\n{pre_deny_reason}",
+                )
+                return
+
+        # Denylist-check remaining commands upfront — they execute after the bg
+        # command starts, but pre-checking avoids presenting a partially-dangerous
+        # sequence to the user for approval only to block part of it later.
+        if remaining_cmds.strip():
+            is_rem_denied, rem_deny_reason, rem_matched_cmd = is_denylisted(
+                remaining_cmds
+            )
+            if is_rem_denied:
+                yield Message(
+                    "system",
+                    f"Command denied (remaining): `{rem_matched_cmd}`\n\n{rem_deny_reason}",
+                )
+                return
+
+        # Build full command context so TOOL_CONFIRM hooks see the complete
+        # sequence — not just bg_cmd — when deciding whether to approve.
+        # A hook that should block `cat ~/.ssh/id_rsa` must see it even when
+        # it precedes an innocuous `bg ls`.
+        _full_cmd_parts: list[str] = []
+        if preceding_cmds.strip():
+            _full_cmd_parts.append(preceding_cmds.strip())
+        _full_cmd_parts.append(f"bg {bg_cmd}")
+        if remaining_cmds.strip():
+            _full_cmd_parts.append(remaining_cmds.strip())
+        _full_cmd_context = "\n".join(_full_cmd_parts)
+
+        def _bg_execute_fn(c: str, p: Path | None) -> Generator[Message, None, None]:
+            # When surrounding commands exist, allow_edit=False so c is the full
+            # command context (_full_cmd_context), not just bg_cmd. Use the
+            # captured bg_cmd from the closure directly in that case.
+            # When no surrounding commands, c is the (possibly edited) bg_cmd with
+            # optional 'bg ' prefix that must be stripped before execution.
+            if _has_surrounding:
+                actual_cmd = bg_cmd
+            else:
+                actual_cmd = c.removeprefix("bg ") if c.startswith("bg ") else c
+                is_edited_denied, edited_deny_reason, edited_matched_cmd = (
+                    is_denylisted(actual_cmd)
+                )
+                if is_edited_denied:
+                    yield Message(
+                        "system",
+                        f"Command denied: `{edited_matched_cmd}`\n\n{edited_deny_reason}",
+                    )
+                    return
+            if preceding_cmds.strip():
+                yield from _execute_preceding_commands(preceding_cmds)
+            yield from execute_bg_command(actual_cmd, memory_limit=_bg_memory_limit)
+            if remaining_cmds.strip():
+                yield from execute_shell(remaining_cmds, [], None)
+
+        def _bg_preview_fn(content: str, path: Path | None) -> str | None:
+            if _has_surrounding:
+                return _full_cmd_context
+            actual_cmd = (
+                content.removeprefix("bg ") if content.startswith("bg ") else content
+            )
+            return f"bg {actual_cmd}"
+
+        # Disable editing when surrounding commands exist: _bg_execute_fn only
+        # applies edits to the bg_cmd portion (passed as `c`), not to the
+        # preceding/remaining commands that are captured in the closure.  If the
+        # user edited the full preview sequence those edits to the surrounding
+        # parts would be silently ignored, causing execution to diverge from the
+        # approved content.  Editing is safe only when bg_cmd is the sole command.
+        _has_surrounding = bool(preceding_cmds.strip() or remaining_cmds.strip())
+        # When surrounding commands exist, pass the full context so that
+        # TOOL_CONFIRM hooks (including third-party guardrails) see the complete
+        # command sequence via tool_use.content, not just the isolated bg_cmd.
+        # This ensures hooks checking tool_use.content can block dangerous
+        # preceding commands (e.g. "cat ~/.ssh/id_rsa") even when the bg payload
+        # itself ("ls") is innocuous.  When no surrounding commands exist, pass
+        # bg_cmd directly so the user can edit it cleanly.
+        _confirm_content = _full_cmd_context if _has_surrounding else bg_cmd
+        yield from execute_with_confirmation(
+            _confirm_content,
+            args,
+            kwargs,
+            execute_fn=_bg_execute_fn,
+            get_path_fn=get_path_fn,
+            preview_fn=_bg_preview_fn,
+            preview_lang="bash",
+            confirm_msg="Run command in background?",
+            allow_edit=not _has_surrounding,
+        )
+        return
 
     if cmd_lower == "jobs":
         # List background jobs
@@ -1709,29 +1899,41 @@ def execute_shell(
         yield Message("system", f"Command denied: `{matched_cmd}`\n\n{deny_reason}")
         return
 
-    # Skip confirmation for allowlisted commands
-    if is_allowlisted(cmd):
-        logger.debug(f"Command allowlisted, skipping confirmation: {cmd[:80]}")
-        logdir = get_path_fn()
-        yield from execute_shell_impl(cmd, logdir, timeout=timeout)
-    else:
-        logger.debug(f"Command not allowlisted, requiring confirmation: {cmd[:80]}")
+    # All non-denied commands go through execute_with_confirmation so that
+    # TOOL_CONFIRM hooks (including third-party guardrail plugins) can intercept
+    # any command — including ones the built-in allowlist would auto-approve.
+    # The shell_allowlist_hook (TOOL_CONFIRM, priority=10) auto-confirms safe
+    # commands; a guardrail registered at priority > 10 runs first and can deny
+    # even "allowlisted" commands such as `cat ~/.ssh/id_rsa`.
+    logger.debug(
+        "Routing shell command through hook chain: %s",
+        cmd[:80],
+    )
 
-        # Create a wrapper function that passes timeout to execute_shell_impl
-        def execute_fn(cmd: str, path: Path | None) -> Generator[Message, None, None]:
-            return execute_shell_impl(cmd, path, timeout=timeout)
+    # Create a wrapper function that rechecks edits against the denylist before
+    # passing the command and timeout to execute_shell_impl. The initial check
+    # above only covers the assistant-authored command; confirmation can replace it.
+    def execute_fn(cmd: str, path: Path | None) -> Generator[Message, None, None]:
+        is_edited_denied, edited_deny_reason, edited_matched_cmd = is_denylisted(cmd)
+        if is_edited_denied:
+            yield Message(
+                "system",
+                f"Command denied: `{edited_matched_cmd}`\n\n{edited_deny_reason}",
+            )
+            return
+        yield from execute_shell_impl(cmd, path, timeout=timeout)
 
-        yield from execute_with_confirmation(
-            cmd,
-            args,
-            kwargs,
-            execute_fn=execute_fn,
-            get_path_fn=get_path_fn,
-            preview_fn=preview_shell,
-            preview_lang="bash",
-            confirm_msg="Run command?",
-            allow_edit=True,
-        )
+    yield from execute_with_confirmation(
+        cmd,
+        args,
+        kwargs,
+        execute_fn=execute_fn,
+        get_path_fn=get_path_fn,
+        preview_fn=preview_shell,
+        preview_lang="bash",
+        confirm_msg="Run command?",
+        allow_edit=True,
+    )
 
 
 def _format_block_smart(header: str, cmd: str, lang="") -> str:

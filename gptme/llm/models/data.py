@@ -1,20 +1,103 @@
 from datetime import datetime, timezone
+from typing import Literal
 
 from ..llm_anthropic_models_deprecated import ANTHROPIC_MODELS_DEPRECATED
 from ..llm_openai_models import OPENAI_MODELS, OPENAI_SUBSCRIPTION_MODELS
 from .types import PROVIDERS, Provider, _ModelDictMeta
 
+
+def _mark_subscription(models: dict[str, _ModelDictMeta]) -> dict[str, _ModelDictMeta]:
+    """Mark all models in a dict as subscription-priced (zero marginal USD cost)."""
+    return {
+        name: {**props, "pricing_type": "subscription"}
+        for name, props in models.items()
+    }
+
+
+def _set_tool_format(
+    models: dict[str, _ModelDictMeta], tool_format: Literal["markdown", "xml", "tool"]
+) -> dict[str, _ModelDictMeta]:
+    """Stamp a default_tool_format on all models that don't already have one."""
+    return {
+        name: props
+        if props.get("default_tool_format")
+        else {**props, "default_tool_format": tool_format}
+        for name, props in models.items()
+    }
+
+
+def _mark_parallel(models: dict[str, _ModelDictMeta]) -> dict[str, _ModelDictMeta]:
+    """Stamp supports_parallel_tool_calls=True unless the model already sets it.
+
+    An explicit per-model value still wins, so a later model that does *not*
+    support parallel can opt out by setting the key to False.
+    """
+    return {
+        name: props
+        if "supports_parallel_tool_calls" in props
+        else {**props, "supports_parallel_tool_calls": True}
+        for name, props in models.items()
+    }
+
+
+# Providers that route through the OpenAI-compatible function-calling API — stamp
+# default_tool_format="tool" on every model that doesn't already have one set.
+# Anthropic and mock are excluded: anthropic uses the Anthropic SDK (not OpenAI-compat),
+# and mock models are test-only stubs that don't need a tool format preference.
+# Exported (no leading underscore) so resolution.py can apply it to dynamic fallbacks.
+OPENAI_COMPAT_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "openai",
+        "openai-subscription",
+        "gemini",
+        "deepseek",
+        "groq",
+        "xai",
+        "grok-subscription",
+        "moonshot",
+        "requesty",
+        "openrouter",
+        "nvidia",
+        "azure",
+        "local",
+        # gptme.ai proxies to various backends, but the client itself talks to it
+        # via the OpenAI-compatible API (see llm_openai.py) — same fallback applies
+        # when dynamic fetch fails/misses and no static registry entry exists.
+        "gptme",
+    }
+)
+
+# Providers whose official docs state that current models can emit multiple
+# tool calls in one response. Applied at MODELS construction so it cannot
+# drift from the static dicts. Mixed providers (openrouter, groq) are stamped
+# per-model instead: Groq's own table is model-specific (llama-3.3 Yes,
+# gpt-oss No), and OpenRouter aliases a mix of backends.
+# Docs:
+#   gemini: https://ai.google.dev/gemini-api/docs/function-calling#parallel_function_calling
+#   xai / grok-subscription: https://docs.x.ai/developers/tools/function-calling#parallel-function-calling
+#   deepseek: https://api-docs.deepseek.com/news/news0725/
+PARALLEL_TOOL_PROVIDERS: frozenset[str] = frozenset(
+    {
+        "gemini",
+        "deepseek",
+        "xai",
+        "grok-subscription",
+    }
+)
+
 # TODO: can we get this from the API?
-MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
+_MODELS_RAW: dict[Provider, dict[str, _ModelDictMeta]] = {
     "openai": OPENAI_MODELS,
     # OpenAI Subscription (ChatGPT Plus/Pro via Codex backend)
     # Uses the Responses API (not Chat Completions). Per-model specs from
     # llm_openai_models.py; prices reflect API-equivalent cost for comparison.
     # Reasoning level suffix (e.g., :high) is stripped at lookup time in get_model()
-    "openai-subscription": {
-        model: {**props, "default_tool_format": "tool"}
-        for model, props in OPENAI_SUBSCRIPTION_MODELS.items()
-    },
+    "openai-subscription": _mark_subscription(
+        {
+            model: {**props, "default_tool_format": "tool"}
+            for model, props in OPENAI_SUBSCRIPTION_MODELS.items()
+        }
+    ),
     # https://docs.anthropic.com/en/docs/about-claude/models
     # Active models here; deprecated models in llm_anthropic_models_deprecated.py
     "anthropic": {
@@ -262,6 +345,11 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
         },
     },
     # https://api-docs.deepseek.com/quick_start/pricing
+    # Parallel: stamped via PARALLEL_TOOL_PROVIDERS.
+    # `strict` mode exists but requires base_url=.../beta, which gptme does not
+    # use — leave supports_strict_tools unset rather than send a flag the
+    # production endpoint may reject.
+    # https://api-docs.deepseek.com/guides/tool_calls/#strict-mode-beta
     "deepseek": {
         "deepseek-chat": {
             "context": 128_000,
@@ -277,9 +365,13 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 0.55,
             "price_output": 2.19,
             "preferred_edit_format": "diff",
+            "supports_reasoning": True,
         },
     },
     # https://groq.com/pricing/
+    # Parallel tool use is model-specific on Groq (llama-3.3-70b-versatile Yes,
+    # openai/gpt-oss-* No). Stamp per-model, not via PARALLEL_TOOL_PROVIDERS.
+    # https://console.groq.com/docs/tool-use/overview#supported-models
     "groq": {
         "llama-3.3-70b-versatile": {
             "context": 128_000,
@@ -287,9 +379,47 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 0.59,
             "price_output": 0.79,
             "preferred_edit_format": "diff",
+            "supports_parallel_tool_calls": True,
         },
     },
     # https://docs.x.ai/docs/models
+    # SuperGrok/SuperGrok-Heavy subscription (grok.com) via xAI API.
+    # Uses OAuth tokens from the grok CLI (~/.grok/auth.json) — $0 marginal.
+    # Prices reflect xAI API-equivalent cost for comparison purposes.
+    # Auth: run `grok login` or `gptme auth grok-subscription`.
+    # Parallel: stamped via PARALLEL_TOOL_PROVIDERS (xAI default).
+    # Tool-arg schemas are implicitly strict; gptme's supports_strict_tools flag
+    # sends OpenAI `strict=True`, which xAI does not document as an accepted
+    # request field, so that flag stays unset.
+    "grok-subscription": _mark_subscription(
+        {
+            # grok-4.6 — current frontier model on SuperGrok subscription and
+            # the grok CLI default (grok CLI 0.2.117, 2026-08).
+            # https://docs.x.ai/developers/models/grok-4.6 — 500K context,
+            # text+image input, reasoning, function calling, structured outputs.
+            # $2/$6 per 1M below 200K prompt tokens ($4/$12 above; $0.50 cached).
+            "grok-4.6": {
+                "context": 500_000,
+                "max_output": 128_000,
+                "price_input": 2,
+                "price_output": 6,
+                "supports_vision": True,
+                "supports_reasoning": True,
+                "preferred_edit_format": "diff",
+            },
+            # grok-4.5 — previous frontier model available on SuperGrok subscription
+            # https://x.ai/blog/grok-4-5 (500K context, reasoning support)
+            "grok-4.5": {
+                "context": 500_000,
+                "max_output": 128_000,
+                "price_input": 2,
+                "price_output": 6,
+                "supports_vision": True,
+                "supports_reasoning": True,
+                "preferred_edit_format": "diff",
+            },
+        }
+    ),
     "xai": {
         "grok-4-1-fast": {
             "context": 2_000_000,
@@ -417,6 +547,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_output": 9,
             "supports_vision": True,
             "supports_reasoning": True,
+            "supports_parallel_tool_calls": True,  # Gemini parallel function calling
             "preferred_edit_format": "diff",
         },
         "moonshotai/kimi-k2": {
@@ -443,6 +574,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 0.435,
             "price_output": 0.87,
             "supports_reasoning": True,
+            "supports_parallel_tool_calls": True,  # DeepSeek API supports parallel tool calls
             "preferred_edit_format": "diff",
         },
         "deepseek/deepseek-v4-flash": {
@@ -451,6 +583,7 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
             "price_input": 0.0983,
             "price_output": 0.1966,
             "supports_reasoning": True,
+            "supports_parallel_tool_calls": True,  # DeepSeek API supports parallel tool calls
             "preferred_edit_format": "diff",
         },
     },
@@ -460,7 +593,17 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
         # Kimi docs list 256K context for k2.6/k2.5. max_completion_tokens
         # is constrained by input + output fitting within that context; the
         # 32K K2.5 guide value is a default, not a documented hard output cap.
-        # All kimi models require temperature=1; handled in llm_openai.py
+        "kimi-k3": {
+            "context": 1_048_576,
+            "max_output": 1_048_576,
+            "price_input": 3.00,
+            "price_output": 15.00,
+            "supports_reasoning": True,
+            "supports_vision": True,
+            "supports_parallel_tool_calls": True,
+            "supports_strict_tools": True,
+            "preferred_edit_format": "diff",
+        },
         "kimi-k2.6": {
             "context": 262_144,
             "max_output": 262_144,
@@ -516,5 +659,27 @@ MODELS: dict[Provider, dict[str, _ModelDictMeta]] = {
     },
 }
 
-# check that all providers have a MODELS entry
-assert set(PROVIDERS) == set(MODELS.keys())
+# check that all providers have a _MODELS_RAW entry
+assert set(PROVIDERS) == set(_MODELS_RAW.keys())
+
+
+def _stamp_provider(
+    provider: str, models: dict[str, _ModelDictMeta]
+) -> dict[str, _ModelDictMeta]:
+    """Apply construction-time stamps so static dicts and MODELS stay consistent."""
+    if provider in PARALLEL_TOOL_PROVIDERS:
+        models = _mark_parallel(models)
+    if provider in OPENAI_COMPAT_PROVIDERS:
+        models = _set_tool_format(models, "tool")
+    return models
+
+
+# Stamp default_tool_format="tool" on all OpenAI-compatible providers, and
+# supports_parallel_tool_calls on PARALLEL_TOOL_PROVIDERS, at construction
+# time. Building MODELS in one step (rather than reassigning it) ensures that any
+# code reading the intermediate dicts (OPENAI_MODELS, etc.) and any code reading
+# MODELS see a consistent value with no ordering hazard.
+MODELS = {
+    provider: _stamp_provider(provider, models)
+    for provider, models in _MODELS_RAW.items()
+}

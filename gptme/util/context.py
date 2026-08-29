@@ -35,11 +35,25 @@ logger = logging.getLogger(__name__)
 
 
 def _is_interactive_mode() -> bool:
-    """Check if we're in interactive CLI mode.
+    """Check if we're in interactive CLI mode where prompt_toolkit prompts are safe.
 
-    Returns True if the cli_confirm hook is registered, indicating
-    interactive mode with confirmation enabled.
+    Returns True if the cli_confirm hook is registered AND we're not inside a
+    running async event loop (e.g. Textual TUI). Calling prompt_toolkit's sync
+    PromptSession.prompt() from inside a running event loop causes
+    ``RuntimeWarning: coroutine 'Application.run_async' was never awaited``
+    and crashes the TUI when the user submits a message containing a URL.
     """
+    import asyncio
+
+    try:
+        asyncio.get_running_loop()
+        # Inside a running event loop (e.g. Textual TUI) — prompt_toolkit's
+        # sync prompt() cannot safely run here; treat as non-interactive so
+        # URLs are included without prompting instead of crashing.
+        return False
+    except RuntimeError:
+        pass  # No running loop — safe to use prompt_toolkit
+
     try:
         from ..hooks import HookType, get_hooks
 
@@ -47,6 +61,24 @@ def _is_interactive_mode() -> bool:
         return any(h.name == "cli_confirm" and h.enabled for h in hooks)
     except (ImportError, AttributeError):
         return False
+
+
+def extract_urls(content: str) -> list[str]:
+    """Extract HTTP/HTTPS URLs from message content (outside code blocks).
+
+    Used by callers that want to preview and confirm URLs before passing them
+    back via the ``pre_confirmed_urls`` parameter of :func:`include_paths`.
+    """
+    potential_paths = _find_potential_paths(content)
+    urls = []
+    for word in potential_paths:
+        try:
+            p = urllib.parse.urlparse(word)
+            if p.scheme in ("http", "https") and p.netloc:
+                urls.append(word)
+        except ValueError:
+            pass
+    return urls
 
 
 def _confirm_urls(urls: list[str]) -> list[str]:
@@ -460,7 +492,11 @@ def enrich_messages_with_context(
     return msgs
 
 
-def include_paths(msg: Message, workspace: Path | None = None) -> Message:
+def include_paths(
+    msg: Message,
+    workspace: Path | None = None,
+    pre_confirmed_urls: list[str] | None = None,
+) -> Message:
     """
     Searches the message for any valid paths and:
      - In legacy mode (default):
@@ -482,6 +518,10 @@ def include_paths(msg: Message, workspace: Path | None = None) -> Message:
     Args:
         msg: Message to process
         workspace: If provided, paths will be stored relative to this directory
+        pre_confirmed_urls: URLs already confirmed by the caller (e.g. via a TUI
+            dialog).  When provided, the interactive-mode prompt is bypassed and
+            only these URLs are fetched.  Pass an empty list to skip all URLs
+            without prompting.
     """
     # Check for explicit disable to prevent silent prompt bloat in autonomous mode
     if os.environ.get("GPTME_DISABLE_PATH_INCLUDE", "").lower() in (
@@ -521,9 +561,16 @@ def include_paths(msg: Message, workspace: Path | None = None) -> Message:
         except ValueError:
             file_paths.append(word)
 
-    # In interactive mode, ask for confirmation before reading URLs
+    # Determine which URLs to fetch:
+    # 1. Caller pre-confirmed (e.g. TUI dialog) — use that list directly.
+    # 2. Interactive CLI mode — prompt the user.
+    # 3. Non-interactive / no URLs — read all (or none if urls_found is empty).
     confirmed_urls: list[str] | None = None
-    if urls_found and _is_interactive_mode():
+    if pre_confirmed_urls is not None:
+        confirmed_urls = pre_confirmed_urls
+        if urls_found and not confirmed_urls:
+            logger.info(f"Skipping {len(urls_found)} URL(s) - not confirmed by user")
+    elif urls_found and _is_interactive_mode():
         confirmed_urls = _confirm_urls(urls_found)
         if not confirmed_urls:
             logger.info(f"Skipping {len(urls_found)} URL(s) - not confirmed by user")

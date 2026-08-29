@@ -1,6 +1,18 @@
 import { test, expect } from '@playwright/test';
 
 test.describe('Connecting', () => {
+  test('connects to the API server (hard requirement)', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+
+    // The chat input only becomes enabled once the app has a live server
+    // connection. If this fails, the suite is running offline against demo
+    // data and NO other test is exercising the API server — fix the server
+    // or the --cors-origin (must exactly match the Playwright origin;
+    // localhost != 127.0.0.1) rather than softening this assertion.
+    await expect(page.getByTestId('chat-input')).toBeEnabled({ timeout: 20000 });
+  });
+
   test('should connect and list conversations', async ({ page }) => {
     // Go to the app
     await page.goto('/');
@@ -105,6 +117,49 @@ test.describe('Conversation Flow', () => {
   });
 });
 
+test.describe('Conversation Creation', () => {
+  // Set E2E_SKIP_CREATE_CONVERSATION=1 to skip when testing against a server
+  // known to reject webui creates (e.g. releases with the #2943 regression).
+  test.skip(
+    process.env.E2E_SKIP_CREATE_CONVERSATION === '1',
+    'server under test has the workspace-containment create regression (fixed by #3319)'
+  );
+
+  test('should create a new conversation when submitting a message', async ({ page }) => {
+    await page.goto('/');
+    await page.waitForLoadState('networkidle');
+
+    // Type a message in the chat input and submit with Enter.
+    // The input stays disabled until the app connects to the server — if this
+    // times out, the webui never connected (check the server's --cors-origin
+    // matches the Playwright origin exactly; localhost != 127.0.0.1).
+    const input = page.getByTestId('chat-input');
+    await expect(input).toBeVisible({ timeout: 10000 });
+    await expect(input).toBeEnabled({ timeout: 20000 });
+    await input.fill('Hello from the e2e test');
+    await input.press('Enter');
+
+    // Server-side creation must succeed and navigate to the new conversation.
+    // Regression guard: the server once rejected every webui create with
+    // "workspace escapes conversation logdir" because the webui sends an
+    // explicit workspace ('.') with each create request.
+    await page.waitForURL(/\/chat\/chat-/, { timeout: 15000 });
+
+    // The submitted message should be rendered in the conversation.
+    // exact: true is required — when the server under test can actually generate
+    // (e.g. the mock/echo provider used by the dev CI pass), the reply
+    // "Echo: Hello from the e2e test" also contains this string, and a substring
+    // match then resolves to two elements and fails on strict mode.
+    await expect(page.getByText('Hello from the e2e test', { exact: true })).toBeVisible({
+      timeout: 10000,
+    });
+
+    // No creation-failure toast (generation itself may fail without API keys;
+    // this test only covers conversation creation)
+    await expect(page.getByText(/Failed to (create|start) conversation/)).not.toBeVisible();
+  });
+});
+
 test.describe('Split View', () => {
   test('should render split panes when ?split= param is present', async ({ page }) => {
     // Navigate with the split parameter using two demo conversation IDs
@@ -137,8 +192,8 @@ test.describe('Split View', () => {
     await page.goto('/chat/introduction');
     await page.waitForLoadState('networkidle');
 
-    // Should see the conversation content
-    await expect(page.getByText(/Hello! I'm gptme/)).toBeVisible({ timeout: 10000 });
+    // Should see the conversation content (virtualizer shows only viewport messages)
+    await expect(page.locator('[data-message-index]').first()).toBeVisible({ timeout: 10000 });
 
     // Press keyboard shortcut (Ctrl+Shift+\) to open split view
     await page.keyboard.press('Control+Shift+\\');

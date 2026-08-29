@@ -7,7 +7,12 @@ on:
     branches: [ master, 'dev/*' ]
     paths:
       - 'webui/**'
+      - 'pyproject.toml'
+      - 'Makefile'
+      - 'scripts/validate_release_package.py'
       - '.github/workflows/webui.yml'
+      - '.github/workflows/webui-visual-diff.yml'
+      - '.github/scripts/diff-screenshots.sh'
 
 defaults:
   run:
@@ -24,7 +29,7 @@ jobs:
     - uses: actions/checkout@v7
 
     - name: Use Node.js ${{ matrix.node-version }}
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@v7
       with:
         node-version: ${{ matrix.node-version }}
         cache: 'npm'
@@ -44,6 +49,19 @@ jobs:
 
     - name: Build
       run: npm run build
+
+    - name: Set up Python
+      uses: actions/setup-python@v7
+      with:
+        python-version: '3.12'
+
+    - name: Verify release package includes the built webui
+      working-directory: .
+      run: |
+        make bundle-webui
+        pipx install poetry
+        poetry build
+        make validate-release-package
 
     - name: Upload dist artifact
       if: github.ref == 'refs/heads/master'
@@ -90,14 +108,14 @@ jobs:
     - uses: actions/checkout@v7
 
     - name: Use Node.js 20
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@v7
       with:
         node-version: 20
         cache: 'npm'
         cache-dependency-path: webui/package-lock.json
 
     - name: Set up Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: '3.11'
         cache: 'pip'
@@ -118,7 +136,11 @@ jobs:
         ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'dummy-ci-key' }}
         MODEL: anthropic/claude-3-5-haiku-latest
       run: |
-        gptme-server --cors-origin="http://localhost:5701" &
+        # Playwright serves the webui at http://127.0.0.1:5701 — the CORS origin
+        # must match that exact origin (localhost != 127.0.0.1 for CORS); with a
+        # mismatched origin the webui silently runs offline against demo data
+        # and no e2e test exercises the server at all.
+        gptme-server --cors-origin="http://127.0.0.1:5701,http://localhost:5701" &
         echo $! > /tmp/gptme-server.pid
         sleep 3
 
@@ -128,6 +150,10 @@ jobs:
     - name: Run e2e tests (stable)
       id: e2e-stable
       continue-on-error: true
+      env:
+        # Latest PyPI release still has the workspace-containment create
+        # regression (#2943, fixed by #3319). Remove after the next release.
+        E2E_SKIP_CREATE_CONVERSATION: '1'
       run: npm run test:e2e
 
     - name: Upload stable test results
@@ -145,17 +171,25 @@ jobs:
         kill "$(cat /tmp/gptme-server.pid)" 2>/dev/null || true
         sleep 2
 
-    # ── dev pass (git master) ─────────────────────────────────────────────────
-    - name: Install dev gptme (git master)
+    # ── dev pass (this checkout) ──────────────────────────────────────────────
+    # Install from the PR/branch checkout, NOT git master: the e2e run must
+    # exercise the server code under review, otherwise server-side regressions
+    # (like the #2943 create breakage) can never be caught pre-merge.
+    - name: Install dev gptme (this checkout)
       working-directory: .
-      run: pip install --force-reinstall 'gptme[server] @ git+https://github.com/gptme/gptme.git'
+      run: |
+        pip uninstall -y gptme
+        pip install '.[server]'
 
     - name: Start server (dev)
       env:
-        ANTHROPIC_API_KEY: ${{ secrets.ANTHROPIC_API_KEY || 'dummy-ci-key' }}
-        MODEL: anthropic/claude-3-5-haiku-latest
+        # mock/echo needs no API key — generation completes deterministically
+        # and exercises the full SSE streaming path without any real LLM call.
+        # This lets the generation.spec.ts E2E tests run in CI without secrets.
+        MODEL: mock/echo
+        GPTME_DISABLE_AUTH: "1"
       run: |
-        gptme-server --cors-origin="http://localhost:5701" &
+        gptme-server --cors-origin="http://127.0.0.1:5701,http://localhost:5701" &
         echo $! > /tmp/gptme-server.pid
         sleep 3
 
@@ -187,4 +221,48 @@ jobs:
         stable="${{ steps.e2e-stable.outcome }}"
         dev="${{ steps.e2e-dev.outcome }}"
         echo "stable: $stable  dev: $dev"
-        [ "$stable" = "success" ] && [ "$dev" = "success" ]
+        # The dev pass exercises the PR code and is the primary gate.
+        # The stable pass tests the latest PyPI release, which may have known
+        # regressions (e.g., #2943) causing timeouts. The stable pass failure
+        # does not block PRs until the next gptme release ships the fix.
+        [ "$dev" = "success" ]
+
+  # ── Visual snapshot capture (PRs only) ───────────────────────────────────────
+  # Takes UI screenshots of the PR branch so that webui-visual-diff.yml can
+  # compare them against a master baseline and post a before/after comment
+  # when visual changes are detected.  No gptme server is needed — the webui
+  # runs in demo mode via `npm run dev`.
+  screenshots:
+    if: github.event_name == 'pull_request'
+    runs-on: ubuntu-latest
+
+    steps:
+    - uses: actions/checkout@v7
+
+    - name: Use Node.js 20
+      uses: actions/setup-node@v7
+      with:
+        node-version: 20
+        cache: 'npm'
+        cache-dependency-path: webui/package-lock.json
+
+    - name: Install dependencies
+      run: npm ci
+
+    - name: Install Playwright browsers
+      run: npx playwright install --with-deps chromium
+
+    - name: Take visual snapshots (PR branch — "after")
+      working-directory: webui
+      env:
+        SCREENSHOTS_DIR: ${{ github.workspace }}/visual-snapshots
+      run: npx playwright test e2e/visual-snapshots.spec.ts --reporter=dot
+
+    - name: Upload visual snapshots
+      uses: actions/upload-artifact@v7
+      with:
+        # Fixed name: the downstream workflow_run job scopes the download by
+        # run_id, so we don't need the PR number in the artifact name here.
+        name: webui-visual-snapshots
+        path: visual-snapshots/
+        retention-days: 7

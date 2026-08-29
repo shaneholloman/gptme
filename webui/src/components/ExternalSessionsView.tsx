@@ -10,7 +10,7 @@ import { useSearchParams } from 'react-router-dom';
 import { getRelativeTimeString } from '@/utils/time';
 import type { ExternalSessionCatalogItem } from '@/types/api';
 import { ApiClientError } from '@/utils/api';
-import { SessionReplayMessages } from '@/components/SessionReplayMessages';
+import { ExternalSessionDetail } from '@/components/ExternalSessionDetail';
 
 const HARNESS_LABELS: Record<string, string> = {
   'claude-code': 'Claude Code',
@@ -104,34 +104,6 @@ interface SessionDetailProps {
 }
 
 const SessionDetail: FC<SessionDetailProps> = ({ sessionId, onClose }) => {
-  const { api } = useApi();
-  const isConnected = use$(api.isConnected$);
-
-  const { data, isLoading, error } = useQuery({
-    queryKey: ['external-session-detail', sessionId],
-    queryFn: () => api.getExternalSession(sessionId),
-    enabled: isConnected && !!sessionId,
-  });
-
-  if (isLoading) {
-    return (
-      <div className="flex h-full items-center justify-center text-muted-foreground">
-        Loading session…
-      </div>
-    );
-  }
-
-  if (error || !data) {
-    return (
-      <div className="flex h-full flex-col items-center justify-center gap-2 text-muted-foreground">
-        <AlertCircle className="h-8 w-8" />
-        <p className="text-sm">Failed to load session details</p>
-      </div>
-    );
-  }
-
-  const messages = Array.isArray(data.transcript.messages) ? data.transcript.messages : null;
-
   return (
     <div className="flex h-full flex-col">
       <div className="flex items-center justify-between border-b px-4 py-2">
@@ -146,14 +118,8 @@ const SessionDetail: FC<SessionDetailProps> = ({ sessionId, onClose }) => {
           <X className="h-4 w-4" />
         </Button>
       </div>
-      <div className="flex-1 overflow-y-auto p-4">
-        {messages ? (
-          <SessionReplayMessages messages={messages} />
-        ) : (
-          <pre className="whitespace-pre-wrap rounded-md bg-muted p-3 text-xs">
-            {JSON.stringify(data.transcript, null, 2)}
-          </pre>
-        )}
+      <div className="min-h-0 flex-1 overflow-hidden">
+        <ExternalSessionDetail sessionId={sessionId} />
       </div>
     </div>
   );
@@ -318,7 +284,11 @@ export const ExternalSessionsView: FC = () => {
       {/* Detail panel */}
       {selectedId && (
         <div className="flex-1 overflow-hidden">
-          <SessionDetail sessionId={selectedId} onClose={() => setSelectedId(null)} />
+          <SessionDetail
+            key={selectedId}
+            sessionId={selectedId}
+            onClose={() => setSelectedId(null)}
+          />
         </div>
       )}
     </div>

@@ -10,6 +10,8 @@ See Issue #935 for design context, #2320 for cache-cold warning.
 """
 
 import logging
+import math
+import os
 import time
 from collections.abc import Generator
 from contextvars import ContextVar
@@ -18,7 +20,7 @@ from typing import TYPE_CHECKING, Any
 
 from ..hooks import HookType, StopPropagation, register_hook
 from ..message import Message
-from ..util.cost_tracker import CostTracker, SessionCosts
+from ..util.cost_tracker import CostEntry, CostTracker, SessionCosts
 
 if TYPE_CHECKING:
     from ..logmanager import LogManager
@@ -28,6 +30,9 @@ logger = logging.getLogger(__name__)
 # Thread-safe storage for pending warning to inject on next user message
 _pending_warning_var: ContextVar[str | None] = ContextVar(
     "pending_warning", default=None
+)
+_turn_start_entry_count_var: ContextVar[int | None] = ContextVar(
+    "turn_start_entry_count", default=None
 )
 
 # Anthropic prompt cache TTL (5 minutes)
@@ -56,10 +61,118 @@ COST_WARNING_THRESHOLDS = [
     1000.00,  # Large session warnings
 ]
 
+DEFAULT_BUDGET_WARN_PCT = 80.0
+
 
 def _is_direct_anthropic_model(model: str | None) -> bool:
     """Return True for direct Anthropic model IDs recorded by gptme."""
     return bool(model and model.startswith(("anthropic/", "claude-")))
+
+
+def _positive_float_from_env(name: str) -> float | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = float(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected positive number", name, value)
+        return None
+    if not math.isfinite(parsed) or parsed <= 0:
+        logger.warning("Ignoring invalid %s=%r; expected positive number", name, value)
+        return None
+    return parsed
+
+
+def _positive_int_from_env(name: str) -> int | None:
+    value = os.environ.get(name)
+    if value is None or not value.strip():
+        return None
+    try:
+        parsed = int(value)
+    except ValueError:
+        logger.warning("Ignoring invalid %s=%r; expected positive integer", name, value)
+        return None
+    if parsed <= 0:
+        logger.warning("Ignoring invalid %s=%r; expected positive integer", name, value)
+        return None
+    return parsed
+
+
+def _budget_warn_pct() -> float:
+    pct = _positive_float_from_env("GPTME_BUDGET_WARN_PCT")
+    if pct is None:
+        return DEFAULT_BUDGET_WARN_PCT
+    if pct > 100:
+        logger.warning(
+            "Ignoring invalid GPTME_BUDGET_WARN_PCT=%r; expected 0-100",
+            os.environ.get("GPTME_BUDGET_WARN_PCT"),
+        )
+        return DEFAULT_BUDGET_WARN_PCT
+    return pct
+
+
+def _total_tokens(costs: SessionCosts) -> int:
+    return (
+        costs.total_input_tokens
+        + costs.total_output_tokens
+        + costs.total_cache_read_tokens
+        + costs.total_cache_creation_tokens
+    )
+
+
+def _budget_warning(
+    costs: SessionCosts, turn_entries: list[CostEntry]
+) -> tuple[str, str] | None:
+    warn_pct = _budget_warn_pct()
+    warn_fraction = warn_pct / 100
+    turn_cost = sum(entry.cost for entry in turn_entries)
+    turn_tokens = sum(
+        entry.input_tokens
+        + entry.output_tokens
+        + entry.cache_read_tokens
+        + entry.cache_creation_tokens
+        for entry in turn_entries
+    )
+    warning_parts: list[str] = []
+    log_parts: list[str] = []
+
+    cost_budget = _positive_float_from_env("GPTME_SESSION_BUDGET_USD")
+    if cost_budget is not None:
+        total_cost = costs.total_cost
+        prev_cost = total_cost - turn_cost
+        warn_at = cost_budget * warn_fraction
+        if prev_cost < warn_at <= total_cost:
+            cache_hit_pct = costs.cache_hit_rate * 100
+            warning_parts.append(
+                f"Session cost reached ${total_cost:.2f} "
+                f"({warn_pct:.0f}% of ${cost_budget:.2f} budget; "
+                f"tokens: {costs.total_input_tokens:,}/{costs.total_output_tokens:,} in/out, "
+                f"cache hit: {cache_hit_pct:.1f}%)"
+            )
+            log_parts.append(
+                f"Session cost reached ${total_cost:.2f} "
+                f"({warn_pct:.0f}% of ${cost_budget:.2f} budget)"
+            )
+
+    token_budget = _positive_int_from_env("GPTME_SESSION_BUDGET_TOKENS")
+    if token_budget is not None:
+        total_tokens = _total_tokens(costs)
+        prev_tokens = total_tokens - turn_tokens
+        warn_at_tokens = token_budget * warn_fraction
+        if prev_tokens < warn_at_tokens <= total_tokens:
+            warning_parts.append(
+                f"Session token usage reached {total_tokens:,} "
+                f"({warn_pct:.0f}% of {token_budget:,} token budget)"
+            )
+            log_parts.append(warning_parts[-1])
+
+    if not warning_parts:
+        return None
+    return (
+        f"<system_warning>{' '.join(warning_parts)}</system_warning>",
+        " ".join(log_parts),
+    )
 
 
 def anthropic_cache_cold_warning(
@@ -161,6 +274,15 @@ def session_start_cost_tracking(
     yield from ()
 
 
+def record_turn_start_costs(
+    manager: "LogManager",
+) -> Generator[Message | StopPropagation, None, None]:
+    """Remember how many cost entries existed before the current turn."""
+    costs = CostTracker.get_session_costs()
+    _turn_start_entry_count_var.set(len(costs.entries) if costs else 0)
+    yield from ()
+
+
 def cost_warning_hook(
     manager: "LogManager",
 ) -> Generator[Message | StopPropagation, None, None]:
@@ -182,10 +304,25 @@ def cost_warning_hook(
         return
 
     total = costs.total_cost
+    turn_start = _turn_start_entry_count_var.get()
+    if turn_start is None:
+        turn_start = len(costs.entries) - 1
+    turn_start = min(turn_start, len(costs.entries))
+    turn_entries = costs.entries[turn_start:]
+    if not turn_entries:
+        return
 
-    # Find if we crossed any threshold with the last request
-    last_entry = costs.entries[-1]
-    prev_cost = total - last_entry.cost
+    # Find whether the completed turn crossed any threshold. A turn may contain
+    # multiple LLM requests when the assistant uses tools.
+    turn_cost = sum(entry.cost for entry in turn_entries)
+    prev_cost = total - turn_cost
+
+    if budget_warning := _budget_warning(costs, turn_entries):
+        warning_text, log_text = budget_warning
+        _pending_warning_var.set(warning_text)
+        logger.info(log_text)
+        yield from ()
+        return
 
     for threshold in COST_WARNING_THRESHOLDS:
         if prev_cost < threshold <= total:
@@ -321,6 +458,12 @@ def register() -> None:
         HookType.GENERATION_PRE,
         cache_cold_warning_hook,
         priority=7,  # Must run before inject_pending_warning (priority=5) so warning is set before injection
+    )
+    register_hook(
+        "cost_awareness.turn_start",
+        HookType.TURN_PRE,
+        record_turn_start_costs,
+        priority=0,
     )
     register_hook(
         "cost_awareness.cost_warning",

@@ -1728,6 +1728,27 @@ def test_list_background_jobs():
     reset_background_jobs()
 
 
+def test_bg_command_executes_remaining_commands():
+    """Commands after a bg line are passed back to execute_shell correctly."""
+    from unittest.mock import patch
+
+    from gptme.hooks.confirm import ConfirmationResult
+    from gptme.tools.shell import execute_shell
+
+    with (
+        patch(
+            "gptme.hooks.get_confirmation",
+            return_value=ConfirmationResult.confirm(),
+        ),
+        patch("gptme.tools.shell.execute_bg_command", return_value=iter([])),
+        patch("gptme.tools.shell.execute_shell_impl", return_value=iter([])) as execute,
+    ):
+        list(execute_shell("bg sleep 1\nprintf remaining", [], None))
+
+    execute.assert_called_once()
+    assert execute.call_args.args[0] == "printf remaining"
+
+
 def test_execute_bg_command():
     """Test the bg command handler."""
     from gptme.tools.shell import execute_bg_command, reset_background_jobs
@@ -1811,6 +1832,11 @@ def test_needs_tty_sudo_detection():
             assert shell._needs_tty(
                 "DEBIAN_FRONTEND=noninteractive sudo apt install vim"
             )
+
+            # A separate TTY subprocess would bypass the configured sandbox.
+            with patch("gptme.tools.shell.SandboxConfig.from_env") as from_env:
+                from_env.return_value.enabled = True
+                assert not shell._needs_tty("sudo apt install vim")
     finally:
         shell.close()
 
@@ -1931,6 +1957,92 @@ def test_check_workspace_config_hint_includes_workdir_param(tmp_path):
     finally:
         os.chdir(original_cwd)
         _hinted_workspaces.discard(str(tmp_path.resolve()))
+
+
+def test_workspace_hint_in_command_output(tmp_path):
+    """Workspace hint is appended to the command output in a single message.
+
+    Strict providers (e.g. Moonshot AI / kimi-k2.6) require that an assistant
+    ``tool_calls`` entry is immediately followed by ``tool`` role responses —
+    any interleaved message causes a 400 error.  The serializer converts system
+    messages without a call_id to user-role messages, so a separate hint yield
+    would appear as a user message between the tool_call and its result.
+    The fix: append the hint directly to the output so the generator yields a
+    single message that receives the call_id stamp and becomes a clean tool
+    response with no interleaved content.
+    """
+    from gptme.tools.shell import _hinted_workspaces, execute_shell
+
+    (tmp_path / "gptme.toml").write_text("[gptme]\n")
+    _hinted_workspaces.discard(str(tmp_path.resolve()))
+
+    original_cwd = os.getcwd()
+    try:
+        messages = list(execute_shell(None, None, {"command": f"cd {tmp_path}"}))
+    finally:
+        os.chdir(original_cwd)
+        _hinted_workspaces.discard(str(tmp_path.resolve()))
+
+    assert len(messages) == 1, (
+        f"Expected 1 message (output + appended hint), got {len(messages)}"
+    )
+
+    msg = messages[0]
+    assert msg.content.startswith("Ran"), "Message should start with the command output"
+    assert "gptme.toml" in msg.content, (
+        "Workspace hint should be appended to the output"
+    )
+
+
+def test_workspace_hint_serializes_as_one_tool_response(tmp_path):
+    """No message may sit between a structured call and its tool result."""
+    from gptme.llm.llm_openai import _prepare_messages_for_api
+    from gptme.message import Message
+    from gptme.tools import get_tool, init_tools
+    from gptme.tools.base import ToolUse
+    from gptme.tools.shell import _hinted_workspaces
+
+    (tmp_path / "gptme.toml").write_text("[gptme]\n")
+    _hinted_workspaces.discard(str(tmp_path.resolve()))
+
+    original_cwd = os.getcwd()
+    try:
+        result_messages = list(
+            ToolUse(
+                tool="shell",
+                args=None,
+                content=None,
+                kwargs={"command": f"cd {tmp_path}"},
+                call_id="call_workspace",
+                _format="tool",
+            ).execute()
+        )
+    finally:
+        os.chdir(original_cwd)
+        _hinted_workspaces.discard(str(tmp_path.resolve()))
+
+    init_tools(allowlist=["shell"])
+    messages = [
+        Message(role="user", content="Enter the workspace."),
+        Message(
+            role="assistant",
+            content=(f'@shell(call_workspace): {{"command": "cd {tmp_path}"}}'),
+        ),
+        *result_messages,
+    ]
+    shell_tool = get_tool("shell")
+    assert shell_tool is not None
+    serialized, _ = _prepare_messages_for_api(
+        messages, "moonshot/kimi-k2.6", [shell_tool]
+    )
+
+    assistant_idx = next(
+        idx for idx, message in enumerate(serialized) if message["role"] == "assistant"
+    )
+    tool_result = serialized[assistant_idx + 1]
+    assert tool_result["role"] == "tool"
+    assert tool_result["tool_call_id"] == "call_workspace"
+    assert "gptme.toml" in str(tool_result["content"])
 
 
 def test_shell_bare_cd_updates_working_directory(tmp_path):

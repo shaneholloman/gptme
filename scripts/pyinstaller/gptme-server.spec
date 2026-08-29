@@ -7,13 +7,18 @@ from pathlib import Path
 project_root = Path.cwd()
 sys.path.insert(0, str(project_root))
 
-# Define data files to include
+# Define data files to include. Standalone executables serve the modern web UI,
+# while the Tauri host already bundles it via frontendDist.
 datas = [
-    # Include server static files
     (str(project_root / 'gptme/server/static'), 'gptme/server/static'),
     # Include the logo if needed
     (str(project_root / 'media/logo.png'), 'media'),
 ]
+if os.environ.get('GPTME_PYINSTALLER_EXCLUDE_WEBUI') != '1':
+    datas.insert(
+        0,
+        (str(project_root / 'gptme/server/webui-dist'), 'gptme/server/webui-dist'),
+    )
 
 # Hidden imports - modules that PyInstaller might miss
 hiddenimports = [

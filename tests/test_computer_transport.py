@@ -22,6 +22,7 @@ from gptme.tools.computer_transport import (
     NativeComputerTransport,
     _resize_image,
     get_transport,
+    register_transport,
 )
 
 
@@ -838,6 +839,232 @@ class TestDispatchTransportScroll(unittest.TestCase):
         _dispatch_transport(stub, "scroll", text="Down", coordinate=(100, 200))
 
         stub.scroll.assert_called_once_with(100, 200, "down")
+
+
+class TestTransportRegistry(unittest.TestCase):
+    """register_transport() lets out-of-tree transports be selected by name."""
+
+    def setUp(self):
+        import gptme.tools.computer_transport as ct
+
+        self._saved_registry = dict(ct._transport_registry)
+        ct._transport_registry.clear()
+        ct._transport = None
+        ct._transport_name = None
+
+    def tearDown(self):
+        import gptme.tools.computer_transport as ct
+
+        ct._transport_registry.clear()
+        ct._transport_registry.update(self._saved_registry)
+        ct._transport = None
+        ct._transport_name = None
+
+    def test_registered_transport_is_selected_by_env_var(self):
+        """GPTME_COMPUTER_TRANSPORT=<registered name> returns that transport."""
+        register_transport("stub-transport", StubTransport)
+
+        with patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "stub-transport"}):
+            transport = get_transport()
+
+        self.assertIsInstance(transport, StubTransport)
+
+    def test_factory_is_not_called_at_registration_time(self):
+        """The factory must stay lazy so heavy/platform-specific imports are deferred."""
+        calls: list[int] = []
+
+        def factory() -> ComputerTransport:
+            calls.append(1)
+            return StubTransport()
+
+        register_transport("lazy-transport", factory)
+        self.assertEqual(calls, [], "factory must not run at registration time")
+
+        with patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "lazy-transport"}):
+            get_transport()
+
+        self.assertEqual(calls, [1], "factory must run once on selection")
+
+    def test_registered_transport_is_cached_across_calls(self):
+        """A successfully created transport is reused, not rebuilt per call."""
+        calls: list[int] = []
+
+        def factory() -> ComputerTransport:
+            calls.append(1)
+            return StubTransport()
+
+        register_transport("cached-transport", factory)
+
+        with patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "cached-transport"}):
+            first = get_transport()
+            second = get_transport()
+
+        self.assertIs(first, second)
+        self.assertEqual(calls, [1])
+
+    def test_switch_with_failing_close_clears_stale_transport(self):
+        """A close failure cannot preserve stale cache state during a switch."""
+        import gptme.tools.computer_transport as ct
+
+        calls: list[int] = []
+
+        class FailingCloseStub(StubTransport):
+            def close(self) -> None:
+                raise RuntimeError("close failed")
+
+        def replacement_factory() -> ComputerTransport:
+            calls.append(1)
+            return StubTransport()
+
+        register_transport("replacement", replacement_factory)
+        ct._transport = FailingCloseStub()
+        ct._transport_name = "original"
+
+        with (
+            patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "replacement"}),
+            self.assertLogs("gptme.tools.computer_transport", level="ERROR") as logs,
+        ):
+            replacement = get_transport()
+
+        self.assertIsInstance(replacement, StubTransport)
+        self.assertEqual(calls, [1])
+        self.assertEqual(ct._transport_name, "replacement")
+        self.assertIn("Failed to close transport", "\n".join(logs.output))
+
+    def test_invalid_factory_result_falls_back_to_native_and_retries(self):
+        """A factory returning the wrong type follows the failure fallback path."""
+        import gptme.tools.computer_transport as ct
+
+        calls: list[int] = []
+
+        def invalid_factory() -> ComputerTransport:
+            calls.append(1)
+            return None  # type: ignore[return-value]
+
+        register_transport("invalid-transport", invalid_factory)
+
+        with (
+            patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "invalid-transport"}),
+            patch.object(ct, "NativeComputerTransport", StubTransport),
+            self.assertLogs("gptme.tools.computer_transport", level="WARNING") as logs,
+        ):
+            transport = get_transport()
+            self.assertIsInstance(transport, StubTransport)
+            self.assertIsNone(ct._transport_name)
+            get_transport()
+
+        self.assertEqual(calls, [1, 1])
+        self.assertIn("expected ComputerTransport", "\n".join(logs.output))
+
+    def test_failing_factory_falls_back_to_native_and_retries(self):
+        """A raising factory must not break the computer tool, and must be retried."""
+        import gptme.tools.computer_transport as ct
+
+        calls: list[int] = []
+
+        def failing_factory() -> ComputerTransport:
+            calls.append(1)
+            raise RuntimeError("phone not connected")
+
+        register_transport("flaky-transport", failing_factory)
+
+        with (
+            patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "flaky-transport"}),
+            patch.object(ct, "NativeComputerTransport", StubTransport),
+        ):
+            transport = get_transport()
+            self.assertIsInstance(transport, StubTransport)
+            # _transport_name stays None so the next call retries the factory
+            self.assertIsNone(ct._transport_name)
+            get_transport()
+
+        self.assertEqual(calls, [1, 1], "failing factory must be retried, not cached")
+
+    def test_registering_builtin_name_raises(self):
+        """Built-in transports may not be shadowed — silently losing them is worse."""
+        for name in ("native", "cua"):
+            with self.subTest(name=name), self.assertRaises(ValueError):
+                register_transport(name, StubTransport)
+
+    def test_registering_empty_name_raises(self):
+        with self.assertRaises(ValueError):
+            register_transport("   ", StubTransport)
+
+    def test_reregistering_replaces_cached_transport(self):
+        closed: list[bool] = []
+
+        class OriginalStub(StubTransport):
+            def close(self) -> None:
+                closed.append(True)
+
+        class ReplacementStub(StubTransport):
+            pass
+
+        register_transport("dup-transport", OriginalStub)
+
+        with patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "dup-transport"}):
+            original = get_transport()
+            register_transport("dup-transport", ReplacementStub)
+            replacement = get_transport()
+
+        self.assertIsInstance(original, OriginalStub)
+        self.assertIsInstance(replacement, ReplacementStub)
+        self.assertIsNot(original, replacement)
+        self.assertEqual(closed, [True])
+
+    def test_registering_unknown_selected_name_replaces_native_fallback(self):
+        """Late registration replaces the cached fallback for that env-var name."""
+        import gptme.tools.computer_transport as ct
+
+        class ReplacementStub(StubTransport):
+            pass
+
+        with (
+            patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "late-transport"}),
+            patch.object(ct, "NativeComputerTransport", StubTransport),
+        ):
+            fallback = get_transport()
+            register_transport("late-transport", ReplacementStub)
+            replacement = get_transport()
+
+        self.assertIsInstance(fallback, StubTransport)
+        self.assertIsInstance(replacement, ReplacementStub)
+        self.assertIsNot(fallback, replacement)
+
+    def test_failed_close_does_not_prevent_replacement(self):
+        """A broken old transport cannot retain stale registration state."""
+
+        class FailingCloseStub(StubTransport):
+            def close(self) -> None:
+                raise RuntimeError("close failed")
+
+        class ReplacementStub(StubTransport):
+            pass
+
+        register_transport("broken-close", FailingCloseStub)
+
+        with patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "broken-close"}):
+            original = get_transport()
+            with self.assertLogs(
+                "gptme.tools.computer_transport", level="ERROR"
+            ) as logs:
+                register_transport("broken-close", ReplacementStub)
+            replacement = get_transport()
+
+        self.assertIsInstance(original, FailingCloseStub)
+        self.assertIsInstance(replacement, ReplacementStub)
+        self.assertIsNot(original, replacement)
+        self.assertIn("Failed to close transport", "\n".join(logs.output))
+
+    def test_unknown_name_still_falls_back_to_native(self):
+        """Registry lookup must not change behaviour for unregistered names."""
+        import gptme.tools.computer_transport as ct
+
+        with (
+            patch.dict(os.environ, {"GPTME_COMPUTER_TRANSPORT": "does-not-exist"}),
+            patch.object(ct, "NativeComputerTransport", StubTransport),
+        ):
+            self.assertIsInstance(get_transport(), StubTransport)
 
 
 if __name__ == "__main__":

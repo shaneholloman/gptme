@@ -52,7 +52,9 @@ def prompt_full(
     workspace: Path | None = None,
 ) -> Generator[Message, None, None]:
     """Full prompt to start the conversation."""
-    yield from prompt_gptme(interactive, model, agent_name, tool_format=tool_format)
+    yield from prompt_gptme(
+        interactive, model, agent_name, tool_format=tool_format, tools=tools
+    )
     yield from prompt_tools(tools=tools, tool_format=tool_format, model=model)
     if interactive:
         yield from prompt_user(tool_format=tool_format)
@@ -76,6 +78,7 @@ def prompt_short(
         agent_name=agent_name,
         tool_format=tool_format,
         compact=True,
+        tools=tools,
     )
     yield from prompt_tools(
         examples=False, tools=tools, tool_format=tool_format, model=model
@@ -91,6 +94,7 @@ def prompt_gptme(
     agent_name: str | None = None,
     tool_format: ToolFormat = "markdown",
     compact: bool = False,
+    tools: list[ToolSpec] | None = None,
 ) -> Generator[Message, None, None]:
     """
     Base system prompt for gptme.
@@ -133,6 +137,111 @@ Always consider the full range of your available tools and abilities when approa
         if compact
         else "Maintain a professional and efficient communication style. Be concise but thorough in your explanations."
     )
+    # Applied uniformly across backends: measurement across Claude, GPT-4o and
+    # Codex found ending on an offer/question instead of an action to be the
+    # shared weakness, not a per-backend one.
+    next_step_guidance = (
+        "End with a concrete next step (a command or specific action), not an offer to elaborate."
+        if compact
+        else """End your response with a concrete next step: a command to run, a file to change, or a specific action to take.
+Do not end with an offer to elaborate ("I can give you a patch if you want") or a generic suggestion."""
+    )
+    if interactive:
+        next_step_guidance += (
+            " Ask a clarifying question only when the request is genuinely ambiguous."
+            if compact
+            else "\nAsk a clarifying question only when the request is genuinely ambiguous and you cannot proceed without the answer."
+        )
+
+    # Determine which editing tools are active in this session.
+    # Tool names are the registered .name values: "patch" (gptme/tools/patch.py)
+    # and "save" (gptme/tools/save.py). Not "write" — that is an alias in some docs.
+    tool_names = {t.name for t in (tools or [])}
+    has_patch = "patch" in tool_names
+    has_save = "save" in tool_names
+
+    # Inline editing hint (only mentions tools that are actually available)
+    if has_patch and has_save:
+        editing_inline = "When suggesting code changes, prefer applying patches over examples. Preserve comments, unless they are no longer relevant.\nUse the patch tool to edit existing files, or the save tool to overwrite."
+    elif has_patch:
+        editing_inline = "When suggesting code changes, prefer applying patches over examples. Preserve comments, unless they are no longer relevant.\nUse the patch tool to edit existing files."
+    elif has_save:
+        editing_inline = "When suggesting code changes, use the save tool to write or overwrite files. Preserve comments, unless they are no longer relevant."
+    else:
+        editing_inline = "When suggesting code changes, show the changes clearly in your response. Preserve comments, unless they are no longer relevant."
+
+    # Full Code Editing Strategy section — only emitted when at least one editing tool is present
+    if has_patch or has_save:
+        patch_section = (
+            """1. **patch** — For targeted changes to existing files
+   - BEST FOR: Fixing a bug, changing a function, adding imports
+   - Uses conflict-marker format (not unified diff) to describe what changes
+   - FAIL MODE: Context-line mismatch if the file changed since you read it
+   - Always read the file first so your context lines match exactly
+"""
+            if has_patch
+            else ""
+        )
+        save_section = (
+            f"""{"2" if has_patch else "1"}. **save** — For complete rewrites or new files
+   - BEST FOR: Test files, newly generated code, structural refactors
+   - COST: Higher (rewrite entire file content)
+   - FAIL MODE: Loses the review diff structure; harder for humans to review
+   - USE WHEN: Multiple edits accumulate, or a patch would be very complex
+"""
+            if has_save
+            else ""
+        )
+        prefer_save_hint = (
+            "- **Prefer the save tool for complex changes** — one clean rewrite beats several risky patches\n"
+            if has_save
+            else ""
+        )
+        intro_line = (
+            "You have two edit tools with different cost/correctness tradeoffs:"
+            if has_patch and has_save
+            else "You have one file-editing tool:"
+        )
+        # Only warn about patch fragility when patch is actually available
+        patch_fragility_warning = (
+            "- DO NOT try to edit cells with patch (whitespace/quoting fragile)\n"
+            if has_patch
+            else ""
+        )
+        code_editing_strategy = f"""
+## Code Editing Strategy
+
+{intro_line}
+
+{patch_section}{save_section}
+When editing a file:
+- **Always read first** to get the current state before editing
+{prefer_save_hint}- **After each edit**: Verify with a read or test run — don't assume it worked
+
+## Spreadsheet and Data Editing
+
+When working with CSV, Excel, or JSON data files:
+
+{patch_fragility_warning}- PREFERRED: Write Python scripts that load, modify, and save data
+  - Use libraries: openpyxl (Excel), csv (CSV), json (JSON)
+  - Write to a temp file first, verify, then move to final location
+- READ the file format first (is it really CSV or Excel?)
+- VERIFY your output matches the expected structure before claiming success
+
+## Editing Multiple Files
+
+When you need to edit multiple files in sequence:
+
+1. Read ALL files first to understand dependencies
+2. PLAN the edits (which file gets edited in which order)
+3. Make ONE edit, verify it works (run tests or read back)
+4. Then move to the next file
+5. DO NOT edit file A, then B, then A again without reading A after the B edit (file state changes can make later edits fail)
+
+This is especially important for code that imports across files.
+"""
+    else:
+        code_editing_strategy = ""
 
     default_base_prompt = f"""
 You are {agent_blurb}. {
@@ -160,13 +269,12 @@ You have the ability to self-correct. {
 You should learn about the context needed to provide the best help,
 such as exploring the current working directory and reading the code using terminal tools.
 
-When suggesting code changes, prefer applying patches over examples. Preserve comments, unless they are no longer relevant.
-Use the patch tool to edit existing files, or the save tool to overwrite.
+{editing_inline}
 When the output of a command is of interest, end the code block and message, so that it can be executed before continuing.
 
 Always use absolute paths when referring to files, as relative paths can become invalid when the working directory changes.
 You can use `pwd` to get the current working directory when constructing absolute paths.
-
+{code_editing_strategy}
 {placeholder_guidance}
 Do not suggest opening a browser or editor, instead do it using available tools.
 
@@ -183,7 +291,7 @@ You are {agent_blurb}. {
     }
 You help users with programming tasks by reading code, running terminal commands, and editing files on the local machine.
 {"Think step by step in `<thinking>` tags." if use_thinking_tags else ""}
-Gather context before acting. Prefer applying patches over prose examples.
+Gather context before acting. {editing_inline}
 Use absolute paths and `pwd` when needed.
 {placeholder_guidance}
 Do not suggest opening a browser or editor when available tools can do it.
@@ -220,6 +328,9 @@ Proceed directly with the most appropriate actions to complete the task.
         + "\n\n"
         + (interactive_prompt if interactive else non_interactive_prompt)
     )
+    # next_step_guidance is applied uniformly even when a project overrides
+    # base_prompt, so the concrete-next-step instruction is not silently dropped.
+    full_prompt += "\n\n" + next_step_guidance
     if _needs_tool_use_enforcement(model_meta):
         full_prompt += _TOOL_USE_ENFORCEMENT_PROMPT
     if tool_format == "xml":

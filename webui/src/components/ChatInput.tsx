@@ -327,10 +327,23 @@ const ModelBadge: FC<{
   models: { id: string; provider: string; model: string }[];
   onModelChange: (model: string) => void;
   isDisabled: boolean;
-}> = ({ model, models, onModelChange, isDisabled }) => {
+  isLoading?: boolean;
+}> = ({ model, models, onModelChange, isDisabled, isLoading }) => {
   const [open, setOpen] = useState(false);
   const modelInfo = models.find((m) => m.id === model);
   const displayName = modelInfo?.model || model.split('/').pop() || model;
+
+  // Show a skeleton pill while the conversation's chatConfig is still loading,
+  // so we never display the wrong fallback model to the user.
+  if (isLoading) {
+    return (
+      <div
+        data-testid="model-selector"
+        className="h-5 w-24 animate-pulse rounded-sm bg-muted"
+        aria-label="Loading model..."
+      />
+    );
+  }
 
   return (
     <Popover open={open} onOpenChange={setOpen}>
@@ -340,6 +353,8 @@ const ModelBadge: FC<{
           size="sm"
           className="h-5 max-w-[200px] rounded-sm px-1.5 text-[10px] text-muted-foreground transition-all hover:bg-accent hover:text-muted-foreground hover:opacity-100"
           disabled={isDisabled}
+          data-testid="model-selector"
+          aria-label={`Model: ${displayName}`}
         >
           {modelInfo?.provider && <ProviderIcon provider={modelInfo.provider} size={10} />}
           <span className="ml-1 truncate">{displayName}</span>
@@ -601,11 +616,31 @@ export const ChatInput: FC<Props> = ({
   const sidebarSelectedAgent = use$(selectedAgent$);
 
   // Use dynamic models instead of static list
-  const { models: modelInfos, defaultModel: apiDefaultModel } = useModels();
+  const {
+    models: modelInfos,
+    defaultModel: apiDefaultModel,
+    isLoading: isModelsLoading,
+  } = useModels();
 
-  // Get conversation config to read the actual model
+  // Get conversation config to read the actual model.
+  // chatConfig uses a three-value sentinel:
+  //   undefined = fetch not yet attempted (show loading skeleton)
+  //   null      = fetch attempted but failed (clear skeleton, show fallback model)
+  //   ChatConfig = successfully fetched
   const conversation$ = conversationId ? conversations$.get(conversationId) : null;
-  const conversationModel = conversation$?.chatConfig?.get()?.chat?.model;
+  const chatConfig = conversation$?.chatConfig?.get();
+  const conversationModel = chatConfig?.chat?.model;
+  // Show the loading skeleton when:
+  //   (a) chatConfig is actively being fetched for an editable conversation — the
+  //       three-value sentinel tracks this: undefined = in-flight, null = failed.
+  //   (b) No model source has resolved yet and the /api/v2/models fetch is still
+  //       in-flight — prevents briefly rendering the wrong hardcoded fallback string
+  //       ('anthropic/claude-sonnet-4-6') on every fresh ChatInput mount while the
+  //       models endpoint responds.  Once isModelsLoading clears (success or failure),
+  //       we show whatever model resolved (real or fallback).
+  const isChatConfigLoading =
+    (!!conversationId && !isReadOnly && chatConfig === undefined) ||
+    (isModelsLoading && !conversationModel && !defaultModel && !apiDefaultModel);
 
   // Initialize message from localStorage for persistence across page reloads
   // Skip localStorage in edit mode — content comes from the message being edited
@@ -1089,7 +1124,7 @@ export const ChatInput: FC<Props> = ({
   };
 
   return (
-    <form onSubmit={handleSubmit} className="p-2 sm:p-4">
+    <form onSubmit={handleSubmit}>
       <p id={inputHelpId} className="sr-only">
         Press Enter to send, Shift Enter for a new line, and Escape to cancel, stop generation, or
         leave the message field.
@@ -1245,6 +1280,7 @@ export const ChatInput: FC<Props> = ({
                           setHasExplicitModelSelection(true);
                         }}
                         isDisabled={isDisabled}
+                        isLoading={isChatConfigLoading}
                       />
                       {/* File attach button */}
                       <Button

@@ -31,6 +31,7 @@ def auto_compact_log(
     max_tool_result_tokens: int = 2000,
     reasoning_strip_age_threshold: int = 5,
     logdir: Path | None = None,
+    keep_head: int = 0,
 ) -> Generator[Message, None, None]:
     """
     Auto-compact log for conversations with massive tool results.
@@ -56,6 +57,11 @@ def auto_compact_log(
         max_tool_result_tokens: Maximum tokens allowed in a tool result before removal
         reasoning_strip_age_threshold: Strip reasoning from messages >N positions back
         logdir: Path to conversation directory for saving removed outputs
+        keep_head: Number of messages at the start of the log to protect from all
+            compaction (default 0 = no protection, existing behavior). Protected
+            head messages are yielded verbatim and count toward the token budget but
+            are never reduced. If the head alone exceeds the limit, compaction accepts
+            the overshoot rather than reducing the protected task context.
     """
 
     # Build master context index for byte-range references
@@ -104,7 +110,12 @@ def auto_compact_log(
         and not needs_compacting
         and not needs_phase3_compression
     ):
-        yield from log
+        # Pin protected head messages even on early return so downstream
+        # limit_log (e.g. in prepare_messages) cannot drop them.
+        yield from (
+            m.replace(pinned=True) if keep_head > 0 and idx < keep_head else m
+            for idx, m in enumerate(log)
+        )
         return
 
     if needs_compacting:
@@ -120,7 +131,7 @@ def auto_compact_log(
     reasoning_tokens_saved = 0
 
     for idx, msg in enumerate(log):
-        if msg.pinned:
+        if msg.pinned or idx < keep_head:
             compacted_log.append(msg)
             continue
 
@@ -153,7 +164,7 @@ def auto_compact_log(
         # Identify all candidate tool results for truncation (with original indices)
         candidates: list[tuple[int, int, Message]] = []  # (idx, tokens, msg)
         for idx, msg in enumerate(compacted_log):
-            if msg.pinned:
+            if msg.pinned or idx < keep_head:
                 continue
             if msg.role == "system":
                 msg_tokens = len_tokens(msg.content, model.model)
@@ -214,7 +225,7 @@ def auto_compact_log(
     # Phase 3: Extractive compression for long assistant messages
     compacted_log_len = len(compacted_log)
     for idx, msg in enumerate(compacted_log):
-        if msg.pinned:
+        if msg.pinned or idx < keep_head:
             continue
 
         distance_from_end = compacted_log_len - idx - 1
@@ -294,10 +305,37 @@ def auto_compact_log(
             f"({reduction_pct:.1f}% reduction, saved {total_saved:,} tokens) "
             f"[{breakdown_str}]"
         )
-        yield from compacted_log
+        # Pin protected head messages so a downstream limit_log call (e.g. in
+        # prepare_messages) cannot drop them — limit_log only preserves pinned
+        # or initial-system messages, not arbitrary index positions.
+        yield from (
+            m.replace(pinned=True) if keep_head > 0 and idx < keep_head else m
+            for idx, m in enumerate(compacted_log)
+        )
         return
 
-    # If still over limit, fall back to regular reduction
+    # If still over limit, fall back to regular reduction.
+    # Protected head messages are yielded with pinned=True so any downstream
+    # reduce_log call (e.g. in prepare_messages) also skips them — it only
+    # respects the pinned flag, not the keep_head index.
     logger.info("Auto-compacting not sufficient, falling back to regular reduction")
 
-    yield from reduce_log(compacted_log, limit)
+    if keep_head > 0 and keep_head < len(compacted_log):
+        head_msgs = [m.replace(pinned=True) for m in compacted_log[:keep_head]]
+        tail_msgs = compacted_log[keep_head:]
+        head_tokens = len_tokens(head_msgs, model.model)
+        tail_limit = max(0, limit - head_tokens)
+        yield from head_msgs
+        yield from reduce_log(tail_msgs, tail_limit)
+    elif keep_head >= len(compacted_log):
+        # All messages are protected — accept the budget overshoot verbatim.
+        # Pin every message so that if the result is still over the model's
+        # context limit, a downstream reduce_log in prepare_messages cannot
+        # summarize or drop task context.
+        logger.info(
+            "keep_head covers all %d messages; yielding pinned verbatim (accepting budget overshoot)",
+            len(compacted_log),
+        )
+        yield from (m.replace(pinned=True) for m in compacted_log)
+    else:
+        yield from reduce_log(compacted_log, limit)

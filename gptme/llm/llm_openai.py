@@ -132,9 +132,10 @@ def _get_temperature(
 ) -> float:
     """Return the temperature for a given provider/model.
 
-    Moonshot/Kimi models require temperature=1.
-    OpenAI GPT-5 class models require temperature=1.
-    All others use the caller value or global default.
+    Moonshot/Kimi models require temperature=1. K3 is marked as a reasoner, so
+    callers omit this fixed parameter rather than invoking this helper. OpenAI
+    GPT-5 class models require temperature=1. All others use the caller value
+    or global default.
     """
     if provider == "moonshot":
         return 1.0
@@ -150,9 +151,10 @@ def _get_top_p(
 ) -> float | None:
     """Return the top_p for a given provider.
 
-    Moonshot/Kimi models require top_p=0.95.
-    All others use the caller value or global default.
-    Returns None for models that don't support top_p (e.g., gpt-5.x).
+    Moonshot/Kimi models require top_p=0.95. K3 is marked as a reasoner, so
+    callers omit this fixed parameter rather than invoking this helper. All
+    others use the caller value or global default. Returns None for models
+    that don't support top_p.
     """
     if model_meta is not None and "gpt-5" in model_meta.model:
         return None
@@ -161,9 +163,41 @@ def _get_top_p(
     return top_p if top_p is not None else TOP_P
 
 
-def _record_usage(usage, model: str) -> MessageMetadata | None:
+def _make_resolved_model(model: str, openrouter_provider: str) -> str | None:
+    """Build resolved model ID with the actual OpenRouter subprovider.
+
+    Returns None when the resolved provider matches the one already in the
+    model string (i.e. no new information to add), including when the user
+    explicitly pinned a provider suffix that names the same provider.
+    """
+    provider_slug = openrouter_provider.lower().replace(" ", "-")
+    base = model.split("@")[0] if "@" in model else model
+    if "@" in model:
+        user_suffix = model.split("@", 1)[1].lower()
+        # OpenRouter's response header uses display names ("Moonshot AI")
+        # while model suffixes use IDs ("moonshotai"). Compare both their
+        # slug and compact forms, while retaining the documented stem match.
+        compact_slug = provider_slug.replace("-", "")
+        compact_suffix = user_suffix.replace("-", "")
+        if (
+            provider_slug == user_suffix
+            or provider_slug.startswith(user_suffix + "-")
+            or compact_slug == compact_suffix
+        ):
+            return None
+    resolved = f"{base}@{provider_slug}"
+    if resolved == model:
+        return None
+    return resolved
+
+
+def _record_usage(
+    usage, model: str, resolved_model: str | None = None
+) -> MessageMetadata | None:
     """Record usage metrics as telemetry and return MessageMetadata."""
     if not usage:
+        if resolved_model:
+            return {"model": model, "resolved_model": resolved_model}
         return None
 
     counts = _extract_usage_token_counts(usage)
@@ -224,6 +258,8 @@ def _record_usage(usage, model: str) -> MessageMetadata | None:
 
     # Return MessageMetadata for attachment to Message
     metadata: MessageMetadata = {"model": model}
+    if resolved_model:
+        metadata["resolved_model"] = resolved_model
     if usage_data:
         metadata["usage"] = usage_data
     if cost > 0:
@@ -368,6 +404,7 @@ def _init_openai_client(
     api_key: str,
     base_url: str | None = None,
     timeout: float | _UnsetTimeout | NotGiven | None = None,
+    default_headers: dict[str, str] | None = None,
 ) -> None:
     """Internal helper to create and register an OpenAI client for a provider.
 
@@ -404,6 +441,7 @@ def _init_openai_client(
             api_key=api_key,
             base_url=base_url or None,
             timeout=timeout,
+            **({"default_headers": default_headers} if default_headers else {}),
         )
 
 
@@ -515,6 +553,22 @@ def init(provider: Provider, config: Config):
         clients[provider] = OpenAI(
             api_key=api_key, base_url="https://api.x.ai/v1", timeout=timeout
         )
+    elif provider == "grok-subscription":
+        # SuperGrok subscription: OAuth token from grok CLI or gptme auth flow.
+        # Routes through the grok-build subscription proxy (cli-chat-proxy.grok.com)
+        # which requires the api:access scope in the JWT — same endpoint used by
+        # other SuperGrok harnesses (openclaw, pi, etc.).
+        from .llm_grok_subscription import GROK_CLIENT_VERSION, GROK_PROXY_URL, get_auth
+
+        auth = get_auth()
+        _init_openai_client(
+            provider,
+            api_key=auth.access_token,
+            base_url=GROK_PROXY_URL,
+            default_headers={"x-grok-client-version": GROK_CLIENT_VERSION},
+            timeout=timeout,
+        )
+        return  # _init_openai_client already assigned clients[provider]
     elif provider == "groq":
         api_key = _get_provider_api_key(config, provider, "GROQ_API_KEY")
         clients[provider] = OpenAI(
@@ -637,6 +691,10 @@ def _is_proxy(client: OpenAI) -> bool:
     # If client has the proxy URL set, it is using the proxy
     if not proxy_url:
         return False
+    # Apply the same /messages normalization that init() applies before building the client,
+    # so the comparison never fails due to a missing suffix.
+    if not proxy_url.endswith("/messages"):
+        proxy_url = proxy_url + "/messages"
     # Normalize URLs for comparison (remove trailing slashes)
     return str(client.base_url).rstrip("/") == proxy_url.rstrip("/")
 
@@ -1019,14 +1077,21 @@ def chat(
     if max_tokens is not None:
         optional_kwargs[_max_tokens_param_name(provider, api_model)] = max_tokens
 
-    response = client.chat.completions.create(
+    raw_response = client.chat.completions.with_raw_response.create(
         model=api_model.split("@")[0],
         messages=cast(list, messages_dicts),
         extra_headers=extra_headers(provider),
         extra_body=extra_body(provider, model_meta, max_tokens=max_tokens),
         **optional_kwargs,
     )
-    metadata = _record_usage(response.usage, model)
+    response = raw_response.parse()
+    _or_provider = (
+        raw_response.headers.get("x-openrouter-provider")
+        if _uses_openrouter_backend(provider, model_meta)
+        else None
+    )
+    _resolved = _make_resolved_model(model, _or_provider) if _or_provider else None
+    metadata = _record_usage(response.usage, model, resolved_model=_resolved)
     if not response.choices:
         raise ValueError("OpenAI API returned empty choices list")
     choice = response.choices[0]
@@ -1054,6 +1119,13 @@ def chat(
     return "\n".join(result), metadata
 
 
+def _uses_openrouter_backend(provider: Provider, model_meta: ModelMeta) -> bool:
+    """Return whether this OpenAI-compatible request routes through OpenRouter."""
+    return provider == "openrouter" or (
+        provider == "gptme" and model_meta.model.startswith("openrouter/")
+    )
+
+
 def extra_headers(provider: Provider) -> dict[str, str]:
     """Return extra headers for the OpenAI API based on the model."""
     headers: dict[str, str] = {}
@@ -1065,6 +1137,7 @@ def extra_headers(provider: Provider) -> dict[str, str]:
 
 _OPENROUTER_REASONING_DEFAULT = 20000
 _VALID_QUANTIZATIONS = {"fp16", "bf16", "fp8", "int8", "int4", "unknown"}
+_KIMI_K3_REASONING_EFFORTS = {"low", "high", "max"}
 
 
 def extra_body(
@@ -1073,6 +1146,17 @@ def extra_body(
     """Return extra body for the OpenAI API based on the model."""
     body: dict[str, Any] = {}
     _maybe_apply_verbosity(body, model_meta)
+    if provider == "moonshot" and model_meta.model == "kimi-k3":
+        effort = get_config().get_env("GPTME_THINKING_EFFORT")
+        if effort is not None:
+            effort = effort.strip().lower()
+            if effort not in _KIMI_K3_REASONING_EFFORTS:
+                valid = ", ".join(sorted(_KIMI_K3_REASONING_EFFORTS))
+                raise ValueError(
+                    f"Invalid Kimi K3 reasoning effort: {effort!r}. "
+                    f"Must be one of: {valid}."
+                )
+            body["reasoning_effort"] = effort
     if provider == "openrouter":
         # Enable detailed usage info including cached tokens
         # See: https://openrouter.ai/docs/guides/usage-accounting
@@ -1285,7 +1369,7 @@ def stream(
     if max_tokens is not None:
         optional_kwargs[_max_tokens_param_name(provider, api_model)] = max_tokens
 
-    for chunk_raw in client.chat.completions.create(
+    _stream_obj = client.chat.completions.create(
         model=api_model.split("@")[0],
         messages=cast(list, messages_dicts),
         stream=True,
@@ -1293,7 +1377,23 @@ def stream(
         extra_body=extra_body(provider, model_meta, max_tokens=max_tokens),
         stream_options={"include_usage": True},
         **optional_kwargs,
-    ):
+    )
+    # Capture which subprovider OpenRouter actually used before consuming the
+    # stream. The x-openrouter-provider header is available on the initial
+    # HTTP response (before the stream body starts).
+    _or_resolved: str | None = None
+    if _uses_openrouter_backend(provider, model_meta):
+        try:
+            _or_stream_provider = _stream_obj.response.headers.get(
+                "x-openrouter-provider"
+            )
+        except AttributeError:
+            _or_stream_provider = None
+        if _or_stream_provider:
+            _or_resolved = _make_resolved_model(model, _or_stream_provider)
+            captured_metadata = _record_usage(None, model, resolved_model=_or_resolved)
+
+    for chunk_raw in _stream_obj:
         from openai.types.chat import ChatCompletionChunk  # fmt: skip
         from openai.types.chat.chat_completion_chunk import (  # fmt: skip
             ChoiceDeltaToolCall,
@@ -1306,7 +1406,9 @@ def stream(
         # Record usage if available (typically in final chunk)
         # and capture metadata for message attachment
         if hasattr(chunk, "usage") and chunk.usage:
-            captured_metadata = _record_usage(chunk.usage, model)
+            captured_metadata = _record_usage(
+                chunk.usage, model, resolved_model=_or_resolved
+            )
 
         if not chunk.choices:
             continue
@@ -1361,17 +1463,65 @@ def stream(
     return captured_metadata
 
 
+def _extract_and_strip_reasoning(
+    content: str | None,
+) -> tuple[str, str]:
+    """Extract reasoning from <think>/<thinking> tags and return cleaned content.
+
+    Returns:
+        Tuple of (reasoning_content, cleaned_content_without_think_tags)
+    """
+    if not content:
+        return "", ""
+
+    # Extract content from <think>...</think> and <thinking>...</thinking> blocks
+    think_matches = re.findall(r"<think>(.*?)</think>", content, flags=re.DOTALL)
+    thinking_matches = re.findall(
+        r"<thinking>(.*?)</thinking>", content, flags=re.DOTALL
+    )
+    all_reasoning = think_matches + thinking_matches
+    reasoning = (
+        "\n".join(r.strip() for r in all_reasoning if r.strip())
+        if all_reasoning
+        else ""
+    )
+
+    # Remove <think> and <thinking> tags from content to prevent duplication
+    cleaned_content = re.sub(r"<think>.*?</think>\s*", "", content, flags=re.DOTALL)
+    cleaned_content = re.sub(
+        r"<thinking>.*?</thinking>\s*", "", cleaned_content, flags=re.DOTALL
+    )
+    cleaned_content = cleaned_content.strip()
+
+    return reasoning, cleaned_content
+
+
 def _handle_tools(message_dicts: Iterable[dict]) -> Generator[dict, None, None]:
+    # Non-tool system messages between an assistant tool_calls message and the
+    # corresponding tool responses break strict APIs like DeepSeek. Buffer them
+    # and re-emit after the tool responses are flushed.
+    pending_system: list[dict] = []
+    pending_tool_call_ids: set[str] = set()
+    after_tool_calls = False
+
     for message in message_dicts:
         # Format tool result as expected by the model
         if message["role"] == "system" and "call_id" in message:
             # Convert system+call_id to tool message (conforms to MessageDict)
             modified_message = dict(message)
             modified_message["role"] = "tool"
-            modified_message["tool_call_id"] = modified_message.pop("call_id")
+            tool_call_id = modified_message.pop("call_id")
+            modified_message["tool_call_id"] = tool_call_id
             yield modified_message
+            pending_tool_call_ids.discard(tool_call_id)
+            after_tool_calls = bool(pending_tool_call_ids)
         # Find tool_use occurrences and format them as expected
         elif message["role"] == "assistant":
+            # Flush any orphaned buffered system messages before next assistant turn
+            for buffered in pending_system:
+                yield buffered
+            pending_system = []
+
             modified_message = dict(message)
 
             content, tool_uses = extract_tool_uses_from_assistant_message(
@@ -1406,9 +1556,26 @@ def _handle_tools(message_dicts: Iterable[dict]) -> Generator[dict, None, None]:
                     del modified_message["content"]
                 modified_message["tool_calls"] = tool_calls
 
+            pending_tool_call_ids = {call["id"] for call in tool_calls if call["id"]}
+            after_tool_calls = bool(tool_calls)
             yield modified_message
         else:
-            yield message
+            if after_tool_calls:
+                # Buffer: a non-tool system message between tool_calls and tool
+                # responses is an invalid sequence for strict APIs (e.g. DeepSeek)
+                pending_system.append(message)
+            else:
+                # Delay flushing until the tool-response run actually ends. A tool
+                # can emit multiple messages with one call ID, and those must stay
+                # adjacent so _merge_tool_results_with_same_call_id can merge them.
+                for buffered in pending_system:
+                    yield buffered
+                pending_system = []
+                yield message
+
+    # Flush any remaining buffered messages at end of conversation
+    for buffered in pending_system:
+        yield buffered
 
 
 def _merge_tool_results_with_same_call_id(
@@ -1440,10 +1607,26 @@ def _merge_tool_results_with_same_call_id(
             if not isinstance(current_content, list):
                 current_content = [{"type": "text", "text": current_content or ""}]
 
+            merged_parts = prev_content + current_content
+
+            # If all parts are plain text, flatten to a single string.
+            # Strict providers (e.g. DeepSeek) require tool message content to be a
+            # string, not an array, and an array of text parts carries no extra
+            # information that a concatenated string doesn't.  Only keep the list
+            # form when at least one part is non-text (e.g. an image).
+            if all(
+                isinstance(p, dict) and p.get("type") == "text" for p in merged_parts
+            ):
+                merged_content: str | list[dict[str, Any]] = "\n\n".join(
+                    p["text"] for p in merged_parts if isinstance(p, dict)
+                )
+            else:
+                merged_content = merged_parts
+
             # Create merged message (conforms to MessageDict structure)
             messages_new[-1] = {
                 "role": "tool",
-                "content": prev_content + current_content,
+                "content": merged_content,
                 "tool_call_id": prev_msg.get("tool_call_id"),
             }
         else:
@@ -1593,15 +1776,16 @@ def _transform_msgs_for_special_provider(
         result: list[MessageDict] = []
         for msg in messages_dicts:
             content = msg.get("content")
-            # Handle messages without content (e.g., tool call messages)
+            is_assistant_tool_call = (
+                model.provider == "deepseek"
+                and msg.get("role") == "assistant"
+                and msg.get("tool_calls")
+            )
+            # Handle messages without content (e.g., tool call messages with no text)
             if content is None:
                 # DeepSeek requires reasoning_content for assistant messages with tool_calls
-                # Since we don't store reasoning_content in Message objects, add empty reasoning_content field
-                if (
-                    model.provider == "deepseek"
-                    and msg.get("role") == "assistant"
-                    and msg.get("tool_calls")
-                ):
+                # since we don't store reasoning_content in Message objects, add empty field
+                if is_assistant_tool_call:
                     result.append(cast(MessageDict, {**msg, "reasoning_content": ""}))
                 else:
                     result.append(cast(MessageDict, msg))
@@ -1614,60 +1798,58 @@ def _transform_msgs_for_special_provider(
                     if isinstance(part, dict) and part.get("type") == "text"
                 ]
                 # Use placeholder if all parts are non-text (e.g., images only)
-                transformed = (
+                text_content = (
                     "\n\n".join(text_parts) if text_parts else "[non-text content]"
                 )
-                result.append(cast(MessageDict, {**msg, "content": transformed}))
+                # For DeepSeek reasoner with tool calls: extract <think> into reasoning_content.
+                # deepseek-reasoner embeds reasoning in <think> tags in gptme's log;
+                # the API expects it in a separate reasoning_content field.
+                if is_assistant_tool_call and model.supports_reasoning:
+                    reasoning, cleaned = _extract_and_strip_reasoning(text_content)
+                    result_msg: dict[str, Any] = {**msg, "reasoning_content": reasoning}
+                    if cleaned:
+                        result_msg["content"] = cleaned
+                    else:
+                        result_msg.pop("content", None)
+                    result.append(cast(MessageDict, result_msg))
+                else:
+                    result.append(cast(MessageDict, {**msg, "content": text_content}))
             else:
-                result.append(cast(MessageDict, msg))
+                # content is a string
+                # For DeepSeek reasoner with tool calls: extract <think> into reasoning_content
+                if (
+                    is_assistant_tool_call
+                    and model.supports_reasoning
+                    and ("<think>" in content or "<thinking>" in content)
+                ):
+                    reasoning, cleaned = _extract_and_strip_reasoning(content)
+                    result_msg = {**msg, "reasoning_content": reasoning}
+                    if cleaned:
+                        result_msg["content"] = cleaned
+                    else:
+                        result_msg.pop("content", None)
+                    result.append(cast(MessageDict, result_msg))
+                else:
+                    result.append(cast(MessageDict, msg))
         return result
 
-    # OpenRouter reasoning models (e.g., Moonshot AI Kimi) need reasoning_content
-    # for assistant messages with tool_calls when thinking mode is enabled
-    # This prevents: "thinking is enabled but reasoning_content is missing in assistant tool call message"
-    if model.provider == "openrouter" and model.supports_reasoning:
-
-        def _extract_and_strip_reasoning(
-            content: str | None,
-        ) -> tuple[str, str]:
-            """Extract reasoning from <think>/<thinking> tags and return cleaned content.
-
-            Returns:
-                Tuple of (reasoning_content, cleaned_content_without_think_tags)
-            """
-            if not content:
-                return "", ""
-
-            # Extract content from <think>...</think> and <thinking>...</thinking> blocks
-            think_matches = re.findall(
-                r"<think>(.*?)</think>", content, flags=re.DOTALL
-            )
-            thinking_matches = re.findall(
-                r"<thinking>(.*?)</thinking>", content, flags=re.DOTALL
-            )
-            all_reasoning = think_matches + thinking_matches
-            reasoning = (
-                "\n".join(r.strip() for r in all_reasoning if r.strip())
-                if all_reasoning
-                else ""
-            )
-
-            # Remove <think> and <thinking> tags from content to prevent duplication
-            cleaned_content = re.sub(
-                r"<think>.*?</think>\s*", "", content, flags=re.DOTALL
-            )
-            cleaned_content = re.sub(
-                r"<thinking>.*?</thinking>\s*", "", cleaned_content, flags=re.DOTALL
-            )
-            cleaned_content = cleaned_content.strip()
-
-            return reasoning, cleaned_content
+    # Reasoning models need the structured field restored from gptme's <think>
+    # representation before historical messages go back to the provider.
+    # OpenRouter requires it on tool-call turns; K3 requires it on every turn.
+    preserve_all_reasoning = model.provider == "moonshot" and model.model == "kimi-k3"
+    if (model.provider == "openrouter" and model.supports_reasoning) or (
+        preserve_all_reasoning
+    ):
+        # DeepSeek models routed through OpenRouter also require string (not
+        # array) content on tool-result messages — same strictness as direct
+        # deepseek provider.  Detected by the OpenRouter model namespace prefix.
+        needs_string_tool_content = model.model.startswith("deepseek/")
 
         openrouter_result: list[MessageDict] = []
         for msg in messages_dicts:
             if (
                 msg.get("role") == "assistant"
-                and msg.get("tool_calls")
+                and (msg.get("tool_calls") or preserve_all_reasoning)
                 and "reasoning_content" not in msg
             ):
                 # Extract reasoning and clean content to prevent context duplication
@@ -1685,17 +1867,42 @@ def _transform_msgs_for_special_provider(
                     content = "\n".join(text_parts)
 
                 reasoning, cleaned_content = _extract_and_strip_reasoning(content)
-                result_msg: dict[str, Any] = {
+                openrouter_msg: dict[str, Any] = {
                     **msg,
                     "reasoning_content": reasoning,
                 }
                 if cleaned_content:
-                    result_msg["content"] = cleaned_content
+                    openrouter_msg["content"] = cleaned_content
                 else:
                     # Remove empty content to avoid provider errors (e.g. Z.AI/GLM
                     # rejects messages with empty text content)
-                    result_msg.pop("content", None)
-                openrouter_result.append(cast(MessageDict, result_msg))
+                    openrouter_msg.pop("content", None)
+                openrouter_result.append(cast(MessageDict, openrouter_msg))
+            elif (
+                needs_string_tool_content
+                and msg.get("role") == "tool"
+                and isinstance(msg.get("content"), list)
+            ):
+                # Flatten array tool-result content to string.
+                # _merge_tool_results_with_same_call_id emits list-form content
+                # when a tool call yields multiple messages (e.g. stdout + stderr).
+                # DeepSeek rejects this with invalid_request; flatten to a plain
+                # string here, consistent with how the direct deepseek provider
+                # branch handles it above.
+                content_list: list[Any] = msg["content"]
+                text_parts_tool = [
+                    part["text"]
+                    for part in content_list
+                    if isinstance(part, dict) and part.get("type") == "text"
+                ]
+                flattened = (
+                    "\n\n".join(text_parts_tool)
+                    if text_parts_tool
+                    else "[non-text content]"
+                )
+                openrouter_result.append(
+                    cast(MessageDict, {**msg, "content": flattened})
+                )
             else:
                 openrouter_result.append(cast(MessageDict, msg))
         return openrouter_result
@@ -1718,13 +1925,18 @@ def _spec2tool(spec: ToolSpec, model: ModelMeta) -> ChatCompletionToolParam:
         )
         description = description[:1024]
 
-    # Custom providers are OpenAI-compatible and support tools API
+    # Custom providers are OpenAI-compatible and support tools API.
+    # grok-subscription routes to xAI's OpenAI-compatible subscription proxy
+    # (cli-chat-proxy.grok.com), which supports function calling — without it
+    # here, `--tool-format tool` raised "Provider doesn't support tools API".
     if model.provider in [
         "openai",
         "azure",
         "openrouter",
         "deepseek",
+        "moonshot",
         "local",
+        "grok-subscription",
     ] or is_custom_provider(model.model.split("/")[0]):
         all_required = all(p.required for p in spec.parameters)
         supports_strict = model.supports_strict_tools and all_required

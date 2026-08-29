@@ -190,24 +190,25 @@ class TestExecuteShellAllowlist:
     def test_allowlisted_command_executes_without_confirmation(
         self, mock_shell, mock_logdir
     ):
-        """Test that allowlisted commands execute without calling confirmation."""
+        """Test that allowlisted commands execute without user prompting.
+
+        After the fix in gptme#3598, all shell commands go through
+        execute_with_confirmation() so that TOOL_CONFIRM guardrails can run.
+        The shell_allowlist_hook (priority=10) auto-confirms safe commands, so
+        the user is never prompted — the behaviour is unchanged from the outside,
+        but the implementation now routes through the hook chain.
+        """
         cmd = "cat README.md | head -100"
 
-        # Mock execute_with_confirmation to track if it's called
-        with patch("gptme.tools.shell.execute_with_confirmation") as mock_confirm:
-            # Execute the command - args must be [] not None for code path
-            messages = list(execute_shell(cmd, [], None))
+        # Execute the command - goes through the hook chain, auto-confirmed by
+        # shell_allowlist_hook; no user prompt appears.
+        messages = list(execute_shell(cmd, [], None))
 
-            # execute_with_confirmation should NOT be called for allowlisted commands
-            mock_confirm.assert_not_called()
+        # The command must have actually executed (mock_shell.run was called).
+        assert mock_shell.run.called, "Shell command did not execute"
 
-            # Should have executed and returned a message
-            assert len(messages) == 1
-            assert "Ran allowlisted command" in messages[0].content
-            assert (
-                "cat README.md | head -100" in messages[0].content
-                or "cat README.md" in messages[0].content
-            )
+        # At least one message should come back from the execution.
+        assert len(messages) >= 1
 
     def test_non_allowlisted_command_uses_confirmation(self, mock_shell, mock_logdir):
         """Test that non-allowlisted commands use confirmation hook."""
@@ -228,3 +229,90 @@ class TestExecuteShellAllowlist:
             mock_exec_confirm.assert_called_once()
             # Result should be the message from our mock
             assert len(result) == 1
+
+    def test_bg_allowlisted_command_auto_confirms(self):
+        """bg <allowlisted> should auto-confirm — not prompt the user.
+
+        Regression: before this fix, is_allowlisted("bg ls") returned False
+        because "bg" is not a shell command, causing a behavior regression
+        where previously-silent bg-wrapped allowlisted commands started
+        prompting the user.
+        """
+        tool_use = ToolUse(
+            tool="shell",
+            args=[],
+            kwargs={},
+            content="bg ls",
+        )
+
+        # When no surrounding commands exist the hook should see "ls" and
+        # auto-confirm.  preview=None so the hook falls back to content.
+        result = shell_allowlist_hook(tool_use, preview="bg ls")
+
+        assert result is not None, (
+            "shell_allowlist_hook must auto-confirm 'bg ls' — 'ls' is allowlisted"
+        )
+        assert result.action.value == "confirm"
+
+    @pytest.mark.parametrize(
+        "preview",
+        [
+            "ls\nbg pwd",
+            "bg ls\npwd",
+            "ls\nbg pwd\nhead README.md",
+            "echo hi; bg ls",
+        ],
+    )
+    def test_bg_with_allowlisted_surrounding_commands_auto_confirms(self, preview):
+        """Safe multi-line bg sequences retain their pre-hook behavior."""
+        tool_use = ToolUse(
+            tool="shell",
+            args=[],
+            kwargs={},
+            content=preview,
+        )
+
+        result = shell_allowlist_hook(tool_use, preview=preview)
+
+        assert result is not None
+        assert result.action.value == "confirm"
+
+    @pytest.mark.parametrize(
+        "preview",
+        [
+            'echo "hi; bg ls"',
+            "echo 'hi; bg ls'",
+        ],
+    )
+    def test_quoted_bg_text_is_not_treated_as_control_syntax(self, preview):
+        """A quoted ``bg`` substring is shell data, not a control prefix."""
+        tool_use = ToolUse(
+            tool="shell",
+            args=[],
+            kwargs={},
+            content=preview,
+        )
+
+        assert shell_allowlist_hook(tool_use, preview=preview) is None
+
+    def test_bg_with_preceding_dangerous_cmd_does_not_auto_confirm(self):
+        """When dangerous preceding commands exist, do NOT auto-confirm.
+
+        The full context "cat ~/.ssh/id_rsa\\nbg ls" must NOT be allowlisted
+        even though the isolated bg payload ("ls") would be.
+        """
+        tool_use = ToolUse(
+            tool="shell",
+            args=[],
+            kwargs={},
+            content="bg ls",
+        )
+
+        # Multi-line preview: preceding dangerous command + bg ls
+        result = shell_allowlist_hook(tool_use, preview="cat ~/.ssh/id_rsa\nbg ls")
+
+        # Must NOT auto-confirm — fall through to next hook
+        assert result is None, (
+            "shell_allowlist_hook must NOT auto-confirm when a dangerous preceding "
+            "command is present in the preview"
+        )

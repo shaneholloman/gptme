@@ -15,6 +15,7 @@ from gptme.llm.llm_openai import (
     _content_to_responses_input,
     _make_responses_text_config,
     _maybe_apply_verbosity,
+    _merge_tool_results_with_same_call_id,
     _messages_dicts_to_responses_input,
     _prepare_messages_for_api,
     _should_use_responses_api,
@@ -228,13 +229,90 @@ def test_message_conversion_with_tools():
         },
         {
             "role": "tool",
-            "content": [
-                {"type": "text", "text": "Saved to toto.txt"},
-                {"type": "text", "text": "(Modified by user)"},
-            ],
+            # Multiple tool messages with the same call_id are merged; when all
+            # parts are plain text the result is flattened to a string so that
+            # strict providers (e.g. DeepSeek) accept the message.
+            "content": "Saved to toto.txt\n\n(Modified by user)",
             "tool_call_id": "tool_call_id",
         },
     ]
+
+
+def test_merge_tool_results_flattens_text_to_string():
+    """Merged tool results with all-text parts must produce a plain string.
+
+    DeepSeek (and DeepSeek via OpenRouter) requires tool message content to be a
+    string, not an array of content parts.  When a single tool call yields
+    multiple messages (e.g. stdout + stderr from pip install), the merge function
+    must collapse pure-text arrays to a single "\n\n"-joined string.
+
+    Regression test for https://github.com/gptme/gptme/issues/3459
+    """
+    call_id = "call_abc123"
+    messages = [
+        {"role": "tool", "content": "stdout output", "tool_call_id": call_id},
+        {
+            "role": "tool",
+            "content": "WARNING: running pip as root",
+            "tool_call_id": call_id,
+        },
+    ]
+    result = _merge_tool_results_with_same_call_id(iter(messages))
+
+    assert len(result) == 1, "Two messages with same call_id should be merged into one"
+    merged = result[0]
+    assert merged["role"] == "tool"
+    assert merged["tool_call_id"] == call_id
+    # Content must be a plain string (not a list) for strict providers like DeepSeek
+    assert isinstance(merged["content"], str), (
+        f"Merged tool content should be a string, got {type(merged['content'])}"
+    )
+    assert "stdout output" in merged["content"]
+    assert "WARNING: running pip as root" in merged["content"]
+
+
+def test_merge_tool_results_keeps_list_when_non_text_parts():
+    """When merged parts include non-text content (e.g. images), keep array form."""
+    call_id = "call_img456"
+    image_part = {
+        "type": "image_url",
+        "image_url": {"url": "data:image/png;base64,abc"},
+    }
+    messages = [
+        {
+            "role": "tool",
+            "content": [{"type": "text", "text": "see image:"}],
+            "tool_call_id": call_id,
+        },
+        {"role": "tool", "content": [image_part], "tool_call_id": call_id},
+    ]
+    result = _merge_tool_results_with_same_call_id(iter(messages))
+
+    assert len(result) == 1
+    merged = result[0]
+    # When a non-text part is present the content MUST stay as a list so the
+    # image survives the round-trip.
+    assert isinstance(merged["content"], list), (
+        "Content with image parts should remain a list"
+    )
+    assert len(merged["content"]) == 2
+
+
+def test_merge_tool_results_single_message_unchanged():
+    """A single tool message (no merging needed) is passed through as-is."""
+    call_id = "call_solo"
+    messages = [
+        {
+            "role": "tool",
+            "content": [{"type": "text", "text": "only output"}],
+            "tool_call_id": call_id,
+        },
+    ]
+    result = _merge_tool_results_with_same_call_id(iter(messages))
+
+    assert len(result) == 1
+    # Single-message case: content format is not changed by the merge function
+    assert result[0] == messages[0]
 
 
 def test_message_conversion_with_tool_and_non_tool():
@@ -308,6 +386,87 @@ def test_message_conversion_with_tool_and_non_tool():
             ],
         },
     ]
+
+
+def test_handle_tools_buffers_non_tool_system_between_tool_calls_and_response():
+    """Non-tool system messages between tool_calls and tool responses are buffered.
+
+    DeepSeek and other strict APIs require that an assistant message with tool_calls
+    be immediately followed by tool messages. A plain system message (no call_id)
+    in between — e.g. a shellcheck warning emitted before the actual tool result —
+    causes a 400 error. The fix buffers such messages and re-emits them after the
+    tool responses.
+    """
+    init_tools(allowlist=["shell"])
+
+    messages = [
+        Message(role="user", content="Run a shell command"),
+        Message(
+            role="assistant",
+            content='@shell(call_001): {"command": "echo hello"}',
+        ),
+        # Non-tool system message (e.g. shellcheck warning) — no call_id
+        Message(role="system", content="Shellcheck found potential issues: SC2086"),
+        # Actual tool result — has call_id
+        Message(role="system", content="Output: hello", call_id="call_001"),
+    ]
+
+    tool_shell = get_tool("shell")
+    assert tool_shell
+
+    model = get_model("openai/gpt-4o")
+    messages_dicts, _ = _prepare_messages_for_api(messages, model.full, [tool_shell])
+
+    # The tool response must immediately follow the assistant tool_calls message.
+    # The non-tool system message must appear AFTER the tool response.
+    assert messages_dicts[0]["role"] == "user"
+    assert messages_dicts[1]["role"] == "assistant"
+    assert "tool_calls" in messages_dicts[1]
+    # Index 2 must be the tool response, not the shellcheck warning
+    assert messages_dicts[2]["role"] == "tool"
+    assert messages_dicts[2]["tool_call_id"] == "call_001"
+    # The buffered system message must appear after the tool response
+    assert messages_dicts[3]["role"] == "system"
+    content = messages_dicts[3]["content"]
+    assert isinstance(content, list)
+    first_part = content[0]
+    assert isinstance(first_part, dict)
+    assert first_part["text"] == "Shellcheck found potential issues: SC2086"
+
+
+def test_handle_tools_buffers_system_until_all_parallel_tool_responses():
+    """Buffered messages must not interrupt parallel tool responses."""
+    init_tools(allowlist=["shell"])
+
+    messages = [
+        Message(role="user", content="Run two shell commands"),
+        Message(
+            role="assistant",
+            content=(
+                '@shell(call_001): {"command": "echo one"}\n'
+                '@shell(call_002): {"command": "echo two"}'
+            ),
+        ),
+        Message(role="system", content="Shellcheck warning"),
+        Message(role="system", content="Output: one", call_id="call_001"),
+        Message(role="system", content="Output: two", call_id="call_002"),
+    ]
+
+    tool_shell = get_tool("shell")
+    assert tool_shell
+
+    model = get_model("openai/gpt-4o")
+    messages_dicts, _ = _prepare_messages_for_api(messages, model.full, [tool_shell])
+
+    assert [message["role"] for message in messages_dicts] == [
+        "user",
+        "assistant",
+        "tool",
+        "tool",
+        "system",
+    ]
+    assert messages_dicts[2]["tool_call_id"] == "call_001"
+    assert messages_dicts[3]["tool_call_id"] == "call_002"
 
 
 def test_message_conversion_tool_response_with_image():
@@ -768,9 +927,14 @@ def test_chat_completions_embeds_reasoning_content(monkeypatch):
             )
         ],
     )
-    completions_create = Mock(return_value=completion)
+    raw_resp = SimpleNamespace(parse=lambda: completion, headers={})
+    completions_create = Mock(return_value=raw_resp)
     mock_client = SimpleNamespace(
-        chat=SimpleNamespace(completions=SimpleNamespace(create=completions_create))
+        chat=SimpleNamespace(
+            completions=SimpleNamespace(
+                with_raw_response=SimpleNamespace(create=completions_create)
+            )
+        )
     )
 
     monkeypatch.setattr(llm_openai, "get_client", lambda provider: mock_client)
@@ -1338,6 +1502,225 @@ def test_transform_msgs_for_deepseek_tool_results():
     assert result[0] == messages[0]
 
 
+def test_transform_msgs_for_openrouter_deepseek_array_tool_content():
+    """Test that array-form tool result content is flattened for DeepSeek via OpenRouter.
+
+    When _merge_tool_results_with_same_call_id merges multiple tool messages
+    (e.g. stdout + stderr from pip install) it produces list-form content:
+        {"role": "tool", "content": [{"type": "text", "text": "..."}, ...]}
+
+    Direct deepseek provider handles this in the groq/deepseek branch.
+    But deepseek-v4-flash arrives as provider="openrouter", so that branch is
+    skipped and the array reaches DeepSeek, which rejects it with invalid_request.
+
+    Regression test: gptme/gptme#3459 (6 invalid_request failures in 14 days).
+    """
+    from typing import Any
+
+    from gptme.llm.llm_openai import _transform_msgs_for_special_provider
+    from gptme.llm.models import ModelMeta
+
+    # deepseek/deepseek-v4-flash is registered under provider="openrouter" in data.py
+    openrouter_deepseek = ModelMeta(
+        provider="openrouter",
+        model="deepseek/deepseek-v4-flash",
+        context=1_000_000,
+        supports_reasoning=True,
+    )
+
+    # Array-form tool content as produced by _merge_tool_results_with_same_call_id
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "tool",
+            "tool_call_id": "call_abc",
+            "content": [
+                {"type": "text", "text": "stdout: installing numpy"},
+                {"type": "text", "text": "stderr: WARNING: running as root"},
+            ],
+        },
+    ]
+
+    result = list(_transform_msgs_for_special_provider(messages, openrouter_deepseek))
+
+    # Array content must be flattened to a string — DeepSeek rejects list form
+    assert result[0]["role"] == "tool"
+    assert result[0]["tool_call_id"] == "call_abc"
+    assert isinstance(result[0]["content"], str)
+    assert "stdout: installing numpy" in result[0]["content"]
+    assert "stderr: WARNING: running as root" in result[0]["content"]
+
+
+def test_transform_msgs_for_openrouter_non_deepseek_array_tool_content_unchanged():
+    """Non-DeepSeek OpenRouter models (e.g. Kimi) pass array tool content through unchanged."""
+    from typing import Any
+
+    from gptme.llm.llm_openai import _transform_msgs_for_special_provider
+    from gptme.llm.models import ModelMeta
+
+    # A non-DeepSeek OpenRouter model that also has supports_reasoning=True
+    openrouter_kimi = ModelMeta(
+        provider="openrouter",
+        model="moonshot/moonshot-v1-8k",
+        context=8192,
+        supports_reasoning=True,
+    )
+
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "tool",
+            "tool_call_id": "call_xyz",
+            "content": [
+                {"type": "text", "text": "result text"},
+            ],
+        },
+    ]
+
+    result = list(_transform_msgs_for_special_provider(messages, openrouter_kimi))
+
+    # Non-DeepSeek OpenRouter models: array content passes through unchanged
+    assert result[0]["content"] == messages[0]["content"]
+
+
+def test_transform_msgs_for_deepseek_reasoner_think_content_string():
+    """Test that deepseek-reasoner assistant messages with <think> content and tool_calls
+    get <think> extracted into reasoning_content, not embedded in content.
+
+    This is the root cause of the tool-call loop: sending <think> tags embedded in
+    content instead of the separate reasoning_content field causes deepseek-reasoner
+    to misinterpret the conversation history and retry the same tool call.
+    """
+    from typing import Any
+
+    from gptme.llm.llm_openai import _transform_msgs_for_special_provider
+    from gptme.llm.models import ModelMeta
+
+    deepseek_reasoner_model = ModelMeta(
+        provider="deepseek",
+        model="deepseek-reasoner",
+        context=128_000,
+        supports_reasoning=True,
+    )
+
+    # Typical assistant message after streaming: <think> block + tool call in content
+    # (tool_calls field already extracted by _handle_tools, content retains <think> text)
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": "<think>\nLet me install numpy.\n</think>\n\n",
+            "tool_calls": [
+                {
+                    "id": "call_abc",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": '{"command": "pip install numpy"}',
+                    },
+                }
+            ],
+        },
+    ]
+
+    result = list(
+        _transform_msgs_for_special_provider(messages, deepseek_reasoner_model)
+    )
+
+    assert len(result) == 1
+    msg = result[0]
+    # reasoning_content should contain the extracted reasoning, not empty string
+    assert "reasoning_content" in msg
+    assert "Let me install numpy." in msg["reasoning_content"]
+    # content should be cleaned — no <think> tags
+    assert "<think>" not in (msg.get("content") or "")
+    assert "<think>" not in msg.get("reasoning_content", "")
+    # tool_calls must be preserved
+    assert msg["tool_calls"] == messages[0]["tool_calls"]
+
+
+def test_transform_msgs_for_deepseek_reasoner_think_content_list():
+    """Test that deepseek-reasoner assistant messages with list content containing
+    <think> tags and tool_calls get <think> extracted into reasoning_content.
+
+    _handle_tools returns content as a list when there is text before the tool call.
+    """
+    from typing import Any
+
+    from gptme.llm.llm_openai import _transform_msgs_for_special_provider
+    from gptme.llm.models import ModelMeta
+
+    deepseek_reasoner_model = ModelMeta(
+        provider="deepseek",
+        model="deepseek-reasoner",
+        context=128_000,
+        supports_reasoning=True,
+    )
+
+    # content is a list (as produced by _handle_tools when there's text before the call)
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "content": [
+                {"type": "text", "text": "<think>\nReasoning here.\n</think>\n\n"}
+            ],
+            "tool_calls": [
+                {
+                    "id": "call_xyz",
+                    "type": "function",
+                    "function": {
+                        "name": "shell",
+                        "arguments": '{"command": "pip install numpy"}',
+                    },
+                }
+            ],
+        },
+    ]
+
+    result = list(
+        _transform_msgs_for_special_provider(messages, deepseek_reasoner_model)
+    )
+
+    assert len(result) == 1
+    msg = result[0]
+    assert "reasoning_content" in msg
+    assert "Reasoning here." in msg["reasoning_content"]
+    assert "<think>" not in (msg.get("content") or "")
+    assert msg["tool_calls"] == messages[0]["tool_calls"]
+
+
+def test_transform_msgs_for_deepseek_chat_no_think_unchanged():
+    """Test that deepseek-chat (non-reasoner) messages without <think> are unchanged."""
+    from typing import Any
+
+    from gptme.llm.llm_openai import _transform_msgs_for_special_provider
+    from gptme.llm.models import ModelMeta
+
+    deepseek_chat_model = ModelMeta(
+        provider="deepseek",
+        model="deepseek-chat",
+        context=128_000,
+    )
+
+    # deepseek-chat doesn't generate <think> content; no content here = None case
+    messages: list[dict[str, Any]] = [
+        {
+            "role": "assistant",
+            "tool_calls": [
+                {
+                    "id": "call_123",
+                    "type": "function",
+                    "function": {"name": "shell", "arguments": '{"command": "ls"}'},
+                }
+            ],
+        },
+    ]
+
+    result = list(_transform_msgs_for_special_provider(messages, deepseek_chat_model))
+
+    assert len(result) == 1
+    # reasoning_content: "" is still required even for deepseek-chat (PR #918)
+    assert result[0]["reasoning_content"] == ""
+    assert result[0]["tool_calls"] == messages[0]["tool_calls"]
+
+
 # Tests for OpenAI retry logic
 class TestOpenAIRetryLogic:
     """Tests for OpenAI API retry logic."""
@@ -1780,6 +2163,47 @@ class TestOpenAIRetryLogic:
 
         assert chunks == ["chunk1", "chunk2"]
         assert return_value == {"metadata": "value"}
+
+
+def test_prepare_kimi_k3_preserves_reasoning_across_turns():
+    """K3 requires historical reasoning content even without a tool call."""
+    messages = [
+        Message(role="user", content="Solve this."),
+        Message(
+            role="assistant",
+            content="<think>Work through it.</think>\nThe answer is 42.",
+        ),
+        Message(role="user", content="Check that answer."),
+    ]
+
+    result, _ = _prepare_messages_for_api(messages, "moonshot/kimi-k3", None)
+
+    assert result[1]["reasoning_content"] == "Work through it."
+    assert result[1]["content"] == "The answer is 42."
+
+
+def test_prepare_kimi_k3_preserves_reasoning_for_tool_calls():
+    """K3 requires complete historical assistant messages on tool turns."""
+    init_tools(allowlist=["shell"])
+    shell = get_tool("shell")
+    assert shell
+    messages = [
+        Message(role="user", content="List the files."),
+        Message(
+            role="assistant",
+            content=(
+                "<think>Inspect the directory first.</think>\n"
+                '@shell(call_123): {"command": "ls"}'
+            ),
+        ),
+        Message(role="system", content="README.md", call_id="call_123"),
+    ]
+
+    result, _ = _prepare_messages_for_api(messages, "moonshot/kimi-k3", [shell])
+
+    assert result[1]["reasoning_content"] == "Inspect the directory first."
+    assert result[1].get("content") is None
+    assert result[1]["tool_calls"][0]["id"] == "call_123"
 
 
 def test_transform_msgs_for_openrouter_reasoning_tool_calls():
@@ -2929,3 +3353,119 @@ class TestSpec2ToolStrictSchema:
         )
         result = _spec2tool(spec, model)
         assert result["function"]["strict"] is True
+
+
+def test_record_usage_preserves_resolved_model_without_usage():
+    """Provider metadata survives responses that omit token accounting."""
+    from gptme.llm.llm_openai import _record_usage
+
+    assert _record_usage(
+        None,
+        "openrouter/meta-llama/llama-3.1",
+        resolved_model="openrouter/meta-llama/llama-3.1@groq",
+    ) == {
+        "model": "openrouter/meta-llama/llama-3.1",
+        "resolved_model": "openrouter/meta-llama/llama-3.1@groq",
+    }
+
+
+class TestMakeResolvedModel:
+    """Tests for _make_resolved_model — the OpenRouter subprovider slug builder."""
+
+    def test_basic_provider_appended(self):
+        from gptme.llm.llm_openai import _make_resolved_model
+
+        result = _make_resolved_model("openrouter/meta-llama/llama-3.1", "Groq")
+        assert result == "openrouter/meta-llama/llama-3.1@groq"
+
+    def test_provider_slug_spaces_to_dashes(self):
+        """'Together AI' → 'together-ai'."""
+        from gptme.llm.llm_openai import _make_resolved_model
+
+        result = _make_resolved_model("openrouter/meta-llama/llama-3.1", "Together AI")
+        assert result == "openrouter/meta-llama/llama-3.1@together-ai"
+
+    def test_provider_slug_lowercased(self):
+        from gptme.llm.llm_openai import _make_resolved_model
+
+        result = _make_resolved_model(
+            "openrouter/anthropic/claude-3.5-sonnet", "Anthropic"
+        )
+        assert result == "openrouter/anthropic/claude-3.5-sonnet@anthropic"
+
+    def test_returns_none_when_already_matches(self):
+        """Returns None when the resolved slug equals the model string — no new info."""
+        from gptme.llm.llm_openai import _make_resolved_model
+
+        result = _make_resolved_model(
+            "openrouter/anthropic/claude-3.5-sonnet@anthropic", "Anthropic"
+        )
+        assert result is None
+
+    def test_at_suffix_explicit_overrides(self):
+        """A model with an existing @suffix gets its base extracted and a new slug applied."""
+        from gptme.llm.llm_openai import _make_resolved_model
+
+        result = _make_resolved_model(
+            "openrouter/meta-llama/llama-3.1@groq", "Together AI"
+        )
+        assert result == "openrouter/meta-llama/llama-3.1@together-ai"
+
+    def test_user_pinned_stem_returns_none(self):
+        """@together is a stem of slug 'together-ai' → user pinned intent matches → None."""
+        from gptme.llm.llm_openai import _make_resolved_model
+
+        result = _make_resolved_model(
+            "openrouter/meta-llama/llama-3.1@together", "Together AI"
+        )
+        assert result is None
+
+    @pytest.mark.parametrize("suffix", ["moonshotai", "MoonshotAI"])
+    def test_user_pinned_compact_provider_id_returns_none(self, suffix):
+        """Display-name separators and suffix casing do not imply rerouting."""
+        from gptme.llm.llm_openai import _make_resolved_model
+
+        result = _make_resolved_model(
+            f"openrouter/moonshotai/kimi-k2.5@{suffix}", "Moonshot AI"
+        )
+        assert result is None
+
+
+class TestIsProxy:
+    """Direct unit tests for _is_proxy() URL comparison — regression for #3526."""
+
+    @pytest.mark.parametrize(
+        ("proxy_url", "client_base_url"),
+        [
+            # no suffix: init() appends /messages, httpx normalizes with trailing slash
+            ("http://127.0.0.1:8080", "http://127.0.0.1:8080/messages/"),
+            # trailing slash: double slash preserved in client base_url
+            ("http://127.0.0.1:8080/", "http://127.0.0.1:8080//messages/"),
+            # already has /messages: init() leaves it unchanged, httpx adds trailing slash
+            ("http://127.0.0.1:8080/messages", "http://127.0.0.1:8080/messages/"),
+        ],
+    )
+    def test_proxy_url_spellings_return_true(
+        self, monkeypatch, proxy_url, client_base_url
+    ):
+        from gptme.llm.llm_openai import _is_proxy
+
+        _is_proxy.cache_clear()
+        monkeypatch.setenv("LLM_PROXY_URL", proxy_url)
+        client = MagicMock()
+        client.base_url = client_base_url
+        assert _is_proxy(client), (
+            f"LLM_PROXY_URL={proxy_url!r} should be detected as proxy"
+        )
+        _is_proxy.cache_clear()
+
+    def test_no_proxy_url_returns_false(self, monkeypatch):
+        from gptme.llm.llm_openai import _is_proxy
+
+        _is_proxy.cache_clear()
+        monkeypatch.delenv("LLM_PROXY_URL", raising=False)
+        monkeypatch.delenv("GPTME_LLM_PROXY_URL", raising=False)
+        client = MagicMock()
+        client.base_url = "http://127.0.0.1:8080/messages/"
+        assert not _is_proxy(client)
+        _is_proxy.cache_clear()

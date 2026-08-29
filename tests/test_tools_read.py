@@ -2,13 +2,21 @@
 
 import os
 import stat
+import sys
 from pathlib import Path
 from unittest.mock import patch
 
 import pytest
 
 from gptme.tools.pruner import PrunePlan
-from gptme.tools.read import execute_read
+from gptme.tools.read import examples, execute_read
+
+
+def test_examples_show_plain_output_without_hashline_tags():
+    rendered = examples("markdown")
+    # Examples should not contain hashline tags — they represent a plain read session.
+    assert "[hello.py#" not in rendered
+    assert "[goodbye.py#" not in rendered
 
 
 def test_read_file(tmp_path: Path):
@@ -34,6 +42,42 @@ def test_read_file_with_line_numbers(tmp_path: Path):
     content = messages[0].content
     assert "1\t" in content
     assert "2\t" in content
+
+
+def test_read_file_no_hashline_tag_without_hashline_tool(tmp_path: Path):
+    """Without hashline_edit loaded, read output must not contain a [path#tag] header."""
+    from gptme.tools import get_tools, set_tools
+
+    path = tmp_path / "test.py"
+    path.write_text('print("hello")\n')
+
+    prev = get_tools()
+    set_tools([])
+    try:
+        messages = list(execute_read(None, [str(path)], None))
+    finally:
+        set_tools(prev)
+    assert len(messages) == 1
+    assert "[" + str(path) + "#" not in messages[0].content
+
+
+def test_read_file_includes_hashline_tag_when_hashline_tool_active(tmp_path: Path):
+    """With hashline_edit loaded, read output must include a [path#tag] header."""
+    from gptme.tools import get_tools, set_tools
+    from gptme.tools.hashline_edit import tool as hashline_tool
+
+    path = tmp_path / "test.py"
+    path.write_text('print("hello")\n')
+
+    prev = get_tools()
+    set_tools([hashline_tool])
+    try:
+        messages = list(execute_read(None, [str(path)], None))
+    finally:
+        set_tools(prev)
+
+    assert len(messages) == 1
+    assert "[" + str(path) + "#" in messages[0].content
 
 
 def test_read_file_line_range_kwargs(tmp_path: Path):
@@ -271,6 +315,96 @@ def test_read_invalid_end_line(tmp_path: Path):
     assert "Invalid end_line" in messages[0].content
 
 
+def test_read_invalid_line_range(tmp_path: Path):
+    """Test that an inverted range (start_line > end_line) returns an error."""
+    path = tmp_path / "test.txt"
+    path.write_text("\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+
+    messages = list(
+        execute_read(
+            None,
+            None,
+            {"path": str(path), "start_line": "8", "end_line": "3"},
+        )
+    )
+    assert len(messages) == 1
+    # Value-anchored substrings pin the diagnostic: the bare digits "8"/"3"
+    # also appear in the broken-master label "(lines 8-3 of 10)".
+    assert "Invalid line range" in messages[0].content
+    assert "start_line (8)" in messages[0].content
+    assert "end_line (3)" in messages[0].content
+
+
+def test_read_nonpositive_start_line(tmp_path: Path):
+    """A non-positive start_line is rejected instead of silently clamping.
+
+    Regression: start_line <= 0 was silently clamped to line 1 by
+    ``max(0, start_line - 1)``, hiding the bad input from the caller.
+    """
+    path = tmp_path / "test.txt"
+    path.write_text("\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+
+    for bad in ("0", "-2"):
+        messages = list(
+            execute_read(None, None, {"path": str(path), "start_line": bad})
+        )
+        assert len(messages) == 1
+        assert "Invalid line range" in messages[0].content
+        assert f"start_line ({bad})" in messages[0].content
+
+
+def test_read_nonpositive_end_line(tmp_path: Path):
+    """A non-positive end_line is rejected instead of silently truncating.
+
+    Regression: end_line=0 yielded an empty codeblock mislabeled with the
+    requested range (``lines[N:0] == []``), and end_line=-1 silently dropped
+    the last line (``lines[N:-1]``).  Same mislabel class as the inverted
+    range fixed in #3494.
+    """
+    path = tmp_path / "test.txt"
+    path.write_text("\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+
+    for bad in ("0", "-1"):
+        messages = list(execute_read(None, None, {"path": str(path), "end_line": bad}))
+        assert len(messages) == 1
+        assert "Invalid line range" in messages[0].content
+        assert f"end_line ({bad})" in messages[0].content
+        assert "line 1" not in messages[0].content
+
+
+def test_read_line_range_start_equals_end(tmp_path: Path):
+    """A single-line range (start_line == end_line) is valid, not inverted."""
+    path = tmp_path / "test.txt"
+    path.write_text("\n".join(f"line {i}" for i in range(1, 11)) + "\n")
+
+    messages = list(
+        execute_read(
+            None,
+            None,
+            {"path": str(path), "start_line": "3", "end_line": "3"},
+        )
+    )
+    assert len(messages) == 1
+    assert "line 3" in messages[0].content
+    assert "lines 3-3 of 10" in messages[0].content
+
+
+def test_read_invalid_line_range_before_file_check(tmp_path: Path):
+    """The inverted-range check runs before the file is read/existence-checked."""
+    missing = tmp_path / "does-not-exist.txt"
+    messages = list(
+        execute_read(
+            None,
+            None,
+            {"path": str(missing), "start_line": "8", "end_line": "3"},
+        )
+    )
+    assert len(messages) == 1
+    # The malformed request is rejected before any filesystem access, so the
+    # range error wins over the usual "File not found" message.
+    assert "Invalid line range" in messages[0].content
+
+
 def test_read_path_traversal(tmp_path: Path, monkeypatch):
     """Test that relative paths traversing outside cwd are blocked."""
     external = tmp_path / "external.txt"
@@ -286,7 +420,78 @@ def test_read_path_traversal(tmp_path: Path, monkeypatch):
     assert "Path traversal detected" in messages[0].content
 
 
-@pytest.mark.skipif(os.getuid() == 0, reason="root bypasses permissions")
+def test_read_root_resolves_relative_paths_from_root(tmp_path: Path, monkeypatch):
+    """Confinement need not make the untrusted tree the process cwd."""
+    root = tmp_path / "checkout"
+    runtime = tmp_path / "runtime"
+    root.mkdir()
+    runtime.mkdir()
+    (root / "source.py").write_text("safe = True\n")
+    monkeypatch.setenv("GPTME_READ_ROOT", str(root))
+    monkeypatch.chdir(runtime)
+
+    messages = list(execute_read(None, ["source.py"], None))
+
+    assert len(messages) == 1
+    assert "safe = True" in messages[0].content
+    assert str(root / "source.py") in messages[0].content
+
+
+def test_read_root_confines_absolute_paths(tmp_path: Path, monkeypatch):
+    """Configured confinement applies to absolute paths, not only ``..``."""
+    root = tmp_path / "checkout"
+    root.mkdir()
+    allowed = root / "source.py"
+    allowed.write_text("allowed\n")
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do not disclose\n")
+    monkeypatch.setenv("GPTME_READ_ROOT", str(root))
+
+    inside = list(execute_read(None, [str(allowed)], None))
+    outside = list(execute_read(None, [str(secret)], None))
+
+    assert "allowed" in inside[0].content
+    assert "Path traversal detected" in outside[0].content
+    assert "do not disclose" not in outside[0].content
+    assert "configured read root" in outside[0].content
+
+
+def test_read_root_blocks_symlink_escape(
+    tmp_path: Path, monkeypatch, requires_symlinks
+):
+    """Resolving before containment prevents an in-root symlink escaping."""
+    root = tmp_path / "checkout"
+    root.mkdir()
+    secret = tmp_path / "secret.txt"
+    secret.write_text("do not disclose\n")
+    (root / "link.txt").symlink_to(secret)
+    monkeypatch.setenv("GPTME_READ_ROOT", str(root))
+
+    messages = list(execute_read(None, [str(root / "link.txt")], None))
+
+    assert "Path traversal detected" in messages[0].content
+    assert "do not disclose" not in messages[0].content
+
+
+def test_invalid_read_root_fails_closed(tmp_path: Path, monkeypatch):
+    target = tmp_path / "target.txt"
+    target.write_text("do not disclose\n")
+    monkeypatch.setenv("GPTME_READ_ROOT", "relative-root")
+
+    messages = list(execute_read(None, [str(target)], None))
+
+    assert "Read denied" in messages[0].content
+    assert "must be an absolute path" in messages[0].content
+    assert "do not disclose" not in messages[0].content
+
+
+skip_if_no_chmod_perms = pytest.mark.skipif(
+    sys.platform == "win32" or getattr(os, "getuid", lambda: -1)() == 0,
+    reason="chmod cannot deny read permissions on Windows or when running as root",
+)
+
+
+@skip_if_no_chmod_perms
 def test_read_permission_denied_file(tmp_path: Path):
     """Test that a file with no read permission returns Permission denied."""
     path = tmp_path / "secret.txt"
@@ -301,7 +506,7 @@ def test_read_permission_denied_file(tmp_path: Path):
         path.chmod(stat.S_IRUSR | stat.S_IWUSR)
 
 
-@pytest.mark.skipif(os.getuid() == 0, reason="root bypasses permissions")
+@skip_if_no_chmod_perms
 def test_read_permission_denied_directory(tmp_path: Path):
     """Test that a directory with no read permission returns Permission denied."""
     subdir = tmp_path / "locked"
@@ -327,6 +532,7 @@ def test_read_directory_truncated(tmp_path: Path):
     assert "more entries" in messages[0].content
 
 
+@pytest.mark.skipif(not hasattr(os, "mkfifo"), reason="FIFOs not supported on Windows")
 def test_read_not_a_file(tmp_path: Path):
     """Test that a named pipe (non-file, non-dir) returns 'Not a file'."""
     fifo = tmp_path / "myfifo"

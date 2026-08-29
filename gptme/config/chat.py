@@ -19,15 +19,16 @@ from typing_extensions import Self
 if sys.version_info >= (3, 11):
     import tomllib
 
-    _CHAT_CONFIG_LOAD_ERRORS = (OSError, tomllib.TOMLDecodeError)
+    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError)
 else:
     tomllib = None
 
-    _CHAT_CONFIG_LOAD_ERRORS = (OSError, TOMLKitError)
+    _CHAT_CONFIG_LOAD_ERRORS = (OSError, UnicodeDecodeError, TOMLKitError)
 
 from ..util import path_with_tilde
 from .models import AgentConfig, MCPConfig
 from .project import get_project_config
+from .user import _back_up_before_reencoding, _read_config_text
 
 if TYPE_CHECKING:
     from ..tools.base import ToolFormat
@@ -137,6 +138,12 @@ class ChatConfig:
         # For old-style config, check if workspace is in the logdir
         elif _logdir and (_logdir / "workspace").exists():
             chat_data["workspace"] = (_logdir / "workspace").resolve()
+        elif _logdir:
+            # No workspace field in config and no logdir/workspace symlink
+            # (e.g. Windows without Developer Mode). Use the logdir itself as a
+            # safe fallback so tool operations don't silently target the process
+            # cwd, which is unrelated to the conversation.
+            chat_data["workspace"] = _logdir.resolve()
 
         # Extract agent
         _missing = object()
@@ -230,20 +237,30 @@ class ChatConfig:
                 )
             return cls(_logdir=path, workspace=workspace.resolve())
         try:
+            # `_read_config_text` decodes as UTF-8 per the TOML spec, with a
+            # fallback for configs an older gptme wrote in the platform encoding.
+            text = _read_config_text(chat_config_path)
             if tomllib is not None:
-                with open(chat_config_path, "rb") as f:
-                    config_data = tomllib.load(f)
+                config_data = tomllib.loads(text)
             else:
-                with open(chat_config_path) as f:
-                    config_data = tomlkit.load(f).unwrap()
+                config_data = tomlkit.loads(text).unwrap()
             config_data["_logdir"] = path
             return cls.from_dict(config_data)
         except _CHAT_CONFIG_LOAD_ERRORS as e:
             logger.warning(f"Failed to load chat config from {chat_config_path}: {e}")
-            return cls()
+            # Keep _logdir unset so save() cannot overwrite an unreadable config
+            # with defaults. The workspace is still safe for read-only recovery.
+            return cls(workspace=path.resolve())
 
     def save(self) -> Self:
-        """Save the chat config to the log directory."""
+        """Save the chat config to the log directory.
+
+        Raises:
+            OSError: If this config was decoded by a guessed codec and its
+                original bytes could not be backed up. The save is abandoned so
+                the unrecoverable bytes stay on disk; only a config that already
+                went through the legacy fallback can reach this.
+        """
         if not self._logdir:
             raise ValueError("ChatConfig has no logdir set")
         self._logdir.mkdir(parents=True, exist_ok=True)
@@ -254,8 +271,7 @@ class ChatConfig:
         # Load existing config as TOMLDocument to preserve formatting/comments
         if chat_config_path.exists():
             try:
-                with open(chat_config_path) as f:
-                    doc = tomlkit.load(f)
+                doc = tomlkit.loads(_read_config_text(chat_config_path))
                 # Update document in-place, preserving formatting
                 for key, value in config_dict.items():
                     if isinstance(value, dict) and key in doc:
@@ -284,11 +300,17 @@ class ChatConfig:
         else:
             doc = tomlkit.parse(tomlkit.dumps(config_dict))
 
+        # If this config was read through a codec that accepts any bytes, its text
+        # is a guess; keep the original bytes before the rename discards them.
+        _back_up_before_reencoding(chat_config_path)
+
         # Use atomic write: write to temp file, then rename
         # This prevents corruption if process is interrupted during write
         # (e.g., daemon thread killed on exit while saving)
         with tempfile.NamedTemporaryFile(
             mode="w",
+            encoding="utf-8",
+            newline="",
             dir=self._logdir,
             suffix=".toml.tmp",
             delete=False,
@@ -326,7 +348,21 @@ class ChatConfig:
                 else:
                     # It's a file or symlink, safe to remove
                     workspace_path.unlink()
-            workspace_path.symlink_to(self.workspace)
+            try:
+                workspace_path.symlink_to(self.workspace)
+            except OSError as err:
+                # Only suppress the specific Windows privilege error (WinError 1314:
+                # ERROR_PRIVILEGE_NOT_HELD) where non-admin users cannot create symlinks
+                # without Developer Mode enabled. The canonical workspace path is safely
+                # preserved in config.toml, which LogManager falls back to.
+                if getattr(err, "winerror", None) == 1314 or (
+                    sys.platform == "win32" and isinstance(err, PermissionError)
+                ):
+                    logger.warning(
+                        f"Could not create workspace symlink '{workspace_path}' -> '{self.workspace}': {err}"
+                    )
+                else:
+                    raise
         else:
             # Workspace IS the log workspace — ensure the directory exists
             # (from_logdir creates it for new conversations, but callers

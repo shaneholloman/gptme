@@ -1,13 +1,13 @@
 [project]
 name = "gptme"
-version = "0.32.1"
+version = "0.33.0"
 description = "Powerful AI agent for coding and general tasks. Terminal-first with shell, code execution, file editing, web browsing, vision, computer use. Unconstrained."
 authors = [
     { name = "Erik Bjäreholt", email = "erik@bjareho.lt" },
 ]
 readme = "README.md"
 license = "MIT"
-requires-python = ">=3.10"
+requires-python = ">=3.10,<3.15"
 dynamic = ["dependencies"]  # "version"
 
 [project.urls]
@@ -37,47 +37,62 @@ gptme-onboard = "gptme.cli.onboard:main"
 gptme-wut = "gptme.cli.wut:main"
 gptme-checkpoint = "gptme.cli.checkpoint:main"
 gptme-init = "gptme.cli.cmd_init:main"
+gptme-tutorial = "gptme.cli.cmd_tutorial:main"
 gptme-dspy = "gptme.eval.dspy:main"
 gptme-eval-trends = "gptme.eval.trends:main"
+gptme-convert = "gptme.tools.convert:main"
 gptme-status = "gptme.cli.cmd_status:status"
 gptme-resume = "gptme.cli.cmd_resume:resume"
 gptme-mcp-server = "gptme.cli.cmd_mcp_serve:main"
+gptme-stats = "gptme.cli.cmd_stats:stats"
+gptme-service = "gptme.cli.cmd_service:cli"
 
 [tool.poetry]
 packages = [
     { include = "gptme" },
 ]
-include = ["gptme/server/static/**/*", "gptme/server/webui-dist/**/*", "gptme/eval/tbench/setup.sh", "media/*.png", "media/*.wav"]
+include = [
+    "gptme/server/static/**/*",
+    # webui-dist is generated and gitignored; an explicit path include is
+    # required so Poetry does not silently omit it from release artifacts.
+    { path = "gptme/server/webui-dist", format = ["sdist", "wheel"] },
+    { path = "gptme/data/faq.yaml", format = ["sdist", "wheel"] },
+    "gptme/eval/tbench/setup.sh",
+    "media/*.png",
+    { path = "media/*.svg", format = ["sdist", "wheel"] },
+    "media/*.wav",
+]
 
 [tool.poetry.dependencies]
-python = "^3.10"
+python = ">=3.10,<3.15"
 click = "^8.4"
 click-default-group = "^1.2.4"
 python-dotenv = "^1.2.2"
-rich = "^14.2"
+rich = "^15.0"
 tabulate = "*"
 pick = {version = "^2.6.0", markers = "sys_platform != 'win32'"}
 tiktoken = ">=0.13.0"
 tomlkit = "*"
 typing-extensions = "*"
-platformdirs = "^4.10"
-lxml = {version = "*", optional = true}  # HTML/XML parsing; optional — pure-Python fallback in base.py
+platformdirs = "^4.11"
+lxml = {version = "*", optional = true}  # HTML/XML parsing; optional — falls back to stdlib xml.etree.ElementTree
 pypdf = {version = ">=6.14.2", optional = true}  # PDF extraction in browser tool (CVE fix: RAM exhaustion + infinite loop)
 requests = "^2.34"  # For HTTP requests in browser tool (PDF detection)
-json-repair = "^0.61.4"
+json-repair = "^0.61.7"
 mcp = "^1.28.1"
 questionary = "^2.1.1"
 python-dateutil = "^2.9.0.post0"
 pyyaml = "^6.0.3"
 
 # providers
-openai = "^2.45"
-anthropic = "^0.116"
+openai = "^2.48"
+anthropic = "^0.120"
 
 # tools
 ipython = "^8.39.0"
 bashlex = "^0.18"
 playwright = {version = "1.61.0", optional=true}  # version constrained due to annoying to have to run `playwright install` on every update
+wasmtime = {version = ">=47.0.1", optional=true}  # Wasmtime WASI Python sandbox (GPTME_SANDBOX=wasmtime)
 python-xlib = {version = "^0.33", optional=true}  # for X11 interaction
 
 # evals
@@ -101,7 +116,7 @@ flask = {version = "^3.0", optional=true}
 flask-cors = {version = ">=6.0.5,<7", optional=true}
 flask-compress = {version = ">=1.14", optional=true}
 pydantic = "^2.13.4"
-prometheus-client = {version = ">=0.17", optional=true}
+prometheus-client = {version = ">=0.26.0", optional=true}
 
 # telemetry
 opentelemetry-api = {version = "^1.20.0", optional=true}
@@ -113,7 +128,7 @@ opentelemetry-exporter-prometheus = {version = "^0.55b1", optional=true}
 opentelemetry-instrumentation-anthropic = {version="^0.48.1", optional=true}
 opentelemetry-instrumentation-openai = {version="^0.48.1", optional=true}
 opentelemetry-instrumentation-threading = {version="^0.55b1", optional=true}
-sentence-transformers = {version = "^5.6.0", optional=true}
+sentence-transformers = {version = "^5.6.1", optional=true}
 
 # build
 pyinstaller = {version="^6.21", python=">=3.10,<3.15", optional=true}  # not yet compatible with Python 3.15+
@@ -157,7 +172,7 @@ sphinx-autobuild = "^2024.10.3"
 sphinx-llms-txt = "^0.7.1"
 sphinxcontrib-programoutput = "*"
 sphinxcontrib-asciinema = "*"
-sphinxcontrib-mermaid = "^2.0.3"
+sphinxcontrib-mermaid = "^2.1.0"
 myst-parser = "*"
 
 # types
@@ -175,6 +190,7 @@ browser = ["playwright"]
 docs = ["lxml", "pypdf"]  # enhanced HTML/XML parsing + PDF extraction; not required for basic use
 minimal = []  # no native extensions beyond pydantic-core; works on ARM/musl/Termux/Lambda
 datascience = ["matplotlib", "pandas", "numpy"]  # pillow (non-opt)
+sandbox = ["wasmtime"]  # Wasmtime WASI Python sandbox (GPTME_SANDBOX=wasmtime)
 sounds = ["sounddevice", "scipy"]
 computer = []  # pillow (non-opt); AT-SPI2 accessibility needs system pkg: apt install python3-pyatspi
 pyinstaller = ["pyinstaller"]
@@ -191,16 +207,14 @@ dspy = ["dspy", "sentence-transformers"]
 swebench = ["datasets", "swebench"]  # narrow install for the SWE-bench public benchmark lane
 eval = ["dspy", "sentence-transformers", "datasets", "swebench", "terminal-bench"]
 all = [
-    # docs (HTML/XML + PDF)
-    "lxml", "pypdf",
     # server
     "flask", "flask-cors", "flask-compress", "pydantic",
     # acp
     "agent-client-protocol",
     # tui
     "textual",
-    # browser
-    "playwright",
+    # browser (lxml + pypdf are optional soft deps; included in all for full-featured installs)
+    "playwright", "lxml", "pypdf",
     # datascience
     "matplotlib", "pandas", "numpy", # "pillow",
     # tool sounds
@@ -280,6 +294,10 @@ module = "acp.*"
 ignore_missing_imports = true
 
 [[tool.mypy.overrides]]
+module = "model_capability_registry"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "flask.*"
 ignore_missing_imports = true
 
@@ -338,6 +356,10 @@ module = [
 disable_error_code = ["unused-ignore"]
 
 [[tool.mypy.overrides]]
+module = "wasmtime.*"
+ignore_missing_imports = true
+
+[[tool.mypy.overrides]]
 module = "sounddevice.*"
 ignore_missing_imports = true
 
@@ -357,6 +379,10 @@ ignore_missing_imports = true
 module = "gptme_sessions.*"
 ignore_missing_imports = true
 
+[[tool.mypy.overrides]]
+module = ["docx", "magic"]
+ignore_missing_imports = true
+
 [tool.pytest.ini_options]
 markers = [
     "slow: marks tests as slow (deselect with '-m \"not slow\"')",
@@ -371,6 +397,24 @@ markers = [
     "xdist_group: marks tests that should run in the same xdist group",
 ]
 asyncio_default_fixture_loop_scope = "function"
+
+# Scope --timeout to the test function only, NOT the whole runtest protocol.
+#
+# With the default (protocol-wide) scoping, pytest-timeout's SIGALRM stays armed
+# across pytest-retry's retry loop -- which sleeps `--retry-delay` between
+# attempts inside pytest_runtest_makereport. When a retried test's cumulative
+# sleep+rerun time crosses the item's timeout, the alarm fires *inside a report
+# hook*, raising Failed where nothing catches it. That crashes the xdist worker
+# and INTERNALERRORs the entire session: every other test passes and the job
+# still exits non-zero.
+#
+# CI runs `--timeout 60 --retries 2 --retry-delay 5` while several modules set a
+# much tighter per-module timeout (tests/test_server_v2.py uses 10s), so 10s of
+# retry sleep alone exceeded the budget -- any single flaky test there took down
+# the whole run. Scoping to the function makes each attempt get its own fresh
+# timeout and keeps the retry delay outside the armed window, while still
+# catching a hanging test body.
+timeout_func_only = true
 
 [tool.coverage.run]
 # Needed to get playwright to play nice with coverage

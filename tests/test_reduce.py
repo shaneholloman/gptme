@@ -385,6 +385,158 @@ def test_limit_log_cascading_orphans():
         )
 
 
+def test_limit_log_partial_call_id_results_dropped():
+    """limit_log must drop assistant when only SOME of its call_id results survive.
+
+    Scenario (Responses-API format):
+    - assistant has 2 function calls: call_id_A and call_id_B
+    - context limit causes the OLDER tool result (call_id_A) to be the
+      message that pushed the budget over, so it gets popped
+    - call_id_B result AND the assistant both survive the initial cut
+    - _is_orphaned misses this: call_id_B's anchor (assistant) is still present
+    - Without the fix: API receives function_call(A)+function_call(B) but only
+      function_call_output(B) → 400 "No tool output found for call_A"
+    - With the fix: _drop_orphaned_tool_pairs detects that assistant has a
+      call_id_A result missing from the result → drops assistant + remaining result
+
+    This reproduces the gptme-gpt-5.5 44% infra-failure-rate root cause
+    (session 96d3, 2026-07-17).
+    """
+    from gptme.llm.models.resolution import _default_model_var
+
+    original_model = _default_model_var.get()
+    try:
+        # Context=11: fits system prompt (2 tok) + call_B result (1 tok)
+        # + assistant (7 tok) = 10 tok; adding call_A result (1 tok) = 11 => over.
+        # So the oldest message in msgs (call_A result, added last in reverse) is popped.
+        tiny_model = ModelMeta(provider="unknown", model="gpt-4", context=11)
+        set_default_model(tiny_model)
+
+        # Assistant message with @tool(call_id): format (Responses API)
+        # Two function calls with distinct call_ids.
+        assistant_content = "@shell(call_A): {}\n@shell(call_B): {}"
+        msgs = [
+            Message("system", "system prompt"),  # 2 tok — initial, always kept
+            Message("assistant", assistant_content),  # ~7 tok — tool use with 2 calls
+            Message("system", "result_A", call_id="call_A"),  # 1 tok — result for A
+            Message("system", "result_B", call_id="call_B"),  # 1 tok — result for B
+        ]
+
+        result = limit_log(msgs)
+
+        result_contents = [m.content for m in result]
+        # Neither partial result should survive without the assistant.
+        # The assistant must also be absent (it has an incomplete pair).
+        assert "result_A" not in result_contents, (
+            "Orphaned call_id_A result should be dropped"
+        )
+        assert "result_B" not in result_contents, (
+            "call_id_B result must be dropped too — its assistant was dropped"
+        )
+        assert assistant_content not in result_contents, (
+            "Assistant with incomplete call_id pair must be dropped"
+        )
+        assert any(m.content == "system prompt" for m in result)
+    finally:
+        set_default_model(original_model) if original_model else _default_model_var.set(
+            None
+        )
+
+
+def test_limit_log_preserves_pinned_head():
+    """limit_log must not drop pinned messages even when they are oldest and non-system.
+
+    Scenario: auto_compact_log marks the first N messages as pinned=True to protect
+    task context. If the compacted log still exceeds the model context, prepare_messages
+    calls limit_log, which builds tail-first and would normally drop the oldest
+    non-system messages — exactly the pinned head messages.
+
+    With the fix: pinned messages are always included (like initial system messages),
+    and the remaining budget is filled from the newest non-pinned messages.
+    """
+    from gptme.llm.models.resolution import _default_model_var
+
+    original_model = _default_model_var.get()
+    try:
+        # Token counts (gpt-4 tokenizer):
+        #   "system" = 1 tok, "task" = 1 tok, "older reply" = 2 tok, "newest message" = 3 tok.
+        # Context=5: system(1) + task(1) + newest(3) = 5, fits.
+        # With old code: system + newest alone = 4, pinned "task" dropped.
+        # With fix: task is always included; tail_budget = 3, newest(3) fits, older(2)+newest(3)=5>3 → only newest.
+        tiny_model = ModelMeta(provider="unknown", model="gpt-4", context=5)
+        set_default_model(tiny_model)
+
+        msgs = [
+            Message("system", "system"),  # 1 tok — initial system, always kept
+            Message("user", "task", pinned=True),  # 1 tok — pinned head
+            Message("assistant", "older reply"),  # 2 tok — old, non-pinned
+            Message("user", "newest message"),  # 2 tok — new, non-pinned
+        ]
+
+        result = limit_log(msgs)
+        result_contents = [m.content for m in result]
+
+        # The pinned "task" message must survive despite being older than "newest".
+        assert "task" in result_contents, "Pinned head message must be preserved"
+        assert "system" in result_contents, "Initial system message must be preserved"
+        # "older reply" should be dropped in favour of pinned head + newest.
+        assert "older reply" not in result_contents, (
+            "Non-pinned older message should be dropped when budget is tight"
+        )
+    finally:
+        set_default_model(original_model) if original_model else _default_model_var.set(
+            None
+        )
+
+
+def test_limit_log_preserves_pinned_tool_call_pair():
+    """limit_log must not drop a pinned assistant tool-call when its result is clipped.
+
+    Scenario: keep_head pins an assistant message that contains a tool call, but the
+    immediately following tool result is not pinned and falls outside the tail budget.
+    _drop_orphaned_tool_pairs would remove the orphaned assistant — but the result
+    should also be included in the always-reserved set to maintain pair atomicity.
+
+    With the fix: extra_pinned is extended to include immediately following call_id
+    results of pinned assistant messages, so the pair is always preserved together.
+    """
+    from gptme.llm.models.resolution import _default_model_var
+
+    original_model = _default_model_var.get()
+    try:
+        # Budget: context=5 tokens.
+        # Messages: system(1) + assistant-with-call(2) + system-result(1) + newest(3)
+        # Without fix: system+newest=4 fits; pinned assistant-call kept but its result
+        # excluded from tail → _drop_orphaned_tool_pairs removes assistant.
+        # With fix: assistant-call + its result both in extra_pinned (reserved budget).
+        tiny_model = ModelMeta(provider="unknown", model="gpt-4", context=7)
+        set_default_model(tiny_model)
+
+        tool_call_msg = Message("assistant", "tool call", pinned=True)
+        tool_result_msg = Message("system", "result", call_id="abc123")
+        msgs = [
+            Message("system", "system"),  # 1 tok — initial system
+            tool_call_msg,  # 2 tok — pinned tool call
+            tool_result_msg,  # 1 tok — tool result (not pinned, but must be kept)
+            Message("user", "newest message"),  # 2 tok — recent context
+        ]
+
+        result = limit_log(msgs)
+        result_contents = [m.content for m in result]
+
+        assert "tool call" in result_contents, (
+            "Pinned assistant tool call must be preserved"
+        )
+        assert "result" in result_contents, (
+            "Tool result of pinned call must be preserved (atomicity)"
+        )
+        assert "system" in result_contents, "Initial system message must be preserved"
+    finally:
+        set_default_model(original_model) if original_model else _default_model_var.set(
+            None
+        )
+
+
 # ---------------------------------------------------------------------------
 # Tests for proactive_summarize_log
 # ---------------------------------------------------------------------------
@@ -952,3 +1104,129 @@ def test_proactive_summarize_error_falls_back(monkeypatch):
         set_default_model(original_model) if original_model else _default_model_var.set(
             None
         )
+
+
+def test_limit_log_preserves_pinned_markdown_tool_result():
+    """limit_log must also protect non-call_id (markdown) tool results of pinned assistant.
+
+    Scenario: a pinned assistant message contains a tool call, and the immediately
+    following system message is a gptme-native markdown result (no call_id).  The
+    old code only added call_id system messages to extra_pinned_ids, leaving the
+    markdown result eligible for budget exclusion.  When excluded, _is_orphaned
+    does NOT catch it (no call_id), so the pinned assistant survives with no result
+    — producing an incoherent log.
+
+    With the fix: ALL consecutive system messages after a pinned assistant tool-use
+    are added to extra_pinned_ids, so the markdown result is always reserved.
+    """
+    from gptme.llm.models.resolution import _default_model_var
+
+    original_model = _default_model_var.get()
+    try:
+        # Budget: context=5 tokens.
+        # Messages: system(1) + pinned-assistant-tool(2) + markdown-result(1) + newest(3)
+        # Without fix: system+newest=4 fits; pinned assistant kept but markdown result
+        # excluded from tail → log has dangling tool call with no result.
+        # With fix: markdown result also in extra_pinned; always reserved.
+        tiny_model = ModelMeta(provider="unknown", model="gpt-4", context=6)
+        set_default_model(tiny_model)
+
+        # Markdown tool result: system message with no call_id
+        tool_call_msg = Message("assistant", "tool call", pinned=True)
+        markdown_result_msg = Message("system", "markdown result")  # no call_id
+
+        msgs = [
+            Message("system", "system"),  # 1 tok — initial system
+            tool_call_msg,  # 2 tok — pinned tool call
+            markdown_result_msg,  # 2 tok — markdown result (no call_id)
+            Message("user", "newest"),  # 1 tok — recent context
+        ]
+
+        result = limit_log(msgs)
+        result_contents = [m.content for m in result]
+
+        assert "tool call" in result_contents, (
+            "Pinned assistant tool call must be preserved"
+        )
+        assert "markdown result" in result_contents, (
+            "Markdown tool result of pinned call must be preserved (no call_id path)"
+        )
+        assert "system" in result_contents, "Initial system message must be preserved"
+    finally:
+        set_default_model(original_model) if original_model else _default_model_var.set(
+            None
+        )
+
+
+def test_limit_log_pinned_system_not_orphaned():
+    """_is_orphaned must not drop a pinned system message even when its anchor is excluded.
+
+    Scenario: a pinned system message's preceding non-system message is NOT in the
+    tail budget selection.  The old _is_orphaned would walk back to that absent anchor
+    and return True, removing the pinned message — defeating the pin guarantee.
+
+    With the fix: _is_orphaned skips messages whose id is in extra_pinned_ids.
+    """
+    from gptme.llm.models.resolution import _default_model_var
+
+    original_model = _default_model_var.get()
+    try:
+        # Budget: context=4 tokens.
+        # Messages: system(1) + assistant-anchor(2) + pinned-result(1) + user(1)
+        # always = system(1) + pinned-result(1) = 2; tail_budget=2; newest is user(1).
+        # assistant-anchor(2) > remaining(1) so it's dropped.
+        # Old _is_orphaned: pinned-result walks back to absent assistant → orphaned → dropped.
+        # New _is_orphaned: pinned-result is in extra_pinned_ids → exempt → kept.
+        tiny_model = ModelMeta(provider="unknown", model="gpt-4", context=4)
+        set_default_model(tiny_model)
+
+        anchor_msg = Message("assistant", "anchor msg")  # 2 tok — non-pinned anchor
+        pinned_result = Message("system", "pinned result", pinned=True)  # 1 tok
+
+        msgs = [
+            Message("system", "system"),  # 1 tok — initial system
+            anchor_msg,  # 2 tok — anchor (will be budget-excluded)
+            pinned_result,  # 1 tok — pinned system result
+            Message("user", "newest"),  # 1 tok — newest
+        ]
+
+        result = limit_log(msgs)
+        result_contents = [m.content for m in result]
+
+        assert "pinned result" in result_contents, (
+            "Pinned system message must not be dropped by _is_orphaned even when anchor is excluded"
+        )
+        assert "system" in result_contents, "Initial system message must be preserved"
+    finally:
+        set_default_model(original_model) if original_model else _default_model_var.set(
+            None
+        )
+
+
+def test_drop_orphaned_tool_pairs_preserves_pinned_tool_result():
+    """_drop_orphaned_tool_pairs must not drop a pinned system tool result.
+
+    When a system message with call_id is pinned, its anchor assistant may have
+    been excluded from the pruned set by limit_log. Previously _drop_orphaned_tool_pairs
+    would detect the missing anchor and remove the pinned result too. The fix: skip
+    Case 1 removal if the system message has pinned=True.
+
+    Regression test for: _drop_orphaned_tool_pairs ignoring pinned flag.
+    """
+    from gptme.util.reduce import _drop_orphaned_tool_pairs
+
+    anchor = Message("assistant", "fn call", call_id="call_abc")
+    pinned_result = Message("system", "fn result", pinned=True, call_id="call_abc")
+    user = Message("user", "follow up")
+
+    original = [anchor, pinned_result, user]
+
+    # Pruned: anchor was excluded (budget or index), only result + user remain
+    pruned = [pinned_result, user]
+
+    result = _drop_orphaned_tool_pairs(original, pruned)
+    result_contents = [m.content for m in result]
+
+    assert "fn result" in result_contents, (
+        "Pinned tool result must survive _drop_orphaned_tool_pairs even when anchor is absent"
+    )

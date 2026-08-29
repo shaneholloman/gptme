@@ -53,7 +53,7 @@ DEFAULT_CONTEXT_FILES = [
     "docker-compose.y*ml",
 ]
 
-PromptType = Literal["full", "short"]
+PromptType = Literal["full", "short", "full-noexamples"]
 
 logger = logging.getLogger(__name__)
 
@@ -114,8 +114,8 @@ def _build_core_prompt_sections(
     agent_name: str | None,
     tool_format: ToolFormat,
     tools: list[ToolSpec],
-    workspace: Path | None,
     include_tools: bool,
+    include_examples: bool,
     is_selective: bool,
 ) -> list[tuple[str, list[Message]]]:
     """Build named core prompt sections in display order."""
@@ -128,28 +128,38 @@ def _build_core_prompt_sections(
     if is_selective and not include_tools:
         add(
             "prompt_gptme",
-            list(prompt_gptme(interactive, model, agent_name, tool_format=tool_format)),
+            list(
+                prompt_gptme(
+                    interactive, model, agent_name, tool_format=tool_format, tools=tools
+                )
+            ),
         )
         return sections
 
     if prompt == "full":
         add(
             "prompt_gptme",
-            list(prompt_gptme(interactive, model, agent_name, tool_format=tool_format)),
+            list(
+                prompt_gptme(
+                    interactive, model, agent_name, tool_format=tool_format, tools=tools
+                )
+            ),
         )
         if include_tools:
             add(
                 "prompt_tools",
-                list(prompt_tools(tools=tools, tool_format=tool_format, model=model)),
+                list(
+                    prompt_tools(
+                        tools=tools,
+                        tool_format=tool_format,
+                        model=model,
+                        examples=include_examples,
+                    )
+                ),
             )
         if interactive:
             add("prompt_user", list(prompt_user(tool_format=tool_format)))
         add("prompt_project", list(prompt_project(tool_format=tool_format)))
-        add(
-            "prompt_systeminfo",
-            list(prompt_systeminfo(workspace, tool_format=tool_format)),
-        )
-        add("prompt_timeinfo", list(prompt_timeinfo(tool_format=tool_format)))
         if include_tools:
             add(
                 "prompt_skills_summary",
@@ -167,6 +177,7 @@ def _build_core_prompt_sections(
                     agent_name=agent_name,
                     tool_format=tool_format,
                     compact=True,
+                    tools=tools,
                 )
             ),
         )
@@ -191,7 +202,14 @@ def _build_core_prompt_sections(
     if include_tools:
         add(
             "prompt_tools",
-            list(prompt_tools(tools=tools, tool_format=tool_format, model=model)),
+            list(
+                prompt_tools(
+                    tools=tools,
+                    tool_format=tool_format,
+                    model=model,
+                    examples=include_examples,
+                )
+            ),
         )
     return sections
 
@@ -208,6 +226,7 @@ def _build_prompt_sections(
     context_mode: ContextMode | None,
     context_include: list[str] | None,
     include_user_context: bool,
+    include_examples: bool,
     initial_prompt: str | None,
 ) -> tuple[
     list[tuple[str, list[Message]]],
@@ -243,10 +262,22 @@ def _build_prompt_sections(
         agent_name=agent_name,
         tool_format=tool_format,
         tools=tools,
-        workspace=workspace,
         include_tools=include_tools,
+        include_examples=include_examples,
         is_selective=is_selective,
     )
+
+    dynamic_sections: list[tuple[str, list[Message]]] = []
+    if prompt == "full" and not (is_selective and not include_tools):
+        dynamic_sections.extend(
+            [
+                (
+                    "prompt_systeminfo",
+                    list(prompt_systeminfo(workspace, tool_format=tool_format)),
+                ),
+                ("prompt_timeinfo", list(prompt_timeinfo(tool_format=tool_format))),
+            ]
+        )
 
     cacheable_sections: list[tuple[str, list[Message]]] = []
     if include_agent_config:
@@ -260,10 +291,21 @@ def _build_prompt_sections(
                         include_path=True,
                         include_context_cmd=False,
                         include_user_context=include_user_context,
+                        include_runtime_context=False,
                     )
                 ),
             )
         )
+        agent_runtime_msgs = list(
+            prompt_workspace_runtime(
+                agent_path,
+                title="Agent Config",
+            )
+        )
+        if agent_runtime_msgs:
+            dynamic_sections.append(
+                ("prompt_agent_workspace_runtime", agent_runtime_msgs)
+            )
     if include_workspace and workspace and workspace != agent_path:
         cacheable_sections.append(
             (
@@ -273,12 +315,17 @@ def _build_prompt_sections(
                         workspace,
                         include_context_cmd=False,
                         include_user_context=include_user_context,
+                        include_runtime_context=False,
                     )
                 ),
             )
         )
+        workspace_runtime_msgs = list(prompt_workspace_runtime(workspace))
+        if workspace_runtime_msgs:
+            dynamic_sections.append(
+                ("prompt_workspace_runtime", workspace_runtime_msgs)
+            )
 
-    dynamic_sections: list[tuple[str, list[Message]]] = []
     if include_context_cmd:
         for ws, title, section_name in [
             (
@@ -346,9 +393,13 @@ def get_prompt_stats(
     context_mode: ContextMode | None = None,
     context_include: list[str] | None = None,
     include_user_context: bool = True,
+    include_examples: bool = True,
     initial_prompt: str | None = None,
 ) -> PromptStats:
     """Return token statistics for each startup prompt section."""
+    if prompt == "full-noexamples":
+        prompt = "full"
+        include_examples = False
     core_sections, cacheable_sections, dynamic_sections = _build_prompt_sections(
         tools=tools,
         tool_format=tool_format,
@@ -360,6 +411,7 @@ def get_prompt_stats(
         context_mode=context_mode,
         context_include=context_include,
         include_user_context=include_user_context,
+        include_examples=include_examples,
         initial_prompt=initial_prompt,
     )
 
@@ -442,7 +494,11 @@ from .templates import (
     prompt_tools,
     prompt_user,
 )
-from .workspace import find_agent_files_in_tree, prompt_workspace
+from .workspace import (
+    find_agent_files_in_tree,
+    prompt_workspace,
+    prompt_workspace_runtime,
+)
 
 
 def get_prompt(
@@ -456,7 +512,9 @@ def get_prompt(
     context_mode: ContextMode | None = None,
     context_include: list[str] | None = None,
     include_user_context: bool = True,
+    include_examples: bool = True,
     initial_prompt: str | None = None,
+    prompt_generation: str | None = None,
 ) -> list[Message]:
     """
     Get the initial system prompt.
@@ -503,11 +561,20 @@ def get_prompt(
         context_include: Components to include in selective mode
         include_user_context: Whether to include user-level prompt files and
             agent instruction files from ~/.config/gptme
+        include_examples: Whether to include tool usage examples in the system
+            prompt. Defaults to True. Also set to False automatically when
+            ``prompt == "full-noexamples"``.
         initial_prompt: First user prompt, exported to context commands as
             ``GPTME_PROMPT_INITIAL``.
+        prompt_generation: Optional unique marker for generated prompt messages.
+            Provider context can omit superseded generations without rewriting
+            the append-only log.
 
     Returns a list of messages: [core_system_prompt, workspace_prompt, ...].
     """
+    if prompt == "full-noexamples":
+        prompt = "full"
+        include_examples = False
     core_sections, cacheable_sections, dynamic_sections = _build_prompt_sections(
         tools=tools,
         tool_format=tool_format,
@@ -519,6 +586,7 @@ def get_prompt(
         context_mode=context_mode,
         context_include=context_include,
         include_user_context=include_user_context,
+        include_examples=include_examples,
         initial_prompt=initial_prompt,
     )
 
@@ -531,7 +599,7 @@ def get_prompt(
     for _, msgs in cacheable_sections:
         result.extend(msgs)
 
-    # Insert an explicit static/dynamic boundary before context_cmd output.
+    # Insert an explicit static/dynamic boundary before runtime context.
     # This keeps the prompt structure stable and makes the cacheable prefix
     # visible to both humans and providers with block-level prompt caching.
     if dynamic_sections and result:
@@ -541,9 +609,18 @@ def get_prompt(
     for _, msgs in dynamic_sections:
         result.extend(msgs)
 
-    # Set hide=True, pinned=True for all messages
+    # Replacement prompts carry a generation marker. Startup prompts created by
+    # older gptme versions remain unmarked, so the first replacement can retire
+    # them using its insertion point (see prepare_messages()).
     for i, msg in enumerate(result):
-        result[i] = msg.replace(hide=True, pinned=True)
+        metadata = dict(msg.metadata) if msg.metadata else {}
+        if prompt_generation is not None:
+            metadata["prompt_generation"] = prompt_generation
+        result[i] = msg.replace(
+            hide=True,
+            pinned=True,
+            metadata=metadata or None,
+        )
 
     return result
 
@@ -593,5 +670,6 @@ __all__ = [
     "prompt_tools",
     "prompt_user",
     "prompt_workspace",
+    "prompt_workspace_runtime",
     "use_chat_history_context",
 ]

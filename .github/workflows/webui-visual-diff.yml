@@ -1,0 +1,273 @@
+name: WebUI Visual Diff
+
+# Trusted context: triggered after the WebUI workflow completes on a PR.
+# Downloads the "after" screenshots captured on the PR branch, takes "before"
+# screenshots from master, diffs them pixel-by-pixel, and posts a PR comment
+# only when at least one view has changed visually.
+#
+# Security model: this workflow runs in the base-repo context (not the fork),
+# so github.token has write access to post PR comments even on fork PRs.  The
+# "after" screenshots come from the untrusted fork run as artifacts — we never
+# execute fork code here.
+# See: https://securitylab.github.com/research/github-actions-preventing-pwn-requests/
+
+on:
+  workflow_run:
+    workflows: ["WebUI"]
+    types: [completed]
+
+jobs:
+  visual-diff:
+    # Only for pull_request-triggered WebUI runs; skip cancelled runs because
+    # the screenshots job may not have had time to upload its artifacts.
+    if: >-
+      github.event.workflow_run.event == 'pull_request' &&
+      github.event.workflow_run.conclusion != 'cancelled'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+      contents: write  # CML needs write access to create draft release assets for image hosting
+      actions: read    # needed to download artifacts from the triggering workflow run
+
+    steps:
+    # Download the "after" screenshots from the triggering PR run.
+    # We use actions/download-artifact (official) rather than dawidd6/action-download-artifact
+    # because the official action guarantees files land directly in `path` (no artifact-name
+    # subdirectory), which is what diff-screenshots.sh expects with its non-recursive glob.
+    #
+    # IMPORTANT: download to /tmp/screenshots-after, NOT a path inside $GITHUB_WORKSPACE.
+    # actions/checkout@v7 runs "Deleting the contents of '$GITHUB_WORKSPACE'" before cloning,
+    # which wipes any files already downloaded there — including these screenshots.
+    # Storing them in /tmp survives the checkout step.
+    - name: Download "after" screenshots
+      id: download
+      uses: actions/download-artifact@v7
+      with:
+        run-id: ${{ github.event.workflow_run.id }}
+        name: webui-visual-snapshots
+        path: /tmp/screenshots-after
+        github-token: ${{ github.token }}
+      continue-on-error: true  # warn rather than fail when screenshots weren't uploaded
+
+    - name: Check for after screenshots and read PR number
+      id: setup
+      run: |
+        # Log the downloaded structure to aid future debugging.
+        echo "=== /tmp/screenshots-after contents ==="
+        find /tmp/screenshots-after -maxdepth 2 2>/dev/null | sort || echo "(empty or not found)"
+        echo "======================================="
+
+        # Use -maxdepth 1 (same non-recursive scope as diff-screenshots.sh's glob)
+        # to avoid a false-positive proceed when files landed in a subdirectory.
+        PNG_COUNT=$(find /tmp/screenshots-after -maxdepth 1 -name '*.png' 2>/dev/null | wc -l | tr -d ' ')
+        if [ "$PNG_COUNT" -eq 0 ]; then
+          echo "No screenshots found directly in /tmp/screenshots-after — skipping diff"
+          echo "skip=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        echo "Found $PNG_COUNT after-screenshot(s)"
+        echo "screenshots_found=true" >> $GITHUB_OUTPUT
+
+        # Derive PR number from trusted event data.
+        # github.event.workflow_run.pull_requests[0].number is populated for
+        # same-repo PRs but is EMPTY for fork PRs (GitHub limitation).
+        # Fall back to a GitHub API lookup by head SHA — the SHA is set by
+        # GitHub's infrastructure, not by user-supplied artifact content.
+        PR_NUMBER="${PR_NUMBER_FROM_EVENT}"
+        if [ -z "$PR_NUMBER" ]; then
+          echo "pull_requests[] empty (likely fork PR) — looking up by head SHA"
+          PR_NUMBER=$(gh api "repos/${GITHUB_REPOSITORY}/pulls?state=open&per_page=100" \
+            --paginate \
+            --jq ".[] | select(.head.sha == \"${HEAD_SHA}\") | .number" 2>/dev/null | head -1 || true)
+        fi
+        if [ -z "$PR_NUMBER" ]; then
+          echo "Could not determine PR number from event or API — skipping"
+          echo "skip=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        echo "pr_number=$PR_NUMBER" >> $GITHUB_OUTPUT
+        echo "skip=false" >> $GITHUB_OUTPUT
+      env:
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER_FROM_EVENT: ${{ github.event.workflow_run.pull_requests[0].number }}
+        HEAD_SHA: ${{ github.event.workflow_run.head_sha }}
+
+    - uses: actions/checkout@v7
+      if: steps.setup.outputs.skip != 'true'
+      with:
+        ref: master
+
+    - name: Use Node.js 20
+      if: steps.setup.outputs.skip != 'true'
+      uses: actions/setup-node@v7
+      with:
+        node-version: 20
+        cache: 'npm'
+        cache-dependency-path: webui/package-lock.json
+
+    - name: Install dependencies (master)
+      if: steps.setup.outputs.skip != 'true'
+      working-directory: webui
+      run: npm ci
+
+    - name: Install Playwright browsers
+      if: steps.setup.outputs.skip != 'true'
+      working-directory: webui
+      run: npx playwright install --with-deps chromium
+
+    - name: Take "before" screenshots (master branch)
+      id: before
+      if: steps.setup.outputs.skip != 'true'
+      working-directory: webui
+      env:
+        SCREENSHOTS_DIR: ${{ github.workspace }}/screenshots/before
+      run: |
+        # The snapshot spec may not exist in master when this is the very first
+        # PR that adds the screenshot infrastructure.  Skip gracefully so the
+        # PR itself is not blocked.
+        if [ ! -f "e2e/visual-snapshots.spec.ts" ]; then
+          echo "No baseline spec in master yet — skipping visual diff"
+          echo "skip=true" >> $GITHUB_OUTPUT
+          exit 0
+        fi
+        npx playwright test e2e/visual-snapshots.spec.ts --reporter=dot
+        echo "skip=false" >> $GITHUB_OUTPUT
+
+    - name: Diff screenshots
+      id: diff
+      if: >-
+        steps.setup.outputs.skip != 'true' &&
+        steps.before.outputs.skip != 'true'
+      run: |
+        bash .github/scripts/diff-screenshots.sh \
+          screenshots/before \
+          /tmp/screenshots-after \
+          screenshots/diff
+        CHANGED=$(python3 -c "import json; d=json.load(open('screenshots/diff/summary.json')); print(d['changed'])")
+        TOTAL=$(python3  -c "import json; d=json.load(open('screenshots/diff/summary.json')); print(d['total'])")
+        echo "changed=$CHANGED" >> $GITHUB_OUTPUT
+        echo "total=$TOTAL"     >> $GITHUB_OUTPUT
+
+    - name: Upload diff artifacts
+      if: steps.diff.outputs.changed > 0
+      uses: actions/upload-artifact@v7
+      with:
+        name: webui-visual-diff-pr-${{ steps.setup.outputs.pr_number }}
+        path: screenshots/diff/
+        retention-days: 14
+
+    - name: Setup CML
+      if: steps.diff.outputs.changed > 0
+      # Pinned to a full commit SHA (not the mutable `v2` tag) because this
+      # job holds `contents: write` + `pull-requests: write` — see Greptile
+      # review on gptme/gptme#3482.
+      uses: iterative/setup-cml@e5f9f4673e0a8f275c45cc66dbbfd29c8469fb4e # v2.1.0
+
+    - name: Build and post PR comment with inline images
+      # CML uploads the local image references to a public host (GitHub draft
+      # release assets) so reviewers see before/after screenshots directly in
+      # the PR comment without needing to download artifacts.
+      #
+      # Replacement is create-then-prune: the new comment is posted FIRST so
+      # reviewers always have a live visual-diff comment even if the cleanup
+      # step fails.  The prune step deletes older copies by keeping only the
+      # comment with the highest (newest) ID.
+      if: steps.diff.outputs.changed > 0
+      env:
+        REPO_TOKEN: ${{ github.token }}
+        GH_TOKEN: ${{ github.token }}
+        PR_NUMBER: ${{ steps.setup.outputs.pr_number }}
+        CHANGED: ${{ steps.diff.outputs.changed }}
+        TOTAL: ${{ steps.diff.outputs.total }}
+      run: |
+        python3 - << 'PYEOF'
+        import json, os, re
+        from urllib.parse import quote
+
+        summary = json.load(open('screenshots/diff/summary.json'))
+        changed = os.environ['CHANGED']
+        total   = os.environ['TOTAL']
+
+        ICON = {'changed': '⚠️', 'new': '🆕', 'removed': '🗑️'}
+
+        def label(name):
+            """Escape filename for a Markdown table cell label (no injection vectors)."""
+            name = re.sub(r'\r?\n|\r', ' ', name)  # newlines would break the table row
+            return '`' + re.sub(r'[`|\[\]]', lambda m: '&#' + str(ord(m.group())) + ';', name) + '`'
+
+        lines = [
+            '## 🎨 WebUI Visual Changes Detected',
+            '',
+            f'**{changed} of {total} screenshots changed** on this PR.',
+            '',
+            '| View | Before | After |',
+            '|------|--------|-------|',
+        ]
+        for r in summary['results']:
+            if r['status'] not in ('changed', 'new', 'removed'):
+                continue
+            name   = r['name']
+            status = r['status']
+            icon   = ICON.get(status, '❓') + ' ' + status
+            # URL-encode the filename: an unescaped `)` or newline in a fork-controlled
+            # screenshot name could terminate the image URL early and inject markdown.
+            url_name = quote(name)
+            before = f'![before](screenshots/diff/before-{url_name})' if status in ('changed', 'removed') else f'_{icon}_'
+            after  = f'![after](screenshots/diff/after-{url_name})'   if status in ('changed', 'new')     else f'_{icon}_'
+            lines.append(f'| {label(name)} | {before} | {after} |')
+
+        lines += [
+            '',
+            '> _Posted automatically when webui screenshots differ from master. '
+            'No comment = no visual changes._',
+        ]
+
+        with open('comment.md', 'w') as f:
+            f.write('\n'.join(lines) + '\n')
+        PYEOF
+
+        # Stamp the run ID so overlapping runs are ordered by workflow run, not
+        # by comment creation time (which can differ from run completion order).
+        printf '<!-- visual-diff-run-id: %s -->\n' "$GITHUB_RUN_ID" >> comment.md
+
+        # Post new comment FIRST — a comment is always visible even if pruning fails.
+        cml comment create comment.md --target "pr/${PR_NUMBER}"
+
+        # Prune stale visual-diff comments; keep the one from the newest workflow
+        # run (highest GITHUB_RUN_ID) so out-of-order completions never replace
+        # newer screenshots with older ones.  Falls back to highest comment ID
+        # for comments that pre-date the run-ID stamp.
+        python3 - << 'PRUNE_EOF'
+        import json, os, re, subprocess
+
+        repo   = os.environ['GITHUB_REPOSITORY']
+        pr     = os.environ['PR_NUMBER']
+        marker = '## 🎨 WebUI Visual Changes Detected'
+        # No array wrapper: `--paginate --jq` outputs one result per matching item
+        # across all pages (NDJSON), not one JSON array per page.
+        jq     = '.[] | select(.user.login=="github-actions[bot]") | select(.body | startswith("' + marker + '")) | {id,body}'
+
+        out = subprocess.run(
+            ['gh', 'api', f'repos/{repo}/issues/{pr}/comments', '--paginate', '--jq', jq],
+            capture_output=True, text=True, check=True,
+        ).stdout
+        comments = [json.loads(line) for line in out.strip().split('\n') if line.strip()]
+
+        def run_id(c):
+            m = re.search(r'visual-diff-run-id:\s*(\d+)', c['body'])
+            return int(m.group(1)) if m else 0
+
+        if comments:
+            keep = max(comments, key=lambda c: (run_id(c), c['id']))
+            for c in comments:
+                if c['id'] != keep['id']:
+                    # A concurrent run may have already deleted this comment (404) —
+                    # the final state (only `keep` surviving) is still correct, so
+                    # don't fail the step over a race.
+                    result = subprocess.run(
+                        ['gh', 'api', '-X', 'DELETE',
+                         f'repos/{repo}/issues/comments/{c["id"]}'],
+                    )
+                    if result.returncode != 0:
+                        print(f'note: could not delete comment {c["id"]} (likely already removed by a concurrent run)')
+        PRUNE_EOF

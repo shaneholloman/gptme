@@ -62,7 +62,6 @@ export function useConversation(conversationId: string, serverId?: string) {
   // Initialize conversation in store if needed
   useEffect(() => {
     if (!conversation$) {
-      console.log(`[useConversation] Initializing conversation ${conversationId}`);
       initConversation(conversationId);
     }
   }, [conversationId, conversation$]);
@@ -91,6 +90,9 @@ export function useConversation(conversationId: string, serverId?: string) {
           `[useConversation] Failed to preload chat config for ${conversationId}:`,
           error
         );
+        // Set chatConfig: null (not undefined) so the model selector skeleton
+        // clears — null means "fetch attempted, no config", not "still loading".
+        if (!cancelled) updateConversation(conversationId, { chatConfig: null });
       });
     return () => {
       cancelled = true;
@@ -103,6 +105,7 @@ export function useConversation(conversationId: string, serverId?: string) {
       return;
     }
 
+    let cancelled = false;
     const loadAndConnect = async () => {
       try {
         // Check if this is a demo conversation
@@ -129,10 +132,6 @@ export function useConversation(conversationId: string, serverId?: string) {
         // real API load and leave indices wrong. isWindowHydrated is set by
         // updateConversationData() and initConversation(data).
         const isWindowHydrated = conversation$?.isWindowHydrated?.peek() === true;
-        console.log('[useConversation] Loading conversation', {
-          conversationId,
-          isWindowHydrated,
-        });
         if (!isWindowHydrated) {
           // Only load from API if we don't already have conversation data
           try {
@@ -143,15 +142,16 @@ export function useConversation(conversationId: string, serverId?: string) {
               const chatConfig = await api.getChatConfig(conversationId);
               updateConversationData(conversationId, data);
               updateConversation(conversationId, { chatConfig, loadError: null });
-              console.log(`[useConversation] Loaded conversation and config for ${conversationId}`);
             } catch (error) {
               console.warn(
                 `[useConversation] Failed to load chat config for ${conversationId}:`,
                 error
               );
-              // Still update with conversation data even if config fails
+              // Still update with conversation data even if config fails.
+              // Set chatConfig: null (not undefined) so the model selector skeleton
+              // clears — null means "fetch attempted, no config", not "still loading".
               updateConversationData(conversationId, data);
-              updateConversation(conversationId, { loadError: null });
+              updateConversation(conversationId, { chatConfig: null, loadError: null });
             }
           } catch (error) {
             console.warn(
@@ -161,13 +161,37 @@ export function useConversation(conversationId: string, serverId?: string) {
             // Don't overwrite existing placeholder data if API call fails, but
             // surface the failure so the user isn't left staring at a blank chat.
             const message = error instanceof Error ? error.message : 'Failed to load conversation';
-            updateConversation(conversationId, { loadError: message });
+            // Set chatConfig: null (not undefined) so the model selector shows the
+            // fallback model rather than an inert loading skeleton indefinitely.
+            updateConversation(conversationId, { chatConfig: null, loadError: message });
             toast({
               variant: 'destructive',
               title: 'Failed to load conversation',
               description: message,
             });
             return;
+          }
+        } else if (conversation$?.chatConfig?.peek() === undefined) {
+          // Conversations created through createConversationWithPlaceholder()
+          // arrive already hydrated, so the branch above — the only other place
+          // that loads chatConfig on first open — is skipped for them.  The
+          // "ensure chat config is loaded" effect above cannot cover this case
+          // either: it bails on !conversation$.isConnected.peek(), and peek()
+          // does not subscribe, so it never re-runs once the conversation
+          // connects.  Without this fetch chatConfig stays `undefined` forever
+          // and the model selector is stuck on its loading skeleton for the
+          // whole life of every newly created conversation.
+          try {
+            const chatConfig = await api.getChatConfig(conversationId);
+            if (!cancelled) updateConversation(conversationId, { chatConfig });
+          } catch (error) {
+            console.warn(
+              `[useConversation] Failed to load chat config for ${conversationId}:`,
+              error
+            );
+            // null (not undefined) = "fetch attempted, no config", which clears
+            // the skeleton and falls back to the default model.
+            if (!cancelled) updateConversation(conversationId, { chatConfig: null });
           }
         }
 
@@ -183,7 +207,6 @@ export function useConversation(conversationId: string, serverId?: string) {
             .filter((id) => id !== selectedId)
             .slice(0, connectedConvs.length - MAX_CONNECTED_CONVERSATIONS + 1);
 
-          console.log(`[useConversation] Disconnecting old conversations:`, toDisconnect);
           for (const id of toDisconnect) {
             api.closeEventStream(id);
             setConnected(id, false);
@@ -191,11 +214,9 @@ export function useConversation(conversationId: string, serverId?: string) {
         }
 
         // Connect to event stream
-        console.log(`[useConversation] Connecting to ${conversationId}`);
         api
           .subscribeToEvents(conversationId, {
             onMessageStart: () => {
-              console.log('[useConversation] Generation started');
               setGenerating(conversationId, true);
               setExecutingTool(conversationId, null, null); // Clear executing tool when starting new generation
               messageJustCompleted.current = false;
@@ -203,14 +224,6 @@ export function useConversation(conversationId: string, serverId?: string) {
               // Add empty message placeholder if needed
               const messages$ = conversation$?.data.log;
               const lastMessage$ = messages$?.[messages$.length - 1];
-              console.log(
-                '[useConversation] MessageStart - messages count:',
-                messages$?.length,
-                'lastMessage role:',
-                lastMessage$?.role?.get(),
-                'content:',
-                JSON.stringify(lastMessage$?.content?.get())
-              );
               if (
                 !lastMessage$ ||
                 lastMessage$.role.get() !== 'assistant' ||
@@ -222,14 +235,7 @@ export function useConversation(conversationId: string, serverId?: string) {
                   timestamp: new Date().toISOString(),
                   isComplete: false,
                 };
-                console.log('[useConversation] Adding streaming message placeholder');
                 addMessage(conversationId, streamingMessage);
-                console.log(
-                  '[useConversation] Placeholder added, new messages count:',
-                  conversation$?.data.log.length
-                );
-              } else {
-                console.log('[useConversation] Reusing existing empty assistant message');
               }
             },
             onToken: (token) => {
@@ -245,7 +251,6 @@ export function useConversation(conversationId: string, serverId?: string) {
               }
             },
             onMessageComplete: (message) => {
-              console.log('[useConversation] Generation complete');
               messageJustCompleted.current = true;
 
               // Update the last message with final content and metadata
@@ -280,7 +285,6 @@ export function useConversation(conversationId: string, serverId?: string) {
               }, 100);
             },
             onMessageAdded: (message) => {
-              console.log('[useConversation] Message added:', message);
               // Check if this message already exists (ignoring timestamp)
               const messages$ = conversation$?.data.log;
               const lastMessage$ = messages$?.[messages$.length - 1];
@@ -288,14 +292,11 @@ export function useConversation(conversationId: string, serverId?: string) {
                 lastMessage$?.role.get() === message.role &&
                 lastMessage$?.content.get() === message.content
               ) {
-                console.log('[useConversation] Skipping duplicate message');
                 return;
               }
               addMessage(conversationId, message);
             },
             onToolPending: (toolId, tooluse, auto_confirm) => {
-              console.log('[useConversation] Tool pending:', { toolId, tooluse, auto_confirm });
-
               if (messageJustCompleted.current) {
                 messageJustCompleted.current = false;
                 // Keep generating true as we're continuing with tool execution
@@ -322,8 +323,6 @@ export function useConversation(conversationId: string, serverId?: string) {
               }
             },
             onToolExecuting: (toolId) => {
-              console.log('[useConversation] Tool executing:', { toolId });
-
               // Get the pending tool to move it to executing state
               const pendingTool = conversation$?.pendingTool.get();
               if (pendingTool && pendingTool.id === toolId) {
@@ -344,7 +343,6 @@ export function useConversation(conversationId: string, serverId?: string) {
               }
             },
             onToolComplete: (toolId, durationMs, success) => {
-              console.log('[useConversation] Tool complete:', { toolId, durationMs, success });
               const executingTool = conversation$?.executingTool.get();
               if (!executingTool) {
                 console.warn(
@@ -364,7 +362,6 @@ export function useConversation(conversationId: string, serverId?: string) {
               setToolComplete(conversationId, toolName, durationMs, success);
             },
             onInterrupted: () => {
-              console.log('[useConversation] Generation interrupted');
               setGenerating(conversationId, false);
               setPendingTool(conversationId, null, null);
               setExecutingTool(conversationId, null, null);
@@ -427,7 +424,6 @@ export function useConversation(conversationId: string, serverId?: string) {
               // This fixes the race condition where step() was called before subscription
               const needsStep = conversation$?.needsInitialStep?.get();
               if (needsStep) {
-                console.log('[useConversation] Triggering initial step after subscription');
                 const initialStepStream = conversation$?.initialStepStream?.get();
                 clearInitialStepState(conversationId);
                 api
@@ -467,7 +463,6 @@ export function useConversation(conversationId: string, serverId?: string) {
               }
             },
             onReconnectState: (state) => {
-              console.log('[useConversation] Restoring state on reconnect:', state);
               if (state.generating) {
                 setGenerating(conversationId, true);
               }
@@ -486,7 +481,6 @@ export function useConversation(conversationId: string, serverId?: string) {
               }
             },
             onConversationEdited: (data) => {
-              console.log('[useConversation] Conversation edited:', data);
               updateBranches(conversationId, data.branches);
               // Reset to main branch (setCurrentBranch also replaces data.log)
               setCurrentBranch(conversationId, 'main');
@@ -514,8 +508,8 @@ export function useConversation(conversationId: string, serverId?: string) {
 
     // Cleanup function - only disconnect if page is being unloaded
     return () => {
+      cancelled = true;
       if (document.hidden) {
-        console.log(`[useConversation] Page hidden, disconnecting from ${conversationId}`);
         api.closeEventStream(conversationId);
         setConnected(conversationId, false);
       }
@@ -527,17 +521,13 @@ export function useConversation(conversationId: string, serverId?: string) {
       throw new Error('Conversation not initialized');
     }
 
-    console.log('[useConversation] Sending message:', { message, options });
-
     // Clear any pending or executing tool when sending a new message
     const pendingTool = conversation$?.pendingTool.get();
     const executingTool = conversation$?.executingTool.get();
     if (pendingTool) {
-      console.log('[useConversation] Clearing pending tool due to new message');
       setPendingTool(conversationId, null, null);
     }
     if (executingTool) {
-      console.log('[useConversation] Clearing executing tool due to new message');
       setExecutingTool(conversationId, null, null);
     }
 

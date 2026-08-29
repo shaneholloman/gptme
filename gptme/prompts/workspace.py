@@ -6,6 +6,7 @@ from pathlib import Path
 from typing import TYPE_CHECKING
 
 from ..config import config_path, get_config, get_project_config
+from ..dirs import get_cc_memory_file
 from ..message import Message
 from ..util.context import md_codeblock
 from ..util.context_dedup import _content_hash
@@ -15,6 +16,7 @@ from . import AGENT_FILES, DEFAULT_CONTEXT_FILES, _loaded_agent_files_var
 from .context_cmd import get_project_context_cmd_output
 
 _HASH_PREFIX = "ch:"
+_CC_MEMORY_MAX_BYTES = 64 * 1024  # 64 KB cap to avoid consuming excessive prompt budget
 
 if TYPE_CHECKING:
     from ..util.uri import FilePath
@@ -120,6 +122,32 @@ def _get_git_status(workspace: Path) -> str | None:
         return None
 
 
+def _workspace_runtime_sections(
+    workspace: Path, *, include_path: bool = False
+) -> list[str]:
+    """Build session-volatile workspace sections."""
+    sections = []
+    if include_path:
+        sections.append(f"**Path:** {workspace.resolve()}")
+    if tree_output := get_tree_output(workspace):
+        sections.append(f"## Project Structure\n\n{md_codeblock('', tree_output)}\n\n")
+    if git_status := _get_git_status(workspace):
+        sections.append(f"## Git Status\n\n{git_status}")
+    return sections
+
+
+def prompt_workspace_runtime(
+    workspace: Path | None = None,
+    title: str = "Project Workspace",
+    include_path: bool = False,
+) -> Generator[Message, None, None]:
+    """Generate session-volatile workspace metadata."""
+    if workspace is None:
+        return
+    if sections := _workspace_runtime_sections(workspace, include_path=include_path):
+        yield Message("system", f"# {title}\n\n" + "\n\n".join(sections))
+
+
 def find_agent_files_in_tree(
     directory: Path,
     exclude: set[str] | None = None,
@@ -180,6 +208,7 @@ def prompt_workspace(
     include_path: bool = False,
     include_context_cmd: bool = True,
     include_user_context: bool = True,
+    include_runtime_context: bool = True,
 ) -> Generator[Message, None, None]:
     """Generate the workspace context prompt."""
     # TODO: update this prompt if the files change
@@ -188,7 +217,10 @@ def prompt_workspace(
     if workspace is None:
         return
 
-    # Add workspace path if requested
+    # Keep the path at the top for direct callers, matching the historical
+    # prompt_workspace() ordering. The tree and git status stay at the end.
+    # Path is static/deterministic, so include_path controls it independently
+    # of include_runtime_context (which gates the volatile tree/git sections).
     if include_path:
         sections.append(f"**Path:** {workspace.resolve()}")
 
@@ -355,13 +387,8 @@ def prompt_workspace(
                 f"Excluded {excluded_count} file(s) via project config exclude patterns"
             )
 
-    # Get tree output if enabled
-    if tree_output := get_tree_output(workspace):
-        sections.append(f"## Project Structure\n\n{md_codeblock('', tree_output)}\n\n")
-
-    # Get git status (branch + working tree changes)
-    if git_status := _get_git_status(workspace):
-        sections.append(f"## Git Status\n\n{git_status}")
+    if include_runtime_context:
+        sections.extend(_workspace_runtime_sections(workspace))
 
     if sections:
         yield Message("system", f"# {title}\n\n" + "\n\n".join(sections))
@@ -388,6 +415,33 @@ def prompt_workspace(
             f"## Selected files\n\nRead more with `cat`.\n\n{context_file_list}",
             files=valid_context_files,
         )
+
+    # Load Claude Code memory if present — makes CC-written memories accessible in gptme
+    if include_user_context:
+        cc_memory_file = get_cc_memory_file(workspace_resolved)
+        if cc_memory_file.exists():
+            try:
+                # Read at most MAX+1 bytes to detect oversized files without loading them fully
+                with open(cc_memory_file, "rb") as _f:
+                    raw = _f.read(_CC_MEMORY_MAX_BYTES + 1)
+                truncated = len(raw) > _CC_MEMORY_MAX_BYTES
+                if truncated:
+                    raw = raw[:_CC_MEMORY_MAX_BYTES]
+                    logger.warning(
+                        f"CC memory file {cc_memory_file} exceeds "
+                        f"{_CC_MEMORY_MAX_BYTES // 1024}KB; truncating"
+                    )
+                memory_content = raw.decode("utf-8", errors="ignore").strip()
+                if memory_content:
+                    yield Message(
+                        "system",
+                        f"## Persistent Memory\n\n"
+                        f"The following memory was saved across sessions "
+                        f"(from `{cc_memory_file}`):\n\n{memory_content}",
+                    )
+                    logger.debug(f"Loaded CC memory from {cc_memory_file}")
+            except OSError as e:
+                logger.debug(f"Failed to read CC memory file {cc_memory_file}: {e}")
 
     # Computed context last (changes most often, least cacheable)
     if (

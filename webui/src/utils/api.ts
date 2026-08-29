@@ -60,6 +60,16 @@ export class ApiClientError extends Error {
   }
 }
 
+// Returns undefined for unset / default '.' workspace so the server can apply
+// its own @log (isolated per-conversation) default. Explicit non-default paths
+// (e.g. '/workspace/project') are passed through unchanged.
+function requestWorkspace(workspace?: string): string | undefined {
+  if (!workspace || workspace === '.') {
+    return undefined;
+  }
+  return workspace;
+}
+
 export function getApiErrorPresentation(
   error: unknown,
   options?: {
@@ -578,6 +588,41 @@ export class ApiClient {
             parseError instanceof Error
               ? `Server response was not valid JSON: ${parseError.message}`
               : 'Server response was not valid JSON',
+        });
+        return false;
+      }
+
+      // /api/v2 is intentionally unauthenticated (version/capability discovery).
+      // After gptme#3430 a live local server still 200s that probe without a
+      // bearer token, then 401-loops on conversations. Confirm auth against a
+      // protected route before reporting connected.
+      const authUrl = `${this.baseUrl}/api/v2/conversations?limit=1`;
+      const authResponse = await this.fetchWithTimeout(authUrl, {}, 3000);
+      if (this._probeNonce !== nonce) return false;
+      if (authResponse.status === 401) {
+        console.error('API accepted the root probe but rejected authenticated routes:', 401);
+        this.isConnected$.set(false);
+        this.compatibilityWarning$.set(null);
+        this.lastConnectionResult$.set({
+          ok: false,
+          url: authUrl,
+          reason: 'http_error',
+          status: 401,
+          message:
+            'Server is running but requires a bearer token. Paste the token printed by gptme-server.',
+        });
+        return false;
+      }
+      if (!authResponse.ok) {
+        console.error('Protected probe failed with status:', authResponse.status);
+        this.isConnected$.set(false);
+        this.compatibilityWarning$.set(null);
+        this.lastConnectionResult$.set({
+          ok: false,
+          url: authUrl,
+          reason: 'http_error',
+          status: authResponse.status,
+          message: `Server returned ${authResponse.status} on the authenticated probe.`,
         });
         return false;
       }
@@ -1243,7 +1288,7 @@ export class ApiClient {
         log: [message],
         logfile: conversationId,
         branches: {},
-        workspace: options?.workspace || '.',
+        workspace: requestWorkspace(options?.workspace) ?? '@log',
       },
       { needsInitialStep: true, initialStepStream: options?.stream }
     );
@@ -1266,7 +1311,7 @@ export class ApiClient {
         chat: {
           model: options?.model,
           stream: options?.stream,
-          workspace: options?.workspace || '.',
+          workspace: requestWorkspace(options?.workspace),
         },
       });
       try {
@@ -1285,7 +1330,7 @@ export class ApiClient {
         chat: {
           model: options?.model,
           stream: options?.stream,
-          workspace: options?.workspace || '.',
+          workspace: requestWorkspace(options?.workspace),
         },
       });
     }
@@ -1707,6 +1752,14 @@ export class ApiClient {
   async getExternalSession(id: string, days = 30): Promise<ExternalSessionDetail> {
     const url = `${this.baseUrl}/api/v2/external-sessions/${id}?days=${days}`;
     return await this.fetchJson<ExternalSessionDetail>(url);
+  }
+
+  async steerExternalSession(id: string, message: string): Promise<void> {
+    const url = `${this.baseUrl}/api/v2/external-sessions/${id}/steer`;
+    await this.fetchJson<{ status: string }>(url, {
+      method: 'POST',
+      body: JSON.stringify({ message }),
+    });
   }
 
   async getSessions(): Promise<ActiveSession[]> {

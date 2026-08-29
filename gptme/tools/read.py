@@ -8,6 +8,7 @@ Multiple paths can be passed in the code block (one per line) to read several
 files in a single tool call, reducing roundtrips when exploring a codebase.
 """
 
+import os
 from collections.abc import Generator
 from pathlib import Path
 
@@ -95,6 +96,30 @@ def _get_read_paths(
 
 
 _MAX_DIR_ENTRIES = 100
+_READ_ROOT_ENV = "GPTME_READ_ROOT"
+
+
+def _configured_read_root() -> tuple[Path | None, str | None]:
+    """Return the optional root that confines every read-tool path.
+
+    The normal read tool remains unrestricted for backwards compatibility.
+    Security-sensitive child sessions can opt into confinement by setting
+    ``GPTME_READ_ROOT`` to an absolute directory.  Invalid configuration fails
+    closed rather than silently widening access.
+    """
+    value = os.environ.get(_READ_ROOT_ENV)
+    if not value:
+        return None, None
+    configured = Path(value).expanduser()
+    if not configured.is_absolute():
+        return None, f"{_READ_ROOT_ENV} must be an absolute path: {value!r}"
+    try:
+        root = configured.resolve(strict=True)
+    except OSError as exc:
+        return None, f"Invalid {_READ_ROOT_ENV} {value!r}: {exc}"
+    if not root.is_dir():
+        return None, f"{_READ_ROOT_ENV} is not a directory: {root}"
+    return root, None
 
 
 def _list_directory(path: Path) -> Generator[Message, None, None]:
@@ -138,18 +163,36 @@ def _read_one(
     end_line: int | None = None,
 ) -> Generator[Message, None, None]:
     """Read a single file or directory and yield messages with the result."""
-    # Path traversal protection: validate relative paths stay within cwd
+    # Path traversal protection: relative paths stay within cwd. A caller may
+    # additionally confine *all* reads (including absolute paths and symlink
+    # targets) by setting GPTME_READ_ROOT for the session. In that mode, resolve
+    # relative paths from the configured root so the process can run from a
+    # separate, trusted directory without loading project configuration from the
+    # untrusted readable tree.
     path_display = path
-    path = path.expanduser().resolve()
-    if not path_display.is_absolute():
-        cwd = Path.cwd().resolve()
+    read_root, read_root_error = _configured_read_root()
+    if read_root_error is not None:
+        yield Message("system", f"Read denied: {read_root_error}")
+        return
+    expanded_path = path.expanduser()
+    if read_root is not None and not expanded_path.is_absolute():
+        path = (read_root / expanded_path).resolve()
+    else:
+        path = expanded_path.resolve()
+    containment_root = read_root or (
+        Path.cwd().resolve() if not path_display.is_absolute() else None
+    )
+    if containment_root is not None:
         try:
-            path.relative_to(cwd)
+            path.relative_to(containment_root)
         except ValueError:
+            label = (
+                "configured read root" if read_root is not None else "current directory"
+            )
             yield Message(
                 "system",
                 f"Path traversal detected: {path_display} resolves to {path} "
-                f"which is outside current directory {cwd}",
+                f"which is outside {label} {containment_root}",
             )
             return
 
@@ -241,7 +284,17 @@ def _read_one(
         shown = f"{start_idx + 1}-{end_idx}"
         range_info = f" (lines {shown} of {total_lines})"
 
-    body = md_codeblock(f"{path}{range_info}", numbered)
+    # Only store a snapshot and show [path#tag] when hashline_edit is active.
+    # notify_file_read returns the tag when hashline_edit is loaded, else None,
+    # so read.py never imports _hashline_snapshot directly.
+    from . import notify_file_read
+
+    tag = notify_file_read(str(path), content)
+
+    if tag is not None:
+        body = md_codeblock(f"{path}{range_info}", f"[{path}#{tag}]\n" + numbered)
+    else:
+        body = md_codeblock(f"{path}{range_info}", numbered)
     if pruned_message_prefix:
         body = pruned_message_prefix + "\n\n" + body
 
@@ -289,6 +342,37 @@ def execute_read(
             "start_line/end_line ignored when reading multiple paths",
         )
         start_line, end_line = 1, None
+
+    # Reject non-positive range bounds instead of silently producing a wrong
+    # slice: start_line <= 0 clamps to the first line (hiding the bad input),
+    # and end_line <= 0 yields an empty or last-line-truncated codeblock
+    # (e.g. end_line=0 -> lines[N:0] == [], end_line=-1 -> lines[N:-1] drops
+    # the last line).  Same class of silent mislabel #3494 fixed for inverted
+    # ranges; checked after the multi-path reset for the same reason.
+    if start_line < 1:
+        yield Message(
+            "system",
+            f"Invalid line range: start_line ({start_line}) must be >= 1.",
+        )
+        return
+    if end_line is not None and end_line < 1:
+        yield Message(
+            "system",
+            f"Invalid line range: end_line ({end_line}) must be >= 1.",
+        )
+        return
+
+    # Reject an inverted line range instead of silently yielding an empty
+    # codeblock mislabeled with the requested range (e.g. lines[7:3] == []).
+    # Checked after the multi-path reset so an inverted range on a batch read
+    # is still treated as "ignored" (ranges don't apply to multi-path reads).
+    if end_line is not None and start_line > end_line:
+        yield Message(
+            "system",
+            f"Invalid line range: start_line ({start_line}) is greater than "
+            f"end_line ({end_line}).",
+        )
+        return
 
     for path in paths:
         yield from _read_one(path, start_line=start_line, end_line=end_line)

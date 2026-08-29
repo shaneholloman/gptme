@@ -8,6 +8,7 @@ import importlib
 import json
 import queue
 import threading
+import time
 from pathlib import Path
 from typing import Literal
 from unittest.mock import MagicMock
@@ -18,7 +19,12 @@ import gptme.tools.subagent.api as subagent_api
 import gptme.tools.subagent.execution as subagent_execution
 import gptme.tools.subagent.types as subagent_types
 from gptme.tools.complete import SessionCompleteException
-from gptme.tools.subagent.api import _write_cancel_op, subagent, subagent_cancel
+from gptme.tools.subagent.api import (
+    _write_cancel_op,
+    subagent,
+    subagent_cancel,
+    subagent_steer,
+)
 from gptme.tools.subagent.batch import BatchJob
 from gptme.tools.subagent.control import (
     CONTROL_FILENAME,
@@ -2921,34 +2927,25 @@ class TestMaxTimeWatchdog:
             stop.set()
             t.join(timeout=1)
 
-    def test_subagent_wait_polls_cache_after_join_timeout(self, tmp_path):
+    def test_subagent_wait_polls_cache_after_join_timeout(self, tmp_path, monkeypatch):
         """subagent_wait() handles join returning just before watchdog writes."""
         from gptme.tools.subagent.api import subagent_wait
-        from gptme.tools.subagent.types import (
-            _subagent_results,
-            _subagent_results_lock,
-            _subagents,
-            _subagents_lock,
-        )
+        from gptme.tools.subagent.types import _subagents, _subagents_lock
 
-        writer_threads: list[threading.Thread] = []
-
-        def write_timeout_after_join():
-            import time
-
-            time.sleep(0.01)
-            with _subagent_results_lock:
-                _subagent_results["wait-race-thread"] = ReturnType(
-                    "timeout", "Auto-cancelled after 0.5s (max_time exceeded)"
-                )
-
-        def join_returns_before_watchdog_write(timeout=None):
-            writer = threading.Thread(target=write_timeout_after_join)
-            writer.start()
-            writer_threads.append(writer)
+        # The first cache read misses (the watchdog has not written yet); the
+        # second one hits. Driving the miss from the read side keeps this
+        # deterministic: an earlier version raced a writer thread sleeping 10ms
+        # against the 50ms poll window in _wait_for_cached_subagent_result(),
+        # and thread wakeup under CI load overshoots that window often enough
+        # to flake (measured median 38ms, p95 172ms under GIL contention).
+        cache = MagicMock()
+        cache.get.side_effect = [
+            None,
+            ReturnType("timeout", "Auto-cancelled after 0.5s (max_time exceeded)"),
+        ]
+        monkeypatch.setattr(subagent_api, "_subagent_results", cache)
 
         mock_thread = MagicMock(spec=threading.Thread)
-        mock_thread.join.side_effect = join_returns_before_watchdog_write
         mock_thread.is_alive.return_value = True
 
         sa = Subagent(
@@ -2962,12 +2959,10 @@ class TestMaxTimeWatchdog:
         with _subagents_lock:
             _subagents.append(sa)
 
-        try:
-            result = subagent_wait("wait-race-thread", timeout=0)
-        finally:
-            for writer in writer_threads:
-                writer.join(timeout=1)
+        result = subagent_wait("wait-race-thread", timeout=0)
 
+        # Two reads prove the result came from the retry loop, not the first read.
+        assert cache.get.call_count == 2
         assert result["status"] == "timeout"
         assert "max_time exceeded" in (result["result"] or "")
 
@@ -3031,13 +3026,20 @@ class TestMaxTimeWatchdog:
 
         subagent("watchdog-test", "do something", max_time=42.0)
 
-        # Wait for the thread to complete
+        # Wait for the thread to complete — join inside the patch window so the mock
+        # is still active when the thread resolves _create_subagent_thread.
+        # Do NOT remove the subagent from _subagents here: cleanup_subagents_after
+        # (conftest autouse) is the authoritative cleanup path.  Removing it early
+        # lets a still-alive thread escape tracking and race the next test's setup
+        # with lazy-import sys.modules mutations ("dictionary changed size" flake).
         with _subagents_lock:
             sa = next((s for s in _subagents if s.agent_id == "watchdog-test"), None)
         if sa and sa.thread:
             sa.thread.join(timeout=5)
-        with _subagents_lock:
-            _subagents[:] = [s for s in _subagents if s.agent_id != "watchdog-test"]
+            assert not sa.thread.is_alive(), (
+                "run_subagent thread must finish inside the mock window; "
+                "if still alive it will leak past teardown and race the next test's setup"
+            )
 
         assert 42.0 in timers_started, f"Expected 42.0s timer; got {timers_started}"
 
@@ -3082,12 +3084,16 @@ class TestMaxTimeWatchdog:
 
         subagent("no-watchdog-test", "do something")  # max_time=None (default)
 
+        # Same as above: join inside the patch window, but let cleanup_subagents_after
+        # own the _subagents removal to prevent untracked-thread leaks.
         with _subagents_lock:
             sa = next((s for s in _subagents if s.agent_id == "no-watchdog-test"), None)
         if sa and sa.thread:
             sa.thread.join(timeout=5)
-        with _subagents_lock:
-            _subagents[:] = [s for s in _subagents if s.agent_id != "no-watchdog-test"]
+            assert not sa.thread.is_alive(), (
+                "run_subagent thread must finish inside the mock window; "
+                "if still alive it will leak past teardown and race the next test's setup"
+            )
 
         assert len(timers_started) == 0, f"No timer expected; got {timers_started}"
 
@@ -3170,9 +3176,13 @@ class TestParentContextForwarding:
         assert captured_parent_msgs[0] is None
         assert any("context_turns" in r.message for r in caplog.records)
 
-        # Cleanup
+        # Join the background thread before removing it from _subagents so
+        # cleanup_subagents_after can't miss it and leave a leaked thread that
+        # races the next test's setup via lazy-import sys.modules mutations.
         with _subagents_lock:
-            _subagents[:] = [s for s in _subagents if s.agent_id != "test-no-log"]
+            _sa = next((s for s in _subagents if s.agent_id == "test-no-log"), None)
+        if _sa and _sa.thread:
+            _sa.thread.join(timeout=2.0)
 
     def test_context_turns_slices_log(self, monkeypatch):
         """context_turns=2 forwards the last 2 turns (from 2nd-to-last user msg onward)."""
@@ -3219,9 +3229,11 @@ class TestParentContextForwarding:
         assert captured[0][0].content == "turn 2 user"
         assert captured[0][-1].content == "turn 3 assistant"
 
-        # Cleanup
+        # Join the background thread before cleanup_subagents_after can miss it.
         with _subagents_lock:
-            _subagents[:] = [s for s in _subagents if s.agent_id != "test-slice"]
+            _sa = next((s for s in _subagents if s.agent_id == "test-slice"), None)
+        if _sa and _sa.thread:
+            _sa.thread.join(timeout=2.0)
 
     def test_context_turns_slices_log_with_tool_results(self, monkeypatch):
         """context_turns correctly includes tool-result system msgs within a turn."""
@@ -3268,9 +3280,11 @@ class TestParentContextForwarding:
         assert captured[0][0].content == "turn 1 user"
         assert captured[0][-1].content == "turn 2 assistant"
 
-        # Cleanup
+        # Join the background thread before cleanup_subagents_after can miss it.
         with _subagents_lock:
-            _subagents[:] = [s for s in _subagents if s.agent_id != "test-slice-tool"]
+            _sa = next((s for s in _subagents if s.agent_id == "test-slice-tool"), None)
+        if _sa and _sa.thread:
+            _sa.thread.join(timeout=2.0)
 
     def test_context_turns_none_passes_none(self, monkeypatch):
         """context_turns=None (default) passes parent_messages=None to thread."""
@@ -3295,9 +3309,11 @@ class TestParentContextForwarding:
         assert len(captured) == 1
         assert captured[0] is None
 
-        # Cleanup
+        # Join the background thread before cleanup_subagents_after can miss it.
         with _subagents_lock:
-            _subagents[:] = [s for s in _subagents if s.agent_id != "test-none-turns"]
+            _sa = next((s for s in _subagents if s.agent_id == "test-none-turns"), None)
+        if _sa and _sa.thread:
+            _sa.thread.join(timeout=2.0)
 
     def test_context_turns_fallback_skips_leading_system_messages(self, monkeypatch):
         """When context_turns exceeds available turns, fallback starts at first user msg.
@@ -3348,11 +3364,14 @@ class TestParentContextForwarding:
         assert captured[0][0].role == "user"
         assert len(captured[0]) == 2  # user + assistant only
 
-        # Cleanup
+        # Join the background thread before cleanup_subagents_after can miss it.
         with _subagents_lock:
-            _subagents[:] = [
-                s for s in _subagents if s.agent_id != "test-fallback-skip-system"
-            ]
+            _sa = next(
+                (s for s in _subagents if s.agent_id == "test-fallback-skip-system"),
+                None,
+            )
+        if _sa and _sa.thread:
+            _sa.thread.join(timeout=2.0)
 
 
 # ---------------------------------------------------------------------------
@@ -5952,3 +5971,594 @@ class TestCancelCheckpointHook:
         # Original success result must be preserved
         with _subagent_results_lock:
             assert _subagent_results["agent-1"].status == "success"
+
+
+# ---------------------------------------------------------------------------
+# subagent_steer tests
+# ---------------------------------------------------------------------------
+
+
+class TestSubagentSteer:
+    """Tests for subagent_steer() — in-flight orchestrator-to-subagent messaging."""
+
+    _logdir = Path("/tmp/test-steer-log")
+
+    def setup_method(self, tmp_path_factory=None):
+        """Clear global subagent registry and steer queue before each test."""
+        with _subagents_lock:
+            _subagents.clear()
+        with _subagent_results_lock:
+            _subagent_results.clear()
+
+    def _register(
+        self,
+        agent_id: str,
+        logdir: Path | None = None,
+        execution_mode: Literal["thread", "subprocess", "acp"] = "thread",
+        **kwargs,
+    ) -> Subagent:
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True
+        sa = Subagent(
+            agent_id=agent_id,
+            prompt="test",
+            thread=kwargs.get("thread", mock_thread),
+            logdir=logdir or self._logdir,
+            model=None,
+            execution_mode=execution_mode,
+            process=kwargs.get("process"),
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        return sa
+
+    def test_steer_unknown_raises(self):
+        """subagent_steer raises ValueError when agent_id is unknown."""
+
+        with pytest.raises(ValueError, match="not found"):
+            subagent_steer("nonexistent", "change direction")
+
+    def test_steer_finished_subagent_raises(self):
+        """subagent_steer raises ValueError when the subagent has already finished."""
+
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = False
+        self._register("done-agent", thread=mock_thread)
+
+        with pytest.raises(ValueError, match="not running"):
+            subagent_steer("done-agent", "too late")
+
+    def test_steer_acp_mode_raises_not_implemented(self):
+        """subagent_steer raises NotImplementedError for ACP-mode subagents."""
+
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True
+        sa = Subagent(
+            agent_id="acp-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=self._logdir,
+            model=None,
+            execution_mode="acp",
+            use_acp=True,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+
+        with pytest.raises(NotImplementedError, match="ACP mode"):
+            subagent_steer("acp-agent", "steer me")
+
+    def test_steer_writes_to_prompt_queue(self, tmp_path):
+        """subagent_steer queues the message as a steer-flagged record."""
+        from gptme.prompt_queue import drain_prompt_queue, drain_steer_prompts
+
+        logdir = tmp_path / "subagent-steer-test"
+        logdir.mkdir()
+        self._register("running-agent", logdir=logdir)
+
+        result = subagent_steer("running-agent", "Focus on async frameworks only")
+
+        assert "queued" in result.lower()
+
+        # Steer messages are steer-flagged and NOT visible to drain_prompt_queue
+        # (which drains between-turn prompts).
+        assert drain_prompt_queue(logdir) == []
+
+        # drain_steer_prompts sees them for mid-turn injection.
+        drained = drain_steer_prompts(logdir)
+        assert len(drained) == 1
+        assert "Focus on async frameworks only" in drained[0].content
+
+    def test_steer_multiple_messages_queued_in_order(self, tmp_path):
+        """Multiple steer calls append messages in FIFO order."""
+        from gptme.prompt_queue import drain_steer_prompts
+
+        logdir = tmp_path / "subagent-steer-fifo"
+        logdir.mkdir()
+        self._register("running-agent", logdir=logdir)
+
+        subagent_steer("running-agent", "First instruction")
+        subagent_steer("running-agent", "Second instruction")
+        subagent_steer("running-agent", "Third instruction")
+
+        drained = drain_steer_prompts(logdir)
+        assert len(drained) == 3
+        assert "First instruction" in drained[0].content
+        assert "Second instruction" in drained[1].content
+        assert "Third instruction" in drained[2].content
+
+    def test_steer_subprocess_mode_uses_logdir(self, tmp_path):
+        """subagent_steer works for subprocess-mode subagents via the same logdir channel."""
+        from gptme.prompt_queue import drain_steer_prompts
+
+        logdir = tmp_path / "subagent-subprocess-steer"
+        logdir.mkdir()
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # still running
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True
+        sa = Subagent(
+            agent_id="proc-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=logdir,
+            model=None,
+            execution_mode="subprocess",
+            process=mock_proc,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+
+        result = subagent_steer("proc-agent", "Change focus to security issues")
+
+        assert "queued" in result.lower()
+        drained = drain_steer_prompts(logdir)
+        assert len(drained) == 1
+        assert "Change focus to security issues" in drained[0].content
+
+    def test_steer_race_condition_finished_after_check(self, tmp_path):
+        """subagent_steer detects when subagent finishes after the initial running check.
+
+        This tests the race condition where:
+        1. is_running() returns True
+        2. The subagent exits
+        3. queue_prompt() writes to a queue no one will drain
+        4. We re-check is_running() and catch the race
+        """
+        logdir = tmp_path / "steer-race-detect"
+        logdir.mkdir()
+        mock_thread = MagicMock(spec=threading.Thread)
+        # side_effect order:
+        #   [pre-check, post-check, interrupt_thread, conftest join, conftest leak-check]
+        # Five calls total:
+        #   1. status() pre-check (inside subagent_steer)
+        #   2. status() post-check (inside subagent_steer, after queue write)
+        #   3. interrupt_thread() — conftest calls interrupt_thread(sa.thread) which
+        #      calls thread.is_alive() internally (retry_abort.py:111)
+        #   4. conftest join loop: thread.is_alive() guard before thread.join()
+        #   5. conftest leak check: thread.is_alive() after join
+        # When side_effect is exhausted it raises StopIteration inside the yield
+        # fixture generator, which Python 3.7+ wraps as RuntimeError — the list
+        # must cover every call.
+        mock_thread.is_alive.side_effect = [True, False, False, False, False]
+        sa = Subagent(
+            agent_id="race-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=logdir,
+            model=None,
+            execution_mode="thread",
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+
+        with pytest.raises(
+            ValueError, match="exited after steering message was queued"
+        ):
+            subagent_steer("race-agent", "steer me")
+
+    def test_steer_cleanup_window_raises(self, tmp_path):
+        """subagent_steer raises when the subagent is in the cleanup window.
+
+        Thread-mode: the wrapper thread is still alive (is_alive()=True),
+        the result is NOT yet cached (_subagent_results is empty), but chat()
+        has returned and prompt_queue_closed is set. is_running() and status()
+        alone would both falsely report "running" here; prompt_queue_closed
+        catches this gap directly.
+        """
+        logdir = tmp_path / "steer-cleanup-window"
+        logdir.mkdir()
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True  # thread alive (cleanup still running)
+        sa = Subagent(
+            agent_id="cleanup-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=logdir,
+            model=None,
+            execution_mode="thread",
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        # Simulate run_subagent() having set prompt_queue_closed immediately
+        # after _create_subagent_thread() returned, before _read_log() and
+        # set_subagent_result_if_absent() are called.
+        sa.prompt_queue_closed.set()
+        # Result is NOT cached yet — the cleanup is mid-flight.
+        assert "cleanup-agent" not in _subagent_results
+
+        with pytest.raises(ValueError, match="closed its prompt queue"):
+            subagent_steer("cleanup-agent", "too late")
+
+    def test_steer_subprocess_cleanup_window_raises(self, tmp_path):
+        """subagent_steer raises for subprocess-mode when prompt_queue_closed is set.
+
+        Subprocess mode: process.poll() can still return None while the OS process
+        is exiting its final teardown. prompt_queue_closed is set by _launch_subprocess()
+        in the finally block immediately when the subprocess exits, before result
+        caching completes. This test verifies that the flag catches the cleanup window
+        for subprocess-mode subagents just as it does for thread-mode.
+        """
+        logdir = tmp_path / "steer-subprocess-cleanup"
+        logdir.mkdir()
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # process appears running per poll()
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True  # launcher thread still alive
+        sa = Subagent(
+            agent_id="proc-cleanup-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=logdir,
+            model=None,
+            execution_mode="subprocess",
+            process=mock_proc,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        # Simulate _launch_subprocess() finally block: subprocess exited,
+        # prompt_queue_closed set before result is cached.
+        sa.prompt_queue_closed.set()
+        assert "proc-cleanup-agent" not in _subagent_results
+
+        with pytest.raises(ValueError, match="closed its prompt queue"):
+            subagent_steer("proc-cleanup-agent", "too late")
+
+    def test_steer_subprocess_sentinel_file_raises(self, tmp_path):
+        """subagent_steer raises for subprocess-mode when the sentinel file exists.
+
+        chat.py writes "prompt-queue-closed" to the logdir at the actual drain
+        boundary — right before `break` in _run_chat_loop (non-interactive path)
+        and right before raising SessionCompleteException — so the window between
+        the final _drain_external_prompt_queue() call and the sentinel becoming
+        visible is just a few bytecode instructions.  The chat() finally block
+        writes it again as a safety net for unexpected exit paths (idempotent).
+
+        The sentinel is a child-side signal: no shared memory needed.
+        """
+        logdir = tmp_path / "steer-subprocess-sentinel"
+        logdir.mkdir()
+        mock_proc = MagicMock()
+        mock_proc.poll.return_value = None  # process appears running per poll()
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True
+        sa = Subagent(
+            agent_id="sentinel-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=logdir,
+            model=None,
+            execution_mode="subprocess",
+            process=mock_proc,
+            started_at=time.time() - 2.0,  # ensure sentinel written next is "current"
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        # Simulate chat.py writing the sentinel in its finally block
+        # (prompt_queue_closed Python event NOT yet set — that happens later
+        # when the parent's launcher finally block runs after process exit).
+        (logdir / "prompt-queue-closed").touch()
+        assert not sa.prompt_queue_closed.is_set()
+
+        with pytest.raises(ValueError, match="closed its prompt queue"):
+            subagent_steer("sentinel-agent", "too late")
+
+    def test_steer_thread_mode_sentinel_file_raises(self, tmp_path):
+        """Thread-mode steer raises when the sentinel file exists but prompt_queue_closed is not set.
+
+        This is the race window Greptile identified: chat() writes the sentinel
+        at the drain boundary (inside _run_chat_loop's non-interactive break),
+        but prompt_queue_closed.set() is called only after chat() returns —
+        a gap where steer could falsely succeed without the file check.
+
+        Verifies that _queue_is_closed() checks the sentinel file for thread mode
+        too, not just subprocess mode.
+        """
+        logdir = tmp_path / "steer-thread-sentinel"
+        logdir.mkdir()
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True  # still "alive" — in cleanup
+        sa = Subagent(
+            agent_id="thread-sentinel-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=logdir,
+            model=None,
+            execution_mode="thread",
+            started_at=time.time() - 2.0,  # ensure sentinel written next is "current"
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        # Simulate chat.py writing the sentinel at the drain boundary
+        # (prompt_queue_closed NOT yet set — chat() hasn't returned yet).
+        (logdir / "prompt-queue-closed").touch()
+        assert not sa.prompt_queue_closed.is_set()
+        assert sa.execution_mode == "thread"
+
+        with pytest.raises(ValueError, match="closed its prompt queue"):
+            subagent_steer("thread-sentinel-agent", "too late")
+
+    def test_steer_result_cached_still_raises(self, tmp_path):
+        """subagent_steer raises when result is cached (covers the post-cache half of cleanup).
+
+        Thread alive, result already written to _subagent_results but
+        prompt_queue_closed not yet set (extremely narrow gap). status() catches this.
+        """
+        logdir = tmp_path / "steer-cached-not-closed"
+        logdir.mkdir()
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True
+        sa = Subagent(
+            agent_id="cached-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=logdir,
+            model=None,
+            execution_mode="thread",
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        with _subagent_results_lock:
+            _subagent_results["cached-agent"] = ReturnType("success", "done")
+
+        with pytest.raises(ValueError, match="not running"):
+            subagent_steer("cached-agent", "too late")
+
+    def test_steer_stale_sentinel_from_previous_run_does_not_block(self, tmp_path):
+        """A prompt-queue-closed sentinel from a *previous* run must not block steering.
+
+        Planner-mode subagents reuse the same logdir (same agent_id, same
+        subagent-{agent_id} directory).  When a run exits it writes
+        prompt-queue-closed.  A subsequent run using the same logdir must not
+        be incorrectly blocked by that stale sentinel — only a sentinel written
+        at or after sa.started_at counts as current.
+        """
+        logdir = tmp_path / "steer-stale-sentinel"
+        logdir.mkdir()
+
+        # Simulate a previous run writing the sentinel (stale).
+        sentinel = logdir / "prompt-queue-closed"
+        sentinel.touch()
+        stale_mtime = sentinel.stat().st_mtime
+
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True  # current run is active
+
+        # started_at is clearly after the stale sentinel — this is a new run.
+        sa = Subagent(
+            agent_id="stale-sentinel-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=logdir,
+            model=None,
+            execution_mode="thread",
+            started_at=stale_mtime + 1.0,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+        assert not sa.prompt_queue_closed.is_set()
+
+        # steer must succeed — the sentinel predates this run.
+        result = subagent_steer("stale-sentinel-agent", "redirect please")
+        assert "stale-sentinel-agent" in result
+
+    def test_steer_current_sentinel_after_reused_logdir_raises(self, tmp_path):
+        """A fresh sentinel written by the *current* run still blocks steering.
+
+        Companion to test_steer_stale_sentinel_from_previous_run_does_not_block:
+        when the sentinel's mtime is >= sa.started_at it belongs to this run
+        and steer must raise.
+        """
+        logdir = tmp_path / "steer-current-sentinel"
+        logdir.mkdir()
+
+        mock_thread = MagicMock(spec=threading.Thread)
+        mock_thread.is_alive.return_value = True
+
+        # Record a "started_at" in the past so the sentinel written next is current.
+        past_start = time.time() - 2.0
+        sa = Subagent(
+            agent_id="current-sentinel-agent",
+            prompt="test",
+            thread=mock_thread,
+            logdir=logdir,
+            model=None,
+            execution_mode="thread",
+            started_at=past_start,
+        )
+        with _subagents_lock:
+            _subagents.append(sa)
+
+        # Sentinel written after started_at — belongs to the current run.
+        (logdir / "prompt-queue-closed").touch()
+        assert not sa.prompt_queue_closed.is_set()
+
+        with pytest.raises(ValueError, match="closed its prompt queue"):
+            subagent_steer("current-sentinel-agent", "too late")
+
+
+# ---------------------------------------------------------------------------
+# Mid-turn steer injection via _subagent_control_hook (STEP_PRE)
+# ---------------------------------------------------------------------------
+
+
+class TestMidTurnSteerInjection:
+    """Tests for mid-turn steer message injection via _subagent_control_hook."""
+
+    def setup_method(self):
+        with _subagents_lock:
+            _subagents.clear()
+        with _subagent_results_lock:
+            _subagent_results.clear()
+
+    def _make_manager(self, logdir):
+        m = MagicMock()
+        m.logdir = logdir
+        return m
+
+    def test_steer_flag_marks_record(self, tmp_path):
+        """queue_prompt(steer=True) adds steer=true to the JSON record."""
+        import json
+
+        from gptme.prompt_queue import QUEUE_FILENAME, queue_prompt
+
+        logdir = tmp_path / "steer-flag-mark"
+        logdir.mkdir()
+        queue_prompt(logdir, "redirect", steer=True)
+
+        lines = (logdir / QUEUE_FILENAME).read_text().splitlines()
+        record = json.loads(lines[0])
+        assert record["steer"] is True
+        assert record["content"] == "redirect"
+
+    def test_regular_prompt_has_no_steer_flag(self, tmp_path):
+        """queue_prompt() without steer= does not write a steer field."""
+        import json
+
+        from gptme.prompt_queue import QUEUE_FILENAME, queue_prompt
+
+        logdir = tmp_path / "no-steer-flag"
+        logdir.mkdir()
+        queue_prompt(logdir, "regular message")
+
+        lines = (logdir / QUEUE_FILENAME).read_text().splitlines()
+        record = json.loads(lines[0])
+        assert "steer" not in record
+
+    def test_drain_steer_prompts_leaves_regular_messages(self, tmp_path):
+        """drain_steer_prompts leaves non-steer records for drain_prompt_queue."""
+        from gptme.prompt_queue import (
+            drain_prompt_queue,
+            drain_steer_prompts,
+            queue_prompt,
+        )
+
+        logdir = tmp_path / "steer-leaves-regular"
+        logdir.mkdir()
+        queue_prompt(logdir, "regular turn", steer=False)
+        queue_prompt(logdir, "steer guidance", steer=True)
+
+        steer_msgs = drain_steer_prompts(logdir)
+        assert len(steer_msgs) == 1
+        assert "steer guidance" in steer_msgs[0].content
+
+        regular_msgs = drain_prompt_queue(logdir)
+        assert len(regular_msgs) == 1
+        assert "regular turn" in regular_msgs[0].content
+
+    def test_drain_prompt_queue_leaves_steer_messages(self, tmp_path):
+        """drain_prompt_queue leaves steer-flagged records for mid-turn draining."""
+        from gptme.prompt_queue import (
+            drain_prompt_queue,
+            drain_steer_prompts,
+            queue_prompt,
+        )
+
+        logdir = tmp_path / "regular-leaves-steer"
+        logdir.mkdir()
+        queue_prompt(logdir, "steer guidance", steer=True)
+        queue_prompt(logdir, "regular turn", steer=False)
+
+        # drain_prompt_queue must skip steer records
+        regular_msgs = drain_prompt_queue(logdir)
+        assert len(regular_msgs) == 1
+        assert "regular turn" in regular_msgs[0].content
+
+        # steer record is still on disk
+        steer_msgs = drain_steer_prompts(logdir)
+        assert len(steer_msgs) == 1
+        assert "steer guidance" in steer_msgs[0].content
+
+    def test_control_hook_injects_steer_as_user_message(self, tmp_path):
+        """_subagent_control_hook yields steer messages as user messages mid-turn."""
+        from gptme.prompt_queue import queue_prompt
+
+        logdir = tmp_path / "hook-steer-inject"
+        logdir.mkdir()
+        queue_prompt(logdir, "Focus only on async frameworks", steer=True)
+
+        manager = self._make_manager(logdir)
+        msgs = list(_subagent_control_hook(manager))
+
+        assert len(msgs) == 1
+        assert msgs[0].role == "user"
+        assert "Focus only on async frameworks" in msgs[0].content
+
+    def test_control_hook_injects_multiple_steer_messages_in_order(self, tmp_path):
+        """Multiple steer messages are injected in FIFO order."""
+        from gptme.prompt_queue import queue_prompt
+
+        logdir = tmp_path / "hook-steer-fifo"
+        logdir.mkdir()
+        queue_prompt(logdir, "First guidance", steer=True)
+        queue_prompt(logdir, "Second guidance", steer=True)
+
+        manager = self._make_manager(logdir)
+        msgs = list(_subagent_control_hook(manager))
+
+        assert len(msgs) == 2
+        assert "First guidance" in msgs[0].content
+        assert "Second guidance" in msgs[1].content
+
+    def test_control_hook_noop_when_no_steer_and_no_cancel(self, tmp_path):
+        """Hook is inert when there is no control file and no steer queue."""
+        logdir = tmp_path / "hook-noop"
+        logdir.mkdir()
+
+        manager = self._make_manager(logdir)
+        msgs = list(_subagent_control_hook(manager))
+        assert msgs == []
+
+    def test_control_hook_cancel_wins_over_pending_steer(self, tmp_path):
+        """When there is both a cancel op and a steer message, cancel takes priority."""
+        from gptme.prompt_queue import drain_steer_prompts, queue_prompt
+        from gptme.tools.subagent.control import append_control_op
+
+        logdir = tmp_path / "hook-cancel-over-steer"
+        logdir.mkdir()
+        queue_prompt(logdir, "Do this instead", steer=True)
+        append_control_op(logdir, "cancel", agent_id="test-agent")
+
+        manager = self._make_manager(logdir)
+
+        with pytest.raises(SessionCompleteException):
+            list(_subagent_control_hook(manager))
+
+        # Steer message was not consumed — still on disk after cancel
+        # (no point injecting guidance when the agent is stopping)
+        steer_msgs = drain_steer_prompts(logdir)
+        assert len(steer_msgs) == 1
+
+    def test_control_hook_regular_prompt_not_injected_mid_turn(self, tmp_path):
+        """Regular (non-steer) queued prompts are NOT injected mid-turn by the hook."""
+        from gptme.prompt_queue import queue_prompt
+
+        logdir = tmp_path / "hook-no-regular-inject"
+        logdir.mkdir()
+        queue_prompt(logdir, "Between-turn prompt", steer=False)
+
+        manager = self._make_manager(logdir)
+        msgs = list(_subagent_control_hook(manager))
+
+        # Hook must not consume non-steer messages
+        assert msgs == []

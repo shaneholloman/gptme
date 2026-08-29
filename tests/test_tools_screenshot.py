@@ -121,8 +121,9 @@ class TestIsAvailable:
     @patch("gptme.tools.screenshot.IS_WAYLAND", False)
     @patch("os.name", "posix")
     @patch("shutil.which")
-    def test_linux_with_gnome_screenshot(self, mock_which):
-        """Available on Linux with gnome-screenshot."""
+    def test_linux_with_gnome_screenshot(self, mock_which, monkeypatch):
+        """Available on Linux/X11 with gnome-screenshot when $DISPLAY is set."""
+        monkeypatch.setenv("DISPLAY", ":1")
         mock_which.side_effect = lambda cmd: (
             "/usr/bin/gnome-screenshot" if cmd == "gnome-screenshot" else None
         )
@@ -132,12 +133,65 @@ class TestIsAvailable:
     @patch("gptme.tools.screenshot.IS_WAYLAND", False)
     @patch("os.name", "posix")
     @patch("shutil.which")
-    def test_linux_with_scrot_x11(self, mock_which):
-        """Available on Linux/X11 with scrot."""
+    def test_linux_gnome_screenshot_without_display(self, mock_which, monkeypatch):
+        """gnome-screenshot without $DISPLAY is not available on X11 (headless host)."""
+        monkeypatch.delenv("DISPLAY", raising=False)
+        mock_which.side_effect = lambda cmd: (
+            "/usr/bin/gnome-screenshot" if cmd == "gnome-screenshot" else None
+        )
+        assert _is_available() is False
+
+    @patch("gptme.tools.screenshot.IS_MACOS", False)
+    @patch("gptme.tools.screenshot.IS_WAYLAND", True)
+    @patch("os.name", "posix")
+    @patch("shutil.which")
+    def test_linux_wayland_gnome_screenshot_no_display(self, mock_which, monkeypatch):
+        """gnome-screenshot is available on Wayland when WAYLAND_DISPLAY is set."""
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.setenv("WAYLAND_DISPLAY", "wayland-0")
+        mock_which.side_effect = lambda cmd: (
+            "/usr/bin/gnome-screenshot" if cmd == "gnome-screenshot" else None
+        )
+        assert _is_available() is True
+
+    @patch("gptme.tools.screenshot.IS_MACOS", False)
+    @patch("gptme.tools.screenshot.IS_WAYLAND", True)
+    @patch("os.name", "posix")
+    @patch("shutil.which")
+    def test_linux_headless_wayland_gnome_screenshot_unavailable(
+        self, mock_which, monkeypatch
+    ):
+        """gnome-screenshot is not available on headless Wayland (no WAYLAND_DISPLAY)."""
+        monkeypatch.delenv("DISPLAY", raising=False)
+        monkeypatch.delenv("WAYLAND_DISPLAY", raising=False)
+        mock_which.side_effect = lambda cmd: (
+            "/usr/bin/gnome-screenshot" if cmd == "gnome-screenshot" else None
+        )
+        assert _is_available() is False
+
+    @patch("gptme.tools.screenshot.IS_MACOS", False)
+    @patch("gptme.tools.screenshot.IS_WAYLAND", False)
+    @patch("os.name", "posix")
+    @patch("shutil.which")
+    def test_linux_with_scrot_x11(self, mock_which, monkeypatch):
+        """Available on Linux/X11 with scrot when $DISPLAY is set."""
+        monkeypatch.setenv("DISPLAY", ":1")
         mock_which.side_effect = lambda cmd: (
             "/usr/bin/scrot" if cmd == "scrot" else None
         )
         assert _is_available() is True
+
+    @patch("gptme.tools.screenshot.IS_MACOS", False)
+    @patch("gptme.tools.screenshot.IS_WAYLAND", False)
+    @patch("os.name", "posix")
+    @patch("shutil.which")
+    def test_linux_scrot_without_display(self, mock_which, monkeypatch):
+        """scrot without $DISPLAY is not available (headless host)."""
+        monkeypatch.delenv("DISPLAY", raising=False)
+        mock_which.side_effect = lambda cmd: (
+            "/usr/bin/scrot" if cmd == "scrot" else None
+        )
+        assert _is_available() is False
 
     @patch("gptme.tools.screenshot.IS_MACOS", False)
     @patch("gptme.tools.screenshot.IS_WAYLAND", True)

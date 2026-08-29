@@ -8,6 +8,7 @@ import json
 import logging
 import re
 import types
+import xml.etree.ElementTree as _ElementTree
 from collections.abc import Callable, Generator, Sequence
 from contextvars import ContextVar
 from dataclasses import dataclass, field
@@ -35,6 +36,10 @@ try:
     _LXML_AVAILABLE = True
 except ImportError:
     _LXML_AVAILABLE = False
+
+_XML_PARSE_ERRORS: tuple[type[Exception], ...] = (_ElementTree.ParseError,)
+if _LXML_AVAILABLE:
+    _XML_PARSE_ERRORS = (_lxml_etree.XMLSyntaxError, _ElementTree.ParseError)
 
 from ..codeblock import Codeblock
 from ..message import Message
@@ -728,6 +733,7 @@ class ToolUse:
         def _execute_tool():
             tool = get_tool(self.tool)
             if tool and tool.execute:
+                result_msgs: list[Message] = []
                 try:
                     from ..hooks.types import ToolExecutePreData  # fmt: skip
 
@@ -757,7 +763,6 @@ class ToolUse:
                     # Set context var so tools can access current ToolUse
                     # via get_current_tool_use() or implicitly in get_confirmation()
                     token = _current_tool_use.set(self)
-                    result_msgs: list[Message] = []
                     try:
                         ex = tool.execute(
                             self.content,
@@ -771,16 +776,71 @@ class ToolUse:
                             else cast(Message | None, ex)
                         )
                         if generator_result is not None:
-                            for msg in generator_result:
-                                result_msgs.append(msg)
-                                if on_result_message:
-                                    on_result_message(msg)
-                                yield msg
+                            if self.call_id:
+                                # Buffer the generator so we can identify the last
+                                # message and stamp call_id plus tool provenance on it.
+                                # The Responses API expects exactly one
+                                # function_call_output per call_id; stamping only the
+                                # last message ensures the actual tool result (not an
+                                # earlier warning such as a shellcheck notice) becomes
+                                # the function_call_output.
+                                # Earlier messages pass through without call_id and
+                                # become system context instead.
+                                #
+                                # Catch KeyboardInterrupt so partial output from an
+                                # interrupted shell command is still forwarded and
+                                # on_result_message callbacks are still invoked.
+                                all_result_msgs: list[Message] = []
+                                _ki: KeyboardInterrupt | None = None
+                                try:
+                                    for msg in generator_result:
+                                        all_result_msgs.append(msg)  # noqa: PERF402
+                                except KeyboardInterrupt as e:
+                                    _ki = e
+                                last_idx = len(all_result_msgs) - 1
+                                for idx, msg in enumerate(all_result_msgs):
+                                    result_msgs.append(msg)
+                                    if on_result_message:
+                                        on_result_message(msg)
+                                    if idx == last_idx and _ki is None:
+                                        metadata = (
+                                            dict(msg.metadata) if msg.metadata else {}
+                                        )
+                                        metadata["tool"] = self.tool
+                                        yield msg.replace(
+                                            call_id=self.call_id,
+                                            metadata=metadata,
+                                        )
+                                    else:
+                                        yield msg
+                                if _ki is not None:
+                                    raise _ki
+                            else:
+                                # No call_id: stream immediately to preserve
+                                # progressive callback ordering for callers that
+                                # interleave on_result_message with the generator.
+                                for msg in generator_result:
+                                    result_msgs.append(msg)
+                                    if on_result_message:
+                                        on_result_message(msg)
+                                    yield msg
                         elif single_result is not None:
                             result_msgs = [single_result]
                             if on_result_message:
                                 on_result_message(single_result)
-                            yield single_result
+                            if self.call_id:
+                                metadata = (
+                                    dict(single_result.metadata)
+                                    if single_result.metadata
+                                    else {}
+                                )
+                                metadata["tool"] = self.tool
+                                yield single_result.replace(
+                                    call_id=self.call_id,
+                                    metadata=metadata,
+                                )
+                            else:
+                                yield single_result
                     finally:
                         _current_tool_use.reset(token)
 
@@ -830,7 +890,15 @@ class ToolUse:
                     logger.exception(e)
                     if "pytest" in globals():
                         raise e
-                    yield Message("system", f"Error executing tool '{self.tool}': {e}")
+                    # Only attribute the error to this call_id if no real result
+                    # was already emitted — a post-hook exception after yielding a
+                    # result would create a duplicate function_call_output entry.
+                    yield Message(
+                        "system",
+                        f"Error executing tool '{self.tool}': {e}",
+                        call_id=self.call_id if not result_msgs else None,
+                        metadata={"tool": self.tool},
+                    )
             else:
                 logger.warning(f"Tool '{self.tool}' is not available for execution.")
 
@@ -1007,17 +1075,24 @@ class ToolUse:
         if _LXML_AVAILABLE:
             yield from cls._iter_from_xml_lxml(content)
         else:
-            yield from cls._iter_from_xml_regex(content)
+            yield from cls._iter_from_xml_etree(content)
 
     @classmethod
     def _iter_from_xml_lxml(cls, content: str) -> Generator[ToolUse, None, None]:
         """lxml-based XML parser: lenient HTML parsing + XPath."""
         try:
+            tree: Any
+            # lxml's HTMLParser is lenient with malformed XML/HTML
             parser = _lxml_etree.HTMLParser()
             tree = _lxml_etree.fromstring(content, parser)
+            tool_use_nodes = tree.xpath("//tool-use")
+            function_call_nodes = tree.xpath("//function_calls")
+
+            def _invoke_nodes(fc):
+                return fc.xpath(".//invoke")
 
             # Handle gptme format: <tool-use><toolname>...</toolname></tool-use>
-            for tooluse in tree.xpath("//tool-use"):
+            for tooluse in tool_use_nodes:
                 for child in tooluse:
                     tool_name = child.tag
                     args = list(child.attrib.values())
@@ -1040,8 +1115,8 @@ class ToolUse:
                     )
 
             # Handle Haiku format: <function_calls><invoke name="toolname">...</invoke></function_calls>
-            for function_calls in tree.xpath("//function_calls"):
-                for invoke in function_calls.xpath(".//invoke"):
+            for function_calls in function_call_nodes:
+                for invoke in _invoke_nodes(function_calls):
                     # Get tool name from 'name' attribute
                     tool_name = invoke.get("name")
                     if not tool_name:
@@ -1063,67 +1138,55 @@ class ToolUse:
                         start=start_pos if start_pos >= 0 else None,
                         _format="xml",
                     )
-        except _lxml_etree.ParseError as e:
+        except _XML_PARSE_ERRORS as e:
             logger.warning(f"Failed to parse XML content: {e}")
             return
 
     @classmethod
-    def _iter_from_xml_regex(cls, content: str) -> Generator[ToolUse, None, None]:
-        """Regex-based fallback XML parser (no lxml required).
+    def _iter_from_xml_etree(cls, content: str) -> Generator[ToolUse, None, None]:
+        """stdlib xml.etree.ElementTree fallback (no C extension required).
 
-        Used when lxml is not installed. Handles the standard gptme and Haiku
-        function_calls formats. Content with angle-bracket tokens (e.g. <filename>)
-        is captured as-is, which is actually more faithful than lxml's HTMLParser
-        (which would consume the tag name).
+        Used when lxml is not installed. Requires structurally valid XML but avoids
+        any native extension dependencies.
         """
-        # Format 1: <tool-use><tagname [attrs]>content</tagname></tool-use>
-        _tool_use_re = re.compile(r"<tool-use[^>]*>(.*?)</tool-use>", re.DOTALL)
-        _tool_tag_re = re.compile(r"<([\w-]+)([^>]*)>(.*?)</\1>", re.DOTALL)
-        _args_re = re.compile(r"""args=["']([^"']*)["']""")
+        try:
+            tree = _ElementTree.fromstring(f"<root>{content}</root>")
 
-        for tool_use_m in _tool_use_re.finditer(content):
-            inner = tool_use_m.group(1)
-            for tag_m in _tool_tag_re.finditer(inner):
-                tool_name = tag_m.group(1)
-                attrs_str = tag_m.group(2)
-                tool_content = tag_m.group(3).strip()
-                args_m = _args_re.search(attrs_str)
-                args = [args_m.group(1)] if args_m else []
-                start_pos = content.find(f"<{tool_name}")
-                yield ToolUse(
-                    tool_name,
-                    args,
-                    tool_content,
-                    start=start_pos if start_pos >= 0 else None,
-                    _format="xml",
-                )
+            # Handle gptme format: <tool-use><toolname>...</toolname></tool-use>
+            for tooluse in tree.findall(".//tool-use"):
+                for child in tooluse:
+                    tool_name = child.tag
+                    args = list(child.attrib.values())
+                    tool_content = "".join(child.itertext()).strip()
+                    start_pos = content.find(f"<{tool_name}")
+                    yield ToolUse(
+                        tool_name,
+                        args,
+                        tool_content,
+                        start=start_pos if start_pos >= 0 else None,
+                        _format="xml",
+                    )
 
-        # Format 2: <function_calls><invoke name="toolname" [attrs]>content</invoke></function_calls>
-        _func_calls_re = re.compile(
-            r"<function_calls[^>]*>(.*?)</function_calls>", re.DOTALL
-        )
-        _invoke_re = re.compile(r"<invoke\s+([^>]*)>(.*?)</invoke>", re.DOTALL)
-        _name_re = re.compile(r"""name=["']([^"']*)["']""")
-
-        for fc_m in _func_calls_re.finditer(content):
-            inner = fc_m.group(1)
-            for invoke_m in _invoke_re.finditer(inner):
-                attrs_str = invoke_m.group(1)
-                tool_content = invoke_m.group(2).strip()
-                name_m = _name_re.search(attrs_str)
-                if not name_m:
-                    continue
-                tool_name = name_m.group(1)
-                args_m = _args_re.search(attrs_str)
-                args = [args_m.group(1)] if args_m else []
-                start_pos = content.find(f'<invoke name="{tool_name}"')
-                yield ToolUse(
-                    tool_name,
-                    args,
-                    tool_content,
-                    start=start_pos if start_pos >= 0 else None,
-                    _format="xml",
-                )
+            # Handle Haiku format: <function_calls><invoke name="toolname">...</invoke></function_calls>
+            for function_calls in tree.findall(".//function_calls"):
+                for invoke in function_calls.findall(".//invoke"):
+                    invoke_name = invoke.get("name")
+                    if not invoke_name:
+                        continue
+                    tool_name = invoke_name
+                    args = [v for k, v in invoke.attrib.items() if k != "name"]
+                    tool_content = "".join(invoke.itertext()).strip()
+                    start_pos = content.find(f'<invoke name="{tool_name}"')
+                    yield ToolUse(
+                        tool_name,
+                        args,
+                        tool_content,
+                        start=start_pos if start_pos >= 0 else None,
+                        _format="xml",
+                    )
+        except _ElementTree.ParseError as e:
+            logger.warning(f"Failed to parse XML content: {e}")
+            return
 
     def to_output(self, tool_format: ToolFormat = "markdown") -> str:
         if tool_format == "markdown":

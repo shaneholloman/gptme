@@ -5,6 +5,7 @@ from collections import UserDict
 from types import SimpleNamespace
 from unittest.mock import patch
 
+import pytest
 from click.testing import CliRunner
 from rich.console import Console
 
@@ -17,6 +18,7 @@ from gptme.cli.doctor import (
     _check_config,
     _check_mcp,
     _check_permissions,
+    _check_proxy,
     _check_python_deps,
     _check_python_version,
     _check_tools,
@@ -434,6 +436,160 @@ class TestCheckConfig:
         assert len(config_results) == 1
 
 
+class TestCheckProxy:
+    """Test _check_proxy function."""
+
+    def test_no_proxy_configured(self):
+        """When LLM_PROXY_URL is not set, check is skipped."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = None
+            results = _check_proxy()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.SKIPPED
+        assert "Proxy" in results[0].name
+
+    def test_valid_https_url(self):
+        """A well-formed https:// proxy URL passes."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = "https://proxy.example.com"
+            results = _check_proxy()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.OK
+
+    def test_valid_http_url_with_port(self):
+        """A well-formed http:// URL with port passes."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = "http://localhost:8080"
+            results = _check_proxy()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.OK
+
+    def test_credentials_are_redacted(self):
+        """Proxy credentials never appear in diagnostic output."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = (
+                "https://user:secret@proxy.example.com:8443"
+            )
+            results = _check_proxy(verbose=True)
+
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.OK
+        assert results[0].message == "Configured (proxy.example.com:8443)"
+        assert results[0].details == "Proxy: https://proxy.example.com:8443"
+        assert "secret" not in f"{results[0].message} {results[0].details}"
+
+    @pytest.mark.parametrize(
+        "proxy_url",
+        [
+            "secret://user:password@proxy.example.com",
+            "https://user:password@",
+            "https://user:password@proxy.example.com:not-a-port",
+        ],
+    )
+    def test_credentials_are_redacted_from_errors(self, proxy_url: str):
+        """Invalid proxy URLs do not expose credentials in verbose details."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = proxy_url
+            results = _check_proxy(verbose=True)
+
+        output = f"{results[0].message} {results[0].details}"
+        assert results[0].status == CheckStatus.ERROR
+        assert "password" not in output
+
+    def test_missing_scheme(self):
+        """A URL without a scheme (no http/https) is an error — gptme#3526 case."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = "proxy.example.com"
+            results = _check_proxy()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.ERROR
+        assert results[0].fix_hint is not None
+
+    def test_wrong_scheme(self):
+        """A non-http/https scheme is an error."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = "ftp://proxy.example.com"
+            results = _check_proxy()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.ERROR
+
+    @pytest.mark.parametrize(
+        "proxy_url",
+        ["https://", "https://:8080", "https://user@"],
+    )
+    def test_missing_host(self, proxy_url: str):
+        """An authority without a hostname is an error."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = proxy_url
+            results = _check_proxy()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.ERROR
+        assert results[0].message == "Missing host"
+
+    @pytest.mark.parametrize(
+        "proxy_url",
+        ["http://[::1", "https://proxy.example.com:not-a-port"],
+    )
+    def test_malformed_url(self, proxy_url: str):
+        """Malformed URLs produce an error instead of aborting diagnostics."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = proxy_url
+            results = _check_proxy()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.ERROR
+        assert "Malformed URL" in results[0].message
+
+    def test_non_root_path_warns_without_exposing_path(self):
+        """A proxy path warns without exposing a potential path credential."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = (
+                "https://proxy.example.com/secret-token"
+            )
+            results = _check_proxy(verbose=True)
+
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.WARNING
+        assert results[0].message == (
+            "URL has a non-root path — may conflict with SDK routing"
+        )
+        assert results[0].details == (
+            "Proxy: https://proxy.example.com/[path redacted]"
+        )
+        assert "secret-token" not in f"{results[0].message} {results[0].details}"
+        assert results[0].fix_hint is not None
+
+    def test_root_path_ok(self):
+        """A URL with a trailing slash (root path) passes."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = "https://proxy.example.com/"
+            results = _check_proxy()
+        assert len(results) == 1
+        assert results[0].status == CheckStatus.OK
+
+    def test_verbose_shows_details(self):
+        """Verbose mode includes URL details."""
+        with patch("gptme.cli.doctor.get_config") as mock_cfg:
+            mock_cfg.return_value.get_env.return_value = "https://proxy.example.com"
+            results = _check_proxy(verbose=True)
+        assert results[0].details is not None
+        assert "proxy.example.com" in results[0].details
+
+    def test_included_in_run_diagnostics(self):
+        """_check_proxy results appear in run_diagnostics output."""
+        proxy_result = CheckResult(
+            name="Proxy: test marker",
+            status=CheckStatus.OK,
+            message="called",
+        )
+        with patch(
+            "gptme.cli.doctor._check_proxy", return_value=[proxy_result]
+        ) as mock_check:
+            results, _ = run_diagnostics()
+
+        assert proxy_result in results
+        mock_check.assert_called_once_with(False)
+
+
 class TestCheckPermissions:
     """Test _check_permissions function."""
 
@@ -797,8 +953,9 @@ class TestCheckApiKeys:
 
         # OAuth provider should use "Auth:" prefix
         auth_results = [r for r in results if r.name.startswith("Auth:")]
-        assert len(auth_results) == 1
-        assert auth_results[0].status == CheckStatus.OK
+        openai_sub = [r for r in auth_results if "openai-subscription" in r.name]
+        assert len(openai_sub) == 1
+        assert openai_sub[0].status == CheckStatus.OK
 
 
 class TestCheckMCP:

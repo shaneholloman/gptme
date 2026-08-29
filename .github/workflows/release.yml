@@ -281,7 +281,7 @@ jobs:
         ref: ${{ env.TAG }}
 
     - name: Set up Python
-      uses: actions/setup-python@v6
+      uses: actions/setup-python@v7
       with:
         python-version: '3.x'
 
@@ -289,7 +289,7 @@ jobs:
       run: pipx install poetry
 
     - name: Set up Node.js
-      uses: actions/setup-node@v6
+      uses: actions/setup-node@v7
       with:
         node-version: '20'
         cache: 'npm'
@@ -305,6 +305,9 @@ jobs:
       run: |
         rm -f dist/*.whl dist/*.tar.gz
         poetry build
+
+    - name: Validate package contents
+      run: make validate-release-package
 
     - name: Validate package (dry-run publish)
       run: |

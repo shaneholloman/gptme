@@ -23,6 +23,7 @@ from .llm.models import get_default_model, get_model
 from .logmanager import Log, LogManager, prepare_messages
 from .message import (
     Message,
+    MessageTimings,
     get_output_format,
     is_output_json,
     is_output_quiet,
@@ -41,6 +42,7 @@ from .util import console, path_with_tilde
 from .util.auto_naming import MAX_ASSISTANT_MSGS_FOR_NAMING, try_auto_name
 from .util.context import include_paths
 from .util.cost import log_costs
+from .util.cost_display import print_inline_cost
 from .util.interrupt import clear_interruptible, set_interruptible
 from .util.prompt import add_history, get_input
 from .util.sound import print_bell
@@ -149,6 +151,14 @@ def chat(
         # Note: Confirmation is now handled within ToolUse.execute() using the hook system,
         # so we no longer need to create and pass confirm_func.
 
+        # Clear any stale prompt-queue-closed sentinel from a previous run.
+        # Planner-mode subagents reuse the same logdir (same agent_id); the
+        # sentinel from a prior run would otherwise falsely block steering of
+        # the new run even though subagent_steer()'s started_at guard already
+        # handles this — belt-and-suspenders cleanup at the start of each run.
+        if logdir is not None:
+            (logdir / "prompt-queue-closed").unlink(missing_ok=True)
+
         # Convert prompt_msgs to a queue for unified handling
         prompt_queue = list(prompt_msgs)
 
@@ -175,6 +185,14 @@ def chat(
             for msg in session_end_msgs:
                 manager.append(msg)
     finally:
+        # Safety-net sentinel write.  The primary writes happen inside
+        # _run_chat_loop at the actual break/raise points so the window between
+        # the final _drain_external_prompt_queue() call and the sentinel being
+        # visible is just a few bytecode instructions.  This finally block
+        # catches any exit path we didn't explicitly handle (exceptions, etc.).
+        # touch() is idempotent so double-writing is harmless.
+        if logdir is not None:
+            (logdir / "prompt-queue-closed").touch()
         # Restore the caller's format so nested chat() calls (inline subagents)
         # don't clobber the parent's JSON mode when they exit.
         set_output_format(_prev_output_format)
@@ -219,14 +237,29 @@ def _run_chat_loop(
                 # Process the message and get response
                 try:
                     _process_message_conversation(
-                        manager, stream, tool_format, model, output_schema
+                        manager,
+                        stream,
+                        tool_format,
+                        model,
+                        output_schema,
                     )
                 except SessionCompleteException:
+                    # Write sentinel BEFORE draining so there is no window
+                    # where the queue file is gone but the sentinel is not yet
+                    # visible.  A concurrent subagent_steer() in that gap would
+                    # see neither the sentinel nor the closed event, write a
+                    # new queue entry, and falsely report success even though
+                    # the chat loop has no remaining drain point.
+                    # If drain finds more chained prompts we unlink the sentinel
+                    # so the loop stays open for steering.
+                    if logdir is not None:
+                        (logdir / "prompt-queue-closed").touch()
                     _drain_external_prompt_queue(manager, prompt_queue)
                     if not prompt_queue:
-                        # No more prompts, properly exit
                         raise
-                    # More chained prompts remain — continue processing them
+                    # More chained prompts remain — clear sentinel, keep loop alive.
+                    if logdir is not None:
+                        (logdir / "prompt-queue-closed").unlink(missing_ok=True)
                     logger.debug(
                         "complete called but %d chained prompts remain, continuing",
                         len(prompt_queue),
@@ -236,6 +269,24 @@ def _run_chat_loop(
                 # Get user input or exit if non-interactive
                 if not interactive:
                     logger.debug("Non-interactive and exhausted prompts")
+                    # Write sentinel BEFORE the final drain so there is no window
+                    # where a concurrent subagent_steer() can append after the
+                    # top-of-loop drain but before the sentinel is visible. Any
+                    # steer arriving after this touch() sees the sentinel and
+                    # raises ValueError; any steer that arrived before it is
+                    # caught by the drain below.
+                    if logdir is not None:
+                        (logdir / "prompt-queue-closed").touch()
+                    _drain_external_prompt_queue(manager, prompt_queue)
+                    if prompt_queue:
+                        # A steer arrived in the window — keep the loop alive.
+                        if logdir is not None:
+                            (logdir / "prompt-queue-closed").unlink(missing_ok=True)
+                        logger.debug(
+                            "steer arrived at drain boundary, %d prompt(s) queued, continuing",
+                            len(prompt_queue),
+                        )
+                        continue
                     break
 
                 user_input = _get_user_input(manager.log, manager.workspace)
@@ -395,6 +446,9 @@ def _process_message_conversation(
             # run any user-commands, if msg is from user
             if response_msg.role == "user" and execute_cmd(response_msg, manager):
                 return
+            # Show per-message cost if GPTME_SHOW_COST=1 (no-op otherwise)
+            if response_msg.role == "assistant":
+                print_inline_cost(response_msg)
 
         # Check if user declined execution - return to prompt without generating response
         # This makes "n" at confirm prompt behave like Ctrl+C (return to user prompt)
@@ -534,6 +588,7 @@ def step(
     model: str | None = None,
     output_schema: type | None = None,
     on_token: Callable[[str], None] | None = None,
+    on_thinking: Callable[[bool], None] | None = None,
     logdir: Path | None = None,
 ) -> Generator[Message, None, None]:
     """Runs a single pass of the chat - generates response and executes tools."""
@@ -568,6 +623,7 @@ def step(
                 workspace,
                 output_schema,
                 on_token=on_token,
+                on_thinking=on_thinking,
             )
             if get_config().get_env_bool("GPTME_COSTS"):
                 log_costs(msgs + [msg_response])
@@ -583,8 +639,54 @@ def step(
 
         # log response and run tools
         if msg_response:
-            yield msg_response.replace(quiet=True)
-            yield from execute_msg(msg_response, log=log, workspace=workspace)
+            tool_timings: dict[str, float] = {}
+            # Buffer tool outputs so we can attach per-step timing to the
+            # assistant message *before* it is yielded (and written to the log).
+            # Trade-off: the assistant message (and any tool output) isn't
+            # exposed or persisted until all tools in this step complete, so a
+            # crash or interrupt mid-tool-execution can lose the step record.
+            # Accepted for the CLI path since most tools finish quickly; the
+            # server path instead persists immediately and patches timings in
+            # after the fact via _attach_tool_timings().
+            # list() exhausts execute_msg which populates tool_timings in-place.
+            tool_outputs = list(
+                execute_msg(
+                    msg_response,
+                    log=log,
+                    workspace=workspace,
+                    tool_timings=tool_timings,
+                )
+            )
+            if tool_timings:
+                # Attach aggregated tool timing to the assistant message metadata
+                # so it is persisted in the session record alongside LLM timings.
+                from typing import cast
+
+                from .message import (
+                    MessageMetadata,
+                )
+
+                existing_meta = (
+                    dict(msg_response.metadata) if msg_response.metadata else {}
+                )
+                _raw_timings = existing_meta.get("timings")
+                existing_timings = cast(
+                    MessageTimings,
+                    dict(_raw_timings) if isinstance(_raw_timings, dict) else {},
+                )
+                existing_timings["tool_ms"] = round(sum(tool_timings.values()), 1)
+                existing_timings["tool_ms_by_name"] = {
+                    k: round(v, 1) for k, v in tool_timings.items()
+                }
+                existing_meta["timings"] = existing_timings
+                msg_response = msg_response.replace(
+                    metadata=cast(MessageMetadata, existing_meta)
+                )
+            # Text streaming already rendered the assistant response token by
+            # token, so suppress the later LogManager print in that mode. JSON
+            # output is non-streaming and needs this structured assistant event.
+            yield msg_response.replace(quiet=not is_output_json())
+            yield from tool_outputs
 
     finally:
         clear_interruptible()

@@ -463,11 +463,82 @@ def proactive_summarize_log(
     return result
 
 
+def _drop_orphaned_tool_pairs(
+    original: list[Message],
+    pruned: list[Message],
+) -> list[Message]:
+    """Drop messages that form broken tool call / tool result pairs.
+
+    Two directions are handled, iterating until stable:
+
+    Case 1 — orphaned tool result: a system message with call_id whose
+    nearest non-system predecessor in *original* was dropped.  Keeping
+    it without the function call causes Responses-API 400.
+
+    Case 2 — orphaned function call: an assistant message immediately
+    followed (in *original*) by one or more system messages with call_id,
+    where at least one of those results is missing from *pruned*.  Keeping
+    the function call without all its outputs also triggers 400.
+
+    Used both by ``limit_log`` (context-limit truncation) and
+    ``prune_ephemeral_messages`` (TTL-based pruning) in logmanager.
+    """
+    if not any(m.call_id for m in original):
+        return pruned
+
+    orig_idx = {id(m): i for i, m in enumerate(original)}
+    kept_ids = {id(m) for m in pruned}
+
+    changed = True
+    while changed:
+        changed = False
+        to_remove: set[int] = set()
+
+        for msg in pruned:
+            mid = id(msg)
+            if mid not in kept_ids or mid in to_remove:
+                continue
+            idx = orig_idx.get(mid)
+            if idx is None:
+                continue
+
+            if msg.role == "system" and msg.call_id:
+                # Case 1: walk backward to find nearest non-system anchor.
+                # Pinned tool results are never dropped, even if the anchor
+                # was excluded — keep_head may protect results whose assistant
+                # anchor lies outside the protected window.
+                if msg.pinned:
+                    continue
+                for j in range(idx - 1, -1, -1):
+                    if original[j].role != "system":
+                        if id(original[j]) not in kept_ids:
+                            to_remove.add(mid)
+                            changed = True
+                        break
+
+            elif msg.role == "assistant":
+                # Case 2: walk forward to find immediately following tool
+                # results; if any are missing, drop the function call too.
+                for j in range(idx + 1, len(original)):
+                    nxt = original[j]
+                    if nxt.role == "system" and nxt.call_id:
+                        if id(nxt) not in kept_ids:
+                            to_remove.add(mid)
+                            changed = True
+                            break
+                    elif nxt.role != "system":
+                        break
+
+        kept_ids -= to_remove
+
+    return [m for m in pruned if id(m) in kept_ids]
+
+
 def limit_log(log: list[Message]) -> list[Message]:
     """
     Picks messages until the total number of tokens exceeds limit,
     then removes the last message to get below the limit.
-    Will always pick the first few system messages.
+    Will always pick the first few system messages and any pinned messages.
     """
     model = get_default_model()
     assert model, "No model loaded"
@@ -479,45 +550,83 @@ def limit_log(log: list[Message]) -> list[Message]:
             break
         initial_system_msgs.append(msg)
 
-    # Pick the messages in latest-first order
+    # Also always include pinned messages beyond the initial system block
+    # (e.g. keep_head-protected task context marked pinned by auto_compact_log).
+    # For pinned assistant messages, extend protection to their immediately following
+    # call_id tool results so _drop_orphaned_tool_pairs doesn't remove the pinned
+    # assistant when its result was excluded from the tail budget.
+    log_tail = log[len(initial_system_msgs) :]
+    extra_pinned_ids: set[int] = set()
+    for i, m in enumerate(log_tail):
+        if m.pinned:
+            extra_pinned_ids.add(id(m))
+            if m.role == "assistant":
+                for j in range(i + 1, len(log_tail)):
+                    nxt = log_tail[j]
+                    if nxt.role == "system":
+                        # Include ALL consecutive system messages (both call_id
+                        # and markdown/no-call_id tool results) so orphan-drop
+                        # passes never strip the result of a pinned tool call.
+                        extra_pinned_ids.add(id(nxt))
+                    else:
+                        break
+    extra_pinned = [m for m in log_tail if id(m) in extra_pinned_ids]
+
+    # Reserve budget for always-included messages.
+    always_tokens = len_tokens(initial_system_msgs + extra_pinned, model.model)
+    tail_budget = max(0, model.context - always_tokens)
+
+    # Pick the non-pinned messages in latest-first order within the remaining budget.
     msgs = []
-    for msg in reversed(log[len(initial_system_msgs) :]):
+    for msg in reversed(log_tail):
+        if id(msg) in extra_pinned_ids:
+            continue  # already included
         msgs.append(msg)
-        if len_tokens(msgs, model.model) > model.context:
+        if len_tokens(msgs, model.model) > tail_budget:
             break
 
     # Remove the message that put us over the limit
-    if len_tokens(msgs, model.model) > model.context:
+    if len_tokens(msgs, model.model) > tail_budget:
         # skip the last message
         msgs.pop()
 
-    result = initial_system_msgs + list(reversed(msgs))
+    # Reconstruct in original log order, preserving initial + pinned + tail selection.
+    kept_ids = (
+        {id(m) for m in initial_system_msgs} | extra_pinned_ids | {id(m) for m in msgs}
+    )
+    result = [m for m in log if id(m) in kept_ids]
 
-    # Ensure tool_use/tool_result atomicity: if a non-initial system message's
-    # immediate predecessor in the original log was dropped by the context limit,
-    # drop the system message too. System messages that follow a dropped message
-    # are almost certainly orphaned tool results — keeping them without their
-    # tool-use anchor produces an incoherent log.
+    # Pass 1 — drop non-call_id system messages whose anchor was removed.
+    # These are gptme-native tool results (markdown format, no call_id).
+    # System messages that follow a dropped non-system message are orphaned
+    # tool results; keeping them without their anchor produces an incoherent log.
     result_id_set = {id(m) for m in result}
     log_by_id = {id(m): i for i, m in enumerate(log)}
     initial_id_set = {id(m) for m in initial_system_msgs}
 
     def _is_orphaned(msg: Message) -> bool:
-        if msg.role != "system" or id(msg) in initial_id_set:
+        if (
+            msg.role != "system"
+            or id(msg) in initial_id_set
+            or id(msg) in extra_pinned_ids
+        ):
             return False
         idx = log_by_id.get(id(msg))
         if idx is None or idx == 0:
             return False
-        # Walk backward through the original log to find the nearest
-        # non-system anchor message. System messages are tool results;
-        # their anchor is the assistant (or user) message that produced
-        # them. If that anchor was dropped by the context limit, this
-        # result is orphaned.
         for j in range(idx - 1, -1, -1):
             if log[j].role != "system":
                 return id(log[j]) not in result_id_set
-        # No non-system predecessor found — shouldn't happen for a
-        # non-initial system message, but treat as not orphaned.
         return False
 
-    return [m for m in result if not _is_orphaned(m)]
+    result = [m for m in result if not _is_orphaned(m)]
+
+    # Pass 2 — enforce Responses-API call_id atomicity.
+    # _is_orphaned above catches orphaned tool *results* (Case 1), but misses
+    # the inverse: an assistant message that kept some call_id results but
+    # lost others.  The API rejects any function_call without all its
+    # matching function_call_outputs.  _drop_orphaned_tool_pairs handles
+    # both directions (and is idempotent with pass 1 for call_id messages).
+    result = _drop_orphaned_tool_pairs(log, result)
+
+    return result

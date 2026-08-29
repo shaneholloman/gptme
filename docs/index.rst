@@ -29,6 +29,7 @@ See the `README <https://github.com/gptme/gptme/blob/master/README.md>`_ file fo
    system-dependencies
    usage
    examples
+   cookbook
    howto/index
    tools
    commands
@@ -36,6 +37,7 @@ See the `README <https://github.com/gptme/gptme/blob/master/README.md>`_ file fo
    tui
    config
    providers
+   provider-integration
    model-routing
    security
 
@@ -58,6 +60,7 @@ See the `README <https://github.com/gptme/gptme/blob/master/README.md>`_ file fo
    :caption: Developer Guide
 
    contributing
+   pr-lifecycle
    building
    custom_tool
    hooks
@@ -74,9 +77,10 @@ See the `README <https://github.com/gptme/gptme/blob/master/README.md>`_ file fo
 
    design/hook-based-confirmations
    design/elicitation
+   design/ptc-tool-interface
 
 .. toctree::
-   :maxdepth: 2
+   :maxdepth: 1
    :caption: About
 
    alternatives

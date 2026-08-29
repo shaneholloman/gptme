@@ -29,7 +29,7 @@ def _resolve_static_folder(webui_dir: str | Path | None = None) -> Path:
 
     Precedence: explicit ``webui_dir`` argument > ``GPTME_WEBUI_DIR`` env var >
     bundled modern webui (``gptme/server/webui-dist/``) >
-    the embedded legacy static bundle. A configured directory must exist so
+    the embedded legacy static fallback. A configured directory must exist so
     that a typo fails loudly at startup instead of silently serving 404s.
     """
     candidate = webui_dir or os.environ.get("GPTME_WEBUI_DIR")
@@ -52,6 +52,7 @@ def create_app(
     host: str = "127.0.0.1",
     webui_dir: str | Path | None = None,
     default_profile: str | None = None,
+    allowed_hosts: list[str] | None = None,
 ) -> flask.Flask:
     """Create the Flask app.
 
@@ -60,10 +61,13 @@ def create_app(
             A comma-separated string allows multiple origins, e.g.
             "tauri://localhost,http://tauri.localhost". Whitespace around
             entries is ignored.
-        webui_dir: Optional directory containing a web UI build (e.g. the
-            modern React webui's ``dist/``) to serve instead of the bundled
-            legacy UI. Falls back to the ``GPTME_WEBUI_DIR`` environment
-            variable, then to the embedded legacy static bundle.
+        allowed_hosts: Extra hostnames to accept in the Host header when auth is
+            explicitly disabled. Adds to the built-in
+            localhost/127.0.0.1/[::1] allow-list. See init_host_validation.
+        webui_dir: Optional directory containing a web UI build to serve
+            instead of the bundled modern UI. Falls back to the
+            ``GPTME_WEBUI_DIR`` environment variable, then to the bundled UI
+            and finally the embedded legacy static fallback.
         default_profile: Optional profile name to apply to new conversations
             that don't specify a system prompt. The profile's system_prompt is
             injected as an additional system message when the conversation is
@@ -168,10 +172,16 @@ def create_app(
                 },
             )
 
-    # Initialize auth (defaults to local-only, no auth required)
-    from .auth import init_auth  # fmt: skip
+    # Initialize auth (required by default for every bind address).
+    from .auth import init_auth, init_host_validation, validate_host  # fmt: skip
 
     init_auth(host=host, display=False)
+
+    # Configure and register optional Host-header validation for deployments that
+    # explicitly disable bearer auth; see init_host_validation.
+    # Registered as a before_request hook so it runs ahead of any route/auth.
+    init_host_validation(host=host, allowed_hosts=allowed_hosts)
+    app.before_request(validate_host)
 
     # Register Prometheus metrics middleware and /api/v0/metrics endpoint
     from .metrics import init_metrics  # fmt: skip

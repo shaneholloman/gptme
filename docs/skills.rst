@@ -7,6 +7,9 @@ Anthropic and adopted by 26+ tools (Claude Code, OpenAI Codex, Gemini CLI,
 GitHub Copilot, Cursor, and more). Skills authored for gptme work in those
 tools, and vice versa — the same interop play gptme makes for :doc:`MCP <mcp>`.
 
+Looking for something to install? See the :doc:`skills-gallery` — a curated
+selection of community skills from gptme-contrib.
+
 .. note::
 
    Skills are a **special case of lessons** using the Agent Skills open standard format.
@@ -154,7 +157,7 @@ Skills are loaded from the following directories (if they exist):
 
 **User-level:**
 
-1. ``~/.config/gptme/skills/`` - gptme native skills
+1. ``~/.config/gptme/skills/`` - gptme native skills (or ``$XDG_CONFIG_HOME/gptme/skills/`` if ``XDG_CONFIG_HOME`` is set)
 2. ``~/.claude/skills/`` - Claude CLI compatibility (share skills with Claude CLI)
 3. ``~/.agents/skills/`` - Cross-platform standard
 
@@ -180,7 +183,38 @@ Use the utility CLI to see what the current workspace already knows about:
 
 ``skills list`` shows skill names and descriptions. ``--all`` includes regular
 lessons in the same discovery pass, and ``skills dirs`` shows exactly which
-directories are being scanned.
+directories are being scanned. For the full list of subcommands, run
+``gptme-util skills --help``.
+
+Install a skill from the default ``gptme-contrib`` registry with
+(use ``gptme-util skills dirs`` to see exactly where it lands):
+
+.. code-block:: bash
+
+    gptme-util skills install home-assistant
+
+See the :doc:`skills-gallery` for a curated list of community skills and the
+same install command.
+
+Invoking Skills as Commands
+---------------------------
+
+Every discovered skill is also registered as a slash command, matching how
+Claude Code and Codex expose skills. Inside a chat (CLI, TUI, or server/WebUI),
+``/skill:<name> [args]`` queues the skill body as your next user prompt (with a
+``Skill invoked:`` header) so the assistant acts on it immediately:
+
+.. code-block:: text
+
+    /skill:end                # canonical form, never collides
+    /end                      # bare alias, only if no command/tool is named "end"
+    /skill:review src/app.py  # arguments are passed through
+
+In the skill body, ``$ARGUMENTS`` expands to the full argument string and
+``$ARGUMENTS[N]`` / ``${N}`` to the N-th (0-based) whitespace-separated
+argument (curly braces are required for positional references to avoid
+ambiguity with literal dollar amounts like ``$100`` in skill prose).
+Use ``/skills read <name>`` to view a skill without invoking it.
 
 Creating Skills
 ---------------
@@ -361,9 +395,15 @@ Example:
 - Lesson: ``lessons/patterns/testing.md`` - Testing best practices
 - Skill: ``skills/testing-skill.md`` - Bundled pytest utilities
 
+.. toctree::
+   :maxdepth: 1
+
+   skills-gallery
+
 Related
 -------
 
+- :doc:`skills-gallery` - Curated community skills to install
 - :doc:`lessons` - Core knowledge system
 - :doc:`plugins` - For hooks, custom tools, and deep integration
 - :doc:`hooks` - Lifecycle callbacks (plugins only)

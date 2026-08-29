@@ -25,7 +25,8 @@ test.describe('Performance: sidebar hot-loop prevention', () => {
 
     // Open the demo conversation to populate the Observable store with messages
     await page.getByText('Introduction to gptme').click();
-    await expect(page.getByText(/Hello! I'm gptme/)).toBeVisible({ timeout: 10000 });
+    // With virtualization only viewport messages are in the DOM; check any message rendered.
+    await expect(page.locator('[data-message-index]').first()).toBeVisible({ timeout: 10000 });
 
     // Use CDP Performance.getMetrics instead of the removed page.metrics() API
     const cdp = await page.context().newCDPSession(page);
@@ -46,7 +47,7 @@ test.describe('Performance: sidebar hot-loop prevention', () => {
       await page.goto('/', { waitUntil: 'domcontentloaded' });
       await expect(page.getByTestId('conversation-list')).toBeVisible();
       await page.getByText('Introduction to gptme').click();
-      await expect(page.getByText(/Hello! I'm gptme/)).toBeVisible({ timeout: 10000 });
+      await expect(page.locator('[data-message-index]').first()).toBeVisible({ timeout: 10000 });
     }
 
     const afterHeap = await sampleHeapUsed();
@@ -116,5 +117,178 @@ test.describe('Performance: sidebar hot-loop prevention', () => {
 
     // 10 hovers should complete in < 2 s total; a hot loop would blow past this
     expect(elapsed).toBeLessThan(2000);
+  });
+});
+
+test.describe('Performance: streaming code block rendering', () => {
+  // Regression suite for gptme/gptme#3362 (second hot path).
+  //
+  // Root cause: markdownRenderer.ts `add_text` rebuilt data.code.innerHTML from
+  // the full accumulated text on every streaming token — O(N) work per token,
+  // O(N²) total. After the fix, streamed fragments update one text node (O(1))
+  // and innerHTML is written exactly once when syntax highlighting runs.
+
+  test('streamed code tokens keep bounded DOM writes and one text node', async ({ page }) => {
+    await page.goto('/', { waitUntil: 'domcontentloaded' });
+
+    const result = await page.evaluate(async () => {
+      const [{ customRenderer }, smd] = await Promise.all([
+        import('/src/utils/markdownRenderer.ts'),
+        import('/src/utils/smd.js'),
+      ]);
+      const root = document.createElement('div');
+      document.body.appendChild(root);
+      const parser = smd.parser(customRenderer(root));
+
+      let codeInnerHTMLWrites = 0;
+      const innerHTMLDescriptor = Object.getOwnPropertyDescriptor(Element.prototype, 'innerHTML')!;
+      Object.defineProperty(Element.prototype, 'innerHTML', {
+        configurable: true,
+        get() {
+          return innerHTMLDescriptor.get!.call(this);
+        },
+        set(value: string) {
+          if (this instanceof HTMLElement && this.tagName === 'CODE') {
+            codeInnerHTMLWrites++;
+          }
+          innerHTMLDescriptor.set!.call(this, value);
+        },
+      });
+
+      try {
+        const body = 'const value = "<safe> & fast";\n'.repeat(100);
+        for (const char of `\`\`\`typescript\n${body}`) {
+          smd.parser_write(parser, char);
+        }
+
+        const streamingCode = root.querySelector('code')!;
+        const duringStream = {
+          childNodes: streamingCode.childNodes.length,
+          innerHTMLWrites: codeInnerHTMLWrites,
+          text: streamingCode.textContent,
+        };
+
+        for (const char of '```\n') {
+          smd.parser_write(parser, char);
+        }
+        smd.parser_end(parser);
+
+        return {
+          duringStream,
+          finalInnerHTMLWrites: codeInnerHTMLWrites,
+          finalText: root.querySelector('code')?.textContent,
+        };
+      } finally {
+        Object.defineProperty(Element.prototype, 'innerHTML', innerHTMLDescriptor);
+        root.remove();
+      }
+    });
+
+    expect(result.duringStream.childNodes).toBe(1);
+    expect(result.duringStream.innerHTMLWrites).toBe(0);
+    expect(result.duringStream.text).toContain('<safe> & fast');
+    expect(result.finalInnerHTMLWrites).toBeLessThanOrEqual(1);
+    expect(result.finalText).toContain('<safe> & fast');
+  });
+});
+
+test.describe('Performance: message list virtualization', () => {
+  // Regression suite for gptme/gptme#3379.
+  //
+  // Root cause: before virtualization, every message in a conversation was
+  // mounted in the DOM simultaneously. A 200-message conversation rendered
+  // 200 ChatMessage components, creating tens of thousands of DOM nodes and
+  // causing multi-second layout jank.
+  //
+  // Fix: ConversationContent uses @tanstack/react-virtual to render only the
+  // messages visible in the scroll viewport (plus overscan), keeping DOM node
+  // count bounded regardless of total conversation length.
+  //
+  // These tests guard against regressions that would re-mount all messages.
+
+  test('mounts only a bounded subset of DOM nodes for a 200-message conversation', async ({
+    page,
+    browserName,
+  }) => {
+    test.skip(browserName !== 'chromium', 'Virtualization behavior is browser-independent');
+    test.setTimeout(30000);
+
+    await page.goto('/', { waitUntil: 'domcontentloaded' });
+    await expect(page.getByText('Stress test (200 messages)')).toBeVisible({ timeout: 10000 });
+
+    await page.getByText('Stress test (200 messages)').click();
+    await expect(page.locator('[data-message-index]').first()).toBeVisible({ timeout: 10000 });
+
+    // Count rendered message rows. With virtualization only ~viewport + overscan
+    // rows are in the DOM. A non-virtualized list would mount all 200.
+    const renderedRows = await page.locator('[data-message-index]').count();
+
+    // The virtualizer renders viewport items + overscan (5). On a standard
+    // CI viewport (1280x720) this is well under 30. Use 50 as a generous
+    // ceiling that still catches a full 200-message regression.
+    expect(renderedRows).toBeLessThan(50);
+    expect(renderedRows).toBeLessThan(200);
+  });
+
+  test('scrolling reveals new messages without mounting all at once', async ({
+    page,
+    browserName,
+  }) => {
+    test.skip(browserName !== 'chromium', 'Virtualization behavior is browser-independent');
+    test.setTimeout(30000);
+
+    await page.goto('/', { waitUntil: 'domcontentloaded' });
+    await expect(page.getByText('Stress test (200 messages)')).toBeVisible({ timeout: 10000 });
+
+    await page.getByText('Stress test (200 messages)').click();
+    await expect(page.locator('[data-message-index]').first()).toBeVisible({ timeout: 10000 });
+
+    // Conversations open at the bottom. Scroll the actual message viewport to
+    // the top rather than sending a wheel event to the sidebar item we clicked.
+    const messageViewport = page.getByTestId('message-scroll-viewport');
+    const initialIndices = await page
+      .locator('[data-message-index]')
+      .evaluateAll((els) => els.map((el) => Number(el.getAttribute('data-message-index'))));
+    await messageViewport.evaluate((element) => element.scrollTo({ top: 0 }));
+
+    // Wait for the virtualizer to replace the bottom rows with top rows.
+    await expect
+      .poll(async () =>
+        page
+          .locator('[data-message-index]')
+          .evaluateAll((els) => els.map((el) => Number(el.getAttribute('data-message-index'))))
+      )
+      .not.toEqual(initialIndices);
+
+    const scrolledIndices = await page
+      .locator('[data-message-index]')
+      .evaluateAll((els) => els.map((el) => Number(el.getAttribute('data-message-index'))));
+
+    // The top of the conversation is now rendered, while the DOM stays bounded.
+    expect(scrolledIndices).toContain(0);
+    expect(scrolledIndices.length).toBeLessThan(50);
+  });
+
+  test('total DOM node count stays bounded for a long conversation', async ({
+    page,
+    browserName,
+  }) => {
+    test.skip(browserName !== 'chromium', 'DOM metrics require Chromium');
+    test.setTimeout(30000);
+
+    await page.goto('/', { waitUntil: 'domcontentloaded' });
+    await expect(page.getByText('Stress test (200 messages)')).toBeVisible({ timeout: 10000 });
+
+    await page.getByText('Stress test (200 messages)').click();
+    await expect(page.locator('[data-message-index]').first()).toBeVisible({ timeout: 10000 });
+
+    // Count total DOM elements. Pre-virtualization, 200 messages with markdown
+    // rendering produced 8000+ nodes. With virtualization it should be well
+    // under 2000 even with the sidebar and chrome.
+    const totalElements = await page.evaluate(() => document.querySelectorAll('*').length);
+
+    // 3000 is a generous ceiling that still catches a non-virtualized regression
+    // (which would produce 8000+ nodes for 200 rendered messages).
+    expect(totalElements).toBeLessThan(3000);
   });
 });
